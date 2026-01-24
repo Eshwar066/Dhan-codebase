@@ -137,7 +137,17 @@ class Tradehull:
                                                order_type=order_type, product_type=product_Type, price=price,
                                                trigger_price=trigger_price)
 
-            orderid = order["data"]["orderId"]
+            if not order:
+                print("❌ No response from Dhan")
+                return None
+
+            if order.get("status") != "success":
+                print("❌ Order Rejected")
+                print("Reason:", order.get("remarks") or order)
+                return None
+
+            orderid = order["data"].get("orderId")
+            print("✅ Order Placed Successfully:", orderid)
             return str(orderid)
         except Exception as e:
             self.logger.exception(f'Got exception in place_order as {e}')
@@ -331,7 +341,7 @@ class Tradehull:
             security_id = row.iloc[-1]['SEM_SMST_SECURITY_ID']
             instrument_type = row.iloc[-1]['SEM_INSTRUMENT_NAME']
 
-            # ---- API Call ----
+            # ---- DHAN API Call ----
             ohlc = self.Dhan.intraday_minute_data(
                 str(security_id),
                 exchangeSegment,
