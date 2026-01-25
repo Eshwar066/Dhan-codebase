@@ -1,18 +1,22 @@
+import os
+import sys
+from dotenv import load_dotenv
 import pdb
 import time
 import datetime
 import traceback
 import talib
 from Dhan_Tradehull import Tradehull
-from FreeNSEFetcher import FreeNSEFetcher
+from core.api.optionChain.dhanOptionChain import DhanOptionChain
 import pandas as pd
 
 
-client_code = "1000690797"
-token_id = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzY5Mjk3OTkxLCJpYXQiOjE3NjkyMTE1OTEsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMDAwNjkwNzk3In0.JUH6awWUcbdInVorsI_iD_9Q8Vhb9YqIf2yFZdfStIG4DQtkh7fu2yQkPr-h0LWlGWPdYBMZf2zLXyDlCZPH2w"
-
+# ================= LOGIN =================
+load_dotenv()
+client_code = os.getenv("DHAN_CLIENT_CODE")
+token_id = os.getenv("DHAN_ACCESS_TOKEN")
 tsl = Tradehull(client_code, token_id)
-freeNse = FreeNSEFetcher()
+
 
 # ---------------- DATE ----------------
 today = datetime.date.today()
@@ -31,20 +35,54 @@ print("Available Balance:", available_balance)
 # ---------------- LTP ----------------
 ltp_acc = tsl.get_ltp("ACC")
 ltp_nifty = tsl.get_ltp("NIFTY")
-print(">>ltp", ltp_acc, ltp_nifty)
+# print(">>ltp", ltp_acc, ltp_nifty)
 
 # ---------------- HIST DATA ----------------
 previous_hist_data = tsl.get_historical_data("ACC", "NSE", 5)
-print(previous_hist_data, ">>previous_hist_data")
-# intraday_hist_data = tsl.get_intraday_data("ACC", "NSE", 1)
+# print(previous_hist_data, ">>previous_hist_data")
+intraday_hist_data = tsl.get_intraday_data("ACC", "NSE", 1)
+
+# --------------option chain--------------
+dhan_oc = DhanOptionChain(client_code, token_id)
+oc_raw = dhan_oc.get_option_chain(
+    underlying_scrip=13,
+    underlying_seg="IDX_I",
+    expiry="2026-01-27",
+)
+df_optionchain = dhan_oc.option_chain_to_df(oc_raw)
+# print(df_optionchain)
+
+#------------expiry list--------------
+expiry = dhan_oc.get_upcoming_expirylist(
+    underlying_scrip=13,
+    underlying_seg="IDX_I",
+)
+
+#-----------------Expired-option chain data---------
+rolling_data = dhan_oc.get_rolling_optionchain(
+    security_id=13,
+    exchange_segment="NSE_FNO",
+    interval=1,
+    instrument="OPTIDX",
+    expiry_flag="MONTH",
+    expiry_code=1,
+    strike="ATM",
+    option_type="CALL",
+    from_date="2025-09-01",
+    to_date="2025-09-30",
+)
+df = dhan_oc.rolling_option_to_df(rolling_data, option_type="CALL")
+print(df[:12])
+
+
+# ---------------- STRIKE SELECTION ----------------
+# ce_name, pe_name, strike = tsl.ATM_Strike_Selection("NIFTY", expiry_date)
+
+# otm_ce_name, otm_pe_name, ce_OTM_strike, pe_OTM_strike = tsl.OTM_Strike_Selection(
+#     "NIFTY", expiry_date, 3
+# )
 
 pdb.set_trace()
-# ---------------- STRIKE SELECTION ----------------
-ce_name, pe_name, strike = tsl.ATM_Strike_Selection("NIFTY", expiry_date)
-
-otm_ce_name, otm_pe_name, ce_OTM_strike, pe_OTM_strike = tsl.OTM_Strike_Selection(
-    "NIFTY", expiry_date, 3
-)
 
 
 # ---------------- INDICATORS ----------------
@@ -58,6 +96,8 @@ qty = 2 * lot_size
 # ---------------- ORDERS ----------------
 orderid1 = tsl.order_placement(otm_ce_name, "NFO", qty, 0, 0, "MARKET", "BUY", "MIS")
 orderid2 = tsl.order_placement("ACC", "NSE", 65, 0, 0, "MARKET", "BUY", "MIS")
+orderid2 = tsl.order_placement("ACC", "NSE", 1, 0, sl_price, "STOPMARKET", "BUY", "MIS")
+
 
 # ---------------- RISK MANAGEMENT ----------------
 live_pnl = tsl.get_live_pnl()

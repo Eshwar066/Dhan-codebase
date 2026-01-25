@@ -230,24 +230,20 @@ class BacktestState:
 def check_inside_bar_setup(chart, idx):
     """Check if inside bar setup exists at index idx."""
     if idx < 4 or len(chart) < idx + 1:
-        return None, None
+        return None, None, None
 
     base = chart.iloc[idx - 4]
     inside = chart.iloc[idx - 3]
     last = chart.iloc[idx - 2]
     current = chart.iloc[idx - 1]
 
-    # Calculate RSI
-    if "rsi" not in chart.columns or pd.isna(last.get("rsi")):
-        return None, None
+    if "rsi" not in chart.columns or pd.isna(last["rsi"]):
+        return None, None, None
 
-    # Inside bar condition
     inside_candle = inside["high"] < base["high"] and inside["low"] > base["low"]
-
     if not inside_candle:
-        return None, None
+        return None, None, None
 
-    # Trend conditions
     uptrend = last["rsi"] > 60
     downtrend = last["rsi"] < 40
 
@@ -257,21 +253,30 @@ def check_inside_bar_setup(chart, idx):
 
     # BUY signal
     if uptrend and upper_break:
-        return "BUY", current["close"]
+        return "BUY", current["close"], last["low"]  # 🔥 SL
 
-    # SELL signal
     if downtrend and lower_break:
-        return "SELL", current["close"]
+        return "SELL", current["close"], last["high"]  # 🔥 SL
 
-    return None, None
+    return None, None, None
 
 
 def should_exit_position(position, current_price, current_time):
-    """Determine if position should be exited (end of day for now)."""
-    # Simple exit: end of day
+    side = position["side"]
+    sl = position["sl"]
+
+    # SL HIT
+    if side == "BUY" and current_price <= sl:
+        return True, "SL"
+
+    if side == "SELL" and current_price >= sl:
+        return True, "SL"
+
+    # END OF DAY
     if current_time.time() >= END_TIME:
-        return True
-    return False
+        return True, "EOD"
+
+    return False, None
 
 
 # ================= MAIN BACKTEST LOOP =================
@@ -402,9 +407,10 @@ def run_backtest():
                         and daily_trade_count < MAX_TRADES_PER_DAY
                         and not entered_today
                     ):
-                        signal, entry_price = check_inside_bar_setup(
+                        signal, entry_price, sl_price = check_inside_bar_setup(
                             chart, idx + 1
-                        )  # idx+1 because function expects index after current
+                        )
+                        # idx+1 because function expects index after current
 
                         if signal:
                             # Calculate quantity
@@ -418,6 +424,7 @@ def run_backtest():
                                     "qty": qty,
                                     "entry_time": current_time,
                                     "side": signal,
+                                    "sl": sl_price,  # 🔥 STORE SL
                                 }
 
                                 state.add_trade(

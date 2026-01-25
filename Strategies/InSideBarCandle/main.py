@@ -102,74 +102,74 @@ traded_symbols = set()
 trade_count = 0
 
 # ================= STRATEGY LOOP =================
+while True:
+    for stock in watchlist:
 
-for stock in watchlist:
+        if trade_count >= MAX_TRADES:
+            break
 
-    if trade_count >= MAX_TRADES:
-        break
+        # now = dt.datetime.now().time()
+        # if not (START_TIME <= now <= END_TIME):
+        #     break
 
-    # now = dt.datetime.now().time()
-    # if not (START_TIME <= now <= END_TIME):
-    #     break
+        # ---- Fetch data ----
+        if stock in traded_symbols:
+            continue
 
-    # ---- Fetch data ----
-    chart = tsl.get_intraday_data(
-        stock, "NSE", 1, from_date="2026-01-23", to_date="2026-01-23"
-    )
+        chart = tsl.get_intraday_data(
+            stock, "NSE", 1, from_date="2026-01-23", to_date="2026-01-23"
+        )
 
-    if chart is None or chart.empty or len(chart) < 20:
-        continue
+        if chart is None or chart.empty or len(chart) < 20:
+            continue
 
-    if stock in traded_symbols:
-        continue
+        # ---- Indicators ----
+        chart["rsi"] = talib.RSI(chart["close"], RSI_PERIOD)
 
-    # ---- Indicators ----
-    chart["rsi"] = talib.RSI(chart["close"], RSI_PERIOD)
+        if chart["rsi"].isna().iloc[-2]:
+            continue
 
-    if chart["rsi"].isna().iloc[-2]:
-        continue
+        # ---- Candle references ----
+        base = chart.iloc[-4]
+        inside = chart.iloc[-3]
+        last = chart.iloc[-2]
 
-    # ---- Candle references ----
-    base = chart.iloc[-4]
-    inside = chart.iloc[-3]
-    last = chart.iloc[-2]
+        # ---- Trend ----
+        uptrend = last["rsi"] > 60
+        downtrend = last["rsi"] < 40
 
-    # ---- Trend ----
-    uptrend = last["rsi"] > 60
-    downtrend = last["rsi"] < 40
+        # ---- Inside bar (correct definition) ----
+        inside_candle = inside["high"] < base["high"] and inside["low"] > base["low"]
 
-    # ---- Inside bar (correct definition) ----
-    inside_candle = inside["high"] < base["high"] and inside["low"] > base["low"]
+        # ---- Breakouts ----
+        upper_break = last["high"] > base["high"]
+        lower_break = last["low"] < base["low"]
 
-    # ---- Breakouts ----
-    upper_break = last["high"] > base["high"]
-    lower_break = last["low"] < base["low"]
+        # ---- Quantity ----
+        qty = int(per_trade_margin / last["close"])
+        if qty <= 0:
+            continue
 
-    # ---- Quantity ----
-    qty = int(per_trade_margin / last["close"])
-    if qty <= 0:
-        continue
+        # ================= BUY =================
+        if uptrend and inside_candle and upper_break:
 
-    # ================= BUY =================
-    if uptrend and inside_candle and upper_break:
+            print(f"📈 {stock} BUY setup")
 
-        print(f"📈 {stock} BUY setup")
+            if not PAPER_TRADING:
+                tsl.order_placement(stock, "NSE", qty, 0, 0, "MARKET", "BUY", "MIS")
 
-        if not PAPER_TRADING:
-            tsl.order_placement(stock, "NSE", qty, 0, 0, "MARKET", "BUY", "MIS")
+            traded_symbols.add(stock)
+            trade_count += 1
 
-        traded_symbols.add(stock)
-        trade_count += 1
+        # ================= SELL =================
+        elif downtrend and inside_candle and lower_break:
 
-    # ================= SELL =================
-    elif downtrend and inside_candle and lower_break:
+            print(f"📉 {stock} SELL setup")
 
-        print(f"📉 {stock} SELL setup")
+            if not PAPER_TRADING:
+                tsl.order_placement(stock, "NSE", qty, 0, 0, "MARKET", "SELL", "MIS")
 
-        if not PAPER_TRADING:
-            tsl.order_placement(stock, "NSE", qty, 0, 0, "MARKET", "SELL", "MIS")
-
-        traded_symbols.add(stock)
-        trade_count += 1
+            traded_symbols.add(stock)
+            trade_count += 1
 
 print("✅ Strategy execution completed", trade_count)
