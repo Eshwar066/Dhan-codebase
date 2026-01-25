@@ -13,6 +13,7 @@ from pprint import pprint
 import logging
 import warnings
 from typing import Tuple, Dict
+import re
 
 from core.config.constants import (
     INTERVAL_PARAMS,
@@ -79,7 +80,6 @@ class Tradehull:
         except Exception as e:
             print(e)
             traceback.print_exc()
-
 
     def get_login(self, ClientCode, token_id):
         try:
@@ -343,15 +343,7 @@ class Tradehull:
 
     def get_intraday_data(self, tradingsymbol, exchange, timeframe, from_date, to_date):
         try:
-            available_frames = {
-                2: "2T",  # 2 minutes
-                3: "3T",  # 3 minutes
-                5: "5T",  # 5 minutes
-                10: "10T",  # 10 minutes
-                15: "15T",  # 15 minutes
-                30: "30T",  # 30 minutes
-                60: "60T",  # 60 minutes
-            }
+            SUPPORTED_FRAMES = {1, 2, 3, 5, 10, 15, 30, 60}
 
             script_exchange = {
                 "NSE": self.Dhan.NSE,
@@ -393,6 +385,8 @@ class Tradehull:
             ohlc = self.Dhan.intraday_minute_data(
                 str(security_id), exchangeSegment, instrument_type, from_date, to_date
             )
+            # print(ohlc["data"])
+            # pdb.set_trace()
             # ---- Safety checks ----
 
             if not ohlc or ohlc.get("status") != "success":
@@ -447,11 +441,14 @@ class Tradehull:
             if timeframe == 1:
                 return df
 
-            if timeframe not in available_frames:
+            if timeframe == 15:
+                return df
+
+            if timeframe not in SUPPORTED_FRAMES:
                 print("😵‍💫>>Unsupported timeframe:", timeframe)
                 return df
 
-            df = self.resample_timeframe(df, available_frames[timeframe])
+            df = self.resample_timeframe(df, timeframe)
             return df
 
         except Exception as e:
@@ -459,12 +456,25 @@ class Tradehull:
             self.logger.exception(f"Exception in Getting OHLC data as {e}")
             traceback.print_exc()
 
-    def resample_timeframe(self, df, timeframe="5T"):
-        # Normalize pandas frequency (T -> min)
-        if timeframe.endswith("T"):
-            timeframe = timeframe.replace("T", "min")
+    def resample_timeframe(self, df, timeframe):
+        """
+        timeframe: int (minutes) → 1, 5, 15, 30, 60
+        """
 
+        # -----------------------------
+        # Validate timeframe
+        # -----------------------------
+        if not isinstance(timeframe, int):
+            raise TypeError(f"timeframe must be int minutes, got {type(timeframe)}")
+
+        if timeframe <= 0:
+            raise ValueError("timeframe must be positive")
+
+        pandas_tf = f"{timeframe}min"
+
+        # -----------------------------
         # Detect datetime column
+        # -----------------------------
         if "timestamp" in df.columns:
             time_col = "timestamp"
         elif "start_Time" in df.columns:
@@ -474,37 +484,45 @@ class Tradehull:
         else:
             raise KeyError(f"No datetime column found. Columns: {df.columns.tolist()}")
 
-        # Convert to datetime and set index
+        # -----------------------------
+        # Prepare index
+        # -----------------------------
+        df = df.copy()
         df[time_col] = pd.to_datetime(df[time_col])
         df = df.set_index(time_col).sort_index()
 
-        # Align candles to market open (09:15 IST)
-        earliest_time = df.index.min()
-        desired_start_time = earliest_time.replace(
-            hour=9, minute=15, second=0, microsecond=0
-        )
+        # -----------------------------
+        # Align candles to 09:15 IST
+        # -----------------------------
+        earliest = df.index.min()
+        market_open = earliest.replace(hour=9, minute=15, second=0, microsecond=0)
 
-        if earliest_time < desired_start_time:
-            adjusted_start_time = desired_start_time
+        if earliest < market_open:
+            origin = market_open
         else:
-            tf_minutes = int(timeframe[:-1])
-            delta_minutes = (earliest_time - desired_start_time).seconds // 60
-            adjusted_start_time = desired_start_time + pd.DateOffset(
-                minutes=(delta_minutes // tf_minutes) * tf_minutes
-            )
+            delta_min = int((earliest - market_open).total_seconds() // 60)
+            aligned = (delta_min // timeframe) * timeframe
+            origin = market_open + pd.Timedelta(minutes=aligned)
 
+        # -----------------------------
         # Resample
-        resampled_df = df.resample(timeframe, origin=adjusted_start_time).agg(
-            {
-                "open": "first",
-                "high": "max",
-                "low": "min",
-                "close": "last",
-                "volume": "sum",
-            }
+        # -----------------------------
+        resampled = (
+            df.resample(pandas_tf, origin=origin)
+            .agg(
+                {
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum",
+                }
+            )
+            .dropna()
+            .reset_index()
         )
 
-        return resampled_df.dropna().reset_index()
+        return resampled
 
     def get_lot_size(self, tradingsymbol: str):
         data = self.instrument_df[
