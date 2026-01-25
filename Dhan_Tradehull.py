@@ -80,6 +80,7 @@ class Tradehull:
             print(e)
             traceback.print_exc()
 
+
     def get_login(self, ClientCode, token_id):
         try:
             self.ClientCode = ClientCode
@@ -393,7 +394,38 @@ class Tradehull:
                 str(security_id), exchangeSegment, instrument_type, from_date, to_date
             )
             # ---- Safety checks ----
-            if not ohlc or "data" not in ohlc or not isinstance(ohlc["data"], list):
+
+            if not ohlc or ohlc.get("status") != "success":
+                # Normalize error extraction
+                error_code = (
+                    ohlc.get("remarks", {}).get("error_code")
+                    or ohlc.get("data", {}).get("errorCode")
+                    or ohlc.get("errorCode")
+                )
+
+                error_message = (
+                    ohlc.get("remarks", {}).get("error_message")
+                    or ohlc.get("data", {}).get("errorMessage")
+                    or ohlc.get("errorMessage")
+                )
+
+                # 🔴 Rate limit → retry later
+                if error_code == "DH-904":
+                    # print("⏳ Rate limit hit. Sleeping...")
+                    time.sleep(2)
+                    return None
+
+                # 🔴 Authentication failure → STOP
+                if error_code == "DH-901":
+                    print("🔐 AUTH ERROR:", error_message)
+                    print("👉 Token expired or invalid. Please re-login.")
+                    raise SystemExit("Dhan authentication failed")
+
+                # 🔴 Any other error
+                print("❌ API Error:", error_code, error_message)
+                return None
+
+            if not ohlc or ohlc.get("status") != "success":
                 print("😵‍💫>>Invalid intraday response:", ohlc)
                 return None
 
@@ -405,7 +437,12 @@ class Tradehull:
             if df.empty:
                 return None
 
-            df["date"] = df["date"].apply(self.convert_to_date_time)
+            # print(">>DF columns:", df.columns.tolist())
+
+            # 🔥 Convert epoch → datetime
+            df["timestamp"] = pd.to_datetime(
+                df["timestamp"], unit="s", utc=True
+            ).dt.tz_convert("Asia/Kolkata")
 
             if timeframe == 1:
                 return df
@@ -423,8 +460,25 @@ class Tradehull:
             traceback.print_exc()
 
     def resample_timeframe(self, df, timeframe="5T"):
-        df["start_Time"] = pd.to_datetime(df["start_Time"])
-        df.set_index("start_Time", inplace=True)
+        # Normalize pandas frequency (T -> min)
+        if timeframe.endswith("T"):
+            timeframe = timeframe.replace("T", "min")
+
+        # Detect datetime column
+        if "timestamp" in df.columns:
+            time_col = "timestamp"
+        elif "start_Time" in df.columns:
+            time_col = "start_Time"
+        elif "start_time" in df.columns:
+            time_col = "start_time"
+        else:
+            raise KeyError(f"No datetime column found. Columns: {df.columns.tolist()}")
+
+        # Convert to datetime and set index
+        df[time_col] = pd.to_datetime(df[time_col])
+        df = df.set_index(time_col).sort_index()
+
+        # Align candles to market open (09:15 IST)
         earliest_time = df.index.min()
         desired_start_time = earliest_time.replace(
             hour=9, minute=15, second=0, microsecond=0
@@ -433,13 +487,13 @@ class Tradehull:
         if earliest_time < desired_start_time:
             adjusted_start_time = desired_start_time
         else:
+            tf_minutes = int(timeframe[:-1])
+            delta_minutes = (earliest_time - desired_start_time).seconds // 60
             adjusted_start_time = desired_start_time + pd.DateOffset(
-                minutes=(earliest_time - desired_start_time).seconds
-                // 60
-                // int(timeframe[:-1])
-                * int(timeframe[:-1])
+                minutes=(delta_minutes // tf_minutes) * tf_minutes
             )
 
+        # Resample
         resampled_df = df.resample(timeframe, origin=adjusted_start_time).agg(
             {
                 "open": "first",
@@ -450,9 +504,7 @@ class Tradehull:
             }
         )
 
-        resampled_df.reset_index(inplace=True)
-
-        return resampled_df
+        return resampled_df.dropna().reset_index()
 
     def get_lot_size(self, tradingsymbol: str):
         data = self.instrument_df[

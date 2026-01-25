@@ -1,18 +1,47 @@
 import os
 import sys
+import time
+import datetime as dt
+from dotenv import load_dotenv
 
-# Project root on path so Dhan_Tradehull, core, etc. import when run from Strategies/InSideBarCandle
+
+# ---- Project root fix ----
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-import pdb
 from Dhan_Tradehull import Tradehull
 import pandas as pd
+import talib
 
-client_code = "1000690797"
-token_id = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzY5Mjk3OTkxLCJpYXQiOjE3NjkyMTE1OTEsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMDAwNjkwNzk3In0.JUH6awWUcbdInVorsI_iD_9Q8Vhb9YqIf2yFZdfStIG4DQtkh7fu2yQkPr-h0LWlGWPdYBMZf2zLXyDlCZPH2w"
+# ================= CONFIG =================
+
+PAPER_TRADING = True  # 🔴 Set False for live
+MAX_TRADES = 2
+API_SLEEP = 0.7  # rate-limit protection
+RSI_PERIOD = 14
+
+# Market hours
+START_TIME = dt.time(9, 20)
+END_TIME = dt.time(14, 30)
+
+# ================= LOGIN =================
+load_dotenv()
+client_code = os.getenv("DHAN_CLIENT_CODE")
+token_id = os.getenv("DHAN_ACCESS_TOKEN")
+
+
+if not client_code or not token_id:
+    raise SystemExit("❌ Missing DHAN credentials")
+
 tsl = Tradehull(client_code, token_id)
+
+# ================= CAPITAL =================
+
+available_balance = tsl.get_balance()
+per_trade_margin = available_balance / MAX_TRADES
+
+# ================= WATCHLIST =================
 
 watchlist = [
     "HINDALCO",
@@ -67,10 +96,80 @@ watchlist = [
     "INDIGO",
 ]
 
-for name in watchlist:
-    print(name)
+# ================= STATE =================
 
-# pdb.set_trace()
+traded_symbols = set()
+trade_count = 0
 
-# intraday_hist_data = tsl.get_intraday_data(otm_ce_name, "NFO", 1)
-# intraday_hist_data["rsi"] = talib.RSI(intraday_hist_data["close"], timeperiod=14)
+# ================= STRATEGY LOOP =================
+
+for stock in watchlist:
+
+    if trade_count >= MAX_TRADES:
+        break
+
+    # now = dt.datetime.now().time()
+    # if not (START_TIME <= now <= END_TIME):
+    #     break
+
+    # ---- Fetch data ----
+    chart = tsl.get_intraday_data(
+        stock, "NSE", 1, from_date="2026-01-23", to_date="2026-01-23"
+    )
+
+    if chart is None or chart.empty or len(chart) < 20:
+        continue
+
+    if stock in traded_symbols:
+        continue
+
+    # ---- Indicators ----
+    chart["rsi"] = talib.RSI(chart["close"], RSI_PERIOD)
+
+    if chart["rsi"].isna().iloc[-2]:
+        continue
+
+    # ---- Candle references ----
+    base = chart.iloc[-4]
+    inside = chart.iloc[-3]
+    last = chart.iloc[-2]
+
+    # ---- Trend ----
+    uptrend = last["rsi"] > 60
+    downtrend = last["rsi"] < 40
+
+    # ---- Inside bar (correct definition) ----
+    inside_candle = inside["high"] < base["high"] and inside["low"] > base["low"]
+
+    # ---- Breakouts ----
+    upper_break = last["high"] > base["high"]
+    lower_break = last["low"] < base["low"]
+
+    # ---- Quantity ----
+    qty = int(per_trade_margin / last["close"])
+    if qty <= 0:
+        continue
+
+    # ================= BUY =================
+    if uptrend and inside_candle and upper_break:
+
+        print(f"📈 {stock} BUY setup")
+
+        if not PAPER_TRADING:
+            tsl.order_placement(stock, "NSE", qty, 0, 0, "MARKET", "BUY", "MIS")
+
+        traded_symbols.add(stock)
+        trade_count += 1
+
+    # ================= SELL =================
+    elif downtrend and inside_candle and lower_break:
+
+        print(f"📉 {stock} SELL setup")
+
+        if not PAPER_TRADING:
+            tsl.order_placement(stock, "NSE", qty, 0, 0, "MARKET", "SELL", "MIS")
+
+        traded_symbols.add(stock)
+        trade_count += 1
+
+print("✅ Strategy execution completed", trade_count)
