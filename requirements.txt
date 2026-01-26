@@ -1,0 +1,9 @@
+requests
+pandas
+numpy
+websocket-client
+websockets
+python-dateutil
+pytz
+dhanhq
+Dhan-Tradehull
