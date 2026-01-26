@@ -23,7 +23,7 @@ from Dhan_Tradehull import Tradehull
 
 # ================= CONFIG =================
 
-BACKTEST_DAYS = 365  # Last 1 month
+BACKTEST_DAYS = 30  # Last 1 month
 MAX_TRADES_PER_DAY = 2
 RSI_PERIOD = 14
 INITIAL_CAPITAL = 100000  # Starting capital for backtest
@@ -323,8 +323,12 @@ def run_backtest():
             try:
                 # Get intraday data for the whole day (1-minute candles)
                 logger.info(f"Fetching data for {stock} on {date_str}...")
-                chart = tsl.get_intraday_data(
-                    stock, "NSE", 15, from_date=date_str, to_date=date_str
+                chart = tsl.get_long_term_historical_data(
+                    tradingsymbol=stock,
+                    exchange="NSE",
+                    timeframe="15",
+                    from_date=date_str,
+                    to_date=date_str,
                 )
 
                 if chart is None or chart.empty or len(chart) < 20:
@@ -450,8 +454,12 @@ def run_backtest():
         for symbol in positions_to_close:
             try:
                 # Get last price from the day's data
-                chart = tsl.get_intraday_data(
-                    symbol, "NSE", 15, from_date=date_str, to_date=date_str
+                chart = tsl.get_long_term_historical_data(
+                    tradingsymbol=stock,
+                    exchange="NSE",
+                    timeframe="15",
+                    from_date=date_str,
+                    to_date=date_str,
                 )
                 if chart is not None and not chart.empty:
                     last_price = chart.iloc[-1]["close"]

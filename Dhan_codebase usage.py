@@ -118,50 +118,8 @@ print(data)
 
 pdb.set_trace()
 
+# ==========end======
 
-# ---------------- LTP ----------------
-ltp_acc = tsl.get_ltp("ACC")
-ltp_nifty = tsl.get_ltp("NIFTY")
-# print(">>ltp", ltp_acc, ltp_nifty)
-
-# ---------------- HIST DATA ----------------
-# previous_hist_data = tsl.get_historical_data("ACC", "NSE", 5)
-# print(previous_hist_data, ">>previous_hist_data")
-# intraday_hist_data = tsl.get_intraday_data("ACC", "NSE", 1)
-
-# --------------option chain--------------
-# ------------expiry list--------------
-
-dhan_oc = DhanOptionChain(client_code, token_id)
-# expiry = dhan_oc.get_upcoming_expirylist(
-#     underlying_scrip=13,
-#     underlying_seg="IDX_I",
-# )
-# print(expiry)
-# oc_raw = dhan_oc.get_option_chain(
-#     underlying_scrip=13,
-#     underlying_seg="IDX_I",
-#     expiry="2026-01-27",
-# )
-# df_optionchain = dhan_oc.option_chain_to_df(oc_raw)
-# print(df_optionchain)
-
-
-# -----------------Expired-option chain data---------
-# rolling_data = dhan_oc.get_rolling_optionchain(
-#     security_id=13,
-#     exchange_segment="NSE_FNO",
-#     interval=1,
-#     instrument="OPTIDX",
-#     expiry_flag="MONTH",
-#     expiry_code=1,
-#     strike="ATM+10",
-#     option_type="CALL",
-#     from_date="2025-09-01",
-#     to_date="2025-09-30",
-# )
-# df = dhan_oc.rolling_option_to_df(rolling_data, option_type="CALL")
-# print(df[:12])
 CE_symbol_name, PE_symbol_name, strike = tsl.ATM_Strike_Selection(
     Underlying="NIFTY", Expiry=0
 )
@@ -174,7 +132,7 @@ print(CE_symbol_name, PE_symbol_name, strike)
 #     "NIFTY", expiry_date, 3
 # )
 
-pdb.set_trace()
+# pdb.set_trace()
 
 
 # ---------------- INDICATORS ----------------

@@ -1,8 +1,12 @@
 import os
 import sys
 import time
+import pdb
 import datetime as dt
 from dotenv import load_dotenv
+from Dhan_Tradehull import Tradehull
+import pandas as pd
+import talib
 
 
 # ---- Project root fix ----
@@ -10,9 +14,6 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from Dhan_Tradehull import Tradehull
-import pandas as pd
-import talib
 
 # ================= CONFIG =================
 
@@ -102,74 +103,81 @@ traded_symbols = set()
 trade_count = 0
 
 # ================= STRATEGY LOOP =================
-while True:
-    for stock in watchlist:
+# while True:
 
-        if trade_count >= MAX_TRADES:
-            break
 
-        # now = dt.datetime.now().time()
-        # if not (START_TIME <= now <= END_TIME):
-        #     break
+for stock in watchlist:
 
-        # ---- Fetch data ----
-        if stock in traded_symbols:
-            continue
+    if trade_count >= MAX_TRADES:
+        break
 
-        chart = tsl.get_intraday_data(
-            stock, "NSE", 1, from_date="2026-01-23", to_date="2026-01-23"
-        )
+    # now = dt.datetime.now().time()
+    # if not (START_TIME <= now <= END_TIME):
+    #     break
 
-        if chart is None or chart.empty or len(chart) < 20:
-            continue
+    # ---- Fetch data ----
+    if stock in traded_symbols:
+        continue
 
-        # ---- Indicators ----
-        chart["rsi"] = talib.RSI(chart["close"], RSI_PERIOD)
 
-        if chart["rsi"].isna().iloc[-2]:
-            continue
+    chart = tsl.get_long_term_historical_data(
+        tradingsymbol=stock,
+        exchange="NSE",
+        timeframe="15",
+        from_date="2026-01-23",
+        to_date="2026-01-23",
+    )
+    
+    if chart is None or chart.empty or len(chart) < 20:
+        continue
 
-        # ---- Candle references ----
-        base = chart.iloc[-4]
-        inside = chart.iloc[-3]
-        last = chart.iloc[-2]
+    # ---- Indicators ----
+    chart["rsi"] = talib.RSI(chart["close"], RSI_PERIOD)
+    pdb.set_trace()
+    if chart["rsi"].isna().iloc[-2]:
+        continue
 
-        # ---- Trend ----
-        uptrend = last["rsi"] > 60
-        downtrend = last["rsi"] < 40
+    # ---- Candle references ----
+    base = chart.iloc[-4]
+    inside = chart.iloc[-3]
+    last = chart.iloc[-2]
 
-        # ---- Inside bar (correct definition) ----
-        inside_candle = inside["high"] < base["high"] and inside["low"] > base["low"]
+    # ---- Trend ----
+    uptrend = last["rsi"] > 60
+    downtrend = last["rsi"] < 40
 
-        # ---- Breakouts ----
-        upper_break = last["high"] > base["high"]
-        lower_break = last["low"] < base["low"]
+    # ---- Inside bar (correct definition) ----
+    inside_candle = inside["high"] < base["high"] and inside["low"] > base["low"]
 
-        # ---- Quantity ----
-        qty = int(per_trade_margin / last["close"])
-        if qty <= 0:
-            continue
+    # ---- Breakouts ----
+    upper_break = last["high"] > base["high"]
+    lower_break = last["low"] < base["low"]
 
-        # ================= BUY =================
-        if uptrend and inside_candle and upper_break:
+    # ---- Quantity ----
+    qty = int(per_trade_margin / last["close"])
+    if qty <= 0:
+        continue
 
-            print(f"📈 {stock} BUY setup")
+    # ================= BUY =================
+    if uptrend and inside_candle and upper_break:
 
-            if not PAPER_TRADING:
-                tsl.order_placement(stock, "NSE", qty, 0, 0, "MARKET", "BUY", "MIS")
+        print(f"📈 {stock} BUY setup")
 
-            traded_symbols.add(stock)
-            trade_count += 1
+        if not PAPER_TRADING:
+            tsl.order_placement(stock, "NSE", qty, 0, 0, "MARKET", "BUY", "MIS")
 
-        # ================= SELL =================
-        elif downtrend and inside_candle and lower_break:
+        traded_symbols.add(stock)
+        trade_count += 1
 
-            print(f"📉 {stock} SELL setup")
+    # ================= SELL =================
+    elif downtrend and inside_candle and lower_break:
 
-            if not PAPER_TRADING:
-                tsl.order_placement(stock, "NSE", qty, 0, 0, "MARKET", "SELL", "MIS")
+        print(f"📉 {stock} SELL setup")
 
-            traded_symbols.add(stock)
-            trade_count += 1
+        if not PAPER_TRADING:
+            tsl.order_placement(stock, "NSE", qty, 0, 0, "MARKET", "SELL", "MIS")
+
+        traded_symbols.add(stock)
+        trade_count += 1
 
 print("✅ Strategy execution completed", trade_count)
