@@ -2,7 +2,7 @@ import pandas as pd
 import datetime as dt
 
 START_TIME = dt.time(9, 20)
-END_TIME = dt.time(14, 30)
+END_TIME = dt.time(15, 30)
 
 
 class HistoricalDhanData:

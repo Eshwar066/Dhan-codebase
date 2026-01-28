@@ -1,21 +1,38 @@
 import talib
 import pandas as pd
-from core.portfolio import Position
+from collections import deque
+from core.models.position import Position
+from core.strategies.base import BaseStrategy
 
 
-class InsideBarStrategy:
+class InsideBarStrategy(BaseStrategy):
+    name = "INSIDE_BAR"
+    required_context = []  # no extra data needed
+
+    def __init__(self):
+        self.buffer = deque(maxlen=5)  # rolling candles
+
     def prepare_indicators(self, df):
         df["rsi"] = talib.RSI(df["close"], 14)
         return df
 
-    def on_candle(self, idx, df, portfolio):
-        if idx < 4:
+    def on_candle(self, candle, ctx, portfolio):
+        """
+        candle = dict with OHLCV + timestamp + symbol
+        """
+
+        self.buffer.append(candle)
+
+        if len(self.buffer) < 5:
             return None
 
-        base = df.iloc[idx - 4]
-        inside = df.iloc[idx - 3]
-        last = df.iloc[idx - 2]
-        current = df.iloc[idx - 1]
+        # Convert buffer → DataFrame (small, cheap)
+        df = pd.DataFrame(self.buffer)
+
+        base = df.iloc[0]
+        inside = df.iloc[1]
+        last = df.iloc[2]
+        current = df.iloc[3]
 
         if pd.isna(last["rsi"]):
             return None
@@ -25,35 +42,41 @@ class InsideBarStrategy:
         if not inside_candle:
             return None
 
-        symbol = df["symbol"].iloc[0]
+        symbol = candle["symbol"]
 
-        # BUY
+        # -------- BUY --------
         if last["rsi"] > 60 and current["high"] > base["high"]:
             return Position(
                 symbol=symbol,
                 side="BUY",
-                entry_price=current["close"],
                 qty=100,
+                entry_price=current["close"],
                 entry_time=current["timestamp"],
                 sl=last["low"],
+                target=None,
+                status="OPEN",
             )
 
-        # SELL
+        # -------- SELL --------
         if last["rsi"] < 40 and current["low"] < base["low"]:
             return Position(
                 symbol=symbol,
                 side="SELL",
-                entry_price=current["close"],
                 qty=100,
+                entry_price=current["close"],
                 entry_time=current["timestamp"],
                 sl=last["high"],
+                target=None,
+                status="OPEN",
             )
 
         return None
 
-    def should_exit(self, pos, candle):
-        if pos.side == "BUY" and candle["close"] <= pos.sl:
+    def should_exit(self, position, candle, ctx=None):
+        if position.side == "BUY" and candle["close"] <= position.sl:
             return True
-        if pos.side == "SELL" and candle["close"] >= pos.sl:
+
+        if position.side == "SELL" and candle["close"] >= position.sl:
             return True
+
         return False
