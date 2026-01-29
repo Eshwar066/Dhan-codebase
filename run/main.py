@@ -3,7 +3,10 @@ from core.strategies.registry import STRATEGY_MAP
 from core.engine.backtest_engine import BacktestEngine
 from core.engine.live_engine import LiveEngine
 from core.portfolio import Portfolio
+from core.risk_manager import RiskManager
 from core.data.sources.dhan_source import DhanSource
+from core.broker.dhanbroker import DhanBroker
+from core.data.candle_service import CandleService
 
 
 def run_job(job):
@@ -41,18 +44,27 @@ def run_job(job):
 
     # ---------- LIVE / PAPER ----------
     else:
-        broker = broker_data.get_broker()
-        live_data = broker_data.get_live_data()
-        risk_manager = broker_data.get_risk_manager(portfolio)
+        live_cfg = job["live"]
+        live_data = broker_data
+        candle_service = CandleService(broker_data)
+        broker = DhanBroker(dhan_source=live_data, portfolio=portfolio)
+        risk_manager = RiskManager(portfolio=portfolio)
 
         engine = LiveEngine(
             broker=broker,
-            strategy_adapter=strategy,
+            portfolio=portfolio,
+            strategy=strategy,
             risk_manager=risk_manager,
             data=live_data,
+            candle_service=candle_service,
+            symbols=job["symbols"],
         )
 
-        engine.start()
+        engine.start(
+            exchange=live_cfg["exchange"],
+            sector=live_cfg["sector"],
+            rsi=live_cfg["rsi"],
+        )
 
 
 if __name__ == "__main__":

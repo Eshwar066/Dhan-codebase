@@ -1,5 +1,6 @@
 from core.strategies.runtime_spec import STRATEGY_RUNTIME_SPEC
-from run.config import RUN_MODE
+from run.config import RUN_MODE, RunMode
+import pdb
 
 
 class BaseEngine:
@@ -14,6 +15,7 @@ class BaseEngine:
         ctx = {
             "symbol": candle["symbol"],
             "timestamp": candle["timestamp"],
+            "exchange": candle.get("exchange"),
         }
 
         spec = self.get_strategy_params()
@@ -22,19 +24,38 @@ class BaseEngine:
         if "option_chain" in spec.get("data", {}):
             params = spec["data"]["option_chain"]
 
-            expiry = self.strategy.get_expiry(candle["timestamp"])
+            if RUN_MODE == RunMode.LIVE:
 
-            ctx["option_chain"] = self.data.get_expired_option_chain(
-                symbol=ctx["symbol"],
-                expiry=expiry,
-                params=params,
-            )
+                # 1) Get expiry list
+                ctx["expiry_list"] = self.data.get_live_expiry(
+                    symbol=ctx["symbol"],
+                    exchange=ctx["exchange"],
+                )
 
-        # ---------- FUTURE EXTENSIONS ----------
-        if "vix" in spec.get("data", {}):
-            ctx["vix"] = self.data.get_vix()
+                # 2) Strategy selects expiry
+                result = self.strategy.on_candle(candle, ctx)
+                if not result:
+                    return
 
-        if "oi" in spec.get("data", {}):
-            ctx["oi"] = self.data.get_open_interest(ctx["symbol"])
+                selected_expiry_index = result.get("selected_expiry")
+
+                # 3) Save it
+                ctx["selected_expiry"] = selected_expiry_index
+
+                # 4) Fetch option chain
+                ctx["option_chain"] = self.data.get_live_option_chain(
+                    symbol=ctx["symbol"],
+                    exchange=ctx["exchange"],
+                    expiry_index=selected_expiry_index,
+                    strikes_around_atm=params.get("strikes", 10),
+                )
+
+            else:
+                # expiry = self.strategy.get_expiry(candle["timestamp"])
+                ctx["option_chain"] = self.data.get_expired_option_chain(
+                    symbol=ctx["symbol"],
+                    expiry=expiry,
+                    params=params,
+                )
 
         return ctx

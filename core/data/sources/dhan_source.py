@@ -22,6 +22,17 @@ class DhanSource:
 
         self.tsl = Tradehull(client_id, access_token)
 
+    def get_latest_candles(self, symbols, debug):
+        # """
+        # Returns:
+        # {
+        #     "NIFTY": { open, high, low, close, ltp, ... },
+        #     "BANKNIFTY": {...}
+        # }
+        # """
+        return self.tsl.get_ohlc_data(symbols, debug)
+
+    #  long term historical data
     def get_intraday(self, symbol, start_date, end_date, timeframe, exchange, sector):
         df = self.tsl.get_long_term_historical_data(
             tradingsymbol=symbol,
@@ -53,7 +64,7 @@ class DhanSource:
 
         return df.reset_index(drop=True)
 
-    def expiry_list(self, symbol, exchange):
+    def get_live_expiry(self, symbol, exchange):
         expiry_list = self.tsl.get_expiry_list(Underlying=symbol, exchange=exchange)
         return expiry_list
 
@@ -83,3 +94,94 @@ class DhanSource:
         )
 
         return data
+
+    def get_atm_options(self, symbol, expiry_index=0):
+        ce, pe, strike = self.tsl.ATM_Strike_Selection(symbol, expiry_index)
+
+        return {"ce": ce, "pe": pe, "strike": strike}
+
+    def get_otm_options(self, symbol, expiry_index=0, distance=1):
+        ce, pe, ce_strike, pe_strike = self.tsl.OTM_Strike_Selection(
+            symbol, expiry_index, distance
+        )
+
+        return {"ce": ce, "pe": pe, "ce_strike": ce_strike, "pe_strike": pe_strike}
+
+    def get_itm_options(self, symbol, expiry_index=0, distance=1):
+        ce, pe, ce_strike, pe_strike = self.tsl.ITM_Strike_Selection(
+            symbol, expiry_index, distance
+        )
+
+        return {"ce": ce, "pe": pe, "ce_strike": ce_strike, "pe_strike": pe_strike}
+
+    def get_live_option_chain(
+        self,
+        symbol: str,
+        exchange: str,
+        expiry_index: int,
+        strikes_around_atm: int,
+    ):
+        """
+        Simple engine-friendly wrapper.
+        Returns ATM strike + filtered option chain df.
+        """
+
+        df = self.tsl.get_option_chain(
+            Underlying=symbol,
+            exchange=exchange,
+            expiry=expiry_index,
+            num_strikes=strikes_around_atm,
+        )
+
+        return {
+            "symbol": symbol,
+            "exchange": exchange,
+            "chain": df,
+        }
+
+    def get_positions(self, debug="NO"):
+        return self.tsl.get_positions(debug=debug)
+
+    def exit_position(position):
+        print(position)
+
+    def place_order(
+        self,
+        tradingsymbol: str,
+        exchange: str,
+        quantity: int,
+        price: int = 0,
+        trigger_price: int = 0,
+        order_type: str = "MARKET",
+        transaction_type: str = "BUY",
+        trade_type: str = "MARGIN",
+        disclosed_quantity: int = 0,
+        after_market_order: bool = False,
+        validity: str = "DAY",
+        amo_time: str = "OPEN",
+        bo_profit_value=None,
+        bo_stop_loss_value=None,
+        tag: str | None = None,
+    ):
+        """
+        Thin execution wrapper for Dhan.
+        No strategy / portfolio logic here.
+        """
+
+        return self.tsl.order_placement(
+            tradingsymbol=tradingsymbol.upper(),
+            exchange=exchange.upper(),
+            quantity=int(quantity),
+            price=int(price),
+            trigger_price=int(trigger_price),
+            order_type=order_type.upper(),
+            transaction_type=transaction_type.upper(),
+            trade_type=trade_type.upper(),
+            disclosed_quantity=disclosed_quantity,
+            after_market_order=after_market_order,
+            validity=validity,
+            amo_time=amo_time,
+            bo_profit_value=bo_profit_value,
+            bo_stop_loss_value=bo_stop_loss_value,
+            tag=tag,
+        )

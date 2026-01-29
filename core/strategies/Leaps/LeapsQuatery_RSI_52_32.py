@@ -1,10 +1,10 @@
 import talib
 import pandas as pd
+import pdb
 from collections import deque
 from core.models.position import Position
 from core.strategies.base import BaseStrategy
 from core.utils.expiry_calendar import Expiry_Calendar
-
 
 VALID_TIMES = {"10:15", "11:15", "12:15", "13:15", "14:15", "15:15"}
 
@@ -16,50 +16,55 @@ class LeapsQuarterly(BaseStrategy):
     """
 
     name = "LEAPS_RSI"
+    timeframe = "60"
 
     # Engine will auto-populate these via runtime_spec
-    required_context = ["option_chain", "expiry"]
+    required_context = ["option_chain"]
 
-    def __init__(self):
-        self.buffer = deque(maxlen=50)  # keep enough candles for RSI
+    # def __init__(self):
+    def should_evaluate(self, candle) -> bool:
+        """
+        Lightweight pre-check before building full context.
+        Only allow evaluation when RSI is in trade zone.
+        """
 
-    def prepare_indicators(self, df):
-        df["rsi"] = talib.RSI(df["close"], 14)
-        return df
+        rsi = candle.get("rsi")
+
+        # No RSI yet
+        if rsi is None or pd.isna(rsi):
+            return False
+
+        # Only evaluate when signal possible
+        if rsi < 32 or rsi > 52:
+            return True
+
+        return False
 
     def _is_valid_time(self, ts):
         return ts.strftime("%H:%M") in VALID_TIMES
 
-    def on_candle(self, candle, ctx, portfolio):
-        """
-        candle: dict (OHLCV + timestamp + symbol)
-        ctx: runtime context built by BaseEngine
-        """
+    def on_candle(self, candle, ctx):
 
         ts = pd.to_datetime(candle["timestamp"])
+        date = ts.date()
         symbol = candle["symbol"]
+        rsi = candle.get("rsi")
 
-        # -------- Time Filter --------
         if not self._is_valid_time(ts):
             return None
 
-        # -------- Maintain buffer --------
-        self.buffer.append(candle)
+        # ---------- Stage 1: Expiry Selection ----------
+        if "option_chain" not in ctx:
+            expiry_list = ctx.get("expiry_list")
+            expiry_index = self.select_expiry(expiry_list, date)
 
-        if len(self.buffer) < 15:
-            return None
+            return {"selected_expiry": expiry_index}
 
-        df = pd.DataFrame(self.buffer)
-        rsi = df.iloc[-1]["rsi"]
-
-        if pd.isna(rsi):
-            return None
-
-        expiry = ctx.get("expiry")
-        option_chain = ctx.get("option_chain")
-
-        # -------- RSI < 32 → SELL CALL --------
-        if rsi < 32 and not portfolio.has_position(symbol, "CALL"):
+        # ---------- Stage 2: Trading Logic ----------
+        option_chain = ctx["option_chain"]
+        atm_strike, oc_df, expiry, expiry_list = option_chain["chain"]
+        pdb.set_trace()
+        if rsi < 32:
             return Position(
                 symbol=symbol,
                 side="SELL",
@@ -67,14 +72,10 @@ class LeapsQuarterly(BaseStrategy):
                 expiry=expiry,
                 qty=1000,
                 entry_time=ts,
-                meta={
-                    "signal": "RSI_BELOW_32",
-                    "regime": "BEARISH",
-                },
+                meta={"signal": "RSI_BELOW_32"},
             )
 
-        # -------- RSI > 52 → SELL PUT --------
-        if rsi > 52 and not portfolio.has_position(symbol, "PUT"):
+        if rsi > 52:
             return Position(
                 symbol=symbol,
                 side="SELL",
@@ -82,13 +83,50 @@ class LeapsQuarterly(BaseStrategy):
                 expiry=expiry,
                 qty=1000,
                 entry_time=ts,
-                meta={
-                    "signal": "RSI_ABOVE_52",
-                    "regime": "BULLISH",
-                },
+                meta={"signal": "RSI_ABOVE_52"},
             )
 
         return None
+
+    def select_expiry(self, expiry_list, date):
+        target_month, target_year = self.select_expiryMonth(date)
+
+        # Convert once
+        expiry_dates = [pd.to_datetime(e).date() for e in expiry_list]
+
+        # Collect matching indices
+        matches = [
+            i
+            for i, e in enumerate(expiry_dates)
+            if e.month == target_month and e.year == target_year
+        ]
+
+        if not matches:
+            return None  # or fallback index
+
+        # Monthly expiry = LAST one in that month
+        return matches[-1]
+
+    def select_expiryMonth(self, trade_date):
+        year = trade_date.year
+        month = trade_date.month
+        day = trade_date.day
+
+        quarters = [3, 6, 9, 12]
+        cutoffs = {2: 15, 5: 15, 8: 20, 11: 20}
+
+        # next quarter
+        q = next((m for m in quarters if m > month), 3)
+        if q == 3 and month > 9:
+            year += 1
+
+        # cutoff shift
+        if month in cutoffs and day > cutoffs[month]:
+            q = quarters[(quarters.index(q) + 1) % 4]
+            if q == 3:
+                year += 1
+
+        return q, year
 
     def should_exit(self, position, candle, ctx=None):
         rsi = candle.get("rsi")

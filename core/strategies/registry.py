@@ -25,6 +25,7 @@ STRATEGY_MAP = {
         "instrument": "OPTION",
         "allowed_modes": [
             RunMode.BACKTEST,
+            RunMode.LIVE,
         ],
     },
 }
