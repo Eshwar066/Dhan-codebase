@@ -1,0 +1,15 @@
+Strategy
+  ↓
+Intent
+  ↓
+RiskManager
+  ↓
+OrderRouter
+  ↓
+DhanBroker.place_order()
+  ↓
+Broker
+  ↓
+Fill
+  ↓
+PositionManager.on_fill()

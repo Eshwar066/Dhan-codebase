@@ -2,7 +2,8 @@ import talib
 import pandas as pd
 import pdb
 from collections import deque
-from core.models.position import Position
+
+# from core.models.position import Position
 from core.strategies.base import BaseStrategy
 from core.utils.expiry_calendar import Expiry_Calendar
 
@@ -54,6 +55,7 @@ class LeapsQuarterly(BaseStrategy):
             return None
 
         # ---------- Stage 1: Expiry Selection ----------
+        # https://www.nseindia.com/api/historicalOR/meta/foCPV/expireDts?instrument=OPTIDX&symbol=NIFTY&year=2026
         if "option_chain" not in ctx:
             expiry_list = ctx.get("expiry_list")
             expiry_index = self.select_expiry(expiry_list, date)
@@ -65,30 +67,35 @@ class LeapsQuarterly(BaseStrategy):
         atm_strike, oc_df, expiry, expiry_list = option_chain["chain"]
         pdb.set_trace()
         if rsi < 32:
-            return Position(
-                symbol=symbol,
-                side="SELL",
-                option_type="CALL",
-                expiry=expiry,
-                qty=1000,
-                entry_time=ts,
-                meta={"signal": "RSI_BELOW_32"},
-            )
+            return null
+            # return Position(
+            #     symbol=symbol,
+            #     side="SELL",
+            #     option_type="CALL",
+            #     expiry=expiry,
+            #     qty=1000,
+            #     entry_time=ts,
+            #     meta={"signal": "RSI_BELOW_32"},
+            # )
 
         if rsi > 52:
-            return Position(
-                symbol=symbol,
-                side="SELL",
-                option_type="PUT",
-                expiry=expiry,
-                qty=1000,
-                entry_time=ts,
-                meta={"signal": "RSI_ABOVE_52"},
-            )
+            return null
+        # return Position(
+        #     symbol=symbol,
+        #     side="SELL",
+        #     option_type="PUT",
+        #     expiry=expiry,
+        #     qty=1000,
+        #     entry_time=ts,
+        #     meta={"signal": "RSI_ABOVE_52"},
+        # )
 
         return None
 
     def select_expiry(self, expiry_list, date):
+        if not expiry_list:
+            print("⚠️ Expiry list is empty! Cannot select expiry.")
+            return None  # Or some fallback, e.g., raise an error or skip
         target_month, target_year = self.select_expiryMonth(date)
 
         # Convert once

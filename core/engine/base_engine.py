@@ -1,6 +1,7 @@
 from core.strategies.runtime_spec import STRATEGY_RUNTIME_SPEC
 from run.config import RUN_MODE, RunMode
 import pdb
+from datetime import datetime
 
 
 class BaseEngine:
@@ -18,6 +19,11 @@ class BaseEngine:
             "exchange": candle.get("exchange"),
         }
 
+        ts = candle["timestamp"]
+        if not isinstance(ts, datetime):
+            ts = datetime.fromisoformat(str(ts))
+        ctx["timestamp"] = ts
+
         spec = self.get_strategy_params()
 
         # ---------- OPTION CHAIN ----------
@@ -27,9 +33,10 @@ class BaseEngine:
             if RUN_MODE == RunMode.LIVE:
 
                 # 1) Get expiry list
-                ctx["expiry_list"] = self.data.get_live_expiry(
+                ctx["expiry_list"] = self.data.get_nse_expiries(
                     symbol=ctx["symbol"],
-                    exchange=ctx["exchange"],
+                    year=ctx["timestamp"].year,
+                    instrument="FUTIDX",
                 )
 
                 # 2) Strategy selects expiry

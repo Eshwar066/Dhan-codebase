@@ -7,7 +7,15 @@ from core.engine.base_engine import BaseEngine
 class LiveEngine(BaseEngine):
 
     def __init__(
-        self, broker, portfolio, strategy, risk_manager, data, candle_service, symbols
+        self,
+        broker,
+        portfolio,
+        strategy,
+        risk_manager,
+        data,
+        candle_service,
+        symbols,
+        order_router,
     ):
         super().__init__(strategy, data)
         self.broker = broker
@@ -15,6 +23,7 @@ class LiveEngine(BaseEngine):
         self.portfolio = portfolio
         self.symbols = symbols
         self.candle_service = candle_service
+        self.order_router = order_router
 
     def start(self, exchange, sector, rsi):
         print("🚀 Live Engine Started")
@@ -48,7 +57,7 @@ class LiveEngine(BaseEngine):
                         continue
 
                     ctx = self.build_context(candle)
-
+                    # pdb.set_trace()
                     self._run_strategy(symbol, candle, ctx)
 
             # -------- TICK MODE --------
@@ -72,19 +81,35 @@ class LiveEngine(BaseEngine):
             time.sleep(1)
 
     def _run_strategy(self, symbol, candle, ctx):
-        # EXIT
-        for position in self.broker.get_positions(symbol=symbol):
+        # ---------- EXIT ----------
+        for position in self.broker.get_positions(symbol):
             exit_signal = self.strategy.should_exit(position, candle, ctx)
-
             if exit_signal:
-                self.broker.exit_position(position, exit_signal)
+                intent = self.strategy.create_exit_intent(position, exit_signal)
+                # process via router
+                price_map = self.get_price_map(symbol)  # fetch current market prices
+                self.order_router.process_intent(intent, price_map)
 
-        # ENTRY
-        position = self.strategy.on_candle(
-            candle=candle,
-            ctx=ctx,
-            # portfolio=self.portfolio,
-        )
+        # ---------- ENTRY ----------
+        intent = self.strategy.on_candle(candle, ctx)
+        if intent:
+            price_map = self.get_price_map(intent.symbol)
+            self.order_router.process_intent(intent, price_map)
 
-        if position and self.risk_manager.allow_trade(position):
-            self.broker.place_order(position)
+    # def _run_strategy(self, symbol, candle, ctx):
+    #     # EXIT
+    #     for position in self.broker.get_positions(symbol=symbol):
+    #         exit_signal = self.strategy.should_exit(position, candle, ctx)
+
+    #         if exit_signal:
+    #             self.broker.exit_position(position, exit_signal)
+
+    #     # ENTRY
+    #     position = self.strategy.on_candle(
+    #         candle=candle,
+    #         ctx=ctx,
+    #         # portfolio=self.portfolio,
+    #     )
+
+    #     if position and self.risk_manager.allow_trade(position):
+    #         self.broker.place_order(position)

@@ -1,6 +1,6 @@
 # core/risk_manager.py
 
-
+# Depricated
 class RiskManager:
     """
     Simple risk manager for live trading.

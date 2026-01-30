@@ -3,6 +3,7 @@ import sys
 import pandas as pd
 from dotenv import load_dotenv
 from Dhan_Tradehull import Tradehull
+from core.data.sources.NSEClient import NSEClient
 import pdb
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -21,6 +22,19 @@ class DhanSource:
             raise RuntimeError("❌ Dhan credentials missing")
 
         self.tsl = Tradehull(client_id, access_token)
+        self.expiry_cache = {}
+        self.nse_client = NSEClient()
+
+    def get_nse_expiries(self, symbol, year, instrument="OPTIDX"):
+        key = (symbol, year, instrument)
+
+        if key not in self.expiry_cache:
+            # sync wrapper, returns list
+            self.expiry_cache[key] = self.nse_client.get_expiries(
+                symbol, year, instrument
+            )
+
+        return self.expiry_cache[key]
 
     def get_latest_candles(self, symbols, debug):
         # """

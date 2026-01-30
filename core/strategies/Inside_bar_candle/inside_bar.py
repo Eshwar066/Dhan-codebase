@@ -1,7 +1,8 @@
 import talib
 import pandas as pd
 from collections import deque
-from core.models.position import Position
+
+# from core.models import Position
 from core.strategies.base import BaseStrategy
 
 

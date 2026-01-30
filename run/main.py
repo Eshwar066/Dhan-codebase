@@ -7,6 +7,7 @@ from core.risk_manager import RiskManager
 from core.data.sources.dhan_source import DhanSource
 from core.broker.dhanbroker import DhanBroker
 from core.data.candle_service import CandleService
+from core.orderExecution.order_router import OrderRouter
 
 
 def run_job(job):
@@ -45,9 +46,10 @@ def run_job(job):
     # ---------- LIVE / PAPER ----------
     else:
         live_cfg = job["live"]
-        live_data = broker_data
+
         candle_service = CandleService(broker_data)
-        broker = DhanBroker(dhan_source=live_data, portfolio=portfolio)
+
+        broker = DhanBroker(dhan_api=broker_data)
         risk_manager = RiskManager(portfolio=portfolio)
 
         engine = LiveEngine(
@@ -55,9 +57,10 @@ def run_job(job):
             portfolio=portfolio,
             strategy=strategy,
             risk_manager=risk_manager,
-            data=live_data,
+            data=broker_data,
             candle_service=candle_service,
             symbols=job["symbols"],
+            order_router=OrderRouter,
         )
 
         engine.start(
