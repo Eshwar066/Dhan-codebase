@@ -3,11 +3,17 @@ from core.strategies.registry import STRATEGY_MAP
 from core.engine.backtest_engine import BacktestEngine
 from core.engine.live_engine import LiveEngine
 from core.portfolio import Portfolio
-from core.risk_manager import RiskManager
+from core.orderExecution.risk_manager import RiskManager
 from core.data.sources.dhan_source import DhanSource
 from core.broker.dhanbroker import DhanBroker
 from core.data.candle_service import CandleService
 from core.orderExecution.order_router import OrderRouter
+from core.orderExecution.intent_store import IntentStore
+from core.orderExecution.position_manager import PositionManager
+import time
+import pdb
+from pathlib import Path
+from core.utils.instruments.instrument_store import InstrumentStore
 
 
 def run_job(job):
@@ -17,12 +23,18 @@ def run_job(job):
         print(f"❌ {job['name']} not allowed in {RUN_MODE}")
         return
 
+    # ------------- Instruments File --------------
+    BASE_DIR = Path(__file__).resolve().parents[1]
+    instrument_store = InstrumentStore(
+        BASE_DIR / "Dependencies" / "all_instrument 2026-01-31.csv"
+    )
+
     # ---------- CORE ----------
     strategy = cfg["strategy"]()
-    portfolio = Portfolio(job["capital"])
 
     # ---------- DATA / BROKER ----------
     broker_data = DhanSource()
+    # portfolio = Portfolio(job["capital"])  # here portfolio is used for bactesting
 
     # ---------- BACKTEST ----------
     if RUN_MODE == RunMode.BACKTEST:
@@ -46,21 +58,24 @@ def run_job(job):
     # ---------- LIVE / PAPER ----------
     else:
         live_cfg = job["live"]
-
         candle_service = CandleService(broker_data)
-
         broker = DhanBroker(dhan_api=broker_data)
-        risk_manager = RiskManager(portfolio=portfolio)
+        intent_store = IntentStore()
+        position_manager = PositionManager()
+        risk_manager = RiskManager(position_manager=position_manager)
+        order_router = OrderRouter(
+            risk_manager=risk_manager,
+            broker=broker,
+            intent_store=intent_store,
+        )
 
         engine = LiveEngine(
             broker=broker,
-            portfolio=portfolio,
             strategy=strategy,
-            risk_manager=risk_manager,
             data=broker_data,
             candle_service=candle_service,
             symbols=job["symbols"],
-            order_router=OrderRouter,
+            order_router=order_router,
         )
 
         engine.start(

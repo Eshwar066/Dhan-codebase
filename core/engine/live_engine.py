@@ -9,9 +9,7 @@ class LiveEngine(BaseEngine):
     def __init__(
         self,
         broker,
-        portfolio,
         strategy,
-        risk_manager,
         data,
         candle_service,
         symbols,
@@ -19,8 +17,6 @@ class LiveEngine(BaseEngine):
     ):
         super().__init__(strategy, data)
         self.broker = broker
-        self.risk_manager = risk_manager
-        self.portfolio = portfolio
         self.symbols = symbols
         self.candle_service = candle_service
         self.order_router = order_router
@@ -82,34 +78,19 @@ class LiveEngine(BaseEngine):
 
     def _run_strategy(self, symbol, candle, ctx):
         # ---------- EXIT ----------
-        for position in self.broker.get_positions(symbol):
-            exit_signal = self.strategy.should_exit(position, candle, ctx)
-            if exit_signal:
-                intent = self.strategy.create_exit_intent(position, exit_signal)
-                # process via router
-                price_map = self.get_price_map(symbol)  # fetch current market prices
-                self.order_router.process_intent(intent, price_map)
+        # for position in self.broker.get_positions(symbol):
+        #     exit_signal = self.strategy.should_exit(position, candle, ctx)
+        #     if exit_signal:
+        #         intent = self.strategy.create_exit_intent(position, exit_signal)
+        #         # process via router
+        #         price_map = self.get_price_map(symbol)  # fetch current market prices
+        #         self.order_router.process_intent(intent, price_map)
 
         # ---------- ENTRY ----------
         intent = self.strategy.on_candle(candle, ctx)
+        # pdb.set_trace()
+
         if intent:
-            price_map = self.get_price_map(intent.symbol)
+            price_map = candle["close"]
+            pdb.set_trace()
             self.order_router.process_intent(intent, price_map)
-
-    # def _run_strategy(self, symbol, candle, ctx):
-    #     # EXIT
-    #     for position in self.broker.get_positions(symbol=symbol):
-    #         exit_signal = self.strategy.should_exit(position, candle, ctx)
-
-    #         if exit_signal:
-    #             self.broker.exit_position(position, exit_signal)
-
-    #     # ENTRY
-    #     position = self.strategy.on_candle(
-    #         candle=candle,
-    #         ctx=ctx,
-    #         # portfolio=self.portfolio,
-    #     )
-
-    #     if position and self.risk_manager.allow_trade(position):
-    #         self.broker.place_order(position)

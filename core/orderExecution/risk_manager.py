@@ -1,5 +1,6 @@
 import time
 
+
 # place this in live_engine.py
 # # live_engine.py
 
@@ -16,6 +17,7 @@ import time
 # else:
 
 #     intent_store.update(intent_id, "REJECTED")
+
 
 class RiskManager:
     def __init__(
@@ -54,7 +56,8 @@ class RiskManager:
             "strategy": str (optional)
         }
         """
-
+        pdb.set_trace()
+        
         symbol = intent["symbol"]
         side = intent["side"]
         qty = intent["qty"]
@@ -116,4 +119,3 @@ class RiskManager:
     def _cooldown_ok(self, symbol):
         last = self.last_trade_time.get(symbol, 0)
         return (time.time() - last) >= self.cooldown_seconds
-

@@ -55,53 +55,89 @@ class LeapsQuarterly(BaseStrategy):
             return None
 
         # ---------- Stage 1: Expiry Selection ----------
-        # https://www.nseindia.com/api/historicalOR/meta/foCPV/expireDts?instrument=OPTIDX&symbol=NIFTY&year=2026
         if "option_chain" not in ctx:
             expiry_list = ctx.get("expiry_list")
-            expiry_index = self.select_expiry(expiry_list, date)
-
-            return {"selected_expiry": expiry_index}
+            expiry_date = self.select_expiry(expiry_list, date)
+            Expiry_date = expiry_date.strftime("%Y-%m-%d")
+            # pdb.set_trace()
+            return {"selected_expiry": expiry_date}
 
         # ---------- Stage 2: Trading Logic ----------
         option_chain = ctx["option_chain"]
-        atm_strike, oc_df, expiry, expiry_list = option_chain["chain"]
-        pdb.set_trace()
+        # pdb.set_trace()
+        atm_strike, oc_df, Expiry_date = option_chain["chain"]
+        # pdb.set_trace()
+        df_Optionchain = oc_df[
+            [
+                "CE Delta",
+                "CE Theta",
+                "CE LTP",
+                "Strike Price",
+                "PE LTP",
+                "PE Theta",
+                "PE Delta",
+            ]
+        ]
+
+        # (df_Optionchain["Strike Price"] < atm_strike)  # OTM puts and this condition is valid for live, since we are using dummy data.
+
+        # filtered = df_Optionchain[
+        #     (df_Optionchain["Strike Price"] % 500 == 0)
+        #     & (df_Optionchain["PE LTP"].between(200, 350))
+        # ]
+        # filtered = None
+        # for low in [300, 250, 200]:
+        #     filtered = df_Optionchain[
+        #         (df_Optionchain["Strike Price"] % 500 == 0)
+        #         & (df_Optionchain["PE LTP"].between(low, 400))
+        #     ]
+
+        #     if not filtered.empty:
+        #         break
+        # pdb.set_trace()
         if rsi < 32:
+            filtered = df_Optionchain[
+                (df_Optionchain["Strike Price"] % 500 == 0)
+                & (df_Optionchain["CE LTP"].between(300, 400))
+            ]
             return null
-            # return Position(
-            #     symbol=symbol,
-            #     side="SELL",
-            #     option_type="CALL",
-            #     expiry=expiry,
-            #     qty=1000,
-            #     entry_time=ts,
-            #     meta={"signal": "RSI_BELOW_32"},
-            # )
 
         if rsi > 52:
-            return null
-        # return Position(
-        #     symbol=symbol,
-        #     side="SELL",
-        #     option_type="PUT",
-        #     expiry=expiry,
-        #     qty=1000,
-        #     entry_time=ts,
-        #     meta={"signal": "RSI_ABOVE_52"},
-        # )
+            filtered = df_Optionchain[
+                (df_Optionchain["Strike Price"] % 500 == 0)
+                & (df_Optionchain["PE LTP"].between(200, 300))
+            ]
+            # pdb.set_trace()
+            if filtered.empty:
+                return None
+
+            row = filtered.iloc[(filtered["PE LTP"] - 350).abs().argsort()[:1]].iloc[0]
+            # pdb.set_trace()
+            # instrument_store.intent_creation_details(25500, "NIFTY", "PE")
+            return {
+                "symbol": symbol,
+                "expiry": Expiry_date,
+                "side": "SELL",
+                "option_type": "PE",
+                "strike": row["Strike Price"],
+                "price": row["PE LTP"],
+                "qty": 1,
+                "strategy": "LEAPS_RSI",
+            }
 
         return None
 
     def select_expiry(self, expiry_list, date):
         if not expiry_list:
             print("⚠️ Expiry list is empty! Cannot select expiry.")
-            return None  # Or some fallback, e.g., raise an error or skip
+            return None
+
         target_month, target_year = self.select_expiryMonth(date)
 
         # Convert once
         expiry_dates = [pd.to_datetime(e).date() for e in expiry_list]
 
-        # Collect matching indices
+        # Find matching indices
         matches = [
             i
             for i, e in enumerate(expiry_dates)
@@ -109,10 +145,13 @@ class LeapsQuarterly(BaseStrategy):
         ]
 
         if not matches:
-            return None  # or fallback index
+            return None
 
         # Monthly expiry = LAST one in that month
-        return matches[-1]
+        selected_index = matches[-1]
+
+        # ✅ Return expiry date
+        return expiry_dates[selected_index]
 
     def select_expiryMonth(self, trade_date):
         year = trade_date.year

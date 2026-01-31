@@ -138,6 +138,8 @@ class DhanSource:
         """
         Simple engine-friendly wrapper.
         Returns ATM strike + filtered option chain df.
+
+        [CE OI, CE Chg in OI, CE Volume, CE IV, CE LTP, CE Bid Qty, CE Bid, CE Ask, CE Ask Qty, CE Delta, CE Theta, CE Gamma, CE Vega, Strike Price, PE Bid Qty, PE Bid, PE Ask, PE Ask Qty, PE LTP, PE IV, PE Volume, PE Chg in OI, PE OI, PE Delta, PE Theta, PE Gamma, PE Vega]
         """
 
         df = self.tsl.get_option_chain(
