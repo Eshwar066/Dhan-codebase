@@ -1,6 +1,9 @@
 import threading
 import time
 from collections import defaultdict
+from logs.logger.trade_logger import TradeLogger
+from datetime import datetime
+import uuid
 
 # use
 # How to Run Auto-Reconciliation
@@ -60,25 +63,34 @@ class Instrument:
 # =========================
 # POSITION
 # =========================
-
-
 class Position:
-    def __init__(self, instrument: Instrument):
+    def __init__(self, instrument):
         self.instrument = instrument
-
         self.net_qty = 0
         self.avg_price = 0.0
         self.realized_pnl = 0.0
 
+        self.trade_id = None
+        self.entry_price = None
+        self.entry_time = None
+
+        self.mae = 0.0
+        self.mfe = 0.0
+
         self.last_updated = time.time()
 
-    # ---------------------
-    # UPDATE FROM FILL
-    # ---------------------
     def update_fill(self, side, qty, price):
         signed_qty = qty if side == "BUY" else -qty
 
-        # Same direction add
+        # -------- ENTRY --------
+        if self.net_qty == 0:
+            self.trade_id = f"T-{uuid.uuid4().hex[:10]}"
+            self.entry_price = price
+            self.entry_time = time.time()
+            self.mae = 0.0
+            self.mfe = 0.0
+
+        # -------- SAME DIRECTION --------
         if (
             self.net_qty == 0
             or (self.net_qty > 0 and signed_qty > 0)
@@ -86,21 +98,22 @@ class Position:
         ):
             new_qty = self.net_qty + signed_qty
 
-            if new_qty != 0:
-                self.avg_price = (
-                    self.avg_price * abs(self.net_qty) + price * abs(signed_qty)
-                ) / abs(new_qty)
-            else:
-                self.avg_price = 0
+            self.avg_price = (
+                (
+                    (self.avg_price * abs(self.net_qty) + price * abs(signed_qty))
+                    / abs(new_qty)
+                )
+                if new_qty != 0
+                else 0
+            )
 
             self.net_qty = new_qty
 
-        # Closing/reducing
+        # -------- CLOSING / REDUCING --------
         else:
             closing = min(abs(self.net_qty), abs(signed_qty))
 
             pnl = closing * (price - self.avg_price)
-
             if self.net_qty < 0:
                 pnl *= -1
 
@@ -110,11 +123,21 @@ class Position:
             self.net_qty += signed_qty
 
             if self.net_qty == 0:
-                self.avg_price = 0
-            else:
-                self.avg_price = price
+                self.avg_price = 0.0
 
         self.last_updated = time.time()
+
+
+def update_risk_metrics(self, ltp):
+    if self.net_qty == 0:
+        return
+
+    diff = ltp - self.entry_price
+    if self.net_qty < 0:
+        diff *= -1
+
+    self.mfe = max(self.mfe, diff)
+    self.mae = min(self.mae, diff)
 
 
 # =========================
@@ -123,12 +146,11 @@ class Position:
 
 
 class PositionManager:
-    def __init__(self):
+    def __init__(self, logger):
         self._lock = threading.Lock()
-
+        self.logger = TradeLogger()
         # symbol → Position
         self.positions = {}
-
         # strategy → symbol → qty
         self.strategy_pos = defaultdict(lambda: defaultdict(int))
 
@@ -137,18 +159,63 @@ class PositionManager:
     # ---------------------
     # LOCAL FILL UPDATE
     # ---------------------
-    def on_fill(self, instrument, side, qty, price, strategy=None):
+    def on_fill(
+        self, instrument, side, qty, price, intent_id=None, order_id=None, strategy=None
+    ):
         with self._lock:
             sym = instrument.symbol
+
+            prev_qty = self.positions[sym].net_qty if sym in self.positions else 0
 
             if sym not in self.positions:
                 self.positions[sym] = Position(instrument)
 
-            self.positions[sym].update_fill(side, qty, price)
+            pos = self.positions[sym]
+
+            pos.update_fill(side, qty, price)
+
+            new_qty = pos.net_qty
 
             if strategy:
                 signed = qty if side == "BUY" else -qty
                 self.strategy_pos[strategy][sym] += signed
+
+        # -------- TRADE TYPE --------
+        if prev_qty == 0 and new_qty != 0:
+            trade_type = "ENTRY"
+        elif prev_qty != 0 and new_qty == 0:
+            trade_type = "EXIT"
+        elif abs(new_qty) > abs(prev_qty):
+            trade_type = "SCALE_IN"
+        elif abs(new_qty) < abs(prev_qty):
+            trade_type = "SCALE_OUT"
+        elif prev_qty * new_qty < 0:
+            trade_type = "REVERSAL"
+        else:
+            trade_type = "UNKNOWN"
+
+        # -------- LOG --------
+        if self.logger:
+            row = {
+                "timestamp": datetime.now().isoformat(),
+                "strategy": strategy,
+                "symbol": sym,
+                "trade_id": pos.trade_id,
+                "trade_type": trade_type,
+                "side": side,
+                "qty": qty,
+                "price": price,
+                "net_qty_after": new_qty,
+                "order_id": order_id,
+                "intent_id": intent_id,
+            }
+
+            if trade_type == "EXIT":
+                row["pnl"] = pos.realized_pnl
+                row["mae"] = pos.mae
+                row["mfe"] = pos.mfe
+
+            self.logger.log(strategy=strategy, row=row)
 
     # ---------------------
     # BROKER RECONCILIATION
@@ -204,6 +271,9 @@ class PositionManager:
                     local.net_qty = bp["qty"]
                     local.avg_price = bp["avg_price"]
                     local.last_updated = time.time()
+
+                if abs(local.net_qty - bp["qty"]) > threshold:
+                    self.trading_paused = True
 
             # 2) Remove ghost locals
             for sym in local_symbols - broker_symbols:
@@ -277,3 +347,24 @@ class PositionManager:
             }
 
         return snap
+
+    def get_open_positions(self, symbol=None, strategy=None):
+        """
+        Returns Position objects (internal truth)
+        """
+        positions = []
+
+        for sym, pos in self.positions.items():
+            if pos.net_qty == 0:
+                continue
+
+            if symbol and sym != symbol:
+                continue
+
+            if strategy:
+                if self.strategy_pos[strategy][sym] == 0:
+                    continue
+
+            positions.append(pos)
+
+        return positions

@@ -4,9 +4,9 @@ import pdb
 
 
 class BacktestEngine(BaseEngine):
-    def __init__(self, data_provider, portfolio, strategy):
+    def __init__(self, data_provider, strategy):
         super().__init__(strategy=strategy, data=data_provider)
-        self.portfolio = portfolio
+        # self.portfolio = portfolio
 
     def run(self, symbols, start_date, end_date, timeframe, exchange, sector):
         for symbol in symbols:
@@ -27,7 +27,7 @@ class BacktestEngine(BaseEngine):
 
             # ---- Indicators ----
             df = self.strategy.prepare_indicators(df)
-            pdb.set_trace()
+            # pdb.set_trace()
             # ---- Iterate candle by candle ----
             for idx in range(len(df)):
                 candle = df.iloc[idx].to_dict()
@@ -60,3 +60,16 @@ class BacktestEngine(BaseEngine):
                         self.portfolio.enter(position)
 
         self.portfolio.report()
+
+    def update_risk_metrics(self, symbol, ltp):
+        pos = self.position_manager.positions.get(symbol)
+        if not pos or pos.net_qty == 0:
+            return
+
+        diff = ltp - pos.entry_price
+
+        if pos.net_qty < 0:
+            diff *= -1
+
+        pos.mfe = max(pos.mfe, diff)
+        pos.mae = min(pos.mae, diff)

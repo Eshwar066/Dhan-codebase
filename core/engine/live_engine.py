@@ -15,12 +15,14 @@ class LiveEngine(BaseEngine):
         symbols,
         order_router,
         instrument_store,
+        position_manager,
     ):
         super().__init__(strategy, data, instrument_store)
         self.broker = broker
         self.symbols = symbols
         self.candle_service = candle_service
         self.order_router = order_router
+        self.position_manager = position_manager
 
     def start(self, exchange, sector, rsi):
         print("🚀 Live Engine Started")
@@ -79,13 +81,18 @@ class LiveEngine(BaseEngine):
 
     def _run_strategy(self, symbol, candle, ctx):
         # ---------- EXIT ----------
-        # for position in self.broker.get_positions(symbol):
-        #     exit_signal = self.strategy.should_exit(position, candle, ctx)
-        #     if exit_signal:
-        #         intent = self.strategy.create_exit_intent(position, exit_signal)
-        #         # process via router
-        #         price_map = self.get_price_map(symbol)  # fetch current market prices
-        #         self.order_router.process_intent(intent, price_map)
+        open_positions = self.position_manager.get_open_positions(
+            symbol=symbol, strategy=self.strategy.name
+        )
+
+        for position in open_positions:
+            exit_signal = self.strategy.should_exit(position, candle, ctx)
+
+            if exit_signal:
+                intent = self.strategy.create_exit_intent(position, exit_signal)
+
+                price_map = self.get_price_map(symbol)
+                self.order_router.process_intent(intent, price_map)
 
         # ---------- ENTRY ----------
         intent = self.strategy.on_candle(candle, ctx)
@@ -94,3 +101,17 @@ class LiveEngine(BaseEngine):
             # pdb.set_trace()
             price_map = candle["close"]
             self.order_router.process_intent(intent, price_map)
+
+
+def update_risk_metrics(self, symbol, ltp):
+    pos = self.position_manager.positions.get(symbol)
+    if not pos or pos.net_qty == 0:
+        return
+
+    diff = ltp - pos.entry_price
+
+    if pos.net_qty < 0:
+        diff *= -1
+
+    pos.mfe = max(pos.mfe, diff)
+    pos.mae = min(pos.mae, diff)

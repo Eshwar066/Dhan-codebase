@@ -140,20 +140,31 @@ class LeapsQuarterly(BaseStrategy):
             if not tradingSymbol:
                 print("Leaps no tradingSymbol found")
                 return None
-
+            print(">>>>>11")
             inst = instrument_store.intent_creation_details(tradingSymbol, "NSE")
+            print(">>>>>222")
             # pdb.set_trace()
             if not inst["SEM_TRADING_SYMBOL"]:
                 print("Leaps no intrument row")
                 return None
 
             intent = self.map_instrument_to_intent(
-                inst, strategy="LEAPS_RSI", side="SELL", qty=1
+                inst, strategy="LEAPS_RSI", side="SELL", strike_row=row
             )
+            # pdb.set_trace()
 
             return intent
 
-    def map_instrument_to_intent(self, row, strategy="LEAPS_RSI", side="SELL", qty=1):
+    # create_exit_intent
+    #  create this
+
+    def map_instrument_to_intent(
+        self,
+        inst,
+        strike_row,
+        strategy="LEAPS_RSI",
+        side="SELL",
+    ):
         """
         Map a Dhan instrument row to an intent dictionary.
 
@@ -167,22 +178,23 @@ class LeapsQuarterly(BaseStrategy):
             dict: intent ready for order placement
         """
 
-        trading_symbol = row["SEM_CUSTOM_SYMBOL"]  # e.g., NIFTY-Mar2026-24500-PE
-        symbol = row["SEM_CUSTOM_SYMBOL"].split()[0]
-        expiry_date = row["SEM_EXPIRY_DATE"]
-        strike_price = float(row["SEM_STRIKE_PRICE"])
-        option_type = row["SEM_OPTION_TYPE"]
-        lot_size = int(row["SEM_LOT_UNITS"])
-        segment = row["SEM_SEGMENT"]
-        exchange = row["SEM_EXM_EXCH_ID"]
-
+        trading_symbol = inst["SEM_CUSTOM_SYMBOL"]  # e.g., NIFTY-Mar2026-24500-PE
+        symbol = inst["SEM_CUSTOM_SYMBOL"].split()[0]
+        expiry_date = inst["SEM_EXPIRY_DATE"]
+        strike_price = float(inst["SEM_STRIKE_PRICE"])
+        option_type = inst["SEM_OPTION_TYPE"]
+        lot_size = int(inst["SEM_LOT_UNITS"])
+        segment = inst["SEM_SEGMENT"]
+        exchange = inst["SEM_EXM_EXCH_ID"]
         option_map = {"CE": "CALL", "PE": "PUT"}
+        reverse_option_map = {"CALL": "CE", "PUT": "PE"}
         option_type_mapped = option_map.get(option_type.upper(), option_type.upper())
-
-        tick_size = float(row["SEM_TICK_SIZE"]) or 1.0
-        ltp = row.get(f"{option_type} LTP", 0.0)  # if column exists
+        tick_size = float(inst["SEM_TICK_SIZE"]) or 1.0
+        ltp = strike_row.get(
+            f"{option_type} LTP",
+            0.0,
+        )  # if column exists
         price = round(float(ltp) / tick_size) * tick_size if ltp else 0.0
-
         intent = {
             "intent_id": uuid.uuid4().hex,
             "trading_symbol": trading_symbol,
@@ -192,7 +204,7 @@ class LeapsQuarterly(BaseStrategy):
             "option_type": option_type_mapped,
             "strike": strike_price,
             "price": price,
-            "qty": qty,
+            "qty": 1,
             "strategy": strategy,
             "trade_type": "MARGIN",
             "disclosed_quantity": 0,
@@ -206,7 +218,7 @@ class LeapsQuarterly(BaseStrategy):
             "lot_size": lot_size,
             "segment": segment,
         }
-
+        # pdb.set_trace()
         return intent
 
     def select_expiry(self, expiry_list, date):

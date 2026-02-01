@@ -1,4 +1,7 @@
 # run in engine: router.process_intent(intent, price_map)
+import pdb
+
+
 class OrderRouter:
     def __init__(self, risk_manager, broker, intent_store, slippage_model=None):
         self.risk = risk_manager
@@ -17,7 +20,7 @@ class OrderRouter:
 
         # ---------- 2️⃣ Apply slippage ----------
         intent["price"] = self.slippage_model(intent["price"])
-
+        # pdb.set_trace()
         # ---------- 3️⃣ Send to broker ----------
         order_id = self.broker.place_order(intent)
 

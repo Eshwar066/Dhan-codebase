@@ -2,7 +2,6 @@ from run.config import RUN_MODE, RunMode, STRATEGY_JOBS
 from core.strategies.registry import STRATEGY_MAP
 from core.engine.backtest_engine import BacktestEngine
 from core.engine.live_engine import LiveEngine
-from core.portfolio import Portfolio
 from core.orderExecution.risk_manager import RiskManager
 from core.data.sources.dhan_source import DhanSource
 from core.broker.dhanbroker import DhanBroker
@@ -15,6 +14,7 @@ import pdb
 from pathlib import Path
 import pandas as pd
 from core.utils.instruments.instrument_store import InstrumentStore
+from logs.logger.trade_logger import TradeLogger
 
 
 def run_job(job):
@@ -24,28 +24,23 @@ def run_job(job):
         print(f"❌ {job['name']} not allowed in {RUN_MODE}")
         return
 
-    # ------------- Instruments File --------------
-
     # ---------- CORE ----------
     strategy = cfg["strategy"]()
-
     # ---------- DATA / BROKER ----------
-    broker_data = DhanSource()
-    #  Instrument store
+    api_data = DhanSource()
+    position_manager = PositionManager(logger=TradeLogger())
+    # ------------- Instruments File --------------
     current_date = time.strftime("%Y-%m-%d")
     expected_file = "all_instrument" + str(current_date) + ".csv"
     BASE_DIR = Path(__file__).resolve().parents[1]
     instrument_store = InstrumentStore(BASE_DIR / "Dependencies" / expected_file)
-
-    # portfolio = Portfolio(job["capital"])  # here portfolio is used for bactesting
 
     # ---------- BACKTEST ----------
     if RUN_MODE == RunMode.BACKTEST:
         bt_cfg = job["backtest"]
 
         engine = BacktestEngine(
-            data_provider=broker_data,
-            portfolio=portfolio,
+            data_provider=api_data,
             strategy=strategy,
         )
 
@@ -61,10 +56,10 @@ def run_job(job):
     # ---------- LIVE / PAPER ----------
     else:
         live_cfg = job["live"]
-        candle_service = CandleService(broker_data)
-        broker = DhanBroker(dhan_api=broker_data)
+        candle_service = CandleService(api_data)
+        broker = DhanBroker(dhan_api=api_data)
         intent_store = IntentStore()
-        position_manager = PositionManager()
+
         risk_manager = RiskManager(position_manager=position_manager)
         order_router = OrderRouter(
             risk_manager=risk_manager,
@@ -75,11 +70,12 @@ def run_job(job):
         engine = LiveEngine(
             broker=broker,
             strategy=strategy,
-            data=broker_data,
+            data=api_data,
             candle_service=candle_service,
             symbols=job["symbols"],
             order_router=order_router,
             instrument_store=instrument_store,
+            position_manager=position_manager,
         )
 
         engine.start(

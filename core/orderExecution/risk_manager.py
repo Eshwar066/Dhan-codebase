@@ -58,7 +58,7 @@ class RiskManager:
         }
         """
 
-        symbol = intent["symbol"]
+        symbol = intent["trading_symbol"]
         side = intent["side"]
         qty = intent["qty"]
         price = intent.get("price", 0)
