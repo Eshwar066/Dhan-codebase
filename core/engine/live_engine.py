@@ -14,8 +14,9 @@ class LiveEngine(BaseEngine):
         candle_service,
         symbols,
         order_router,
+        instrument_store,
     ):
-        super().__init__(strategy, data)
+        super().__init__(strategy, data, instrument_store)
         self.broker = broker
         self.symbols = symbols
         self.candle_service = candle_service
@@ -34,13 +35,13 @@ class LiveEngine(BaseEngine):
                     #     symbol, tf, exchange, sector, rsi
                     # )
                     candle = {
-                        "open": 25345,
+                        "open": 25346,
                         "close": 25342.75,
                         "high": 25359.35,
                         "low": 25159.8,
                         "volume": 63503115.0,
-                        "timestamp": "2026-01-29 14:15:00+05:30",
-                        "time": "14:15",
+                        "timestamp": "2026-02-01 13:15:00+05:30",
+                        "time": "13:15",
                         "rsi": 54,
                     }
                     if candle is None:
@@ -88,9 +89,8 @@ class LiveEngine(BaseEngine):
 
         # ---------- ENTRY ----------
         intent = self.strategy.on_candle(candle, ctx)
-        # pdb.set_trace()
 
         if intent:
+            # pdb.set_trace()
             price_map = candle["close"]
-            pdb.set_trace()
             self.order_router.process_intent(intent, price_map)

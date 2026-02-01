@@ -13,6 +13,7 @@ from core.orderExecution.position_manager import PositionManager
 import time
 import pdb
 from pathlib import Path
+import pandas as pd
 from core.utils.instruments.instrument_store import InstrumentStore
 
 
@@ -24,16 +25,18 @@ def run_job(job):
         return
 
     # ------------- Instruments File --------------
-    BASE_DIR = Path(__file__).resolve().parents[1]
-    instrument_store = InstrumentStore(
-        BASE_DIR / "Dependencies" / "all_instrument 2026-01-31.csv"
-    )
 
     # ---------- CORE ----------
     strategy = cfg["strategy"]()
 
     # ---------- DATA / BROKER ----------
     broker_data = DhanSource()
+    #  Instrument store
+    current_date = time.strftime("%Y-%m-%d")
+    expected_file = "all_instrument" + str(current_date) + ".csv"
+    BASE_DIR = Path(__file__).resolve().parents[1]
+    instrument_store = InstrumentStore(BASE_DIR / "Dependencies" / expected_file)
+
     # portfolio = Portfolio(job["capital"])  # here portfolio is used for bactesting
 
     # ---------- BACKTEST ----------
@@ -76,6 +79,7 @@ def run_job(job):
             candle_service=candle_service,
             symbols=job["symbols"],
             order_router=order_router,
+            instrument_store=instrument_store,
         )
 
         engine.start(

@@ -6,7 +6,7 @@ import time
 import datetime
 import traceback
 import talib
-from core.api.optionChain.dhanOptionChain import DhanOptionChain
+
 import pandas as pd
 from Dhan_Tradehull import Tradehull
 
@@ -88,6 +88,39 @@ tsl = Tradehull(client_code, token_id)
 # orderid = tsl.order_placement("ACC", "NSE", 1, 2674, 2670, "STOPLIMIT", "BUY", "MIS")
 # orderid = tsl.order_placement("ACC", "NSE", 1, 0, 2670, "STOPMARKET", "BUY", "MIS")
 
+# 1-2-26
+# orderid = tsl.order_placement(
+#     tradingsymbol="NIFTY 05 FEB 25300 CALL",
+#     exchange="NFO",
+#     quantity=65,
+#     price=0.05,
+#     trigger_price=0,
+#     order_type="LIMIT",
+#     transaction_type="BUY",
+#     trade_type="MIS",
+#     # after_market_order=True,
+#     # amo_time="OPEN",
+# )
+
+orderid1 = tsl.order_placement(
+    "NIFTY 03 FEB 28100 CALL", "NFO", 75, 0.05, 0, "LIMIT", "BUY", "MIS"
+)
+print(orderid1)
+
+# orderid = tsl.order_placement(
+#     "ACC",
+#     "NSE",
+#     quantity=1,
+#     price=100,  # ignored
+#     trigger_price=0,  # ignored
+#     order_type="Limit",
+#     transaction_type="BUY",
+#     trade_type="MIS",
+#     # after_market_order=True,
+#     # amo_time="OPEN",
+# )
+# print(orderid)
+pdb.set_trace()
 # =========================Modify order========================
 # orderid = '12241210603927'
 # modified_order_id = tsl.modify_order(order_id=orderid,order_type="LIMIT",quantity=50,price=0.1,trigger_price=0)
@@ -102,28 +135,28 @@ print("Available Balance:", available_balance)
 # print(option_chain)
 
 # ============expired option chain=============
-data = tsl.get_expired_option_data(
-    tradingsymbol="RELIANCE",
-    exchange="NSE",
-    interval=1,
-    expiry_flag="MONTH",
-    expiry_code=1,
-    strike="ATM",
-    option_type="CALL",
-    from_date="2024-10-10",
-    to_date="2024-11-10",
-)
-print(data)
+# data = tsl.get_expired_option_data(
+#     tradingsymbol="RELIANCE",
+#     exchange="NSE",
+#     interval=1,
+#     expiry_flag="MONTH",
+#     expiry_code=1,
+#     strike="ATM",
+#     option_type="CALL",
+#     from_date="2023-10-10",
+#     to_date="2024-11-10",
+# )
+# print(data)
 
 
-pdb.set_trace()
+# pdb.set_trace()
 
 # ==========end======
 
-CE_symbol_name, PE_symbol_name, strike = tsl.ATM_Strike_Selection(
-    Underlying="NIFTY", Expiry=0
-)
-print(CE_symbol_name, PE_symbol_name, strike)
+# CE_symbol_name, PE_symbol_name, strike = tsl.ATM_Strike_Selection(
+#     Underlying="NIFTY", Expiry=0
+# )
+# print(CE_symbol_name, PE_symbol_name, strike)
 
 # ---------------- STRIKE SELECTION ----------------
 # ce_name, pe_name, strike = tsl.ATM_Strike_Selection("NIFTY", expiry_date)
@@ -136,8 +169,8 @@ print(CE_symbol_name, PE_symbol_name, strike)
 
 
 # ---------------- INDICATORS ----------------
-intraday_hist_data = tsl.get_intraday_data(otm_ce_name, "NFO", 1)
-intraday_hist_data["rsi"] = talib.RSI(intraday_hist_data["close"], timeperiod=14)
+# intraday_hist_data = tsl.get_intraday_data(otm_ce_name, "NFO", 1)
+# intraday_hist_data["rsi"] = talib.RSI(intraday_hist_data["close"], timeperiod=14)
 
 # ---------------- LOT SIZE ----------------
 lot_size = tsl.get_lot_size(otm_ce_name)

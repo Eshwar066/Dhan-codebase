@@ -2,6 +2,8 @@ import talib
 import pandas as pd
 import pdb
 from collections import deque
+import uuid
+import datetime as dt
 
 # from core.models.position import Position
 from core.strategies.base import BaseStrategy
@@ -44,6 +46,39 @@ class LeapsQuarterly(BaseStrategy):
     def _is_valid_time(self, ts):
         return ts.strftime("%H:%M") in VALID_TIMES
 
+    def build_option_symbol(self, symbol, expiry, strike, option_type):
+        """
+        Output:
+        NIFTY 30 MAR 25000 PUT
+        NIFTY 30 MAR 25000 CALL
+        """
+
+        # normalize expiry
+        if isinstance(expiry, str):
+            expiry = dt.datetime.strptime(expiry, "%Y-%m-%d").date()
+        elif isinstance(expiry, dt.datetime):
+            expiry = expiry.date()
+
+        day = f"{expiry.day:02d}"  # 30
+        month = expiry.strftime("%b").upper()  # MAR
+
+        strike = int(float(strike))
+
+        # --- normalize option type ---
+        opt = option_type.upper()
+        option_map = {
+            "CE": "CALL",
+            "PE": "PUT",
+            "CALL": "CALL",
+            "PUT": "PUT",
+        }
+
+        if opt not in option_map:
+            raise ValueError(f"Invalid option_type: {option_type}")
+
+        option_type = option_map[opt]
+        return f"{symbol.upper()} {day} {month} {strike} {option_type}"
+
     def on_candle(self, candle, ctx):
 
         ts = pd.to_datetime(candle["timestamp"])
@@ -51,8 +86,8 @@ class LeapsQuarterly(BaseStrategy):
         symbol = candle["symbol"]
         rsi = candle.get("rsi")
 
-        if not self._is_valid_time(ts):
-            return None
+        # if not self._is_valid_time(ts):
+        #     return None
 
         # ---------- Stage 1: Expiry Selection ----------
         if "option_chain" not in ctx:
@@ -79,22 +114,6 @@ class LeapsQuarterly(BaseStrategy):
             ]
         ]
 
-        # (df_Optionchain["Strike Price"] < atm_strike)  # OTM puts and this condition is valid for live, since we are using dummy data.
-
-        # filtered = df_Optionchain[
-        #     (df_Optionchain["Strike Price"] % 500 == 0)
-        #     & (df_Optionchain["PE LTP"].between(200, 350))
-        # ]
-        # filtered = None
-        # for low in [300, 250, 200]:
-        #     filtered = df_Optionchain[
-        #         (df_Optionchain["Strike Price"] % 500 == 0)
-        #         & (df_Optionchain["PE LTP"].between(low, 400))
-        #     ]
-
-        #     if not filtered.empty:
-        #         break
-        # pdb.set_trace()
         if rsi < 32:
             filtered = df_Optionchain[
                 (df_Optionchain["Strike Price"] % 500 == 0)
@@ -105,27 +124,90 @@ class LeapsQuarterly(BaseStrategy):
         if rsi > 52:
             filtered = df_Optionchain[
                 (df_Optionchain["Strike Price"] % 500 == 0)
-                & (df_Optionchain["PE LTP"].between(200, 300))
+                & (df_Optionchain["PE LTP"].between(200, 400))
             ]
             # pdb.set_trace()
             if filtered.empty:
+                print("filtered option strike didnt found")
                 return None
 
             row = filtered.iloc[(filtered["PE LTP"] - 350).abs().argsort()[:1]].iloc[0]
+            instrument_store = ctx["instrument_store"]
+            tradingSymbol = self.build_option_symbol(
+                symbol, Expiry_date, float(row["Strike Price"]), "PE"
+            )
             # pdb.set_trace()
-            # instrument_store.intent_creation_details(25500, "NIFTY", "PE")
-            return {
-                "symbol": symbol,
-                "expiry": Expiry_date,
-                "side": "SELL",
-                "option_type": "PE",
-                "strike": row["Strike Price"],
-                "price": row["PE LTP"],
-                "qty": 1,
-                "strategy": "LEAPS_RSI",
-            }
+            if not tradingSymbol:
+                print("Leaps no tradingSymbol found")
+                return None
 
-        return None
+            inst = instrument_store.intent_creation_details(tradingSymbol, "NSE")
+            # pdb.set_trace()
+            if not inst["SEM_TRADING_SYMBOL"]:
+                print("Leaps no intrument row")
+                return None
+
+            intent = self.map_instrument_to_intent(
+                inst, strategy="LEAPS_RSI", side="SELL", qty=1
+            )
+
+            return intent
+
+    def map_instrument_to_intent(self, row, strategy="LEAPS_RSI", side="SELL", qty=1):
+        """
+        Map a Dhan instrument row to an intent dictionary.
+
+        Args:
+            row (pd.Series): instrument row from instrument_df
+            strategy (str): strategy name
+            side (str): BUY or SELL
+            qty (int): quantity to trade
+
+        Returns:
+            dict: intent ready for order placement
+        """
+
+        trading_symbol = row["SEM_CUSTOM_SYMBOL"]  # e.g., NIFTY-Mar2026-24500-PE
+        symbol = row["SEM_CUSTOM_SYMBOL"].split()[0]
+        expiry_date = row["SEM_EXPIRY_DATE"]
+        strike_price = float(row["SEM_STRIKE_PRICE"])
+        option_type = row["SEM_OPTION_TYPE"]
+        lot_size = int(row["SEM_LOT_UNITS"])
+        segment = row["SEM_SEGMENT"]
+        exchange = row["SEM_EXM_EXCH_ID"]
+
+        option_map = {"CE": "CALL", "PE": "PUT"}
+        option_type_mapped = option_map.get(option_type.upper(), option_type.upper())
+
+        tick_size = float(row["SEM_TICK_SIZE"]) or 1.0
+        ltp = row.get(f"{option_type} LTP", 0.0)  # if column exists
+        price = round(float(ltp) / tick_size) * tick_size if ltp else 0.0
+
+        intent = {
+            "intent_id": uuid.uuid4().hex,
+            "trading_symbol": trading_symbol,
+            "symbol": symbol,
+            "expiry": str(expiry_date),
+            "side": side,
+            "option_type": option_type_mapped,
+            "strike": strike_price,
+            "price": price,
+            "qty": qty,
+            "strategy": strategy,
+            "trade_type": "MARGIN",
+            "disclosed_quantity": 0,
+            "after_market_order": False,
+            "validity": "DAY",
+            "amo_time": "OPEN",
+            "bo_profit_value": None,
+            "bo_stop_loss_value": None,
+            "tag": f"{strategy} intent",
+            "exchange": exchange,
+            "lot_size": lot_size,
+            "segment": segment,
+        }
+
+        return intent
 
     def select_expiry(self, expiry_list, date):
         if not expiry_list:

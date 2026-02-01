@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from Dhan_Tradehull import Tradehull
 from core.data.sources.NSEClient import NSEClient
 import pdb
+import datetime as dt
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if PROJECT_ROOT not in sys.path:
@@ -155,6 +156,40 @@ class DhanSource:
             "chain": df,
         }
 
+    def build_option_symbol(self, symbol, expiry, strike, option_type):
+        """
+        Output:
+        NIFTY 30 MAR 25000 PUT
+        NIFTY 30 MAR 25000 CALL
+        """
+
+        # normalize expiry
+        if isinstance(expiry, str):
+            expiry = dt.datetime.strptime(expiry, "%Y-%m-%d").date()
+        elif isinstance(expiry, dt.datetime):
+            expiry = expiry.date()
+
+        day = f"{expiry.day:02d}"  # 30
+        month = expiry.strftime("%b").upper()  # MAR
+
+        strike = int(float(strike))
+
+        # --- normalize option type ---
+        opt = option_type.upper()
+        option_map = {
+            "CE": "CALL",
+            "PE": "PUT",
+            "CALL": "CALL",
+            "PUT": "PUT",
+        }
+
+        if opt not in option_map:
+            raise ValueError(f"Invalid option_type: {option_type}")
+
+        option_type = option_map[opt]
+
+        return f"{symbol.upper()} {day} {month} {strike} {option_type}"
+
     def get_positions(self, debug="NO"):
         return self.tsl.get_positions(debug=debug)
 
@@ -198,6 +233,6 @@ class DhanSource:
             validity=validity,
             amo_time=amo_time,
             bo_profit_value=bo_profit_value,
-            bo_stop_loss_value=bo_stop_loss_value,
+            bo_stop_loss_Value=bo_stop_loss_value,  # ✅ Capital V
             tag=tag,
         )

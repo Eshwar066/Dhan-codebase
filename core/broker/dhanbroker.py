@@ -126,6 +126,7 @@
 
 import time
 import uuid
+import pdb
 
 
 # ✅ Idempotent orders
@@ -149,24 +150,50 @@ class DhanBroker:
         self.intent_store = intent_store
 
     # =========================
+    # BUILD DHAN PAYLOAD
+    # =========================
+    def _build_payload(self, intent):
+        """
+        Convert intent into broker payload for Dhan API.
+        """
+
+        # Map segment to exchange for Dhan API
+        segment_map = {
+            "EQ": "NSE",
+            "FUT": "NFO",
+            "OPT": "NFO",
+            "MCX": "MCX",
+            "CRYPTO": "CRYPTO",
+            "D": "NFO",
+        }
+        exchange = segment_map.get(intent["segment"], "NSE")
+
+        payload = {
+            "tradingsymbol": intent["trading_symbol"],
+            "exchange": intent["exchange"],  # NSE / NFO / etc
+            "quantity": 65,
+            "price": float(intent.get("price", 0)),  # limit price if any
+            "trigger_price": float(intent.get("trigger_price", 0)),
+            "order_type": intent.get("order_type", "MARKET"),
+            "transaction_type": intent["side"],  # BUY / SELL
+            "trade_type": intent.get("trade_type", "MARGIN"),
+            "disclosed_quantity": intent.get("disclosed_quantity", 0),
+            "after_market_order": intent.get("after_market_order", False),
+            "validity": intent.get("validity", "DAY"),
+            "amo_time": intent.get("amo_time", "OPEN"),
+            "bo_profit_value": intent.get("bo_profit_value"),
+            "bo_stop_loss_value": intent.get("bo_stop_loss_value"),
+            "tag": intent.get("intent_id"),  # idempotency / client_order_id
+        }
+
+        return payload
+
+    # =========================
     # ORDER PLACEMENT
     # =========================
     def place_order(self, intent, retries=2):
         """
         Intent → Safe Dhan Order
-
-        intent fields expected:
-        {
-            intent_id,
-            symbol,
-            side,
-            qty,
-            segment,
-            order_type,
-            price,
-            trigger_price,
-            product
-        }
         """
 
         client_order_id = intent.get(
@@ -174,13 +201,15 @@ class DhanBroker:
         )
 
         order_payload = self._build_payload(intent)
+        # order_payload["tag"] = client_order_id  # Dhan API uses 'tag' for idempotency
 
         for attempt in range(retries + 1):
             try:
-                resp = self.api.place_order(
-                    **order_payload, client_order_id=client_order_id
-                )
-
+                resp = self.api.place_order(**order_payload)
+                if not resp:
+                    print(">>", resp)
+                    raise Exception(f"❌ Order rejected by broker: {order_payload}")
+                # pdb.set_trace()
                 if resp.get("status") == "success":
                     order_id = resp["order_id"]
 
@@ -206,32 +235,6 @@ class DhanBroker:
                 time.sleep(0.4)
 
         return None
-
-    # =========================
-    # BUILD DHAN PAYLOAD
-    # =========================
-    def _build_payload(self, intent):
-
-        segment_map = {
-            "EQ": "NSE",
-            "FUT": "NFO",
-            "OPT": "NFO",
-            "MCX": "MCX",
-            "CRYPTO": "CRYPTO",
-        }
-
-        exchange = segment_map.get(intent["segment"], "NSE")
-
-        return dict(
-            symbol=intent["symbol"],
-            side=intent["side"],
-            quantity=intent["qty"],
-            order_type=intent.get("order_type", "MARKET"),
-            product=intent.get("product", "MARGIN"),
-            price=intent.get("price", 0),
-            trigger_price=intent.get("trigger_price", 0),
-            exchange=exchange,
-        )
 
     # =========================
     # ORDER SEARCH (Idempotency)

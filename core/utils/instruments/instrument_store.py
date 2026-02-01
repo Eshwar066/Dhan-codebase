@@ -1,6 +1,7 @@
 from pathlib import Path
 import pandas as pd
 import datetime
+import pdb
 
 # instrument_store.df.columns.tolist()
 # [
@@ -67,7 +68,6 @@ class InstrumentStore:
     # 🔹 CORE RESOLVER
     # --------------------------------------------------
 
-
     # working
     def map_row_to_instrument(self, row):
         return {
@@ -95,16 +95,31 @@ class InstrumentStore:
         print(self.df.head(n))
 
     #  main
-    def intent_creation_details(self, strike, symbol, optType):
-        # use
-        # instrument_store.intent_creation_details(25500, "NIFTY", "PE")
-        nifty_options = self.df[
-            self.df["SEM_TRADING_SYMBOL"].str.contains(symbol)
-            & (self.df["SEM_OPTION_TYPE"] == optType)
+    def intent_creation_details(self, tradingsymbol, exchange):
+        instrument_exchange = {
+            "NSE": "NSE",
+            "BSE": "BSE",
+            "NFO": "NSE",
+            "BFO": "BSE",
+            "MCX": "MCX",
+            "CUR": "NSE",
+        }
+        security_check = self.df[
+            (
+                (self.df["SEM_TRADING_SYMBOL"] == tradingsymbol)
+                | (self.df["SEM_CUSTOM_SYMBOL"] == tradingsymbol)
+            )
+            & (self.df["SEM_EXM_EXCH_ID"] == instrument_exchange[exchange])
         ]
-        target_strike = strike
-        nearest_row = nifty_options.iloc[
-            (nifty_options["SEM_STRIKE_PRICE"] - target_strike).abs().argmin()
-        ]
-        row = self.map_row_to_instrument(nearest_row)
-        return row
+
+        # Check if present and return row(s)
+        if not security_check.empty:
+            # If you want the first match only
+            row = security_check.iloc[0]
+            print("✅ Found security row:")
+            print(row)
+            return row
+        else:
+            print(
+                f"❌ No instrument found for symbol '{tradingsymbol}' on exchange '{exchange}'"
+            )

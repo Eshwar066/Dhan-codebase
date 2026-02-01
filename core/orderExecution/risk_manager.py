@@ -1,4 +1,5 @@
 import time
+import pdb
 
 
 # place this in live_engine.py
@@ -56,13 +57,12 @@ class RiskManager:
             "strategy": str (optional)
         }
         """
-        pdb.set_trace()
-        
+
         symbol = intent["symbol"]
         side = intent["side"]
         qty = intent["qty"]
         price = intent.get("price", 0)
-        inst = intent["instrument"]
+        lot_size = intent.get("lot_size", 65)
 
         # 1️⃣ Cooldown check
         if not self._cooldown_ok(symbol):
@@ -86,14 +86,14 @@ class RiskManager:
             return False
 
         # 5️⃣ Symbol exposure check
-        sym_exposure = future_qty * price * inst.lot_size
+        sym_exposure = future_qty * price * lot_size
         if sym_exposure > self.max_symbol_exposure:
             print(f"❌ Symbol exposure breach {symbol}")
             return False
 
         # 6️⃣ Portfolio exposure check
         portfolio_exposure = self.pm.total_exposure(price_map)
-        new_exposure = portfolio_exposure + (qty * price * inst.lot_size)
+        new_exposure = portfolio_exposure + (qty * price * lot_size)
 
         if new_exposure > self.max_portfolio_exposure:
             print("❌ Portfolio exposure breach")
