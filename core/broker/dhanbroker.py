@@ -127,6 +127,7 @@
 import time
 import uuid
 import pdb
+from core.broker.base_broker import BaseBroker
 
 
 # ✅ Idempotent orders
@@ -143,7 +144,7 @@ import pdb
 # price = None or 0
 
 
-class DhanBroker:
+class DhanBroker(BaseBroker):
     def __init__(self, dhan_api, position_manager=None, intent_store=None):
         self.api = dhan_api
         self.position_manager = position_manager

@@ -8,7 +8,6 @@ class LiveEngine(BaseEngine):
 
     def __init__(
         self,
-        broker,
         strategy,
         data,
         candle_service,
@@ -18,7 +17,6 @@ class LiveEngine(BaseEngine):
         position_manager,
     ):
         super().__init__(strategy, data, instrument_store)
-        self.broker = broker
         self.symbols = symbols
         self.candle_service = candle_service
         self.order_router = order_router
@@ -54,10 +52,10 @@ class LiveEngine(BaseEngine):
 
                     if not self.strategy.should_evaluate(candle):
                         continue
-
-                    ctx = self.build_context(candle)
                     # pdb.set_trace()
-                    self._run_strategy(symbol, candle, ctx)
+                    ctx, intent = self.build_context(candle)
+                    # pdb.set_trace()
+                    self._run_strategy(symbol, candle, ctx, intent)
 
             # -------- TICK MODE --------
             else:
@@ -73,13 +71,13 @@ class LiveEngine(BaseEngine):
                     candle["symbol"] = symbol
                     candle["exchange"] = exchange
 
-                    ctx = self.build_context(candle)
+                    ctx, intent = self.build_context(candle)
 
-                    self._run_strategy(symbol, candle, ctx)
+                    self._run_strategy(symbol, candle, ctx, intent)
 
             time.sleep(1)
 
-    def _run_strategy(self, symbol, candle, ctx):
+    def _run_strategy(self, symbol, candle, ctx, intent):
         # ---------- EXIT ----------
         open_positions = self.position_manager.get_open_positions(
             symbol=symbol, strategy=self.strategy.name
@@ -95,7 +93,7 @@ class LiveEngine(BaseEngine):
                 self.order_router.process_intent(intent, price_map)
 
         # ---------- ENTRY ----------
-        intent = self.strategy.on_candle(candle, ctx)
+        # intent = self.strategy.on_candle(candle, ctx)
 
         if intent:
             # pdb.set_trace()

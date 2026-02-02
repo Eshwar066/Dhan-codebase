@@ -26,17 +26,6 @@ class DhanSource:
         self.expiry_cache = {}
         self.nse_client = NSEClient()
 
-    def get_nse_expiries(self, symbol, year, instrument="OPTIDX"):
-        key = (symbol, year, instrument)
-
-        if key not in self.expiry_cache:
-            # sync wrapper, returns list
-            self.expiry_cache[key] = self.nse_client.get_expiries(
-                symbol, year, instrument
-            )
-
-        return self.expiry_cache[key]
-
     def get_latest_candles(self, symbols, debug):
         # """
         # Returns:
@@ -218,21 +207,150 @@ class DhanSource:
         Thin execution wrapper for Dhan.
         No strategy / portfolio logic here.
         """
-
+        # pdb.set_trace()
+        # tradingsymbol.upper(),
         return self.tsl.order_placement(
-            tradingsymbol=tradingsymbol.upper(),
-            exchange=exchange.upper(),
-            quantity=int(quantity),
-            price=int(price),
-            trigger_price=int(trigger_price),
-            order_type=order_type.upper(),
-            transaction_type=transaction_type.upper(),
-            trade_type=trade_type.upper(),
-            disclosed_quantity=disclosed_quantity,
-            after_market_order=after_market_order,
-            validity=validity,
-            amo_time=amo_time,
-            bo_profit_value=bo_profit_value,
-            bo_stop_loss_Value=bo_stop_loss_value,  # ✅ Capital V
-            tag=tag,
+            tradingsymbol="NIFTY-Mar2026-24500-PE",
+            exchange="NFO",
+            quantity=65,
+            price=0.0,  # MARKET → price ignored
+            trigger_price=0.0,
+            order_type="MARKET",
+            transaction_type="SELL",
+            trade_type="MARGIN",
+            disclosed_quantity=0,
+            after_market_order=False,
+            validity="DAY",
+            amo_time="OPEN",
+            bo_profit_value=None,
+            bo_stop_loss_Value=None,
+            tag="73f0f9a6ce3943ca82c59f9c1be74290",
         )
+
+        # (
+        #     tradingsymbol="NIFTY-Mar2026-25000-CE",
+        #     exchange=exchange.upper(),
+        #     quantity=int(quantity),
+        #     price=int(price),
+        #     trigger_price=int(trigger_price),
+        #     order_type=order_type.upper(),
+        #     transaction_type=transaction_type.upper(),
+        #     trade_type=trade_type.upper(),
+        #     # disclosed_quantity=disclosed_quantity,
+        #     # after_market_order=after_market_order,
+        #     validity=validity,
+        #     # amo_time=amo_time,
+        #     # bo_profit_value=bo_profit_value,
+        #     # bo_stop_loss_Value=bo_stop_loss_value,  # ✅ Capital V
+        #     tag=tag,
+        # )
+
+    # =============================================================================
+    # NSE API
+    def get_nse_expiries(self, symbol, year, instrument="OPTIDX"):
+        key = (symbol, year, instrument)
+
+        if key not in self.expiry_cache:
+            # sync wrapper, returns list
+            self.expiry_cache[key] = self.nse_client.get_expiries(
+                symbol, year, instrument
+            )
+
+        return self.expiry_cache[key]
+
+    def generate_otm_strikes(
+        self,
+        spot_price: float,
+        step: int,
+        count: int,
+    ):
+        """
+        Example:
+        spot = 23300
+        step = 500
+        count = 3
+
+        → [23500, 24000, 24500]
+        """
+
+        if step not in (500, 1000):
+            raise ValueError("step must be 500 or 1000")
+
+        base = ((int(spot_price) // step) + 1) * step
+
+        return [base + i * step for i in range(count)]
+
+    def get_nse_optionchain_historical(
+        self,
+        symbol,
+        from_date,
+        expiry_date,
+        instrumentType,
+        spot_price,
+        strike_step,
+        strike_count,
+        option_type,
+    ):
+        """
+        strike_step → 500 / 1000
+        strike_count → number of strikes OTM
+        """
+
+        strikes = self.generate_otm_strikes(
+            spot_price=spot_price,
+            step=strike_step,
+            count=strike_count,
+        )
+        # pdb.set_trace()
+
+        records = []
+
+        for strike in strikes:
+            for option_type in ("CE", "PE"):
+                try:
+                    hist = self.nse_client.get_options_history(
+                        symbol=symbol,
+                        from_date=from_date,
+                        to_date=expiry_date,
+                        instrumentType=instrumentType,
+                        expiry_date=expiry_date,
+                        strike=strike,
+                        option_type=option_type,
+                        year=expiry_date.year,
+                    )
+
+                    if not hist or "data" not in hist or not hist["data"]:
+                        continue
+
+                    row = hist["data"][-1]
+
+                    records.append(
+                        {
+                            "Strike Price": strike,
+                            f"{option_type} LTP": row.get("FH_LAST_TRADED_PRICE", 0),
+                        }
+                    )
+                    pdb.set_trace()
+                except Exception:
+                    continue
+
+        if not records:
+            return None
+
+        oc_df = (
+            pd.DataFrame(records)
+            .groupby("Strike Price")
+            .first()
+            .reset_index()
+            .sort_values("Strike Price")
+        )
+
+        atm_base = strikes[0]
+
+        return {
+            "chain": (
+                atm_base,
+                oc_df,
+                expiry_date,
+            )
+        }

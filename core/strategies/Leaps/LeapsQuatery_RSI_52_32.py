@@ -24,6 +24,10 @@ class LeapsQuarterly(BaseStrategy):
     # Engine will auto-populate these via runtime_spec
     required_context = ["option_chain"]
 
+    def prepare_indicators(self, df):
+        df["rsi"] = talib.RSI(df["close"], 14)
+        return df
+
     # def __init__(self):
     def should_evaluate(self, candle) -> bool:
         """
@@ -99,7 +103,7 @@ class LeapsQuarterly(BaseStrategy):
 
         # ---------- Stage 2: Trading Logic ----------
         option_chain = ctx["option_chain"]
-        # pdb.set_trace()
+        pdb.set_trace()
         atm_strike, oc_df, Expiry_date = option_chain["chain"]
         # pdb.set_trace()
         df_Optionchain = oc_df[
@@ -140,9 +144,7 @@ class LeapsQuarterly(BaseStrategy):
             if not tradingSymbol:
                 print("Leaps no tradingSymbol found")
                 return None
-            print(">>>>>11")
             inst = instrument_store.intent_creation_details(tradingSymbol, "NSE")
-            print(">>>>>222")
             # pdb.set_trace()
             if not inst["SEM_TRADING_SYMBOL"]:
                 print("Leaps no intrument row")

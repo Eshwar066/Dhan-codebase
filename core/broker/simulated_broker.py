@@ -1,12 +1,20 @@
 import uuid
 import time
 import random
+from core.broker.base_broker import BaseBroker
 
 
 class SimulatedBroker(BaseBroker):
-    def __init__(self, position_manager, intent_store, latency_ms=20):
-        self.position_manager = position_manager
-        self.intent_store = intent_store
+    def __init__(
+        self,
+        position_manager=None,
+        intent_store=None,
+        latency_ms=20,
+    ):
+        super().__init__(
+            position_manager=position_manager,
+            intent_store=intent_store,
+        )
         self.latency_ms = latency_ms
 
     # =========================

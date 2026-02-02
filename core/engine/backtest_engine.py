@@ -1,16 +1,31 @@
 import pandas as pd
 from core.engine.base_engine import BaseEngine
-import pdb
+import datetime as dt
 
 
 class BacktestEngine(BaseEngine):
-    def __init__(self, data_provider, strategy):
-        super().__init__(strategy=strategy, data=data_provider)
-        # self.portfolio = portfolio
+
+    def __init__(
+        self,
+        data_provider,
+        strategy,
+        instrument_store,
+        order_router,
+        position_manager,
+    ):
+        super().__init__(
+            strategy=strategy,
+            data=data_provider,
+            instrument_store=instrument_store,
+        )
+        self.order_router = order_router
+        self.position_manager = position_manager
 
     def run(self, symbols, start_date, end_date, timeframe, exchange, sector):
+
         for symbol in symbols:
-            # ---- Fetch full data once ----
+
+            # -------- Load full historical data --------
             df = self.data.get_intraday(
                 symbol=symbol,
                 start_date=start_date,
@@ -20,46 +35,51 @@ class BacktestEngine(BaseEngine):
                 sector=sector,
             )
 
-            if df is None or len(df) < 20:
+            if df is None or len(df) < 50:
                 continue
 
             df["symbol"] = symbol
+            df["exchange"] = exchange
 
-            # ---- Indicators ----
+            # -------- Indicators --------
             df = self.strategy.prepare_indicators(df)
-            # pdb.set_trace()
-            # ---- Iterate candle by candle ----
-            for idx in range(len(df)):
-                candle = df.iloc[idx].to_dict()
 
-                # Skip weekends (extra safety)
+            # -------- Candle-by-candle simulation --------
+            for _, row in df.iterrows():
+                candle = row.to_dict()
+
                 ts = pd.to_datetime(candle["timestamp"])
                 if ts.weekday() >= 5:
                     continue
 
-                # ---- Build runtime context ----
-                ctx = self.build_context(candle)
+                # -------- Runtime context --------
+                ctx, entry_intent = self.build_context(candle)
 
-                # ========== EXIT ==========
-                if self.portfolio.has_position(symbol):
-                    position = self.portfolio.get_position(symbol)
+                self._run_strategy(symbol, candle, ctx, entry_intent)
+                self.update_risk_metrics(symbol, candle["close"])
 
-                    if self.strategy.should_exit(position, candle, ctx):
-                        self.portfolio.exit(position, candle)
-                        continue
+    def _run_strategy(self, symbol, candle, ctx, entry_intent):
+        # ---------- EXIT ----------
+        open_positions = self.position_manager.get_open_positions(
+            symbol=symbol, strategy=self.strategy.name
+        )
 
-                # ========== ENTRY ==========
-                if not self.portfolio.has_position(symbol):
-                    position = self.strategy.on_candle(
-                        candle=candle,
-                        ctx=ctx,
-                        portfolio=self.portfolio,
-                    )
+        for position in open_positions:
+            exit_signal = self.strategy.should_exit(position, candle, ctx)
 
-                    if position:
-                        self.portfolio.enter(position)
+            if exit_signal:
+                exit_intent = self.strategy.create_exit_intent(position, exit_signal)
 
-        self.portfolio.report()
+                price_map = candle["close"]
+                self.order_router.process_intent(exit_intent, price_map)
+
+            # ---------- ENTRY ----------
+            # intent = self.strategy.on_candle(candle, ctx)
+
+            if entry_intent:
+                # pdb.set_trace()
+                price_map = candle["close"]
+                self.order_router.process_intent(entry_intent, price_map)
 
     def update_risk_metrics(self, symbol, ltp):
         pos = self.position_manager.positions.get(symbol)
