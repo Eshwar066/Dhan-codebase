@@ -77,5 +77,5 @@ class BaseEngine:
                     # year=result["selected_expiry"].year,
                 )
                 intent = self.strategy.on_candle(candle, ctx)
-
+                pdb.set_trace()
         return ctx, intent

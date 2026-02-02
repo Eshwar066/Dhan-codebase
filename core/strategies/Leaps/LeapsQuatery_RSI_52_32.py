@@ -94,7 +94,7 @@ class LeapsQuarterly(BaseStrategy):
         #     return None
 
         # ---------- Stage 1: Expiry Selection ----------
-        if "option_chain" not in ctx:
+        if not ctx.get("option_chain"):
             expiry_list = ctx.get("expiry_list")
             expiry_date = self.select_expiry(expiry_list, date)
             Expiry_date = expiry_date.strftime("%Y-%m-%d")
@@ -104,7 +104,18 @@ class LeapsQuarterly(BaseStrategy):
         # ---------- Stage 2: Trading Logic ----------
         option_chain = ctx["option_chain"]
         pdb.set_trace()
-        atm_strike, oc_df, Expiry_date = option_chain["chain"]
+        chain = option_chain.get("chain")
+        # if not chain or len(chain) != 3:
+        #     return None
+
+        atm_strike, oc_df, expiry_date = chain
+        pdf.set_trace()
+        if oc_df is None or oc_df.empty:
+            return None
+
+        # option_chain = ctx["option_chain"]
+        # pdb.set_trace()
+        # atm_strike, oc_df, Expiry_date = option_chain["chain"]
         # pdb.set_trace()
         df_Optionchain = oc_df[
             [
@@ -117,6 +128,7 @@ class LeapsQuarterly(BaseStrategy):
                 "PE Delta",
             ]
         ]
+        pdf.set_trace()
 
         if rsi < 32:
             filtered = df_Optionchain[
@@ -130,7 +142,7 @@ class LeapsQuarterly(BaseStrategy):
                 (df_Optionchain["Strike Price"] % 500 == 0)
                 & (df_Optionchain["PE LTP"].between(200, 400))
             ]
-            # pdb.set_trace()
+            pdb.set_trace()
             if filtered.empty:
                 print("filtered option strike didnt found")
                 return None

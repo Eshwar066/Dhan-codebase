@@ -301,12 +301,13 @@ class DhanSource:
             step=strike_step,
             count=strike_count,
         )
-        # pdb.set_trace()
+    
 
         records = []
 
         for strike in strikes:
             for option_type in ("CE", "PE"):
+
                 try:
                     hist = self.nse_client.get_options_history(
                         symbol=symbol,
@@ -318,11 +319,12 @@ class DhanSource:
                         option_type=option_type,
                         year=expiry_date.year,
                     )
-
-                    if not hist or "data" not in hist or not hist["data"]:
+                    
+                    if not hist:
+                        print(">>no hist")
                         continue
-
-                    row = hist["data"][-1]
+                  
+                    row = hist[-1]
 
                     records.append(
                         {
@@ -330,7 +332,6 @@ class DhanSource:
                             f"{option_type} LTP": row.get("FH_LAST_TRADED_PRICE", 0),
                         }
                     )
-                    pdb.set_trace()
                 except Exception:
                     continue
 
@@ -344,13 +345,18 @@ class DhanSource:
             .reset_index()
             .sort_values("Strike Price")
         )
-
+        pdb.set_trace()
         atm_base = strikes[0]
 
         return {
-            "chain": (
-                atm_base,
-                oc_df,
-                expiry_date,
-            )
+            "symbol": symbol,
+            "exchange": "OPTIDX",
+            "chain": oc_df,
         }
+        # return {
+        #     "chain": (
+        #         atm_base,
+        #         oc_df,
+        #         expiry_date,
+        #     )
+        # }
