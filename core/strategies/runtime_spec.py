@@ -25,6 +25,8 @@ STRATEGY_RUNTIME_SPEC = {
                     "exchange": "NSE",
                     "interval": "60",  # 1hr candle
                     "segment": "OPT",
+                    "api": "DHAN",
+                    "expiry_flag": "MONTHLY",
                 }
             }
         },

@@ -74,8 +74,7 @@ class DhanSource:
 
     def get_expired_optionchain(
         self,
-        symbol,
-        monthlyExpiryDate,
+        # symbol,
         exchange,
         interval,
         expiry_flag,
@@ -86,15 +85,16 @@ class DhanSource:
         to_date,
     ):
         data = self.tsl.get_expired_option_data(
-            tradingsymbol=symbol,
+            # tradingsymbol=symbol,
             exchange=exchange,
-            interval=interval,  # 1-hour candle
-            expiry_flag=expiry_flag,  # Monthly expiry
-            expiry_code=expiry_code,  # March 2023 expiry (check your DHAN expiry sequence)
-            strike=strike,  # OTM strike relative to ATM
+            interval=interval,
+            expiry_flag=expiry_flag,
+            expiry_code=expiry_code,
+            strike=strike,
             option_type=option_type,
-            from_date=from_date,  # start of month
-            to_date=to_date,  # expiry date
+            fromDate=from_date,
+            toDate=to_date,
+            securityId=13,
         )
 
         return data
@@ -258,6 +258,7 @@ class DhanSource:
 
         return self.expiry_cache[key]
 
+    # nse historical option chain
     def generate_otm_strikes(
         self,
         spot_price: float,
@@ -301,39 +302,37 @@ class DhanSource:
             step=strike_step,
             count=strike_count,
         )
-    
 
         records = []
 
         for strike in strikes:
-            for option_type in ("CE", "PE"):
+            # for option_type in ("CE", "PE"):
+            try:
+                hist = self.nse_client.get_options_history(
+                    symbol=symbol,
+                    from_date=from_date,
+                    to_date=expiry_date,
+                    instrumentType=instrumentType,
+                    expiry_date=expiry_date,
+                    strike=strike,
+                    option_type=option_type,
+                    year=expiry_date.year,
+                )
 
-                try:
-                    hist = self.nse_client.get_options_history(
-                        symbol=symbol,
-                        from_date=from_date,
-                        to_date=expiry_date,
-                        instrumentType=instrumentType,
-                        expiry_date=expiry_date,
-                        strike=strike,
-                        option_type=option_type,
-                        year=expiry_date.year,
-                    )
-                    
-                    if not hist:
-                        print(">>no hist")
-                        continue
-                  
-                    row = hist[-1]
-
-                    records.append(
-                        {
-                            "Strike Price": strike,
-                            f"{option_type} LTP": row.get("FH_LAST_TRADED_PRICE", 0),
-                        }
-                    )
-                except Exception:
+                if not hist:
+                    print(">>no hist")
                     continue
+
+                row = hist[-1]
+
+                records.append(
+                    {
+                        "Strike Price": strike,
+                        f"{option_type} LTP": row.get("FH_LAST_TRADED_PRICE", 0),
+                    }
+                )
+            except Exception:
+                continue
 
         if not records:
             return None

@@ -1,6 +1,7 @@
 import pandas as pd
 from core.engine.base_engine import BaseEngine
 import datetime as dt
+import pdb
 
 
 class BacktestEngine(BaseEngine):
@@ -50,6 +51,9 @@ class BacktestEngine(BaseEngine):
 
                 ts = pd.to_datetime(candle["timestamp"])
                 if ts.weekday() >= 5:
+                    continue
+
+                if not self.strategy.should_evaluate(candle):
                     continue
 
                 # -------- Runtime context --------

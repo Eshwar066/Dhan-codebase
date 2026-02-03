@@ -1,3 +1,20 @@
+
+wire parent–child linkage (parent_intent_id)
+
+enforce exactly one hedge per sell
+
+add hedge PnL attribution
+
+make rollover holiday-aware without Expiry_Calendar
+
+add regime lock (1 trade per regime)
+
+add hedge PnL attribution
+
+add delta-aware hedge distance
+
+add backtest sanity assertions
+====
 If nifty rsi is below 32 will sell call option in 1hr candle, until it crosses rsi 52
 
 If nifty rsi is above 52 will sell put option in 1hr candle, until it crosses rsi 32

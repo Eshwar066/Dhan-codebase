@@ -113,7 +113,7 @@ class NSEClient:
     # =========================
 
     # =========================
-    # DATE NORMALIZERS
+    # option chain cached data + if new date date is in between the cached date range will use same cached data
     # =========================
     def to_dd_mm_yyyy(self, value):
         if isinstance(value, (datetime, date)):
