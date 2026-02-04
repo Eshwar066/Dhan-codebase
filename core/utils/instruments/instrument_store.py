@@ -2,6 +2,7 @@ from pathlib import Path
 import pandas as pd
 import datetime
 import pdb
+from run.config import RUN_MODE, RunMode
 
 # instrument_store.df.columns.tolist()
 # [
@@ -39,6 +40,25 @@ import pdb
 # nearest_row = nifty_options.iloc[
 #     (nifty_options["SEM_STRIKE_PRICE"] - target_strike).abs().argmin()
 # ]
+
+# ✅ Found security row:
+# Unnamed: 0                                  216446
+# SEM_EXM_EXCH_ID                                NSE
+# SEM_SEGMENT                                      D
+# SEM_SMST_SECURITY_ID                         62925
+# SEM_INSTRUMENT_NAME                         OPTIDX
+# SEM_EXPIRY_CODE                                  0
+# SEM_TRADING_SYMBOL          NIFTY-Mar2026-24000-PE
+# SEM_LOT_UNITS                                 65.0
+# SEM_CUSTOM_SYMBOL           NIFTY 30 MAR 24000 PUT
+# SEM_EXPIRY_DATE                         2026-03-30
+# SEM_STRIKE_PRICE                           24000.0
+# SEM_OPTION_TYPE                                 PE
+# SEM_TICK_SIZE                                  5.0
+# SEM_EXPIRY_FLAG                                  M
+# SEM_EXCH_INSTRUMENT_TYPE                        OP
+# SEM_SERIES                                     NaN
+# SM_SYMBOL_NAME                                 NaN
 from datetime import date, datetime
 
 INDEX_TO_OPT_SYMBOL = {
@@ -95,7 +115,11 @@ class InstrumentStore:
         print(self.df.head(n))
 
     #  main
-    def intent_creation_details(self, tradingsymbol, exchange):
+    dummy_security_counter = 100000
+
+    def intent_creation_details(
+        self, tradingsymbol, exchange, expiry, option_type, strike
+    ):
         instrument_exchange = {
             "NSE": "NSE",
             "BSE": "BSE",
@@ -104,13 +128,38 @@ class InstrumentStore:
             "MCX": "MCX",
             "CUR": "NSE",
         }
-        security_check = self.df[
-            (
-                (self.df["SEM_TRADING_SYMBOL"] == tradingsymbol)
-                | (self.df["SEM_CUSTOM_SYMBOL"] == tradingsymbol)
-            )
-            & (self.df["SEM_EXM_EXCH_ID"] == instrument_exchange[exchange])
-        ]
+        if RUN_MODE == RunMode.LIVE or RUN_MODE == RunMode.PAPER:
+            security_check = self.df[
+                (
+                    (self.df["SEM_TRADING_SYMBOL"] == tradingsymbol)
+                    | (self.df["SEM_CUSTOM_SYMBOL"] == tradingsymbol)
+                )
+                & (self.df["SEM_EXM_EXCH_ID"] == instrument_exchange[exchange])
+            ]
+        else:
+            InstrumentStore.dummy_security_counter += 1
+            dummy_row = {
+                "Unnamed: 0": 0,
+                "SEM_EXM_EXCH_ID": instrument_exchange.get(exchange, exchange),
+                "SEM_SEGMENT": "D",
+                "SEM_SMST_SECURITY_ID": InstrumentStore.dummy_security_counter,
+                "SEM_INSTRUMENT_NAME": "OPTIDX",
+                "SEM_EXPIRY_CODE": 0,
+                "SEM_TRADING_SYMBOL": tradingsymbol,
+                "SEM_LOT_UNITS": 65.0,
+                "SEM_CUSTOM_SYMBOL": tradingsymbol,
+                "SEM_EXPIRY_DATE": pd.Timestamp(expiry),
+                "SEM_STRIKE_PRICE": strike,
+                "SEM_OPTION_TYPE": ("PE" if option_type == "PUT" else "CE"),
+                "SEM_TICK_SIZE": 5.0,
+                "SEM_EXPIRY_FLAG": "M",
+                "SEM_EXCH_INSTRUMENT_TYPE": "OP",
+                "SEM_SERIES": None,
+                "SM_SYMBOL_NAME": None,
+            }
+
+            # Convert to pandas Series to mimic a row
+            security_check = pd.DataFrame([dummy_row])
 
         # Check if present and return row(s)
         if not security_check.empty:

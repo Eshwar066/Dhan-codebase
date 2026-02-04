@@ -24,9 +24,9 @@ class RiskManager:
     def __init__(
         self,
         position_manager,
-        max_portfolio_exposure=10_000_000,
-        max_symbol_exposure=2_000_000,
-        max_qty_per_symbol=10_000,
+        max_portfolio_exposure=10000000,
+        max_symbol_exposure=2000000,
+        max_qty_per_symbol=10000,
         max_open_positions=20,
         cooldown_seconds=5,
     ):

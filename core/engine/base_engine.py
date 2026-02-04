@@ -36,5 +36,4 @@ class BaseEngine:
         ctx["option_chain_service"] = OptionChainService(self.data_router)
         # ONE call only
         intent = self.strategy.on_candle(candle, ctx)
-        pdb.set_trace()
         return ctx, intent

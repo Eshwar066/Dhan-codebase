@@ -74,7 +74,6 @@ class DhanSource:
 
     def get_expired_optionchain(
         self,
-        # symbol,
         exchange,
         interval,
         expiry_flag,
@@ -83,9 +82,11 @@ class DhanSource:
         option_type,
         from_date,
         to_date,
+        securityId,
+        instrument,
+        exchangeSegment,
     ):
         data = self.tsl.get_expired_option_data(
-            # tradingsymbol=symbol,
             exchange=exchange,
             interval=interval,
             expiry_flag=expiry_flag,
@@ -94,7 +95,9 @@ class DhanSource:
             option_type=option_type,
             fromDate=from_date,
             toDate=to_date,
-            securityId=13,
+            securityId=securityId,
+            instrument=instrument,
+            exchangeSegment=exchangeSegment,
         )
 
         return data
@@ -145,39 +148,7 @@ class DhanSource:
             "chain": df,
         }
 
-    def build_option_symbol(self, symbol, expiry, strike, option_type):
-        """
-        Output:
-        NIFTY 30 MAR 25000 PUT
-        NIFTY 30 MAR 25000 CALL
-        """
 
-        # normalize expiry
-        if isinstance(expiry, str):
-            expiry = dt.datetime.strptime(expiry, "%Y-%m-%d").date()
-        elif isinstance(expiry, dt.datetime):
-            expiry = expiry.date()
-
-        day = f"{expiry.day:02d}"  # 30
-        month = expiry.strftime("%b").upper()  # MAR
-
-        strike = int(float(strike))
-
-        # --- normalize option type ---
-        opt = option_type.upper()
-        option_map = {
-            "CE": "CALL",
-            "PE": "PUT",
-            "CALL": "CALL",
-            "PUT": "PUT",
-        }
-
-        if opt not in option_map:
-            raise ValueError(f"Invalid option_type: {option_type}")
-
-        option_type = option_map[opt]
-
-        return f"{symbol.upper()} {day} {month} {strike} {option_type}"
 
     def get_positions(self, debug="NO"):
         return self.tsl.get_positions(debug=debug)
@@ -259,27 +230,6 @@ class DhanSource:
         return self.expiry_cache[key]
 
     # nse historical option chain
-    def generate_otm_strikes(
-        self,
-        spot_price: float,
-        step: int,
-        count: int,
-    ):
-        """
-        Example:
-        spot = 23300
-        step = 500
-        count = 3
-
-        → [23500, 24000, 24500]
-        """
-
-        if step not in (500, 1000):
-            raise ValueError("step must be 500 or 1000")
-
-        base = ((int(spot_price) // step) + 1) * step
-
-        return [base + i * step for i in range(count)]
 
     def get_nse_optionchain_historical(
         self,
@@ -288,20 +238,9 @@ class DhanSource:
         expiry_date,
         instrumentType,
         spot_price,
-        strike_step,
-        strike_count,
         option_type,
+        strikes,
     ):
-        """
-        strike_step → 500 / 1000
-        strike_count → number of strikes OTM
-        """
-
-        strikes = self.generate_otm_strikes(
-            spot_price=spot_price,
-            step=strike_step,
-            count=strike_count,
-        )
 
         records = []
 
@@ -310,20 +249,21 @@ class DhanSource:
             try:
                 hist = self.nse_client.get_options_history(
                     symbol=symbol,
-                    from_date=from_date,
-                    to_date=expiry_date,
+                    from_date=from_date.strftime("%Y-%m-%d"),
+                    to_date=expiry_date.strftime("%Y-%m-%d"),
                     instrumentType=instrumentType,
-                    expiry_date=expiry_date,
+                    expiry_date=expiry_date.strftime("%Y-%m-%d"),
                     strike=strike,
                     option_type=option_type,
                     year=expiry_date.year,
                 )
+                # pdb.set_trace()
 
                 if not hist:
                     print(">>no hist")
                     continue
 
-                row = hist[-1]
+                row = hist[0]
 
                 records.append(
                     {
@@ -344,7 +284,6 @@ class DhanSource:
             .reset_index()
             .sort_values("Strike Price")
         )
-        pdb.set_trace()
         atm_base = strikes[0]
 
         return {

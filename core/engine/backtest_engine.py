@@ -77,13 +77,11 @@ class BacktestEngine(BaseEngine):
                 price_map = candle["close"]
                 self.order_router.process_intent(exit_intent, price_map)
 
-            # ---------- ENTRY ----------
-            # intent = self.strategy.on_candle(candle, ctx)
-
-            if entry_intent:
-                # pdb.set_trace()
-                price_map = candle["close"]
-                self.order_router.process_intent(entry_intent, price_map)
+        # ---------- ENTRY ----------
+        if entry_intent:
+            price_map = candle["close"]
+            for singleIntent in entry_intent:
+                self.order_router.process_intent(singleIntent, price_map)
 
     def update_risk_metrics(self, symbol, ltp):
         pos = self.position_manager.positions.get(symbol)

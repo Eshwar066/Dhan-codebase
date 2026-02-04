@@ -1,6 +1,7 @@
 import pandas as pd
 import datetime as dt
 import calendar
+import math
 
 
 class ExpiryResolver:
@@ -16,13 +17,6 @@ class ExpiryResolver:
     @staticmethod
     def resolve(expiry_list, trade_date, api="NSE", expiry_pref="MONTHLY"):
         # NSE will check later-->Pending
-        """
-        Returns:
-        - NSE  → datetime.date
-        - DHAN → expiry series string (MONTHLY / MONTHLY_NEXT)
-
-        expiry_pref: MONTHLY / QUARTERLY (future)
-        """
 
         if isinstance(trade_date, str):
             trade_date = pd.to_datetime(trade_date).date()
@@ -48,6 +42,61 @@ class ExpiryResolver:
     # NSE EXPIRY (exact date)
     # ============================
 
+    def get_otm_strikes(self, spot, option_type, step=500, count=4):
+        """
+        Returns nearest OTM strikes relative to spot.
+        For spot = 17700, step = 500:
+        CE -> [17500, 17000, 16500]
+        PE -> [18000, 18500, 19000]
+        """
+
+        atm = round(spot / step) * step
+
+        if option_type in ("CALL", "CE"):
+            # OTM calls are BELOW spot
+            return [atm] + [atm + (i * step) for i in range(1, count)]
+
+        elif option_type in ("PUT", "PE"):
+            # OTM puts are ABOVE spot
+            return [atm] + [atm - (i * step) for i in range(1, count)]
+
+        else:
+            raise ValueError("option_type must be CALL/CE or PUT/PE")
+
+    def build_option_symbol(self, symbol, expiry, strike, option_type):
+        """
+        Output:
+        NIFTY 30 MAR 25000 PUT
+        NIFTY 30 MAR 25000 CALL
+        """
+
+        # normalize expiry
+        if isinstance(expiry, str):
+            expiry = dt.datetime.strptime(expiry, "%Y-%m-%d").date()
+        elif isinstance(expiry, dt.datetime):
+            expiry = expiry.date()
+
+        day = f"{expiry.day:02d}"  # 30
+        month = expiry.strftime("%b").upper()  # MAR
+
+        strike = int(float(strike))
+
+        # --- normalize option type ---
+        opt = option_type.upper()
+        option_map = {
+            "CE": "CALL",
+            "PE": "PUT",
+            "CALL": "CALL",
+            "PUT": "PUT",
+        }
+
+        if opt not in option_map:
+            raise ValueError(f"Invalid option_type: {option_type}")
+
+        option_type = option_map[opt]
+
+        return f"{symbol.upper()} {day} {month} {strike} {option_type}"
+
     @staticmethod
     def last_thursday(year, month):
         last_day = dt.date(year, month, 1)
@@ -61,33 +110,33 @@ class ExpiryResolver:
 
     @staticmethod
     def current_month_expiry(trade_date):
-        return Expiry_Calendar.last_thursday(trade_date.year, trade_date.month)
+        return ExpiryResolver.last_thursday(trade_date.year, trade_date.month)
 
     @staticmethod
     def next_month_expiry(trade_date):
         if trade_date.month == 12:
-            return Expiry_Calendar.last_thursday(trade_date.year + 1, 1)
-        return Expiry_Calendar.last_thursday(trade_date.year, trade_date.month + 1)
+            return ExpiryResolver.last_thursday(trade_date.year + 1, 1)
+        return ExpiryResolver.last_thursday(trade_date.year, trade_date.month + 1)
 
-    # @staticmethod
-    # def _select_nse_expiry(expiry_list, trade_date):
-    #     # NSE will check later-->Pending
-    #     """
-    #     Select last expiry of target month/year.
-    #     """
-    #     target_month, target_year = ExpiryResolver._select_expiry_month(trade_date)
+    @staticmethod
+    def _select_nse_expiry(expiry_list, trade_date):
+        # NSE will check later-->Pending
+        """
+        Select last expiry of target month/year.
+        """
+        target_month, target_year = ExpiryResolver._select_expiry_month(trade_date)
 
-    #     expiry_dates = [pd.to_datetime(e).date() for e in expiry_list]
+        expiry_dates = [pd.to_datetime(e).date() for e in expiry_list]
 
-    #     matches = [
-    #         e for e in expiry_dates if e.month == target_month and e.year == target_year
-    #     ]
+        matches = [
+            e for e in expiry_dates if e.month == target_month and e.year == target_year
+        ]
 
-    #     if not matches:
-    #         return None
+        if not matches:
+            return None
 
-    #     # Monthly expiry = LAST one
-    #     return matches[-1]
+        # Monthly expiry = LAST one
+        return matches[-1]
 
     # # ============================
     # # DHAN EXPIRY SERIES
@@ -108,13 +157,13 @@ class ExpiryResolver:
 
     #     return "MONTHLY"
 
-    # @staticmethod
-    # def _last_thursday(year, month):
-    #     cal = calendar.monthcalendar(year, month)
-    #     thursdays = [
-    #         week[calendar.THURSDAY] for week in cal if week[calendar.THURSDAY] != 0
-    #     ]
-    #     return dt.date(year, month, thursdays[-1])
+    @staticmethod
+    def _last_thursday(year, month):
+        cal = calendar.monthcalendar(year, month)
+        thursdays = [
+            week[calendar.THURSDAY] for week in cal if week[calendar.THURSDAY] != 0
+        ]
+        return dt.date(year, month, thursdays[-1])
 
     # ============================================================================================
     # Below functions are used for Leaps RSI 53,32

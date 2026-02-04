@@ -4,6 +4,7 @@ import uuid
 import datetime as dt
 import pdb
 
+
 from run.config import RUN_MODE, RunMode
 from core.strategies.base import BaseStrategy
 
@@ -22,7 +23,7 @@ class LeapsQuarterly(BaseStrategy):
     name = "LEAPS_RSI"
     timeframe = "60"
     required_context = ["option_chain"]
-    api = "DHAN"
+    api = "NSE"
     expiryType = "QUARTERLY"
     strike_count = 5
     # --------------------------------------------------
@@ -76,45 +77,46 @@ class LeapsQuarterly(BaseStrategy):
 
         # decide direction
         if rsi < 32:
-            option_type = "CE"
-            ltp_range = (200, 400)
+            option_type = "CALL"
         elif rsi > 52:
-            option_type = "PE"
-            ltp_range = (200, 400)
+            option_type = "PUT"
         else:
             return None
 
-        chain = self.fetch_option_chain(candle, ctx, option_type)
-        pdb.set_trace()
-        if not chain:
+        strike, premium, row = self.find_strike_in_premium_range(
+            candle, ctx, option_type
+        )
+        expiry = ctx["selected_expiry"]
+        if not strike:
             return None
 
-        atm, oc_df, expiry = chain["chain"]
+        # atm, oc_df, expiry = chain["chain"]
 
-        ltp_col = "CE LTP" if option_type == "CALL" else "PE LTP"
+        # ltp_col = "CE LTP" if option_type == "CALL" else "PE LTP"
 
-        filtered = oc_df[
-            (oc_df["Strike Price"] % 500 == 0) & (oc_df[ltp_col].between(*ltp_range))
-        ]
+        # filtered = oc_df[
+        #     (oc_df["Strike Price"] % 500 == 0) & (oc_df[ltp_col].between(*ltp_range))
+        # ]
 
-        if filtered.empty:
-            return None
+        # if filtered.empty:
+        #     return None
 
-        row = filtered.iloc[(filtered[ltp_col] - 350).abs().argsort()].iloc[0]
+        # row = filtered.iloc[(filtered[ltp_col] - 350).abs().argsort()].iloc[0]
 
-        trading_symbol = self.build_option_symbol(
+        trading_symbol = ExpiryResolver.build_option_symbol(
+            self,
             candle["symbol"],
             expiry,
-            row["Strike Price"],
+            strike,
             option_type,
         )
 
         inst = ctx["instrument_store"].intent_creation_details(
-            trading_symbol, ctx["exchange"]
+            trading_symbol, ctx["exchange"], expiry, option_type, strike
         )
 
-        if not inst:
-            return None
+        if inst is None or inst.empty:
+            return
 
         sell_intent = self.map_instrument_to_intent(
             inst=inst,
@@ -122,6 +124,7 @@ class LeapsQuarterly(BaseStrategy):
             strategy=self.name,
             side="SELL",
         )
+
         sell_intent["tag"] = "MAIN"
 
         hedge_intent = self.create_hedge_intent(
@@ -129,6 +132,7 @@ class LeapsQuarterly(BaseStrategy):
             candle=candle,
             ctx=ctx,
         )
+
         if hedge_intent:
             return [sell_intent, hedge_intent]
         return sell_intent
@@ -200,6 +204,7 @@ class LeapsQuarterly(BaseStrategy):
 
         return ts.date() == target
 
+    # used for Create hedge intent
     def resolve_hedge_expiry(self, trade_date):
         if trade_date.day < 15:
             return ExpiryResolver.current_month_expiry(trade_date)
@@ -219,7 +224,8 @@ class LeapsQuarterly(BaseStrategy):
             parent_sell_intent["option_type"],
         )
 
-        hedge_symbol = self.build_option_symbol(
+        hedge_symbol = ExpiryResolver.build_option_symbol(
+            self,
             parent_sell_intent["symbol"],
             hedge_expiry,
             hedge_strike,
@@ -227,10 +233,14 @@ class LeapsQuarterly(BaseStrategy):
         )
 
         inst = ctx["instrument_store"].intent_creation_details(
-            hedge_symbol, ctx["exchange"]
+            hedge_symbol,
+            ctx["exchange"],
+            hedge_expiry,
+            hedge_strike,
+            parent_sell_intent["option_type"],
         )
 
-        if not inst:
+        if inst is None or inst.empty:
             return None
 
         return {
@@ -268,6 +278,11 @@ class LeapsQuarterly(BaseStrategy):
     def fetch_option_chain(self, candle, ctx, option_type):
         ocs = ctx["option_chain_service"]
 
+        if self.api == "NSE":
+            ctx["expiry_list"] = ocs.get_expiries(
+                api=self.api, ctx=ctx, instrument="FUTIDX"
+            )
+
         expiry_code = ExpiryResolver.resolve(
             expiry_list=ctx.get("expiry_list"),
             trade_date=ctx["timestamp"],
@@ -275,33 +290,83 @@ class LeapsQuarterly(BaseStrategy):
             expiry_pref=self.expiryType,
         )
 
-        params = {
-            "exchange": ctx["exchange"],
-            "interval": self.timeframe,
-            "expiry_code": expiry_code,
-            "strike": f"ATM+{self.strike_count}",
-            "option_type": option_type,
-            "expiry_flag": "MONTHLY",
-        }
+        spot = candle["close"]
 
-        ctx["selected_expiry"] = expiry_code
-
-        return ocs.get_chain(
-            # self,
-            api=self.api,
-            ctx=ctx,
-            params=params,
+        step = 500
+        otm_strikes = ExpiryResolver.get_otm_strikes(
+            self, spot=spot, option_type=option_type, step=step, count=4
         )
+        ctx["selected_expiry"] = expiry_code
+        ctx["otm_strikes"] = otm_strikes
 
-    # --------------------------------------------------
-    # SYMBOL BUILDER
-    # --------------------------------------------------
+        return otm_strikes
 
-    def build_option_symbol(self, symbol, expiry, strike, option_type):
-        if isinstance(expiry, str):
-            expiry = dt.datetime.strptime(expiry, "%Y-%m-%d").date()
+    def find_strike_in_premium_range(
+        self, candle, ctx, option_type, min_prem=200, max_prem=400
+    ):
+        otm_strikes = self.fetch_option_chain(candle, ctx, option_type)
 
-        return f"{symbol.upper()} {expiry.day:02d} {expiry.strftime('%b').upper()} {int(strike)} {option_type}"
+        candle_time = candle["timestamp"].replace(tzinfo=None)
+
+        for strike in otm_strikes:
+            params = {
+                "exchange": ctx["exchange"],
+                "interval": self.timeframe,
+                "expiry_code": ctx["selected_expiry"],
+                "strike": str(strike),
+                "option_type": option_type,
+                "expiry_flag": "MONTH",
+                "instrument": "OPTIDX",
+                "exchangeSegment": "NSE_FNO",
+                "securityId": "13",
+            }
+
+            chain = ctx["option_chain_service"].get_chain(
+                api=self.api, ctx=ctx, params=params
+            )
+
+            if RUN_MODE == RunMode.LIVE or RUN_MODE == RunMode.PAPER:
+                # If API returns empty dataframe
+                if chain is None or len(chain) == 0:
+                    continue
+
+                # Filter row matching candle timestamp
+                row = chain[chain["datetime"] == candle_time]
+
+                if row.empty:
+                    continue
+
+                # Premium at that exact candle time
+                premium = float(row.iloc[0]["close"])
+                selected_strike = row.iloc[0]["strike"]
+            else:
+                chain = chain["chain"]
+                if chain is None or len(chain) == 0:
+                    continue
+
+                # Find column that matches option_type (case-insensitive, ignores extra spaces)
+                option_type_upper = option_type.upper()  # 'PUT' or 'CE'
+                premium_col = None
+                for col in chain.columns:
+                    if option_type_upper in col.upper() and "LTP" in col.upper():
+                        premium_col = col
+                        break
+
+                if premium_col is None:
+                    continue
+
+                # filter by premium
+                row = chain[chain[premium_col].between(min_prem, max_prem)]
+                if row.empty:
+                    continue
+
+                selected_strike = row.iloc[0]["Strike Price"]
+                premium = float(row.iloc[0][premium_col])
+
+            if min_prem <= premium <= max_prem:
+                return selected_strike, premium, row
+
+        return None, None, None
 
     # --------------------------------------------------
     # INTENT MAPPER
@@ -309,7 +374,16 @@ class LeapsQuarterly(BaseStrategy):
 
     def map_instrument_to_intent(self, inst, strike_row, strategy, side):
         option_type = inst["SEM_OPTION_TYPE"]
-        ltp = strike_row.get(f"{option_type} LTP", 0)
+        if RUN_MODE == RunMode.LIVE or RUN_MODE == RunMode.PAPER:
+            ltp = strike_row.get(f"{option_type} LTP", 0)
+        else:
+            optionType = "PUT" if option_type == "PE" else "CALL"
+            ltp_value = strike_row.get(f"{optionType} LTP", 0)
+            ltp = (
+                float(ltp_value.iloc[0])
+                if isinstance(ltp_value, pd.Series)
+                else float(ltp_value)
+            )
 
         return {
             "intent_id": uuid.uuid4().hex,

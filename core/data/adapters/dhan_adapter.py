@@ -41,23 +41,44 @@ class DhanAdapter(BaseAdapter):
         if not isinstance(expiry_index, int):
             raise ValueError("DHAN selected_expiry must be expiry index")
 
-        # DHAN strike expansion logic (ATM+N)
-        strike_count = ctx.get("strike_count", 0)
+        # Required inputs
+        spot_price = ctx["spot_price"]  # e.g. 19735
+        target_strike = params["strike"]  # e.g. 19850
+        strike_step = 50
 
-        if strike_count == 0:
+        # Calculate ATM strike
+        atm_strike = round(spot_price / strike_step) * strike_step
+
+        # Calculate N
+        diff = int(target_strike) - int(atm_strike)
+        n = int(diff / strike_step)
+
+        # Build strike string
+
+        MAX_N = 10
+
+        if n == 0:
             strike = "ATM"
-        else:
-            strike = f"ATM+{strike_count}"
+        elif 0 < n <= MAX_N:
+            strike = f"ATM+{n}"
+        elif -MAX_N <= n < 0:
+            strike = f"ATM{n}"  # n is negative → ATM-1, ATM-5
+        elif n > MAX_N:
+            strike = f"ATM+{MAX_N}"
+        else:  # n < -MAX_N
+            strike = f"ATM-{MAX_N}"
+            # n already negative → ATM-1, ATM-2
 
-        pdb.set_trace()
         return self.data.get_expired_optionchain(
-            # tradingsymbol=ctx["symbol"],
             exchange=params["exchange"],
-            interval=params["interval"],  # 60 min
-            expiry_flag=params["expiry_flag"],  # Monthly
+            securityId=params["securityId"],
+            interval=params["interval"],
+            expiry_flag=params["expiry_flag"],
             expiry_code=expiry_index,
-            strike=strike,  # ATM+N → multiple strikes
-            option_type=params["option_type"],  # CE / PE
-            from_date=ctx["timestamp"].date(),
-            to_date=ctx["timestamp"].date(),
+            strike=strike,  # <-- computed strike
+            option_type=params["option_type"],
+            from_date=ctx["timestamp"].strftime("%Y-%m-%d"),
+            to_date=ctx["timestamp"].strftime("%Y-%m-%d"),
+            instrument=params["instrument"],
+            exchangeSegment=params["exchangeSegment"],
         )

@@ -1,21 +1,33 @@
-from datetime import date
+from datetime import datetime, date
 from .base import BaseAdapter
+import pdb
 
 
 class NSEAdapter(BaseAdapter):
 
     def get_expiries(self, ctx):
-        expiries = self.data.get_nse_expiries(
+        raw_expiries = self.data.get_nse_expiries(
             symbol=ctx["symbol"],
             year=ctx["timestamp"].year,
-            instrument=ctx["instrumentType"],
+            instrument=ctx["instrument"],
         )
 
+        # pdb.set_trace()
         # invariant
-        for e in expiries:
-            if not isinstance(e, date):
-                raise ValueError("NSE expiries must be datetime.date")
+        expiries = []
 
+        for exp in raw_expiries:
+            if isinstance(exp, date):
+                expiries.append(exp)
+            elif isinstance(exp, datetime):
+                expiries.append(exp.date())
+            elif isinstance(exp, str):
+                # adjust format if needed
+                expiries.append(datetime.strptime(exp, "%Y-%m-%d").date())
+            else:
+                raise ValueError(f"Unsupported expiry type: {type(exp)}")
+
+        ctx["expiry_list"] = expiries
         return expiries
 
     def get_option_chain(self, ctx, params):
@@ -35,11 +47,9 @@ class NSEAdapter(BaseAdapter):
         return self.data.get_nse_optionchain_historical(
             symbol=ctx["symbol"],
             from_date=ctx["timestamp"].date(),
-            to_date=ctx["timestamp"].date(),
-            instrumentType=ctx["instrumentType"],
+            instrumentType=params["instrument"],
             expiry_date=expiry,
             spot_price=ctx["spot_price"],
-            strike_step=ctx["strike_step"],
-            strike_count=ctx["strike_count"],
-            option_type=ctx["option_type"],
+            option_type=params["option_type"],
+            strikes=ctx["otm_strikes"],
         )

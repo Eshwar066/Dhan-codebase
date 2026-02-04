@@ -12,7 +12,6 @@ class OrderRouter:
         )  # default: no slippage
 
     def process_intent(self, intent, price_map):
-
         # ---------- 1️⃣ Risk check ----------
         if not self.risk.allow_intent(intent, price_map):
             self.intent_store.update(intent["intent_id"], "REJECTED")
@@ -20,7 +19,7 @@ class OrderRouter:
 
         # ---------- 2️⃣ Apply slippage ----------
         intent["price"] = self.slippage_model(intent["price"])
-        # pdb.set_trace()
+        
         # ---------- 3️⃣ Send to broker ----------
         order_id = self.broker.place_order(intent)
 

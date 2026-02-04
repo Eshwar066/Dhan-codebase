@@ -21,6 +21,7 @@ class SimulatedBroker(BaseBroker):
     # PLACE ORDER (ENTRY / EXIT)
     # =========================
     def place_order(self, intent):
+        pdb.set_trace()
         """
         Same contract as DhanBroker.place_order
         """

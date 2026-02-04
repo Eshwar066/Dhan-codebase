@@ -223,6 +223,15 @@ class NSEClient:
         option_type,
         year,
     ):
+        OPTION_TYPE_MAP = {
+            "CALL": "CE",
+            "PUT": "PE",
+            "CE": "CE",
+            "PE": "PE",
+        }
+        option_type = OPTION_TYPE_MAP.get(option_type)
+        if option_type is None:
+            raise ValueError(f"Invalid option_type: {option_type}")
 
         # normalize dates
         if not isinstance(from_date, date):
@@ -236,7 +245,7 @@ class NSEClient:
         cache_key = f"opt_{symbol}_{expiry_key}_{strike}_{option_type}_{year}"
 
         cached = self._load_cache(cache_key) or []
-        # pdb.set_trace()
+
         cached = sorted(
             cached,
             key=lambda x: self._ts_to_date(x["FH_TIMESTAMP"]),
@@ -246,7 +255,7 @@ class NSEClient:
 
         earliest = self._ts_to_date(cached[0]["FH_TIMESTAMP"]) if cached else None
         latest = self._ts_to_date(cached[-1]["FH_TIMESTAMP"]) if cached else None
-
+        # pdb.set_trace()
         # fully covered
         if earliest and latest:
             if earliest <= from_date and latest >= to_date:
@@ -282,7 +291,7 @@ class NSEClient:
                 year,
             )
             stitched += data
-        
+
         # dedupe + sort
         stitched = sorted(
             {
