@@ -40,7 +40,6 @@ class SimulatedBroker(BaseBroker):
 
         # ---- update position manager ----
         instrument = intent["instrument"]
-
         self.position_manager.on_fill(
             instrument=instrument,
             side=intent["side"],
@@ -49,6 +48,7 @@ class SimulatedBroker(BaseBroker):
             intent_id=intent["intent_id"],
             order_id=order_id,
             strategy=intent["strategy"],
+            candle_ts=intent["candle_ts"],
         )
         if self.intent_store:
             self.intent_store.update(intent["intent_id"], "FILLED")

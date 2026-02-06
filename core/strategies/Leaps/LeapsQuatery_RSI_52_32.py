@@ -130,13 +130,13 @@ class LeapsQuarterly(BaseStrategy):
 
         if inst is None or inst.empty:
             return
-
         sell_intent = self.map_instrument_to_intent(
             inst=inst,
             strike_row=row,
             strategy=self.name,
             side="SELL",
             structure_id=structure_id,
+            candle_ts=candle["timestamp"],
         )
         sell_intent["tag"] = "MAIN"
 
@@ -259,6 +259,7 @@ class LeapsQuarterly(BaseStrategy):
         return {
             "intent_id": uuid.uuid4().hex,
             "structure_id": parent_sell_intent["structure_id"],
+            "candle_ts": candle["timestamp"],
             "instrument": inst,
             "trading_symbol": inst["SEM_CUSTOM_SYMBOL"],
             "symbol": parent_sell_intent["symbol"],
@@ -389,7 +390,9 @@ class LeapsQuarterly(BaseStrategy):
     # INTENT MAPPER
     # --------------------------------------------------
 
-    def map_instrument_to_intent(self, inst, strike_row, strategy, side, structure_id):
+    def map_instrument_to_intent(
+        self, inst, strike_row, strategy, side, structure_id, candle_ts
+    ):
         option_type = inst["SEM_OPTION_TYPE"]
         if RUN_MODE == RunMode.LIVE or RUN_MODE == RunMode.PAPER:
             # ltp = strike_row.get(f"{option_type} LTP", 0)
@@ -407,6 +410,7 @@ class LeapsQuarterly(BaseStrategy):
             "intent_id": uuid.uuid4().hex,
             "instrument": inst,
             "structure_id": structure_id,
+            "candle_ts": candle_ts,
             "trading_symbol": inst["SEM_CUSTOM_SYMBOL"],
             "symbol": inst["SEM_CUSTOM_SYMBOL"].split()[0],
             "expiry": str(inst["SEM_EXPIRY_DATE"]),
@@ -423,6 +427,6 @@ class LeapsQuarterly(BaseStrategy):
         }
 
     def build_structure_id(self, candle, regime):
-        ts = pd.to_datetime(candle["timestamp"]).strftime("%Y%m%d_%H")  # ⬅ hourly
+        ts = pd.to_datetime(candle["timestamp"]).strftime("%Y%m%d_%H%M")  # ⬅ hourly
         symbol = candle["symbol"]
         return f"{self.name}:{symbol}:{regime}:{ts}"

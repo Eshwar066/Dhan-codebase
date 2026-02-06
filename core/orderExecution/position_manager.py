@@ -78,10 +78,9 @@ class Position:
         self.mae = 0.0
         self.mfe = 0.0
 
-        # ✅ NEW
         self.strategy = None
         self.structure_id = None
-        self.tag = None  # MAIN / HEDGE
+        self.tag = None
 
         self.last_updated = time.time()
 
@@ -177,6 +176,7 @@ class PositionManager:
         strategy=None,
         structure_id=None,
         tag=None,
+        candle_ts=None,
     ):
         with self._lock:
             sym = instrument["SEM_CUSTOM_SYMBOL"]
@@ -217,7 +217,12 @@ class PositionManager:
         # -------- LOG --------
         if self.logger:
             row = {
-                "timestamp": datetime.now().isoformat(),
+                "candle_timestamp": (
+                    candle_ts.isoformat()
+                    if isinstance(candle_ts, datetime)
+                    else candle_ts
+                ),
+                "execution_timestamp": datetime.now().isoformat(),
                 "strategy": strategy,
                 "symbol": sym,
                 "trade_id": pos.trade_id,
