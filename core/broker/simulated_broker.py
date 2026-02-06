@@ -1,6 +1,7 @@
 import uuid
 import time
 import random
+import pdb
 from core.broker.base_broker import BaseBroker
 
 
@@ -21,7 +22,6 @@ class SimulatedBroker(BaseBroker):
     # PLACE ORDER (ENTRY / EXIT)
     # =========================
     def place_order(self, intent):
-        pdb.set_trace()
         """
         Same contract as DhanBroker.place_order
         """
@@ -39,17 +39,17 @@ class SimulatedBroker(BaseBroker):
         fill_price = self._fill_price(intent)
 
         # ---- update position manager ----
+        instrument = intent["instrument"]
+
         self.position_manager.on_fill(
-            symbol=intent["trading_symbol"],
-            side=intent["side"],  # BUY / SELL
+            instrument=instrument,
+            side=intent["side"],
             qty=intent["qty"],
-            price=fill_price,
-            lot_size=intent.get("lot_size", 1),
-            segment=intent.get("segment"),
+            price=float(intent["price"]),
             intent_id=intent["intent_id"],
             order_id=order_id,
+            strategy=intent["strategy"],
         )
-
         if self.intent_store:
             self.intent_store.update(intent["intent_id"], "FILLED")
 

@@ -17,6 +17,7 @@ from core.orderExecution.position_manager import PositionManager
 from core.utils.instruments.instrument_store import InstrumentStore
 from logs.logger.trade_logger import TradeLogger
 
+
 def run_job(job):
     cfg = STRATEGY_MAP[job["name"]]
 
@@ -40,7 +41,7 @@ def run_job(job):
     # ---------- BACKTEST ----------
     if RUN_MODE == RunMode.BACKTEST:
         bt_cfg = job["backtest"]
-        simulatedBroker = SimulatedBroker()
+        simulatedBroker = SimulatedBroker(position_manager=position_manager)
         order_router = OrderRouter(
             risk_manager=risk_manager,
             broker=simulatedBroker,

@@ -46,6 +46,7 @@ class IntentStore:
 
         # idempotency_key → intent_id
         self.idempotency_index = {}
+        print(self.intents)
 
     # -------------------------
     # CREATE

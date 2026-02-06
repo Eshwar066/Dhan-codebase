@@ -245,6 +245,7 @@ class LeapsQuarterly(BaseStrategy):
 
         return {
             "intent_id": uuid.uuid4().hex,
+            "instrument": inst,
             "trading_symbol": inst["SEM_CUSTOM_SYMBOL"],
             "symbol": parent_sell_intent["symbol"],
             "expiry": str(inst["SEM_EXPIRY_DATE"]),
@@ -252,6 +253,7 @@ class LeapsQuarterly(BaseStrategy):
             "option_type": parent_sell_intent["option_type"],
             "strike": hedge_strike,
             "qty": 1,
+            "price": 10,
             "strategy": self.name,
             "trade_type": "MARGIN",
             "exchange": inst["SEM_EXM_EXCH_ID"],
@@ -387,6 +389,7 @@ class LeapsQuarterly(BaseStrategy):
 
         return {
             "intent_id": uuid.uuid4().hex,
+            "instrument": inst,
             "trading_symbol": inst["SEM_CUSTOM_SYMBOL"],
             "symbol": inst["SEM_CUSTOM_SYMBOL"].split()[0],
             "expiry": str(inst["SEM_EXPIRY_DATE"]),
@@ -401,3 +404,5 @@ class LeapsQuarterly(BaseStrategy):
             "segment": inst["SEM_SEGMENT"],
             "lot_size": int(inst["SEM_LOT_UNITS"]),
         }
+
+    

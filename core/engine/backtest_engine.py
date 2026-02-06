@@ -74,13 +74,13 @@ class BacktestEngine(BaseEngine):
             if exit_signal:
                 exit_intent = self.strategy.create_exit_intent(position, exit_signal)
 
-                price_map = candle["close"]
+                price_map = {singleIntent["symbol"]: candle["close"]}
                 self.order_router.process_intent(exit_intent, price_map)
 
         # ---------- ENTRY ----------
         if entry_intent:
-            price_map = candle["close"]
             for singleIntent in entry_intent:
+                price_map = {singleIntent["symbol"]: candle["close"]}
                 self.order_router.process_intent(singleIntent, price_map)
 
     def update_risk_metrics(self, symbol, ltp):

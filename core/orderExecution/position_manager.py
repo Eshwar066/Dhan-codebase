@@ -4,6 +4,7 @@ from collections import defaultdict
 from logs.logger.trade_logger import TradeLogger
 from datetime import datetime
 import uuid
+import pdb
 
 # use
 # How to Run Auto-Reconciliation
@@ -163,7 +164,7 @@ class PositionManager:
         self, instrument, side, qty, price, intent_id=None, order_id=None, strategy=None
     ):
         with self._lock:
-            sym = instrument.symbol
+            sym = instrument["SEM_CUSTOM_SYMBOL"]
 
             prev_qty = self.positions[sym].net_qty if sym in self.positions else 0
 
@@ -328,7 +329,7 @@ class PositionManager:
         for sym, pos in self.positions.items():
             ltp = price_map.get(sym, pos.avg_price)
 
-            total += abs(pos.net_qty) * ltp * pos.instrument.lot_size
+            total += abs(pos.net_qty) * ltp * pos.instrument["SEM_LOT_UNITS"]
 
         return total
 
