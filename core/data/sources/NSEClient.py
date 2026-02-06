@@ -241,21 +241,15 @@ class NSEClient:
             to_date = datetime.fromisoformat(str(to_date)).date()
 
         expiry_key = self.to_dd_mmm_yyyy(expiry_date)
-        # pdb.set_trace()
         cache_key = f"opt_{symbol}_{expiry_key}_{strike}_{option_type}_{year}"
-
         cached = self._load_cache(cache_key) or []
-
         cached = sorted(
             cached,
             key=lambda x: self._ts_to_date(x["FH_TIMESTAMP"]),
         )
-
         stitched = cached.copy()
-
         earliest = self._ts_to_date(cached[0]["FH_TIMESTAMP"]) if cached else None
         latest = self._ts_to_date(cached[-1]["FH_TIMESTAMP"]) if cached else None
-        # pdb.set_trace()
         # fully covered
         if earliest and latest:
             if earliest <= from_date and latest >= to_date:

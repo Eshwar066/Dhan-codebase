@@ -39,17 +39,14 @@ class NSEAdapter(BaseAdapter):
         return "Needs to implemented"
 
     def get_historical_option_chain(self, ctx, params):
-        expiry = ctx["selected_expiry"]
 
-        if not isinstance(expiry, date):
-            raise ValueError("NSE selected_expiry must be date")
-
+        # pdb.set_trace()
         return self.data.get_nse_optionchain_historical(
             symbol=ctx["symbol"],
             from_date=ctx["timestamp"].date(),
             instrumentType=params["instrument"],
-            expiry_date=expiry,
+            expiry_date=params["expiry_code"],
             spot_price=ctx["spot_price"],
             option_type=params["option_type"],
-            strikes=ctx["otm_strikes"],
+            strikes=params["strike"],
         )

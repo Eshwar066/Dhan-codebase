@@ -148,8 +148,6 @@ class DhanSource:
             "chain": df,
         }
 
-
-
     def get_positions(self, debug="NO"):
         return self.tsl.get_positions(debug=debug)
 
@@ -245,7 +243,6 @@ class DhanSource:
         records = []
 
         for strike in strikes:
-            # for option_type in ("CE", "PE"):
             try:
                 hist = self.nse_client.get_options_history(
                     symbol=symbol,
@@ -253,11 +250,10 @@ class DhanSource:
                     to_date=expiry_date.strftime("%Y-%m-%d"),
                     instrumentType=instrumentType,
                     expiry_date=expiry_date.strftime("%Y-%m-%d"),
-                    strike=strike,
+                    strike=int(strike),
                     option_type=option_type,
                     year=expiry_date.year,
                 )
-                # pdb.set_trace()
 
                 if not hist:
                     print(">>no hist")

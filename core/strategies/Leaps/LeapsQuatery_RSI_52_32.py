@@ -171,23 +171,37 @@ class LeapsQuarterly(BaseStrategy):
     def on_position_exit(self, position, candle, ctx):
         """
         Called when a main position is exiting.
-        Exit hedge explicitly.
+        Exit hedge explicitly with backtest-safe pricing.
         """
         if position.tag != "MAIN":
             return None
 
+        # Find associated hedge
         hedge = ctx["position_store"].get_hedge_for(position)
-
         if not hedge:
             return None
+
+        # Backtest: fetch the hedge price from option chain
+        if RUN_MODE == RunMode.BACKTEST:
+            exit_price = self.get_option_price_at_candle(
+                candle=candle,
+                ctx=ctx,
+                strike=hedge.strike,
+                option_type=hedge.option_type,
+                expiry=hedge.expiry,
+            )
+        else:
+            exit_price = None  # Live/Paper → use actual fill
 
         return {
             "intent_id": uuid.uuid4().hex,
             "action": "EXIT",
             "trading_symbol": hedge.trading_symbol,
             "qty": abs(hedge.net_qty),
+            "price": exit_price,  # 🔑 backtest-safe price
             "strategy": self.name,
             "tag": "HEDGE_EXIT",
+            "candle_ts": candle["timestamp"],  # optional, useful for logging/cooldown
         }
 
     def on_candle_rollover(self, open_positions, candle, ctx):
@@ -231,12 +245,14 @@ class LeapsQuarterly(BaseStrategy):
     def create_hedge_intent(self, parent_sell_intent, candle, ctx):
         trade_date = pd.to_datetime(candle["timestamp"]).date()
 
+        # 1️⃣ Resolve expiry and strike
         hedge_expiry = self.resolve_hedge_expiry(trade_date)
         hedge_strike = self.calculate_hedge_strike(
             parent_sell_intent["strike"],
             parent_sell_intent["option_type"],
         )
 
+        # 2️⃣ Build option symbol
         hedge_symbol = ExpiryResolver.build_option_symbol(
             self,
             parent_sell_intent["symbol"],
@@ -245,6 +261,7 @@ class LeapsQuarterly(BaseStrategy):
             parent_sell_intent["option_type"],
         )
 
+        # 3️⃣ Fetch instrument details
         inst = ctx["instrument_store"].intent_creation_details(
             hedge_symbol,
             ctx["exchange"],
@@ -256,6 +273,19 @@ class LeapsQuarterly(BaseStrategy):
         if inst is None or inst.empty:
             return None
 
+        # 4️⃣ Get backtest-safe premium (use actual market price in backtest)
+        if RUN_MODE == RunMode.BACKTEST:
+            hedge_price = self.get_option_price_at_candle(
+                candle=candle,
+                ctx=ctx,
+                strike=hedge_strike,
+                option_type=parent_sell_intent["option_type"],
+                expiry=hedge_expiry,
+            )
+        else:
+            hedge_price = None  # live / paper → fill price comes from broker
+
+        # 5️⃣ Build hedge intent
         return {
             "intent_id": uuid.uuid4().hex,
             "structure_id": parent_sell_intent["structure_id"],
@@ -268,7 +298,7 @@ class LeapsQuarterly(BaseStrategy):
             "option_type": parent_sell_intent["option_type"],
             "strike": hedge_strike,
             "qty": 1,
-            "price": 10,
+            "price": hedge_price,  # 🔑 backtest-safe price
             "strategy": self.name,
             "trade_type": "MARGIN",
             "exchange": inst["SEM_EXM_EXCH_ID"],
@@ -278,15 +308,34 @@ class LeapsQuarterly(BaseStrategy):
             "parent_intent_id": parent_sell_intent["intent_id"],
         }
 
-    def create_hedge_exit_intent(self, hedge_position):
+    def create_hedge_exit_intent(self, hedge_position, candle, ctx):
+        """
+        Create exit intent for hedge position.
+        Backtest: use option chain premium at candle timestamp.
+        Live/Paper: price comes from broker fill.
+        """
+        # Backtest: fetch price from option chain
+        if RUN_MODE == RunMode.BACKTEST:
+            exit_price = self.get_option_price_at_candle(
+                candle=candle,
+                ctx=ctx,
+                strike=hedge_position.strike,
+                option_type=hedge_position.option_type,
+                expiry=hedge_position.expiry,
+            )
+        else:
+            exit_price = None 
+
         return {
             "intent_id": uuid.uuid4().hex,
             "structure_id": hedge_position.structure_id,
             "action": "EXIT",
             "trading_symbol": hedge_position.trading_symbol,
             "qty": abs(hedge_position.net_qty),
+            "price": exit_price,
             "strategy": self.name,
             "tag": "HEDGE_EXIT",
+            "candle_ts": candle["timestamp"], 
         }
 
     # --------------------------------------------------
@@ -326,63 +375,63 @@ class LeapsQuarterly(BaseStrategy):
 
         candle_time = candle["timestamp"].replace(tzinfo=None)
 
-        for strike in otm_strikes:
-            params = {
-                "exchange": ctx["exchange"],
-                "interval": self.timeframe,
-                "expiry_code": ctx["selected_expiry"],
-                "strike": str(strike),
-                "option_type": option_type,
-                "expiry_flag": "MONTH",
-                "instrument": "OPTIDX",
-                "exchangeSegment": "NSE_FNO",
-                "securityId": "13",
-            }
+        # for strike in otm_strikes:
+        params = {
+            "exchange": ctx["exchange"],
+            "interval": self.timeframe,
+            "expiry_code": ctx["selected_expiry"],
+            "strike": otm_strikes,
+            "option_type": option_type,
+            "instrument": "OPTIDX",
+            "exchangeSegment": "NSE_FNO",
+            "expiry_flag": "MONTH",
+            "securityId": "13",
+        }
 
-            chain = ctx["option_chain_service"].get_chain(
-                api=self.api, ctx=ctx, params=params
-            )
+        chain = ctx["option_chain_service"].get_chain(
+            api=self.api, ctx=ctx, params=params
+        )
 
-            if RUN_MODE == RunMode.LIVE or RUN_MODE == RunMode.PAPER:
-                # If API returns empty dataframe
-                if chain is None or len(chain) == 0:
-                    continue
+        if RUN_MODE == RunMode.LIVE or RUN_MODE == RunMode.PAPER:
+            # If API returns empty dataframe
+            if chain is None or len(chain) == 0:
+                return None
 
-                # Filter row matching candle timestamp
-                row = chain[chain["datetime"] == candle_time]
+            # Filter row matching candle timestamp
+            row = chain[chain["datetime"] == candle_time]
 
-                if row.empty:
-                    continue
+            if row.empty:
+                return None
 
-                # Premium at that exact candle time
-                premium = float(row.iloc[0]["close"])
-                selected_strike = row.iloc[0]["strike"]
-            else:
-                chain = chain["chain"]
-                if chain is None or len(chain) == 0:
-                    continue
+            # Premium at that exact candle time
+            premium = float(row.iloc[0]["close"])
+            selected_strike = row.iloc[0]["strike"]
+        else:
+            chain = chain["chain"]
+            if chain is None or len(chain) == 0:
+                return None
 
-                # Find column that matches option_type (case-insensitive, ignores extra spaces)
-                option_type_upper = option_type.upper()  # 'PUT' or 'CE'
-                premium_col = None
-                for col in chain.columns:
-                    if option_type_upper in col.upper() and "LTP" in col.upper():
-                        premium_col = col
-                        break
+            # Find column that matches option_type (case-insensitive, ignores extra spaces)
+            option_type_upper = option_type.upper()  # 'PUT' or 'CE'
+            premium_col = None
+            for col in chain.columns:
+                if option_type_upper in col.upper() and "LTP" in col.upper():
+                    premium_col = col
+                    break
 
-                if premium_col is None:
-                    continue
+            if premium_col is None:
+                return None
 
-                # filter by premium
-                row = chain[chain[premium_col].between(min_prem, max_prem)]
-                if row.empty:
-                    continue
+            # filter by premium
+            row = chain[chain[premium_col].between(min_prem, max_prem)]
+            if row.empty:
+                return None
 
-                selected_strike = row.iloc[0]["Strike Price"]
-                premium = float(row.iloc[0][premium_col])
-
-            if min_prem <= premium <= max_prem:
-                return selected_strike, premium, row
+            selected_strike = row.iloc[0]["Strike Price"]
+            premium = float(row.iloc[0][premium_col])
+            # pdb.set_trace()
+        if min_prem <= premium <= max_prem:
+            return selected_strike, premium, row
 
         return None, None, None
 
@@ -430,3 +479,35 @@ class LeapsQuarterly(BaseStrategy):
         ts = pd.to_datetime(candle["timestamp"]).strftime("%Y%m%d_%H%M")  # ⬅ hourly
         symbol = candle["symbol"]
         return f"{self.name}:{symbol}:{regime}:{ts}"
+
+    #  Option chain based on candle and if strike is known
+    def get_option_price_at_candle(self, candle, ctx, strike, option_type, expiry):
+        params = {
+            "exchange": ctx["exchange"],
+            "interval": self.timeframe,
+            "expiry_code": expiry,
+            "strike": [str(strike)],
+            "option_type": option_type,
+            "instrument": "OPTIDX",
+            "exchangeSegment": "NSE_FNO",
+            "expiry_flag": "MONTH",
+            "securityId": "13",
+        }
+
+        chain = ctx["option_chain_service"].get_chain(
+            api=self.api, ctx=ctx, params=params
+        )
+
+        candle_time = pd.to_datetime(candle["timestamp"]).replace(tzinfo=None)
+
+        if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
+            row = chain[chain["datetime"] == candle_time]
+            if row.empty:
+                return None
+            return float(row.iloc[0]["close"])
+
+        else:
+            chain = chain["chain"]
+            option_col = "PUT LTP" if option_type == "PUT" else "CALL LTP"
+            price = float(chain[option_col].iloc[0])
+            return price
