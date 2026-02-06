@@ -18,6 +18,7 @@ class BacktestEngine(BaseEngine):
             strategy=strategy,
             data=data_provider,
             instrument_store=instrument_store,
+            position_manager=position_manager,
         )
         self.order_router = order_router
         self.position_manager = position_manager

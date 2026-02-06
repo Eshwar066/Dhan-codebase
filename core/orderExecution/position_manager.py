@@ -78,6 +78,11 @@ class Position:
         self.mae = 0.0
         self.mfe = 0.0
 
+        # ✅ NEW
+        self.strategy = None
+        self.structure_id = None
+        self.tag = None  # MAIN / HEDGE
+
         self.last_updated = time.time()
 
     def update_fill(self, side, qty, price):
@@ -160,8 +165,18 @@ class PositionManager:
     # ---------------------
     # LOCAL FILL UPDATE
     # ---------------------
+
     def on_fill(
-        self, instrument, side, qty, price, intent_id=None, order_id=None, strategy=None
+        self,
+        instrument,
+        side,
+        qty,
+        price,
+        intent_id=None,
+        order_id=None,
+        strategy=None,
+        structure_id=None,
+        tag=None,
     ):
         with self._lock:
             sym = instrument["SEM_CUSTOM_SYMBOL"]
@@ -181,6 +196,10 @@ class PositionManager:
                 signed = qty if side == "BUY" else -qty
                 self.strategy_pos[strategy][sym] += signed
 
+            if pos.net_qty == 0:
+                pos.strategy = strategy
+                pos.structure_id = structure_id
+                pos.tag = tag
         # -------- TRADE TYPE --------
         if prev_qty == 0 and new_qty != 0:
             trade_type = "ENTRY"
@@ -217,6 +236,16 @@ class PositionManager:
                 row["mfe"] = pos.mfe
 
             self.logger.log(strategy=strategy, row=row)
+
+    def has_open_structure(self, strategy: str, structure_id: str) -> bool:
+        for pos in self.positions.values():
+            if (
+                pos.net_qty != 0
+                and pos.strategy == strategy
+                and pos.structure_id == structure_id
+            ):
+                return True
+        return False
 
     # ---------------------
     # BROKER RECONCILIATION

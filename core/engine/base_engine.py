@@ -7,12 +7,14 @@ import pdb
 
 
 class BaseEngine:
-    def __init__(self, strategy, data, instrument_store):
+
+    def __init__(self, strategy, data, instrument_store, position_manager):
         self.strategy = strategy
         self.data = data
         self.instrument_store = instrument_store
-        self.option_chain_service = OptionChainService
+        self.position_manager = position_manager
         self.data_router = DataRouter(data)
+        self.option_chain_service = OptionChainService(self.data_router)
 
     def get_strategy_params(self):
         return STRATEGY_RUNTIME_SPEC[self.strategy.name][RUN_MODE]
@@ -29,11 +31,12 @@ class BaseEngine:
             "exchange": candle.get("exchange"),
             "timestamp": ts,
             "spot_price": candle["close"],
+            # ✅ shared services
             "instrument_store": self.instrument_store,
-            # 🔑 Inject capability, not data
+            "position_store": self.position_manager,
             "option_chain_service": self.option_chain_service,
         }
-        ctx["option_chain_service"] = OptionChainService(self.data_router)
+
         # ONE call only
         intent = self.strategy.on_candle(candle, ctx)
         return ctx, intent

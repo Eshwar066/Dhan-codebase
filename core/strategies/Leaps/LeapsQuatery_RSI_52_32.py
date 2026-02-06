@@ -78,11 +78,24 @@ class LeapsQuarterly(BaseStrategy):
         # decide direction
         if rsi < 32:
             option_type = "CALL"
+            regime = "RSI_LT_32"
         elif rsi > 52:
             option_type = "PUT"
+            regime = "RSI_GT_52"
         else:
             return None
 
+        # ✅ BUILD STRUCTURE ID (ONCE)
+        structure_id = self.build_structure_id(candle, regime)
+
+        # ✅ DUPLICATE BLOCK
+        if ctx["position_store"].has_open_structure(
+            strategy=self.name,
+            structure_id=structure_id,
+        ):
+            return None
+
+        # option chain
         strike, premium, row = self.find_strike_in_premium_range(
             candle, ctx, option_type
         )
@@ -123,8 +136,8 @@ class LeapsQuarterly(BaseStrategy):
             strike_row=row,
             strategy=self.name,
             side="SELL",
+            structure_id=structure_id,
         )
-
         sell_intent["tag"] = "MAIN"
 
         hedge_intent = self.create_hedge_intent(
@@ -245,6 +258,7 @@ class LeapsQuarterly(BaseStrategy):
 
         return {
             "intent_id": uuid.uuid4().hex,
+            "structure_id": parent_sell_intent["structure_id"],
             "instrument": inst,
             "trading_symbol": inst["SEM_CUSTOM_SYMBOL"],
             "symbol": parent_sell_intent["symbol"],
@@ -266,6 +280,7 @@ class LeapsQuarterly(BaseStrategy):
     def create_hedge_exit_intent(self, hedge_position):
         return {
             "intent_id": uuid.uuid4().hex,
+            "structure_id": hedge_position.structure_id,
             "action": "EXIT",
             "trading_symbol": hedge_position.trading_symbol,
             "qty": abs(hedge_position.net_qty),
@@ -374,10 +389,11 @@ class LeapsQuarterly(BaseStrategy):
     # INTENT MAPPER
     # --------------------------------------------------
 
-    def map_instrument_to_intent(self, inst, strike_row, strategy, side):
+    def map_instrument_to_intent(self, inst, strike_row, strategy, side, structure_id):
         option_type = inst["SEM_OPTION_TYPE"]
         if RUN_MODE == RunMode.LIVE or RUN_MODE == RunMode.PAPER:
-            ltp = strike_row.get(f"{option_type} LTP", 0)
+            # ltp = strike_row.get(f"{option_type} LTP", 0)
+            ltp = float(strike_row.iloc[0]["close"])
         else:
             optionType = "PUT" if option_type == "PE" else "CALL"
             ltp_value = strike_row.get(f"{optionType} LTP", 0)
@@ -390,6 +406,7 @@ class LeapsQuarterly(BaseStrategy):
         return {
             "intent_id": uuid.uuid4().hex,
             "instrument": inst,
+            "structure_id": structure_id,
             "trading_symbol": inst["SEM_CUSTOM_SYMBOL"],
             "symbol": inst["SEM_CUSTOM_SYMBOL"].split()[0],
             "expiry": str(inst["SEM_EXPIRY_DATE"]),
@@ -405,4 +422,7 @@ class LeapsQuarterly(BaseStrategy):
             "lot_size": int(inst["SEM_LOT_UNITS"]),
         }
 
-    
+    def build_structure_id(self, candle, regime):
+        ts = pd.to_datetime(candle["timestamp"]).strftime("%Y%m%d_%H")  # ⬅ hourly
+        symbol = candle["symbol"]
+        return f"{self.name}:{symbol}:{regime}:{ts}"
