@@ -51,6 +51,7 @@ class SimulatedBroker(BaseBroker):
             candle_ts=intent["candle_ts"],
             tag=intent["tag"],
             structure_id=intent["structure_id"],
+            action=intent.get("action"),
         )
         if self.intent_store:
             self.intent_store.update(intent["intent_id"], "FILLED")

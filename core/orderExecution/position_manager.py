@@ -186,6 +186,7 @@ class PositionManager:
         structure_id=None,
         tag=None,
         candle_ts=None,
+        action=None,
     ):
         with self._lock:
             if isinstance(instrument, Instrument):
@@ -220,19 +221,23 @@ class PositionManager:
                 pos.strategy = strategy
                 pos.structure_id = structure_id
                 pos.tag = tag
+
+            if action == "ENTRY" and prev_qty != 0:
+                raise RuntimeError(
+                    f"ENTRY received for open position {sym}. "
+                    f"Use SCALE_IN explicitly."
+                )
         # -------- TRADE TYPE --------
-        if prev_qty == 0 and new_qty != 0:
-            trade_type = "ENTRY"
-        elif prev_qty != 0 and new_qty == 0:
-            trade_type = "EXIT"
-        elif abs(new_qty) > abs(prev_qty):
-            trade_type = "SCALE_IN"
-        elif abs(new_qty) < abs(prev_qty):
-            trade_type = "SCALE_OUT"
-        elif prev_qty * new_qty < 0:
-            trade_type = "REVERSAL"
+        if action:
+            trade_type = action
         else:
-            trade_type = "UNKNOWN"
+            # fallback only if action is missing (should not happen)
+            if prev_qty == 0 and new_qty != 0:
+                trade_type = "ENTRY"
+            elif prev_qty != 0 and new_qty == 0:
+                trade_type = "EXIT"
+            else:
+                trade_type = "UNKNOWN"
 
         # -------- LOG --------
         if self.logger:

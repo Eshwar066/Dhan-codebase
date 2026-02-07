@@ -141,8 +141,8 @@ class RiskManager:
 
     def _get_event_time(self, candle_ts):
         if candle_ts is None:
-            return time.time() 
-        return candle_ts.timestamp()  
+            return time.time()
+        return candle_ts.timestamp()
 
     def _cooldown_ok(self, symbol, now_ts):
         last = self.last_trade_time.get(symbol, 0)
