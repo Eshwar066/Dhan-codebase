@@ -45,7 +45,7 @@ class RiskManager:
     # -------------------------
     # MAIN CHECK
     # -------------------------
-    def allow_intent(self, intent, price_map):
+    def allow_intent(self, intent, price_map, candle_ts=None):
         """
         intent format:
         {
@@ -67,6 +67,9 @@ class RiskManager:
         structure_id = intent.get("structure_id")
         tag = intent.get("tag")
 
+        if intent.get("action") in ("EXIT", "FORCE_EXIT"):
+            return True
+
         # 0️⃣ STRUCTURE LOCK (🔥 IMPORTANT)
         if (
             strategy
@@ -83,7 +86,9 @@ class RiskManager:
                 return False
 
         # 1️⃣ Cooldown check
-        if not self._cooldown_ok(symbol):
+        now_ts = self._get_event_time(candle_ts)
+
+        if not self._cooldown_ok(symbol, now_ts):
             print(f"❌ Cooldown active {symbol}")
             return False
 
@@ -118,7 +123,7 @@ class RiskManager:
             return False
 
         # Passed all checks
-        self.last_trade_time[symbol] = time.time()
+        self.last_trade_time[symbol] = now_ts
         return True
 
     # -------------------------
@@ -134,6 +139,11 @@ class RiskManager:
     def _open_positions_count(self):
         return sum(1 for p in self.pm.positions.values() if p.net_qty != 0)
 
-    def _cooldown_ok(self, symbol):
+    def _get_event_time(self, candle_ts):
+        if candle_ts is None:
+            return time.time() 
+        return candle_ts.timestamp()  
+
+    def _cooldown_ok(self, symbol, now_ts):
         last = self.last_trade_time.get(symbol, 0)
-        return (time.time() - last) >= self.cooldown_seconds
+        return (now_ts - last) >= self.cooldown_seconds

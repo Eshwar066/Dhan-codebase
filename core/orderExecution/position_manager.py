@@ -188,7 +188,13 @@ class PositionManager:
         candle_ts=None,
     ):
         with self._lock:
-            sym = instrument["SEM_CUSTOM_SYMBOL"]
+            if isinstance(instrument, Instrument):
+                sym = instrument.symbol
+                lot_size = instrument.lot_size
+            else:
+                sym = instrument["SEM_CUSTOM_SYMBOL"]
+                lot_size = int(instrument.get("SEM_LOT_UNITS", 1))
+
             prev_qty = self.positions[sym].net_qty if sym in self.positions else 0
 
             if sym not in self.positions:

@@ -39,8 +39,7 @@ class NSEAdapter(BaseAdapter):
         return "Needs to implemented"
 
     def get_historical_option_chain(self, ctx, params):
-
-        # pdb.set_trace()
+        
         return self.data.get_nse_optionchain_historical(
             symbol=ctx["symbol"],
             from_date=ctx["timestamp"].date(),

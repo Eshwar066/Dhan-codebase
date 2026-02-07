@@ -241,7 +241,7 @@ class DhanSource:
     ):
 
         records = []
-
+        # pdb.set_trace()
         for strike in strikes:
             try:
                 hist = self.nse_client.get_options_history(
@@ -250,7 +250,7 @@ class DhanSource:
                     to_date=expiry_date.strftime("%Y-%m-%d"),
                     instrumentType=instrumentType,
                     expiry_date=expiry_date.strftime("%Y-%m-%d"),
-                    strike=int(strike),
+                    strike=int(float(strike)),
                     option_type=option_type,
                     year=expiry_date.year,
                 )

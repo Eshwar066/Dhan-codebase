@@ -185,7 +185,7 @@ class NSEClient:
             "optionType": option_type,
             "strikePrice": strike,
         }
-
+        print(">>api hit option chain")
         r = self.session.get(BASE + HISTORICAL_API, params=params, timeout=self.timeout)
         r.raise_for_status()
         raw = r.json()
@@ -242,6 +242,7 @@ class NSEClient:
 
         expiry_key = self.to_dd_mmm_yyyy(expiry_date)
         cache_key = f"opt_{symbol}_{expiry_key}_{strike}_{option_type}_{year}"
+        # pdb.set_trace()
         cached = self._load_cache(cache_key) or []
         cached = sorted(
             cached,

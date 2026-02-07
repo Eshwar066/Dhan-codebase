@@ -13,7 +13,9 @@ class OrderRouter:
 
     def process_intent(self, intent, price_map):
         # ---------- 1️⃣ Risk check ----------
-        if not self.risk.allow_intent(intent, price_map):
+        if not self.risk.allow_intent(
+            intent, price_map, candle_ts=intent.get("candle_ts")
+        ):
             self.intent_store.update(intent["intent_id"], "REJECTED")
             return
 

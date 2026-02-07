@@ -220,7 +220,7 @@ class LeapsQuarterly(BaseStrategy):
             "structure_id": hedge_position.structure_id,
             "action": "EXIT",
             "instrument": hedge_position.instrument,
-            "trading_symbol": hedge_position.instrument.trading_symbol,
+            "trading_symbol": hedge_position.instrument.symbol,
             "qty": abs(hedge_position.net_qty),
             "price": exit_price,
             "strategy": self.name,
@@ -391,7 +391,6 @@ class LeapsQuarterly(BaseStrategy):
         chain = ctx["option_chain_service"].get_chain(
             api=self.api, ctx=ctx, params=params
         )
-
         if RUN_MODE == RunMode.LIVE or RUN_MODE == RunMode.PAPER:
             # If API returns empty dataframe
             if chain is None or len(chain) == 0:
@@ -496,10 +495,18 @@ class LeapsQuarterly(BaseStrategy):
             "expiry_flag": "MONTH",
             "securityId": "13",
         }
-
+        print(">>candle", candle)
+        # pdb.set_trace()
         chain = ctx["option_chain_service"].get_chain(
             api=self.api, ctx=ctx, params=params
         )
+        # ❌ No chain → cannot price
+        if not chain or "chain" not in chain:
+            print(
+                f"⚠️ No option chain | {candle['symbol']} "
+                f"{expiry} {strike} {option_type} @ {candle['timestamp']}"
+            )
+            return None
 
         candle_time = pd.to_datetime(candle["timestamp"]).replace(tzinfo=None)
         if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
@@ -509,8 +516,7 @@ class LeapsQuarterly(BaseStrategy):
             return float(row.iloc[0]["close"])
 
         else:
-            pdb.set_trace()
-            chain = chain["chain"]
+            df = chain["chain"]
 
             opt = option_type.upper()
             if opt in ("PUT", "PE"):
@@ -522,12 +528,12 @@ class LeapsQuarterly(BaseStrategy):
 
             option_col = None
             for col in candidates:
-                if col in chain.columns:
+                if col in df.columns:
                     option_col = col
                     break
 
             if option_col is None:
                 raise KeyError(f"No LTP column found for option_type={option_type}")
 
-            price = float(chain[option_col].iloc[0])
+            price = float(df[option_col].iloc[0])
             return price
