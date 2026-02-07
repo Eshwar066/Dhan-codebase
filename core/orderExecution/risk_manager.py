@@ -65,11 +65,21 @@ class RiskManager:
         lot_size = intent.get("lot_size", 65)
         strategy = intent.get("strategy")
         structure_id = intent.get("structure_id")
+        tag = intent.get("tag")
 
         # 0️⃣ STRUCTURE LOCK (🔥 IMPORTANT)
-        if strategy and structure_id:
-            if self.pm.has_open_structure(strategy, structure_id):
-                print(f"❌ Structure already open " f"{strategy} | {structure_id}")
+        if (
+            strategy
+            and structure_id
+            and intent.get("action", "ENTRY") == "ENTRY"
+            and tag == "MAIN"
+        ):
+            if self.pm.has_open_structure(
+                structure_id=structure_id,
+                tag="MAIN",
+                strategy=strategy,
+            ):
+                print(f"❌ Structure already open {strategy} | {structure_id}")
                 return False
 
         # 1️⃣ Cooldown check

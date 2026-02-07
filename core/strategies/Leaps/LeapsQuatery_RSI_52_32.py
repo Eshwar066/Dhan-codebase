@@ -2,14 +2,11 @@ import talib
 import pandas as pd
 import uuid
 import datetime as dt
-import pdb
-
 
 from run.config import RUN_MODE, RunMode
 from core.strategies.base import BaseStrategy
-
-# from core.utils.expiry_calendar import Expiry_Calendar
 from core.utils.expiry_resolver import ExpiryResolver
+import pdb
 
 VALID_TIMES = {"10:15", "11:15", "12:15", "13:15", "14:15", "15:15"}
 
@@ -26,10 +23,10 @@ class LeapsQuarterly(BaseStrategy):
     api = "NSE"
     expiryType = "QUARTERLY"
     strike_count = 5
+
     # --------------------------------------------------
     # INDICATORS
     # --------------------------------------------------
-
     def prepare_indicators(self, df):
         df["rsi"] = talib.RSI(df["close"], 14)
         df["prev_rsi"] = df["rsi"].shift(1)
@@ -38,14 +35,12 @@ class LeapsQuarterly(BaseStrategy):
     # --------------------------------------------------
     # TIME FILTER
     # --------------------------------------------------
-
     def _is_valid_time(self, ts):
         return ts.strftime("%H:%M") in VALID_TIMES
 
     # --------------------------------------------------
     # ENTRY SIGNAL
     # --------------------------------------------------
-
     def should_evaluate(self, candle):
         rsi = candle.get("rsi")
         prev = candle.get("prev_rsi")
@@ -65,7 +60,6 @@ class LeapsQuarterly(BaseStrategy):
     # --------------------------------------------------
     # MAIN ENTRY
     # --------------------------------------------------
-
     def on_candle(self, candle, ctx):
         ts = pd.to_datetime(candle["timestamp"])
 
@@ -90,8 +84,7 @@ class LeapsQuarterly(BaseStrategy):
 
         # ✅ DUPLICATE BLOCK
         if ctx["position_store"].has_open_structure(
-            strategy=self.name,
-            structure_id=structure_id,
+            strategy=self.name, structure_id=structure_id, tag="MAIN"
         ):
             return None
 
@@ -160,24 +153,20 @@ class LeapsQuarterly(BaseStrategy):
 
         rsi = candle.get("rsi")
 
-        if position.option_type == "CALL" and rsi > 52:
+        if position.instrument.option_type == "CE" and rsi > 52:
             return True
 
-        if position.option_type == "PUT" and rsi < 32:
+        if position.instrument.option_type == "PE" and rsi < 32:
             return True
 
         return False
 
     def on_position_exit(self, position, candle, ctx):
-        """
-        Called when a main position is exiting.
-        Exit hedge explicitly with backtest-safe pricing.
-        """
         if position.tag != "MAIN":
             return None
 
-        # Find associated hedge
         hedge = ctx["position_store"].get_hedge_for(position)
+
         if not hedge:
             return None
 
@@ -186,9 +175,9 @@ class LeapsQuarterly(BaseStrategy):
             exit_price = self.get_option_price_at_candle(
                 candle=candle,
                 ctx=ctx,
-                strike=hedge.strike,
-                option_type=hedge.option_type,
-                expiry=hedge.expiry,
+                strike=hedge.instrument.strike,
+                option_type=hedge.instrument.option_type,
+                expiry=hedge.instrument.expiry,
             )
         else:
             exit_price = None  # Live/Paper → use actual fill
@@ -196,14 +185,54 @@ class LeapsQuarterly(BaseStrategy):
         return {
             "intent_id": uuid.uuid4().hex,
             "action": "EXIT",
-            "trading_symbol": hedge.trading_symbol,
+            "instrument": position.instrument,
+            "trading_symbol": hedge.instrument.symbol,
             "qty": abs(hedge.net_qty),
-            "price": exit_price,  # 🔑 backtest-safe price
+            "price": exit_price,
             "strategy": self.name,
             "tag": "HEDGE_EXIT",
-            "candle_ts": candle["timestamp"],  # optional, useful for logging/cooldown
+            "candle_ts": candle["timestamp"],
+            "side": "BUY",
+            "structure_id": position.structure_id,
         }
 
+    def create_hedge_exit_intent(self, hedge_position, candle, ctx):
+        """
+        Create exit intent for hedge position.
+        Backtest: use option chain premium at candle timestamp.
+        Live/Paper: price comes from broker fill.
+        """
+        # Backtest: fetch price from option chain
+        if RUN_MODE == RunMode.BACKTEST:
+
+            exit_price = self.get_option_price_at_candle(
+                candle=candle,
+                ctx=ctx,
+                strike=hedge_position.instrument.strike,
+                option_type=hedge_position.instrument.option_type,
+                expiry=hedge_position.instrument.expiry,
+            )
+        else:
+            exit_price = None
+
+        return {
+            "intent_id": uuid.uuid4().hex,
+            "structure_id": hedge_position.structure_id,
+            "action": "EXIT",
+            "instrument": hedge_position.instrument,
+            "trading_symbol": hedge_position.instrument.trading_symbol,
+            "qty": abs(hedge_position.net_qty),
+            "price": exit_price,
+            "strategy": self.name,
+            "tag": "HEDGE_EXIT",
+            "candle_ts": candle["timestamp"],
+            "side": "SELL",
+            "structure_id": hedge_position.structure_id,
+        }
+
+    # --------------------------------------------------
+    # RollOver
+    # --------------------------------------------------
     def on_candle_rollover(self, open_positions, candle, ctx):
         ts = pd.to_datetime(candle["timestamp"])
 
@@ -231,7 +260,9 @@ class LeapsQuarterly(BaseStrategy):
 
         return ts.date() == target
 
-    # used for Create hedge intent
+    # --------------------------------------------------
+    # Entry Hedge Intent
+    # --------------------------------------------------
     def resolve_hedge_expiry(self, trade_date):
         if trade_date.day < 15:
             return ExpiryResolver.current_month_expiry(trade_date)
@@ -266,8 +297,8 @@ class LeapsQuarterly(BaseStrategy):
             hedge_symbol,
             ctx["exchange"],
             hedge_expiry,
-            hedge_strike,
             parent_sell_intent["option_type"],
+            hedge_strike,
         )
 
         if inst is None or inst.empty:
@@ -308,40 +339,9 @@ class LeapsQuarterly(BaseStrategy):
             "parent_intent_id": parent_sell_intent["intent_id"],
         }
 
-    def create_hedge_exit_intent(self, hedge_position, candle, ctx):
-        """
-        Create exit intent for hedge position.
-        Backtest: use option chain premium at candle timestamp.
-        Live/Paper: price comes from broker fill.
-        """
-        # Backtest: fetch price from option chain
-        if RUN_MODE == RunMode.BACKTEST:
-            exit_price = self.get_option_price_at_candle(
-                candle=candle,
-                ctx=ctx,
-                strike=hedge_position.strike,
-                option_type=hedge_position.option_type,
-                expiry=hedge_position.expiry,
-            )
-        else:
-            exit_price = None 
-
-        return {
-            "intent_id": uuid.uuid4().hex,
-            "structure_id": hedge_position.structure_id,
-            "action": "EXIT",
-            "trading_symbol": hedge_position.trading_symbol,
-            "qty": abs(hedge_position.net_qty),
-            "price": exit_price,
-            "strategy": self.name,
-            "tag": "HEDGE_EXIT",
-            "candle_ts": candle["timestamp"], 
-        }
-
     # --------------------------------------------------
     # OPTION CHAIN (LIVE + BACKTEST SAFE)
     # --------------------------------------------------
-
     def fetch_option_chain(self, candle, ctx, option_type):
         ocs = ctx["option_chain_service"]
 
@@ -429,7 +429,7 @@ class LeapsQuarterly(BaseStrategy):
 
             selected_strike = row.iloc[0]["Strike Price"]
             premium = float(row.iloc[0][premium_col])
-            # pdb.set_trace()
+
         if min_prem <= premium <= max_prem:
             return selected_strike, premium, row
 
@@ -480,6 +480,9 @@ class LeapsQuarterly(BaseStrategy):
         symbol = candle["symbol"]
         return f"{self.name}:{symbol}:{regime}:{ts}"
 
+    # --------------------------------------------------
+    # option chain for given strike
+    # --------------------------------------------------
     #  Option chain based on candle and if strike is known
     def get_option_price_at_candle(self, candle, ctx, strike, option_type, expiry):
         params = {
@@ -499,7 +502,6 @@ class LeapsQuarterly(BaseStrategy):
         )
 
         candle_time = pd.to_datetime(candle["timestamp"]).replace(tzinfo=None)
-
         if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
             row = chain[chain["datetime"] == candle_time]
             if row.empty:
@@ -507,7 +509,25 @@ class LeapsQuarterly(BaseStrategy):
             return float(row.iloc[0]["close"])
 
         else:
+            pdb.set_trace()
             chain = chain["chain"]
-            option_col = "PUT LTP" if option_type == "PUT" else "CALL LTP"
+
+            opt = option_type.upper()
+            if opt in ("PUT", "PE"):
+                candidates = ["PUT LTP", "PE LTP"]
+            elif opt in ("CALL", "CE"):
+                candidates = ["CALL LTP", "CE LTP"]
+            else:
+                raise ValueError(f"Unknown option_type: {option_type}")
+
+            option_col = None
+            for col in candidates:
+                if col in chain.columns:
+                    option_col = col
+                    break
+
+            if option_col is None:
+                raise KeyError(f"No LTP column found for option_type={option_type}")
+
             price = float(chain[option_col].iloc[0])
             return price

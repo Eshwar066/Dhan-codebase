@@ -17,7 +17,6 @@ class OrderRouter:
             self.intent_store.update(intent["intent_id"], "REJECTED")
             return
 
-        # pdb.set_trace()
         # Safety
         if intent["price"] is None:
             raise ValueError(f"No price available for {intent}")

@@ -68,15 +68,20 @@ class BacktestEngine(BaseEngine):
         open_positions = self.position_manager.get_open_positions(
             underlying=symbol, strategy=self.strategy.name
         )
-        pdb.set_trace()
-        for position in open_positions:
-            exit_signal = self.strategy.should_exit(position, candle, ctx)
 
-            if exit_signal:
-                exit_intent = self.strategy.create_exit_intent(position, exit_signal)
+        for pos in open_positions:
+            if pos.tag == "MAIN" and self.strategy.should_exit(pos, candle, ctx):
+                exit_main_intent = self.strategy.on_position_exit(pos, candle, ctx)
+                if exit_main_intent:
+                    price_map = {exit_main_intent["trading_symbol"]: candle["close"]}
+                    self.order_router.process_intent(exit_main_intent, price_map)
 
-                price_map = {singleIntent["symbol"]: candle["close"]}
-                self.order_router.process_intent(exit_intent, price_map)
+            # 2️⃣ Exit HEDGE (strategy-controlled)
+            hedge_exit_intent = self.strategy.create_hedge_exit_intent(pos, candle, ctx)
+
+            if hedge_exit_intent:
+                price_map = {hedge_exit_intent["trading_symbol"]: candle["close"]}
+                self.order_router.process_intent(hedge_exit_intent, price_map)
 
         # ---------- ENTRY ----------
         if entry_intent:

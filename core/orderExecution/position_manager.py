@@ -266,15 +266,43 @@ class PositionManager:
             expiry=row.get("SEM_EXPIRY_DATE"),
         )
 
-    def has_open_structure(self, strategy: str, structure_id: str) -> bool:
+    def has_open_structure(self, strategy: str, structure_id: str, tag: str) -> bool:
         for pos in self.positions.values():
             if (
                 pos.net_qty != 0
                 and pos.strategy == strategy
                 and pos.structure_id == structure_id
+                and pos.tag != tag
             ):
                 return True
         return False
+
+    # Used while exiting positions
+    def get_hedge_for(self, main_position):
+        """
+        Find hedge position linked to a main position.
+        Matching is done via:
+        - same strategy
+        - same structure_id
+        - tag == 'HEDGE'
+        """
+        for pos in self.positions.values():
+            # pdb.set_trace()
+            if pos.net_qty == 0:
+                continue
+
+            if pos.tag != "HEDGE":
+                continue
+
+            if pos.strategy != main_position.strategy:
+                continue
+
+            if pos.structure_id != main_position.structure_id:
+                continue
+
+            return pos
+
+        return None
 
     # ---------------------
     # BROKER RECONCILIATION
@@ -407,12 +435,11 @@ class PositionManager:
 
         return snap
 
-
     def get_open_positions(self, underlying=None, strategy=None):
         positions = []
 
         for pos in self.positions.values():
-            pdb.set_trace()
+            # pdb.set_trace()
 
             if pos.net_qty == 0:
                 continue
