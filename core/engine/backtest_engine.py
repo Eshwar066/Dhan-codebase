@@ -26,7 +26,6 @@ class BacktestEngine(BaseEngine):
     def run(self, symbols, start_date, end_date, timeframe, exchange, sector):
 
         for symbol in symbols:
-
             # -------- Load full historical data --------
             df = self.data.get_intraday(
                 symbol=symbol,
@@ -65,10 +64,11 @@ class BacktestEngine(BaseEngine):
 
     def _run_strategy(self, symbol, candle, ctx, entry_intent):
         # ---------- EXIT ----------
+        getAllPositions = self.position_manager.positions
         open_positions = self.position_manager.get_open_positions(
-            symbol=symbol, strategy=self.strategy.name
+            underlying=symbol, strategy=self.strategy.name
         )
-
+        pdb.set_trace()
         for position in open_positions:
             exit_signal = self.strategy.should_exit(position, candle, ctx)
 

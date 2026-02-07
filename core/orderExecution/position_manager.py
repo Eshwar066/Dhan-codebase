@@ -84,6 +84,14 @@ class Position:
 
         self.last_updated = time.time()
 
+    def __repr__(self):
+        sym = (
+            self.instrument.symbol
+            if hasattr(self.instrument, "symbol")
+            else str(self.instrument)
+        )
+        return f"<Position symbol={sym} qty={self.net_qty} avg={self.avg_price}>"
+
     def update_fill(self, side, qty, price):
         signed_qty = qty if side == "BUY" else -qty
 
@@ -132,17 +140,16 @@ class Position:
 
         self.last_updated = time.time()
 
+    def update_risk_metrics(self, ltp):
+        if self.net_qty == 0:
+            return
 
-def update_risk_metrics(self, ltp):
-    if self.net_qty == 0:
-        return
+        diff = ltp - self.entry_price
+        if self.net_qty < 0:
+            diff *= -1
 
-    diff = ltp - self.entry_price
-    if self.net_qty < 0:
-        diff *= -1
-
-    self.mfe = max(self.mfe, diff)
-    self.mae = min(self.mae, diff)
+        self.mfe = max(self.mfe, diff)
+        self.mae = min(self.mae, diff)
 
 
 # =========================
@@ -154,9 +161,11 @@ class PositionManager:
     def __init__(self, logger):
         self._lock = threading.Lock()
         self.logger = TradeLogger()
-        # symbol → Position
+
+        # All Positions, using symbol
         self.positions = {}
-        # strategy → symbol → qty
+
+        # strategy → symbol → qty  #strategy wise positions
         self.strategy_pos = defaultdict(lambda: defaultdict(int))
 
         self.last_recon_time = 0
@@ -180,14 +189,18 @@ class PositionManager:
     ):
         with self._lock:
             sym = instrument["SEM_CUSTOM_SYMBOL"]
-
             prev_qty = self.positions[sym].net_qty if sym in self.positions else 0
 
             if sym not in self.positions:
-                self.positions[sym] = Position(instrument)
+                inst = self._to_instrument(instrument)
+                self.positions[sym] = Position(inst)
 
             pos = self.positions[sym]
 
+            if not isinstance(pos.instrument, Instrument):
+                raise TypeError(
+                    f"Position.instrument must be Instrument, got {type(pos.instrument)}"
+                )
             pos.update_fill(side, qty, price)
 
             new_qty = pos.net_qty
@@ -196,7 +209,8 @@ class PositionManager:
                 signed = qty if side == "BUY" else -qty
                 self.strategy_pos[strategy][sym] += signed
 
-            if pos.net_qty == 0:
+            # helps in postions array
+            if prev_qty == 0 and new_qty != 0:
                 pos.strategy = strategy
                 pos.structure_id = structure_id
                 pos.tag = tag
@@ -241,6 +255,16 @@ class PositionManager:
                 row["mfe"] = pos.mfe
 
             self.logger.log(strategy=strategy, row=row)
+
+    def _to_instrument(self, row):
+        return Instrument(
+            symbol=row["SEM_CUSTOM_SYMBOL"],
+            segment=row["SEM_SEGMENT"],
+            lot_size=int(row["SEM_LOT_UNITS"]),
+            strike=row.get("SEM_STRIKE_PRICE"),
+            option_type=row.get("SEM_OPTION_TYPE"),
+            expiry=row.get("SEM_EXPIRY_DATE"),
+        )
 
     def has_open_structure(self, strategy: str, structure_id: str) -> bool:
         for pos in self.positions.values():
@@ -363,7 +387,7 @@ class PositionManager:
         for sym, pos in self.positions.items():
             ltp = price_map.get(sym, pos.avg_price)
 
-            total += abs(pos.net_qty) * ltp * pos.instrument["SEM_LOT_UNITS"]
+            total += abs(pos.net_qty) * ltp * pos.instrument.lot_size
 
         return total
 
@@ -383,21 +407,21 @@ class PositionManager:
 
         return snap
 
-    def get_open_positions(self, symbol=None, strategy=None):
-        """
-        Returns Position objects (internal truth)
-        """
+
+    def get_open_positions(self, underlying=None, strategy=None):
         positions = []
 
-        for sym, pos in self.positions.items():
+        for pos in self.positions.values():
+            pdb.set_trace()
+
             if pos.net_qty == 0:
                 continue
 
-            if symbol and sym != symbol:
+            if strategy and pos.strategy != strategy:
                 continue
 
-            if strategy:
-                if self.strategy_pos[strategy][sym] == 0:
+            if underlying:
+                if not pos.instrument.symbol.startswith(underlying):
                     continue
 
             positions.append(pos)
