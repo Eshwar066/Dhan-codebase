@@ -142,8 +142,54 @@ class LeapsQuarterly(BaseStrategy):
         return False
 
     def on_position_exit(self, position, candle, ctx):
+        price = (
+            self.get_option_price_at_candle(
+                candle,
+                ctx,
+                position.instrument.strike,
+                position.instrument.option_type,
+                position.instrument.expiry,
+            )
+            if RUN_MODE == RunMode.BACKTEST
+            else None
+        )
+
+        intents = []
+
+        # =========================
+        # MAIN POSITION EXIT
+        # =========================
+        intents.append(
+            {
+                "intent_id": uuid.uuid4().hex,
+                "action": "EXIT",
+                "structure_id": position.structure_id,
+                "instrument": position.instrument,
+                "trading_symbol": position.instrument.symbol,
+                "qty": abs(position.net_qty),
+                "price": price,
+                "strategy": self.name,
+                "tag": "MAIN_EXIT",
+                "side": "BUY" if position.net_qty < 0 else "SELL",
+                "candle_ts": candle["timestamp"],
+            }
+        )
+
+        # =========================
+        # HEDGE EXIT (IF EXISTS)
+        # =========================
+        hedge_exit = self.create_hedge_exit_intent(position, candle, ctx)
+        if hedge_exit:
+            intents.append(hedge_exit)
+
+        return intents
+
+    # ==================================================
+    # HEDGE EXIT (REUSED)
+    # ==================================================
+    def create_hedge_exit_intent(self, position, candle, ctx):
         hedge = ctx["position_store"].get_hedge_for(position)
-        if not hedge:
+        if not hedge or hedge.net_qty == 0:
             return None
 
         price = (
@@ -161,44 +207,14 @@ class LeapsQuarterly(BaseStrategy):
         return {
             "intent_id": uuid.uuid4().hex,
             "action": "EXIT",
-            "structure_id": position.structure_id,
+            "structure_id": hedge.structure_id,
             "instrument": hedge.instrument,
             "trading_symbol": hedge.instrument.symbol,
             "qty": abs(hedge.net_qty),
             "price": price,
             "strategy": self.name,
             "tag": "HEDGE_EXIT",
-            "side": "BUY",
-            "candle_ts": candle["timestamp"],
-        }
-
-    # ==================================================
-    # HEDGE EXIT (REUSED)
-    # ==================================================
-    def create_hedge_exit_intent(self, hedge_position, candle, ctx):
-        price = (
-            self.get_option_price_at_candle(
-                candle,
-                ctx,
-                hedge_position.instrument.strike,
-                hedge_position.instrument.option_type,
-                hedge_position.instrument.expiry,
-            )
-            if RUN_MODE == RunMode.BACKTEST
-            else None
-        )
-
-        return {
-            "intent_id": uuid.uuid4().hex,
-            "action": "EXIT",
-            "structure_id": hedge_position.structure_id,
-            "instrument": hedge_position.instrument,
-            "trading_symbol": hedge_position.instrument.symbol,
-            "qty": abs(hedge_position.net_qty),
-            "price": price,
-            "strategy": self.name,
-            "tag": "HEDGE_EXIT",
-            "side": "SELL",
+            "side": "BUY" if hedge.net_qty < 0 else "SELL",
             "candle_ts": candle["timestamp"],
         }
 
