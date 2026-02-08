@@ -93,7 +93,9 @@ class SimulatedBroker(BaseBroker):
 
         # fallback: last traded price from PM
         if not price:
-            price = self.position_manager.last_price(intent["trading_symbol"])
+            # dont have this
+            # price = self.position_manager.last_price(intent["trading_symbol"])
+            price = 1
 
         if intent.get("order_type") == "MARKET":
             slippage = random.uniform(-0.0005, 0.0005)  # ±5 bps

@@ -1,8 +1,9 @@
 import uuid
-import datetime as dt
 import pandas as pd
 import talib
 import pdb
+from datetime import date, timedelta
+
 
 from run.config import RUN_MODE, RunMode
 from core.strategies.base import BaseStrategy
@@ -181,6 +182,7 @@ class LeapsQuarterly(BaseStrategy):
         if hedge_exit:
             intents.append(hedge_exit)
 
+        # pdb.set_trace()
         return intents
 
     # ==================================================
@@ -274,6 +276,8 @@ class LeapsQuarterly(BaseStrategy):
             if RUN_MODE == RunMode.BACKTEST
             else None
         )
+        if not hedge_price:
+            hedge_price = 0
 
         return {
             "intent_id": uuid.uuid4().hex,
@@ -365,7 +369,7 @@ class LeapsQuarterly(BaseStrategy):
         return otm_strikes
 
     def find_strike_in_premium_range(
-        self, candle, ctx, option_type, min_prem=200, max_prem=400
+        self, candle, ctx, option_type, min_prem=200, max_prem=500
     ):
         otm_strikes = self.fetch_option_chain(candle, ctx, option_type)
 
@@ -387,6 +391,10 @@ class LeapsQuarterly(BaseStrategy):
         chain = ctx["option_chain_service"].get_chain(
             api=self.api, ctx=ctx, params=params
         )
+        if not chain:
+            print(">>no option chain data", ctx, params)
+            return
+
         if RUN_MODE == RunMode.LIVE or RUN_MODE == RunMode.PAPER:
             # If API returns empty dataframe
             if chain is None or len(chain) == 0:
@@ -469,59 +477,48 @@ class LeapsQuarterly(BaseStrategy):
     # --------------------------------------------------
     # RollOver
     # --------------------------------------------------
+    def is_rollover_window(self, ts):
+        return 15 <= ts.day <= 18
+
+    def should_roll_hedge(self, hedge, ts):
+        expiry = pd.to_datetime(hedge.instrument.expiry).date()
+        current = pd.to_datetime(ts).date()
+
+        if expiry <= current:
+            return False
+
+        target = date(current.year, current.month, 18)
+        if target.weekday() == 5:
+            target -= timedelta(days=1)
+        elif target.weekday() == 6:
+            target -= timedelta(days=2)
+
+        return current >= target
+
     def on_candle_rollover(self, open_positions, candle, ctx):
         ts = pd.to_datetime(candle["timestamp"])
 
-        if not self.is_hedge_rollover_day(ts):
+        if not self.is_rollover_window(ts):
             return []
 
         intents = []
 
-        # Split positions
-        main_positions = {
-            p.structure_id: p
-            for p in open_positions
-            if p.tag == "MAIN" and p.net_qty != 0
-        }
+        for hedge in [p for p in open_positions if p.tag == "HEDGE" and p.net_qty != 0]:
+            if not self.should_roll_hedge(hedge, ts):
+                continue
 
-        hedge_positions = [
-            p for p in open_positions if p.tag == "HEDGE" and p.net_qty != 0
-        ]
-
-        for hedge in hedge_positions:
-            parent = main_positions.get(hedge.structure_id)
-
-            if not parent:
-                continue  # orphan hedge, skip safely
-
-            # -------- EXIT OLD HEDGE --------
-            hedge_exit = self.create_hedge_exit_intent(parent, candle, ctx)
-            if hedge_exit:
-                intents.append(hedge_exit)
-
-            # -------- RE-ENTER NEW HEDGE --------
-            sell_like_intent = {
-                "intent_id": uuid.uuid4().hex,
-                "structure_id": parent.structure_id,
-                "symbol": parent.instrument.symbol.split()[0],
-                "strike": parent.instrument.strike,
-                "option_type": (
-                    "CALL" if parent.instrument.option_type in ("CE", "CALL") else "PUT"
+            parent = next(
+                (
+                    p
+                    for p in open_positions
+                    if p.structure_id == hedge.structure_id and p.tag == "MAIN"
                 ),
-            }
+                None,
+            )
+            if not parent:
+                continue
 
-            hedge_entry = self.create_hedge_intent(sell_like_intent, candle, ctx)
-            if hedge_entry:
-                intents.append(hedge_entry)
+            intents.append(self.create_hedge_exit_intent(parent, candle, ctx))
+            intents.append(self.create_hedge_intent(parent, candle, ctx))
 
-        return intents
-
-    def is_hedge_rollover_day(self, ts):
-        target = dt.date(ts.year, ts.month, 18)
-
-        if target.weekday() == 5:  # Saturday
-            target -= dt.timedelta(days=1)
-        elif target.weekday() == 6:  # Sunday
-            target -= dt.timedelta(days=2)
-
-        return ts.date() == target
+        return [i for i in intents if i]

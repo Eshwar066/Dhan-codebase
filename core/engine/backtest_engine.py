@@ -1,7 +1,6 @@
 import pandas as pd
-from core.engine.base_engine import BaseEngine
 import datetime as dt
-import pdb
+from core.engine.base_engine import BaseEngine
 
 
 class BacktestEngine(BaseEngine):
@@ -23,10 +22,12 @@ class BacktestEngine(BaseEngine):
         self.order_router = order_router
         self.position_manager = position_manager
 
+    # ==========================================================
+    # MAIN RUN LOOP
+    # ==========================================================
     def run(self, symbols, start_date, end_date, timeframe, exchange, sector):
 
         for symbol in symbols:
-            # -------- Load full historical data --------
             df = self.data.get_intraday(
                 symbol=symbol,
                 start_date=start_date,
@@ -45,61 +46,78 @@ class BacktestEngine(BaseEngine):
             # -------- Indicators --------
             df = self.strategy.prepare_indicators(df)
 
-            # -------- Candle-by-candle simulation --------
+            # -------- Candle loop --------
             for _, row in df.iterrows():
                 candle = row.to_dict()
-
                 ts = pd.to_datetime(candle["timestamp"])
-                if ts.weekday() >= 5:
-                    continue
 
-                if not self.strategy.should_evaluate(candle):
+                if ts.weekday() >= 5:
                     continue
 
                 # -------- Runtime context --------
                 ctx, entry_intent = self.build_context(candle)
 
-                self._run_strategy(symbol, candle, ctx, entry_intent)
+                # 🔥 ALWAYS run exits + rollover
+                self._run_risk_and_rollover(symbol, candle, ctx)
+
+                # 🔒 ONLY gate entries
+                if self.strategy.should_evaluate(candle):
+                    self._run_entry(symbol, candle, entry_intent)
+
                 self.update_risk_metrics(symbol, candle["close"])
 
-    def _run_strategy(self, symbol, candle, ctx, entry_intent):
-        # ---------- EXIT ----------
-        getAllPositions = self.position_manager.positions
+    # ==========================================================
+    # EXIT + ROLLOVER (ALWAYS EXECUTES)
+    # ==========================================================
+    def _run_risk_and_rollover(self, symbol, candle, ctx):
+
         open_positions = self.position_manager.get_open_positions(
-            underlying=symbol, strategy=self.strategy.name
+            underlying=symbol,
+            strategy=self.strategy.name,
         )
 
+        # ---------- FORCED / STRATEGY EXITS ----------
         for pos in open_positions:
             if pos.tag == "MAIN" and self.strategy.should_exit(pos, candle, ctx):
-                exit_intents = self.strategy.on_position_exit(pos, candle, ctx)
-                if exit_intents:
-                    for exit_intent in exit_intents:
-                        price_map = {exit_intent["trading_symbol"]: candle["close"]}
-                        self.order_router.process_intent(exit_intent, price_map)
+                exit_intents = self.strategy.on_position_exit(pos, candle, ctx) or []
+                for intent in exit_intents:
+                    price_map = {intent["trading_symbol"]: candle["close"]}
+                    self.order_router.process_intent(intent, price_map)
 
-            # ---------- ROLLOVER ----------
-        rollover_intents = self.strategy.on_candle_rollover(
-            open_positions=open_positions,
-            candle=candle,
-            ctx=ctx,
+        # ---------- HEDGE ROLLOVER ----------
+        rollover_intents = (
+            self.strategy.on_candle_rollover(
+                open_positions=open_positions,
+                candle=candle,
+                ctx=ctx,
+            )
+            or []
         )
 
         for intent in rollover_intents:
             price_map = {intent["trading_symbol"]: candle["close"]}
             self.order_router.process_intent(intent, price_map)
-        # ---------- ENTRY ----------
-        if entry_intent:
-            for singleIntent in entry_intent:
-                price_map = {singleIntent["symbol"]: candle["close"]}
-                self.order_router.process_intent(singleIntent, price_map)
 
+    # ==========================================================
+    # ENTRY (SIGNAL DRIVEN)
+    # ==========================================================
+    def _run_entry(self, symbol, candle, entry_intent):
+        if not entry_intent:
+            return
+
+        for intent in entry_intent:
+            price_map = {intent["symbol"]: candle["close"]}
+            self.order_router.process_intent(intent, price_map)
+
+    # ==========================================================
+    # RISK METRICS
+    # ==========================================================
     def update_risk_metrics(self, symbol, ltp):
         pos = self.position_manager.positions.get(symbol)
         if not pos or pos.net_qty == 0:
             return
 
         diff = ltp - pos.entry_price
-
         if pos.net_qty < 0:
             diff *= -1
 
