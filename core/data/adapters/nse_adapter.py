@@ -6,14 +6,23 @@ import pdb
 class NSEAdapter(BaseAdapter):
 
     def get_expiries(self, ctx):
-        raw_expiries = self.data.get_nse_expiries(
-            symbol=ctx["symbol"],
-            year=ctx["timestamp"].year,
-            instrument=ctx["instrument"],
-        )
+        ts = ctx["timestamp"]
+        years = [ts.year]
 
-        # pdb.set_trace()
-        # invariant
+        if ts.month > 6:
+            years.append(ts.year + 1)
+
+        raw_expiries = []
+
+        for year in years:
+            raw_expiries.extend(
+                self.data.get_nse_expiries(
+                    symbol=ctx["symbol"],
+                    year=year,
+                    instrument=ctx["instrument"],
+                )
+            )
+
         expiries = []
 
         for exp in raw_expiries:
@@ -22,10 +31,12 @@ class NSEAdapter(BaseAdapter):
             elif isinstance(exp, datetime):
                 expiries.append(exp.date())
             elif isinstance(exp, str):
-                # adjust format if needed
                 expiries.append(datetime.strptime(exp, "%Y-%m-%d").date())
             else:
                 raise ValueError(f"Unsupported expiry type: {type(exp)}")
+
+        # Optional but recommended: unique + sorted
+        expiries = sorted(set(expiries))
 
         ctx["expiry_list"] = expiries
         return expiries
@@ -39,7 +50,7 @@ class NSEAdapter(BaseAdapter):
         return "Needs to implemented"
 
     def get_historical_option_chain(self, ctx, params):
-        
+
         return self.data.get_nse_optionchain_historical(
             symbol=ctx["symbol"],
             from_date=ctx["timestamp"].date(),

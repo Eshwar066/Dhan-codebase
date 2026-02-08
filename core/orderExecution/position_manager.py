@@ -249,6 +249,7 @@ class PositionManager:
                 ),
                 "execution_timestamp": datetime.now().isoformat(),
                 "strategy": strategy,
+                "tag": tag,
                 "symbol": sym,
                 "trade_id": pos.trade_id,
                 "trade_type": trade_type,

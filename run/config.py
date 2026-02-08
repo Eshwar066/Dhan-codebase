@@ -19,8 +19,8 @@ STRATEGY_JOBS = [
         "symbols": ["NIFTY"],
         "live": {"exchange": "INDEX", "sector": "YES", "rsi": "YES"},
         "backtest": {
-            "start_date": "2023-02-01",
-            "end_date": "2023-06-30",
+            "start_date": "2023-10-19",
+            "end_date": "2024-06-30",
             "timeframe": "60",
             "exchange": "INDEX",
             "sector": "YES",
