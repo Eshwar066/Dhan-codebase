@@ -2,6 +2,7 @@ import uuid
 import datetime as dt
 import pandas as pd
 import talib
+import pdb
 
 from run.config import RUN_MODE, RunMode
 from core.strategies.base import BaseStrategy
@@ -14,7 +15,7 @@ VALID_TIMES = {"10:15", "11:15", "12:15", "13:15", "14:15", "15:15"}
 class LeapsQuarterly(BaseStrategy):
     """
     LEAPS Quarterly RSI Option Selling Strategy
-    SIGNAL ONLY
+    SIGNAL + HEDGE
     """
 
     # ==================================================
@@ -25,7 +26,6 @@ class LeapsQuarterly(BaseStrategy):
     required_context = ["option_chain"]
     api = "NSE"
     expiryType = "QUARTERLY"
-    # strike_count = 5
 
     # ==================================================
     # INDICATORS
@@ -42,7 +42,7 @@ class LeapsQuarterly(BaseStrategy):
         return ts.strftime("%H:%M") in VALID_TIMES
 
     # ==================================================
-    # ENTRY SIGNAL
+    # SHOULD EVALUATE
     # ==================================================
     def should_evaluate(self, candle):
         rsi = candle.get("rsi")
@@ -54,11 +54,10 @@ class LeapsQuarterly(BaseStrategy):
         return (prev >= 32 and rsi < 32) or (prev <= 52 and rsi > 52)
 
     # ==================================================
-    # MAIN ENTRY
+    # ENTRY
     # ==================================================
     def on_candle(self, candle, ctx):
         ts = pd.to_datetime(candle["timestamp"])
-
         if not self._is_valid_time(ts):
             return None
 
@@ -128,7 +127,7 @@ class LeapsQuarterly(BaseStrategy):
         return [sell_intent, hedge_intent] if hedge_intent else sell_intent
 
     # ==================================================
-    # EXIT LOGIC
+    # EXIT SIGNAL
     # ==================================================
     def should_exit(self, position, candle, ctx=None):
         if position.tag != "MAIN":
@@ -144,7 +143,12 @@ class LeapsQuarterly(BaseStrategy):
 
         return False
 
+    # ==================================================
+    # EXIT HANDLER
+    # ==================================================
     def on_position_exit(self, position, candle, ctx):
+        intents = []
+
         price = (
             self.get_option_price_at_candle(
                 candle,
@@ -157,11 +161,6 @@ class LeapsQuarterly(BaseStrategy):
             else None
         )
 
-        intents = []
-
-        # =========================
-        # MAIN POSITION EXIT
-        # =========================
         intents.append(
             {
                 "intent_id": uuid.uuid4().hex,
@@ -178,9 +177,6 @@ class LeapsQuarterly(BaseStrategy):
             }
         )
 
-        # =========================
-        # HEDGE EXIT (IF EXISTS)
-        # =========================
         hedge_exit = self.create_hedge_exit_intent(position, candle, ctx)
         if hedge_exit:
             intents.append(hedge_exit)
@@ -188,7 +184,7 @@ class LeapsQuarterly(BaseStrategy):
         return intents
 
     # ==================================================
-    # HEDGE EXIT (REUSED)
+    # HEDGE EXIT
     # ==================================================
     def create_hedge_exit_intent(self, position, candle, ctx):
         hedge = ctx["position_store"].get_hedge_for(position)
@@ -243,7 +239,6 @@ class LeapsQuarterly(BaseStrategy):
 
     def create_hedge_intent(self, parent_sell_intent, candle, ctx):
         trade_date = pd.to_datetime(candle["timestamp"]).date()
-
         hedge_expiry = self.resolve_hedge_expiry(trade_date)
         hedge_strike = self.calculate_hedge_strike(
             parent_sell_intent["strike"],
@@ -305,7 +300,6 @@ class LeapsQuarterly(BaseStrategy):
     # STRUCTURE ID
     # ==================================================
     def build_structure_id(self, candle, regime):
-        # ts = pd.to_datetime(candle["timestamp"]).strftime("%Y%m%d_%H%M")
         return f"{self.name}:{candle['symbol']}:{regime}"
 
     # ==================================================
@@ -483,12 +477,42 @@ class LeapsQuarterly(BaseStrategy):
 
         intents = []
 
-        for hedge in open_positions:
-            if hedge.tag != "HEDGE":
-                continue
+        # Split positions
+        main_positions = {
+            p.structure_id: p
+            for p in open_positions
+            if p.tag == "MAIN" and p.net_qty != 0
+        }
 
-            intents.append(self.create_hedge_exit_intent(hedge))
-            intents.append(self.create_hedge_intent(hedge.parent_position, candle, ctx))
+        hedge_positions = [
+            p for p in open_positions if p.tag == "HEDGE" and p.net_qty != 0
+        ]
+
+        for hedge in hedge_positions:
+            parent = main_positions.get(hedge.structure_id)
+
+            if not parent:
+                continue  # orphan hedge, skip safely
+
+            # -------- EXIT OLD HEDGE --------
+            hedge_exit = self.create_hedge_exit_intent(parent, candle, ctx)
+            if hedge_exit:
+                intents.append(hedge_exit)
+
+            # -------- RE-ENTER NEW HEDGE --------
+            sell_like_intent = {
+                "intent_id": uuid.uuid4().hex,
+                "structure_id": parent.structure_id,
+                "symbol": parent.instrument.symbol.split()[0],
+                "strike": parent.instrument.strike,
+                "option_type": (
+                    "CALL" if parent.instrument.option_type in ("CE", "CALL") else "PUT"
+                ),
+            }
+
+            hedge_entry = self.create_hedge_intent(sell_like_intent, candle, ctx)
+            if hedge_entry:
+                intents.append(hedge_entry)
 
         return intents
 

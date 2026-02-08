@@ -165,8 +165,8 @@ class InstrumentStore:
         if not security_check.empty:
             # If you want the first match only
             row = security_check.iloc[0]
-            print("✅ Found security row:")
-            print(row)
+            # print("✅ Found security row:")
+            # print(row)
             return row
         else:
             print(

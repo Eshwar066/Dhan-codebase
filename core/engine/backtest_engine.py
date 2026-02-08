@@ -77,13 +77,16 @@ class BacktestEngine(BaseEngine):
                         price_map = {exit_intent["trading_symbol"]: candle["close"]}
                         self.order_router.process_intent(exit_intent, price_map)
 
-            # 2️⃣ Exit HEDGE (strategy-controlled)
-            # hedge_exit_intent = self.strategy.create_hedge_exit_intent(pos, candle, ctx)
+            # ---------- ROLLOVER ----------
+        rollover_intents = self.strategy.on_candle_rollover(
+            open_positions=open_positions,
+            candle=candle,
+            ctx=ctx,
+        )
 
-            # if hedge_exit_intent:
-            #     price_map = {hedge_exit_intent["trading_symbol"]: candle["close"]}
-            #     self.order_router.process_intent(hedge_exit_intent, price_map)
-
+        for intent in rollover_intents:
+            price_map = {intent["trading_symbol"]: candle["close"]}
+            self.order_router.process_intent(intent, price_map)
         # ---------- ENTRY ----------
         if entry_intent:
             for singleIntent in entry_intent:
