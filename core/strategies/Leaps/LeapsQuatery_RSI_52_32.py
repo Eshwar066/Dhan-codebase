@@ -80,9 +80,12 @@ class LeapsQuarterly(BaseStrategy):
         ):
             return None
 
-        strike, premium, row = self.find_strike_in_premium_range(
-            candle, ctx, option_type
-        )
+        result = self.find_strike_in_premium_range(candle, ctx, option_type)
+        if result is None:
+            print(f"⚠️ No valid strike found at {candle['timestamp']}")
+            return None
+
+        strike, premium, row = result
         if not strike:
             return None
 
@@ -203,6 +206,11 @@ class LeapsQuarterly(BaseStrategy):
             if RUN_MODE == RunMode.BACKTEST
             else None
         )
+        if price is None:
+            print(
+                f"⚠️ No exit price for hedge {hedge.instrument.symbol} at {candle['timestamp']}"
+            )
+            return None
 
         return {
             "intent_id": uuid.uuid4().hex,
@@ -297,8 +305,8 @@ class LeapsQuarterly(BaseStrategy):
     # STRUCTURE ID
     # ==================================================
     def build_structure_id(self, candle, regime):
-        ts = pd.to_datetime(candle["timestamp"]).strftime("%Y%m%d_%H%M")
-        return f"{self.name}:{candle['symbol']}:{regime}:{ts}"
+        # ts = pd.to_datetime(candle["timestamp"]).strftime("%Y%m%d_%H%M")
+        return f"{self.name}:{candle['symbol']}:{regime}"
 
     # ==================================================
     # OPTION PRICING (BACKTEST SAFE)
