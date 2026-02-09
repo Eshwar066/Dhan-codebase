@@ -1,0 +1,26 @@
+[
+  {
+    "FH_INSTRUMENT": "OPTIDX",
+    "FH_SYMBOL": "NIFTY",
+    "FH_EXPIRY_DT": "28-Mar-2024",
+    "FH_STRIKE_PRICE": 18500,
+    "FH_OPTION_TYPE": "PE",
+    "FH_MARKET_TYPE": null,
+    "FH_OPENING_PRICE": null,
+    "FH_TRADE_HIGH_PRICE": null,
+    "FH_TRADE_LOW_PRICE": null,
+    "FH_CLOSING_PRICE": null,
+    "FH_LAST_TRADED_PRICE": null,
+    "FH_PREV_CLS": null,
+    "FH_SETTLE_PRICE": null,
+    "FH_TOT_TRADED_QTY": null,
+    "FH_TOT_TRADED_VAL": null,
+    "FH_OPEN_INT": null,
+    "FH_CHANGE_IN_OI": null,
+    "FH_MARKET_LOT": null,
+    "FH_TIMESTAMP": "03-Jan-2024",
+    "FH_TIMESTAMP_ORDER": "2024-01-02T18:30:00.000+00:00",
+    "FH_UNDERLYING_VALUE": 21517.35,
+    "CALCULATED_PREMIUM_VAL": null
+  }
+]
