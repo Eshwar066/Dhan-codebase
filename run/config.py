@@ -20,7 +20,7 @@ STRATEGY_JOBS = [
         "live": {"exchange": "INDEX", "sector": "YES", "rsi": "YES"},
         "backtest": {
             "start_date": "2023-10-19",
-            "end_date": "2024-06-30",
+            "end_date": "2024-02-28",
             "timeframe": "60",
             "exchange": "INDEX",
             "sector": "YES",

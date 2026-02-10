@@ -143,7 +143,9 @@ class InstrumentStore:
             "SEM_CUSTOM_SYMBOL": trading_symbol,
             "SM_SYMBOL_NAME": trading_symbol.split()[0],
             "SEM_EXCH_INSTRUMENT_TYPE": "OP",
-            "SEM_OPTION_TYPE": "PE" if option_type == "PUT" else "CE",
+            "SEM_OPTION_TYPE": (
+                "PE" if option_type == "PUT" or option_type == "PE" else "CE"
+            ),
             "SEM_STRIKE_PRICE": strike,
             "SEM_EXPIRY_DATE": expiry,
             "SEM_LOT_UNITS": 65,
