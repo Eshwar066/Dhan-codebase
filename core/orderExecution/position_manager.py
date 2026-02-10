@@ -230,15 +230,12 @@ class PositionManager:
             if self.logger:
                 row = {
                     "candle_timestamp": (
-                        candle_ts.isoformat()
+                        candle_ts.strftime("%Y-%m-%d %H:%M")
                         if isinstance(candle_ts, datetime)
                         else candle_ts
                     ),
-                    "execution_timestamp": datetime.now().isoformat(),
-                    "strategy": strategy,
                     "tag": tag,
                     "symbol": sym,
-                    "trade_id": pos.trade_id,
                     "trade_type": trade_type,
                     "side": side,
                     "qty": qty,
@@ -246,6 +243,9 @@ class PositionManager:
                     "net_qty_after": new_qty,
                     "order_id": order_id,
                     "intent_id": intent_id,
+                    "trade_id": pos.trade_id,
+                    "execution_timestamp": datetime.now().isoformat(),
+                    "strategy": strategy,
                 }
 
                 if trade_type == "EXIT":

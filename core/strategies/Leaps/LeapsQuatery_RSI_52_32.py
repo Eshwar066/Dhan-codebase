@@ -7,7 +7,7 @@ import pdb
 from run.config import RUN_MODE, RunMode
 from core.strategies.base import BaseStrategy
 from core.utils.expiry_resolver import ExpiryResolver
-from core.models.order_intent import OrderIntent  # Make sure this is imported
+from core.models.order_intent import OrderIntent
 
 
 VALID_TIMES = {"10:15", "11:15", "12:15", "13:15", "14:15", "15:15"}
@@ -208,6 +208,7 @@ class LeapsQuarterly(BaseStrategy):
             if RUN_MODE == RunMode.BACKTEST
             else None
         )
+        # pdb.set_trace()
         if price is None:
             print(
                 f"⚠️ No exit price for hedge {hedge.instrument.symbol} at {candle['timestamp']}"
@@ -545,11 +546,6 @@ class LeapsQuarterly(BaseStrategy):
 
         for hedge in [p for p in open_positions if p.tag == "HEDGE" and p.net_qty != 0]:
 
-            roll_key = self._hedge_roll_key(hedge)
-
-            # 🚫 Already rolled → skip forever
-            if roll_key in self.rolled_hedges:
-                continue
             if not self.should_roll_hedge(hedge, ts):
                 continue
 
@@ -564,7 +560,14 @@ class LeapsQuarterly(BaseStrategy):
             if not parent:
                 continue
 
+            roll_key = (hedge.structure_id, ts.date())
+
+            # 🚫 Already rolled for this structure+expiry
+            if roll_key in self.rolled_hedges:
+                continue
+
             # Append hedge exit and new hedge OrderIntent
+            # pdb.set_trace()
             hedge_exit = self.create_hedge_exit_intent(parent, candle, ctx)
             if hedge_exit:
                 intents.append(hedge_exit)
