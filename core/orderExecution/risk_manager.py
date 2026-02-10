@@ -2,24 +2,6 @@ import time
 import pdb
 
 
-# place this in live_engine.py
-# # live_engine.py
-
-# intent = strategy.generate_intent()
-
-# intent_store.create(intent)
-
-# if risk_manager.allow_intent(intent, price_map):
-
-#     broker.place_order(intent)
-
-#     intent_store.update(intent_id, "SENT")
-
-# else:
-
-#     intent_store.update(intent_id, "REJECTED")
-
-
 class RiskManager:
     def __init__(
         self,
@@ -47,36 +29,28 @@ class RiskManager:
     # -------------------------
     def allow_intent(self, intent, price_map, candle_ts=None):
         """
-        intent format:
-        {
-            "symbol": str,
-            "side": BUY/SELL,
-            "qty": int,
-            "price": float,
-            "instrument": Instrument,
-            "strategy": str (optional)
-        }
+        intent: OrderIntent object
         """
+        symbol = intent.instrument.trading_symbol
+        side = intent.side
+        qty = intent.qty
+        price = intent.price or 0
+        lot_size = getattr(intent, "lot_size", 65)
+        strategy = getattr(intent, "strategy", None)
+        structure_id = getattr(intent, "structure_id", None)
+        tag = getattr(intent, "tag", None)
+        action = getattr(intent, "action", "ENTRY")
+        if action is None:
+            raise ValueError(
+                f"Intent {intent.intent_id} missing action " f"(ENTRY / EXIT / ROLL)"
+            )
 
-        symbol = intent["trading_symbol"]
-        side = intent["side"]
-        qty = intent["qty"]
-        price = intent.get("price", 0)
-        lot_size = intent.get("lot_size", 65)
-        strategy = intent.get("strategy")
-        structure_id = intent.get("structure_id")
-        tag = intent.get("tag")
-
-        if intent.get("action") in ("EXIT", "FORCE_EXIT"):
+        # Exit/force exit always allowed
+        if action in ("EXIT", "FORCE_EXIT"):
             return True
 
         # 0️⃣ STRUCTURE LOCK (🔥 IMPORTANT)
-        if (
-            strategy
-            and structure_id
-            and intent.get("action", "ENTRY") == "ENTRY"
-            and tag == "MAIN"
-        ):
+        if strategy and structure_id and action == "ENTRY" and tag == "MAIN":
             if self.pm.has_open_structure(
                 structure_id=structure_id,
                 tag="MAIN",
@@ -87,7 +61,6 @@ class RiskManager:
 
         # 1️⃣ Cooldown check
         now_ts = self._get_event_time(candle_ts)
-
         if not self._cooldown_ok(symbol, now_ts):
             print(f"❌ Cooldown active {symbol}")
             return False
@@ -104,7 +77,7 @@ class RiskManager:
             return False
 
         # 4️⃣ No double-direction entries
-        if not self._direction_ok(symbol, side):
+        if not self._direction_ok(intent.instrument, side):
             print(f"❌ Opposite position exists {symbol}")
             return False
 
@@ -117,23 +90,29 @@ class RiskManager:
         # 6️⃣ Portfolio exposure check
         portfolio_exposure = self.pm.total_exposure(price_map)
         new_exposure = portfolio_exposure + (qty * price * lot_size)
-
         if new_exposure > self.max_portfolio_exposure:
             print("❌ Portfolio exposure breach")
             return False
 
         # Passed all checks
-        self.last_trade_time[symbol] = now_ts
+        key = (intent.strategy, intent.structure_id, intent.instrument.contract_key)
+        self.last_trade_time[key] = now_ts
         return True
 
     # -------------------------
     # HELPERS
     # -------------------------
-    def _direction_ok(self, symbol, side):
-        if side == "BUY" and self.pm.is_short(symbol):
-            return False
-        if side == "SELL" and self.pm.is_long(symbol):
-            return False
+    def _direction_ok(self, instrument, side):
+        for pos in self.pm.get_open_positions():
+            if pos.instrument.contract_key != instrument.contract_key:
+                continue
+
+            if side == "BUY" and pos.net_qty < 0:
+                return False
+
+            if side == "SELL" and pos.net_qty > 0:
+                return False
+
         return True
 
     def _open_positions_count(self):

@@ -4,68 +4,68 @@ import datetime
 import pdb
 from run.config import RUN_MODE, RunMode
 
-# instrument_store.df.columns.tolist()
-# [
-#     "Unnamed: 0",
-#     "SEM_EXM_EXCH_ID",
-#     "SEM_SEGMENT",
-#     "SEM_SMST_SECURITY_ID",
-#     "SEM_INSTRUMENT_NAME",
-#     "SEM_EXPIRY_CODE",
-#     "SEM_TRADING_SYMBOL",
-#     "SEM_LOT_UNITS",
-#     "SEM_CUSTOM_SYMBOL",
-#     "SEM_EXPIRY_DATE",
-#     "SEM_STRIKE_PRICE",
-#     "SEM_OPTION_TYPE",
-#     "SEM_TICK_SIZE",
-#     "SEM_EXPIRY_FLAG",
-#     "SEM_EXCH_INSTRUMENT_TYPE",
-#     "SEM_SERIES",
-#     "SM_SYMBOL_NAME",
-# ]
-
-#  instrument_store.df[instrument_store.df["SM_SYMBOL_NAME"] == "NIFTY" ].head()
-# instrument_store.df[instrument_store.df["SEM_EXCH_INSTRUMENT_TYPE"] == "OPTIDX"]["SM_SYMBOL_NAME"].value_counts().head(10)
+from dataclasses import dataclass
+from datetime import date
 
 
-# 2️⃣ Filter NIFTY PE options
-# nifty_options = instrument_store.df[
-#     instrument_store.df["SEM_TRADING_SYMBOL"].str.contains("NIFTY")
-#     & (instrument_store.df["SEM_OPTION_TYPE"] == "PE")
-# ]
+class Instrument:
+    def __init__(
+        self,
+        trading_symbol,
+        custom_symbol,
+        exchange,
+        segment,
+        instrument_type,
+        expiry=None,
+        strike=None,
+        option_type=None,
+        lot_size=1,
+        instrument_id=None,
+        series=None,
+    ):
+        self.trading_symbol = trading_symbol
+        self.custom_symbol = custom_symbol
 
-# # 3️⃣ Pick nearest strike to your target
-# target_strike = 25000
-# nearest_row = nifty_options.iloc[
-#     (nifty_options["SEM_STRIKE_PRICE"] - target_strike).abs().argmin()
-# ]
+        self.exchange = exchange
+        self.segment = segment
+        self.instrument_type = instrument_type
 
-# ✅ Found security row:
-# Unnamed: 0                                  216446
-# SEM_EXM_EXCH_ID                                NSE
-# SEM_SEGMENT                                      D
-# SEM_SMST_SECURITY_ID                         62925
-# SEM_INSTRUMENT_NAME                         OPTIDX
-# SEM_EXPIRY_CODE                                  0
-# SEM_TRADING_SYMBOL          NIFTY-Mar2026-24000-PE
-# SEM_LOT_UNITS                                 65.0
-# SEM_CUSTOM_SYMBOL           NIFTY 30 MAR 24000 PUT
-# SEM_EXPIRY_DATE                         2026-03-30
-# SEM_STRIKE_PRICE                           24000.0
-# SEM_OPTION_TYPE                                 PE
-# SEM_TICK_SIZE                                  5.0
-# SEM_EXPIRY_FLAG                                  M
-# SEM_EXCH_INSTRUMENT_TYPE                        OP
-# SEM_SERIES                                     NaN
-# SM_SYMBOL_NAME                                 NaN
-from datetime import date, datetime
+        self.expiry = expiry
+        self.strike = strike
+        self.option_type = option_type
+        self.lot_size = int(lot_size)
 
-INDEX_TO_OPT_SYMBOL = {
-    "NIFTY": "SX50OPT",
-    "BANKNIFTY": "BKXOPT",
-    "SENSEX": "BSXOPT",
-}
+        self.instrument_id = instrument_id
+        self.series = series
+
+    def __repr__(self):
+        return (
+            f"Instrument("
+            f"{self.custom_symbol}, "
+            f"{self.exchange}, "
+            f"{self.segment}, "
+            f"{self.instrument_type}, "
+            f"expiry={self.expiry}, "
+            f"strike={self.strike}, "
+            f"option_type={self.option_type}"
+            f")"
+        )
+
+    @property
+    def contract_key(self):
+        """
+        Uniquely identifies a tradable contract.
+        Used for netting, direction checks, hedges, and rollovers.
+        """
+        return (
+            self.exchange,
+            self.segment,
+            self.instrument_type,
+            self.custom_symbol.split()[0],  # underlying (NIFTY, BANKNIFTY)
+            self.expiry,
+            self.strike,
+            self.option_type,
+        )
 
 
 class InstrumentStore:
@@ -84,42 +84,28 @@ class InstrumentStore:
         if not csv_path.exists():
             raise FileNotFoundError(f"Instrument file not found: {csv_path}")
 
-    # --------------------------------------------------
-    # 🔹 CORE RESOLVER
-    # --------------------------------------------------
+    def map_row_to_instrument(self, row) -> Instrument:
+        # pdb.set_trace()
+        return Instrument(
+            trading_symbol=row["SEM_TRADING_SYMBOL"],
+            custom_symbol=row["SEM_CUSTOM_SYMBOL"],
+            exchange=row["SEM_EXM_EXCH_ID"],
+            segment=row["SEM_SEGMENT"],
+            instrument_type=row["SEM_EXCH_INSTRUMENT_TYPE"],
+            expiry=row.get("SEM_EXPIRY_DATE"),
+            strike=row.get("SEM_STRIKE_PRICE"),
+            option_type=row.get("SEM_OPTION_TYPE"),
+            lot_size=row.get("LOT_SIZE", 1),
+            instrument_id=row.get("INSTRUMENT_ID"),
+            series=row.get("SEM_SERIES"),
+        )
 
-    # working
-    def map_row_to_instrument(self, row):
-        return {
-            "exchange": row["SEM_EXM_EXCH_ID"],
-            "segment": row["SEM_SEGMENT"],
-            "instrument_id": int(row["SEM_SMST_SECURITY_ID"]),
-            "trading_symbol": row["SEM_TRADING_SYMBOL"],
-            "custom_symbol": row["SEM_CUSTOM_SYMBOL"],
-            "symbol": row["SM_SYMBOL_NAME"],
-            "instrument_type": row["SEM_EXCH_INSTRUMENT_TYPE"],
-            "option_type": row["SEM_OPTION_TYPE"],
-            "strike": (
-                float(row["SEM_STRIKE_PRICE"])
-                if not pd.isna(row["SEM_STRIKE_PRICE"])
-                else None
-            ),
-            "expiry": row["SEM_EXPIRY_DATE"],
-            "lot_size": int(row["SEM_LOT_UNITS"]),
-            "tick_size": float(row["SEM_TICK_SIZE"]),
-            "series": row["SEM_SERIES"],
-        }
-
-    # working
-    def show_sample(self, n=5):
-        print(self.df.head(n))
-
-    #  main
     dummy_security_counter = 100000
 
     def intent_creation_details(
-        self, tradingsymbol, exchange, expiry, option_type, strike
-    ):
+        self, trading_symbol, exchange, expiry, option_type, strike
+    ) -> Instrument | None:
+
         instrument_exchange = {
             "NSE": "NSE",
             "BSE": "BSE",
@@ -128,47 +114,41 @@ class InstrumentStore:
             "MCX": "MCX",
             "CUR": "NSE",
         }
-        if RUN_MODE == RunMode.LIVE or RUN_MODE == RunMode.PAPER:
-            security_check = self.df[
+
+        if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
+            df = self.df[
                 (
-                    (self.df["SEM_TRADING_SYMBOL"] == tradingsymbol)
-                    | (self.df["SEM_CUSTOM_SYMBOL"] == tradingsymbol)
+                    (self.df["SEM_TRADING_SYMBOL"] == trading_symbol)
+                    | (self.df["SEM_CUSTOM_SYMBOL"] == trading_symbol)
                 )
                 & (self.df["SEM_EXM_EXCH_ID"] == instrument_exchange[exchange])
             ]
-        else:
-            InstrumentStore.dummy_security_counter += 1
-            dummy_row = {
-                "Unnamed: 0": 0,
-                "SEM_EXM_EXCH_ID": instrument_exchange.get(exchange, exchange),
-                "SEM_SEGMENT": "D",
-                "SEM_SMST_SECURITY_ID": InstrumentStore.dummy_security_counter,
-                "SEM_INSTRUMENT_NAME": "OPTIDX",
-                "SEM_EXPIRY_CODE": 0,
-                "SEM_TRADING_SYMBOL": tradingsymbol,
-                "SEM_LOT_UNITS": 65.0,
-                "SEM_CUSTOM_SYMBOL": tradingsymbol,
-                "SEM_EXPIRY_DATE": pd.Timestamp(expiry),
-                "SEM_STRIKE_PRICE": strike,
-                "SEM_OPTION_TYPE": ("PE" if option_type == "PUT" else "CE"),
-                "SEM_TICK_SIZE": 5.0,
-                "SEM_EXPIRY_FLAG": "M",
-                "SEM_EXCH_INSTRUMENT_TYPE": "OP",
-                "SEM_SERIES": None,
-                "SM_SYMBOL_NAME": None,
-            }
 
-            # Convert to pandas Series to mimic a row
-            security_check = pd.DataFrame([dummy_row])
+            if df.empty:
+                print(f"❌ No instrument found for {trading_symbol} on {exchange}")
+                return None
 
-        # Check if present and return row(s)
-        if not security_check.empty:
-            # If you want the first match only
-            row = security_check.iloc[0]
-            # print("✅ Found security row:")
-            # print(row)
-            return row
-        else:
-            print(
-                f"❌ No instrument found for symbol '{tradingsymbol}' on exchange '{exchange}'"
-            )
+            return self.map_row_to_instrument(df.iloc[0])
+
+        # -------------------------------
+        # BACKTEST / SIMULATION MODE
+        # -------------------------------
+        InstrumentStore.dummy_security_counter += 1
+
+        dummy_row = {
+            "SEM_EXM_EXCH_ID": instrument_exchange.get(exchange, exchange),
+            "SEM_SEGMENT": "D",
+            "SEM_SMST_SECURITY_ID": InstrumentStore.dummy_security_counter,
+            "SEM_TRADING_SYMBOL": trading_symbol,
+            "SEM_CUSTOM_SYMBOL": trading_symbol,
+            "SM_SYMBOL_NAME": trading_symbol.split()[0],
+            "SEM_EXCH_INSTRUMENT_TYPE": "OP",
+            "SEM_OPTION_TYPE": "PE" if option_type == "PUT" else "CE",
+            "SEM_STRIKE_PRICE": strike,
+            "SEM_EXPIRY_DATE": expiry,
+            "SEM_LOT_UNITS": 65,
+            "SEM_TICK_SIZE": 5.0,
+            "SEM_SERIES": None,
+        }
+
+        return self.map_row_to_instrument(pd.Series(dummy_row))

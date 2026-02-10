@@ -1,10 +1,10 @@
 import pandas as pd
 import datetime as dt
 from core.engine.base_engine import BaseEngine
+import pdb
 
 
 class BacktestEngine(BaseEngine):
-
     def __init__(
         self,
         data_provider,
@@ -81,7 +81,8 @@ class BacktestEngine(BaseEngine):
             if pos.tag == "MAIN" and self.strategy.should_exit(pos, candle, ctx):
                 exit_intents = self.strategy.on_position_exit(pos, candle, ctx) or []
                 for intent in exit_intents:
-                    price_map = {intent["trading_symbol"]: candle["close"]}
+                    # dot notation since intent is now an object
+                    price_map = {intent.instrument.trading_symbol: candle["close"]}
                     self.order_router.process_intent(intent, price_map)
 
         # ---------- HEDGE ROLLOVER ----------
@@ -95,7 +96,7 @@ class BacktestEngine(BaseEngine):
         )
 
         for intent in rollover_intents:
-            price_map = {intent["trading_symbol"]: candle["close"]}
+            price_map = {intent.instrument.trading_symbol: candle["close"]}
             self.order_router.process_intent(intent, price_map)
 
     # ==========================================================
@@ -105,8 +106,13 @@ class BacktestEngine(BaseEngine):
         if not entry_intent:
             return
 
+        # entry_intent can be a single OrderIntent or a list
+        if not isinstance(entry_intent, list):
+            entry_intent = [entry_intent]
+
         for intent in entry_intent:
-            price_map = {intent["symbol"]: candle["close"]}
+            # dot notation since intent is an object
+            price_map = {intent.instrument.trading_symbol: candle["close"]}
             self.order_router.process_intent(intent, price_map)
 
     # ==========================================================

@@ -1,13 +1,13 @@
 import uuid
 import pandas as pd
 import talib
-import pdb
 from datetime import date, timedelta
-
+import pdb
 
 from run.config import RUN_MODE, RunMode
 from core.strategies.base import BaseStrategy
 from core.utils.expiry_resolver import ExpiryResolver
+from core.models.order_intent import OrderIntent  # Make sure this is imported
 
 
 VALID_TIMES = {"10:15", "11:15", "12:15", "13:15", "14:15", "15:15"}
@@ -19,9 +19,6 @@ class LeapsQuarterly(BaseStrategy):
     SIGNAL + HEDGE
     """
 
-    # ==================================================
-    # META
-    # ==================================================
     name = "LEAPS_RSI"
     timeframe = "60"
     required_context = ["option_chain"]
@@ -48,10 +45,8 @@ class LeapsQuarterly(BaseStrategy):
     def should_evaluate(self, candle):
         rsi = candle.get("rsi")
         prev = candle.get("prev_rsi")
-
         if pd.isna(rsi) or pd.isna(prev):
             return False
-
         return (prev >= 32 and rsi < 32) or (prev <= 52 and rsi > 52)
 
     # ==================================================
@@ -63,7 +58,6 @@ class LeapsQuarterly(BaseStrategy):
             return None
 
         rsi = candle["rsi"]
-
         if rsi < 32:
             option_type = "CALL"
             regime = "RSI_LT_32"
@@ -75,11 +69,13 @@ class LeapsQuarterly(BaseStrategy):
 
         structure_id = self.build_structure_id(candle, regime)
 
+        # Check if structure is already open
         if ctx["position_store"].has_open_structure(
             strategy=self.name, structure_id=structure_id, tag="MAIN"
         ):
             return None
 
+        # Find strike in premium range
         result = self.find_strike_in_premium_range(candle, ctx, option_type)
         if result is None:
             print(f"⚠️ No valid strike found at {candle['timestamp']}")
@@ -91,6 +87,7 @@ class LeapsQuarterly(BaseStrategy):
 
         expiry = ctx["selected_expiry"]
 
+        # Build the trading symbol
         trading_symbol = ExpiryResolver.build_option_symbol(
             self,
             candle["symbol"],
@@ -99,6 +96,7 @@ class LeapsQuarterly(BaseStrategy):
             option_type,
         )
 
+        # Fetch Instrument object from InstrumentStore
         inst = ctx["instrument_store"].intent_creation_details(
             trading_symbol,
             ctx["exchange"],
@@ -106,26 +104,33 @@ class LeapsQuarterly(BaseStrategy):
             option_type,
             strike,
         )
-        if inst is None or inst.empty:
+
+        if inst is None:
+            print(f"❌ Instrument not found for {trading_symbol}")
             return None
 
+        # Main sell intent as OrderIntent
         sell_intent = self.map_instrument_to_intent(
             inst=inst,
-            strike_row=row,
+            strike_row=row,  # keep for any additional data if needed
             strategy=self.name,
             side="SELL",
             structure_id=structure_id,
             candle_ts=candle["timestamp"],
+            tag="MAIN",
+            symbol=candle["symbol"],
+            action="ENTRY",
         )
-        sell_intent["tag"] = "MAIN"
 
+        # Hedge intent as OrderIntent
         hedge_intent = self.create_hedge_intent(
             parent_sell_intent=sell_intent,
             candle=candle,
             ctx=ctx,
         )
 
-        return [sell_intent, hedge_intent] if hedge_intent else sell_intent
+        # Return intents as a list
+        return [sell_intent, hedge_intent] if hedge_intent else [sell_intent]
 
     # ==================================================
     # EXIT SIGNAL
@@ -133,15 +138,11 @@ class LeapsQuarterly(BaseStrategy):
     def should_exit(self, position, candle, ctx=None):
         if position.tag != "MAIN":
             return False
-
         rsi = candle.get("rsi")
-
         if position.instrument.option_type in ("CE", "CALL") and rsi > 52:
             return True
-
         if position.instrument.option_type in ("PE", "PUT") and rsi < 32:
             return True
-
         return False
 
     # ==================================================
@@ -161,28 +162,25 @@ class LeapsQuarterly(BaseStrategy):
             if RUN_MODE == RunMode.BACKTEST
             else None
         )
-
         intents.append(
-            {
-                "intent_id": uuid.uuid4().hex,
-                "action": "EXIT",
-                "structure_id": position.structure_id,
-                "instrument": position.instrument,
-                "trading_symbol": position.instrument.symbol,
-                "qty": abs(position.net_qty),
-                "price": price,
-                "strategy": self.name,
-                "tag": "MAIN_EXIT",
-                "side": "BUY" if position.net_qty < 0 else "SELL",
-                "candle_ts": candle["timestamp"],
-            }
+            self.create_order_intent(
+                inst=position.instrument,
+                side="BUY" if position.net_qty < 0 else "SELL",
+                qty=abs(position.net_qty),
+                price=price,
+                strategy=self.name,
+                candle_ts=candle["timestamp"],
+                structure_id=position.structure_id,
+                tag="MAIN_EXIT",
+                symbol=candle["symbol"],
+                action="EXIT",
+            )
         )
 
         hedge_exit = self.create_hedge_exit_intent(position, candle, ctx)
         if hedge_exit:
             intents.append(hedge_exit)
 
-        # pdb.set_trace()
         return intents
 
     # ==================================================
@@ -210,19 +208,18 @@ class LeapsQuarterly(BaseStrategy):
             )
             return None
 
-        return {
-            "intent_id": uuid.uuid4().hex,
-            "action": "EXIT",
-            "structure_id": hedge.structure_id,
-            "instrument": hedge.instrument,
-            "trading_symbol": hedge.instrument.symbol,
-            "qty": abs(hedge.net_qty),
-            "price": price,
-            "strategy": self.name,
-            "tag": "HEDGE_EXIT",
-            "side": "BUY" if hedge.net_qty < 0 else "SELL",
-            "candle_ts": candle["timestamp"],
-        }
+        return self.create_order_intent(
+            inst=hedge.instrument,
+            side="BUY" if hedge.net_qty < 0 else "SELL",
+            qty=abs(hedge.net_qty),
+            price=price,
+            strategy=self.name,
+            candle_ts=candle["timestamp"],
+            structure_id=hedge.structure_id,
+            tag="HEDGE_EXIT",
+            symbol=candle["symbol"],
+            action="EXIT",
+        )
 
     # ==================================================
     # HEDGE ENTRY
@@ -242,27 +239,32 @@ class LeapsQuarterly(BaseStrategy):
     def create_hedge_intent(self, parent_sell_intent, candle, ctx):
         trade_date = pd.to_datetime(candle["timestamp"]).date()
         hedge_expiry = self.resolve_hedge_expiry(trade_date)
+
         hedge_strike = self.calculate_hedge_strike(
-            parent_sell_intent["strike"],
-            parent_sell_intent["option_type"],
+            parent_sell_intent.instrument.strike,
+            parent_sell_intent.instrument.option_type,
         )
 
-        hedge_symbol = ExpiryResolver.build_option_symbol(
-            self,
-            parent_sell_intent["symbol"],
-            hedge_expiry,
-            hedge_strike,
-            parent_sell_intent["option_type"],
-        )
+        # Enters into if condition on main entry and into else for rollover logic
+        if not parent_sell_intent.instrument.custom_symbol:
+            hedge_symbol = ExpiryResolver.build_option_symbol(
+                self,
+                parent_sell_intent.symbol,
+                hedge_expiry,
+                hedge_strike,
+                parent_sell_intent.instrument.option_type,
+            )
+        else:
+            hedge_symbol = parent_sell_intent.instrument.custom_symbol
 
         inst = ctx["instrument_store"].intent_creation_details(
             hedge_symbol,
             ctx["exchange"],
             hedge_expiry,
-            parent_sell_intent["option_type"],
+            parent_sell_intent.instrument.option_type,
             hedge_strike,
         )
-        if inst is None or inst.empty:
+        if inst is None:
             return None
 
         hedge_price = (
@@ -270,41 +272,66 @@ class LeapsQuarterly(BaseStrategy):
                 candle,
                 ctx,
                 hedge_strike,
-                parent_sell_intent["option_type"],
+                parent_sell_intent.instrument.option_type,
                 hedge_expiry,
             )
             if RUN_MODE == RunMode.BACKTEST
-            else None
+            else 0
         )
-        if not hedge_price:
-            hedge_price = 0
 
-        return {
-            "intent_id": uuid.uuid4().hex,
-            "structure_id": parent_sell_intent["structure_id"],
-            "instrument": inst,
-            "trading_symbol": inst["SEM_CUSTOM_SYMBOL"],
-            "symbol": parent_sell_intent["symbol"],
-            "expiry": str(inst["SEM_EXPIRY_DATE"]),
-            "side": "BUY",
-            "option_type": parent_sell_intent["option_type"],
-            "strike": hedge_strike,
-            "qty": 1,
-            "price": hedge_price,
-            "strategy": self.name,
-            "exchange": inst["SEM_EXM_EXCH_ID"],
-            "segment": inst["SEM_SEGMENT"],
-            "lot_size": int(inst["SEM_LOT_UNITS"]),
-            "tag": "HEDGE",
-            "parent_intent_id": parent_sell_intent["intent_id"],
-            "candle_ts": candle["timestamp"],
-        }
+        return self.create_order_intent(
+            inst=inst,
+            side="BUY",
+            qty=1,
+            price=hedge_price,
+            strategy=self.name,
+            candle_ts=candle["timestamp"],
+            structure_id=parent_sell_intent.structure_id,
+            tag="HEDGE",
+            parent_intent_id=parent_sell_intent.intent_id,
+            symbol=candle["symbol"],
+            action="ENTRY",
+        )
 
     # ==================================================
     # STRUCTURE ID
     # ==================================================
     def build_structure_id(self, candle, regime):
         return f"{self.name}:{candle['symbol']}:{regime}"
+
+    # ==================================================
+    # ORDER INTENT FACTORY
+    # ==================================================
+    def create_order_intent(
+        self,
+        inst,
+        side,
+        qty,
+        price,
+        strategy,
+        candle_ts,
+        structure_id,
+        tag,
+        symbol,
+        action,
+        parent_intent_id=None,
+    ):
+        return OrderIntent(
+            intent_id=uuid.uuid4().hex,
+            instrument=inst,
+            side=side,
+            qty=int(inst.lot_size),  # or 1 lot if you prefer
+            price=price,
+            order_type="LIMIT",
+            strategy=strategy,
+            structure_id=structure_id,
+            trade_type="MARGIN",
+            tag=tag,
+            candle_ts=candle_ts,
+            parent_intent_id=parent_intent_id,
+            symbol=symbol,
+            action=action,
+        )
 
     # ==================================================
     # OPTION PRICING (BACKTEST SAFE)
@@ -439,51 +466,62 @@ class LeapsQuarterly(BaseStrategy):
         return None, None, None
 
     def map_instrument_to_intent(
-        self, inst, strike_row, strategy, side, structure_id, candle_ts
+        self,
+        inst,
+        strike_row,
+        strategy,
+        side,
+        structure_id,
+        candle_ts,
+        symbol,
+        action,
+        tag=None,
+        parent_intent_id=None,
     ):
-        option_type = inst["SEM_OPTION_TYPE"]
-        if RUN_MODE == RunMode.LIVE or RUN_MODE == RunMode.PAPER:
-            # ltp = strike_row.get(f"{option_type} LTP", 0)
+        option_type = inst.option_type
+
+        # --- price discovery ---
+        if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
             ltp = float(strike_row.iloc[0]["close"])
         else:
-            optionType = "PUT" if option_type == "PE" else "CALL"
-            ltp_value = strike_row.get(f"{optionType} LTP", 0)
+            option_type_label = "PUT" if option_type == "PE" else "CALL"
+            ltp_value = strike_row.get(f"{option_type_label} LTP", 0)
             ltp = (
                 float(ltp_value.iloc[0])
                 if isinstance(ltp_value, pd.Series)
                 else float(ltp_value)
             )
 
-        return {
-            "intent_id": uuid.uuid4().hex,
-            "instrument": inst,
-            "structure_id": structure_id,
-            "candle_ts": candle_ts,
-            "trading_symbol": inst["SEM_CUSTOM_SYMBOL"],
-            "symbol": inst["SEM_CUSTOM_SYMBOL"].split()[0],
-            "expiry": str(inst["SEM_EXPIRY_DATE"]),
-            "side": side,
-            "option_type": "CALL" if option_type == "CE" else "PUT",
-            "strike": float(inst["SEM_STRIKE_PRICE"]),
-            "price": ltp,
-            "qty": 1,
-            "strategy": strategy,
-            "trade_type": "MARGIN",
-            "exchange": inst["SEM_EXM_EXCH_ID"],
-            "segment": inst["SEM_SEGMENT"],
-            "lot_size": int(inst["SEM_LOT_UNITS"]),
-        }
+        # --- invariants ---
+        assert inst.trading_symbol
+        assert inst.custom_symbol
 
-    # --------------------------------------------------
-    # RollOver
-    # --------------------------------------------------
+        return OrderIntent(
+            intent_id=uuid.uuid4().hex,
+            instrument=inst,
+            side=side,
+            qty=int(inst.lot_size),  # or 1 lot if you prefer
+            price=ltp,
+            order_type="LIMIT",
+            strategy=strategy,
+            structure_id=structure_id,
+            trade_type="MARGIN",
+            tag=tag,
+            candle_ts=candle_ts,
+            parent_intent_id=parent_intent_id,
+            symbol=symbol,
+            action=action,
+        )
+
+    # ==================================================
+    # ROLLOVER
+    # ==================================================
     def is_rollover_window(self, ts):
         return 15 <= ts.day <= 18
 
     def should_roll_hedge(self, hedge, ts):
         expiry = pd.to_datetime(hedge.instrument.expiry).date()
         current = pd.to_datetime(ts).date()
-
         if expiry <= current:
             return False
 
@@ -497,7 +535,6 @@ class LeapsQuarterly(BaseStrategy):
 
     def on_candle_rollover(self, open_positions, candle, ctx):
         ts = pd.to_datetime(candle["timestamp"])
-
         if not self.is_rollover_window(ts):
             return []
 
@@ -518,7 +555,13 @@ class LeapsQuarterly(BaseStrategy):
             if not parent:
                 continue
 
-            intents.append(self.create_hedge_exit_intent(parent, candle, ctx))
-            intents.append(self.create_hedge_intent(parent, candle, ctx))
+            # Append hedge exit and new hedge OrderIntent
+            hedge_exit = self.create_hedge_exit_intent(parent, candle, ctx)
+            if hedge_exit:
+                intents.append(hedge_exit)
 
-        return [i for i in intents if i]
+            new_hedge = self.create_hedge_intent(parent, candle, ctx)
+            if new_hedge:
+                intents.append(new_hedge)
+
+        return intents

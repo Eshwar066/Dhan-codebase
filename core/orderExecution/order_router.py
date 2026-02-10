@@ -1,4 +1,3 @@
-# run in engine: router.process_intent(intent, price_map)
 import pdb
 
 
@@ -13,21 +12,26 @@ class OrderRouter:
 
     def process_intent(self, intent, price_map):
         # ---------- 1️⃣ Risk check ----------
-        if not self.risk.allow_intent(
-            intent, price_map, candle_ts=intent.get("candle_ts")
-        ):
-            self.intent_store.update(intent["intent_id"], "REJECTED")
+        if not self.risk.allow_intent(intent, price_map, candle_ts=intent.candle_ts):
+            self.intent_store.update(intent.intent_id, "REJECTED")
             return
 
-        # Safety
-        if intent["price"] is None:
-            raise ValueError(f"No price available for {intent}")
+        # ---------- Safety ----------
+        if intent.price is None:
+            raise ValueError(f"No price available for intent {intent.intent_id}")
 
         # ---------- 2️⃣ Apply slippage ----------
-        intent["price"] = self.slippage_model(intent["price"])
+        exec_price = self.slippage_model(intent.price)
 
         # ---------- 3️⃣ Send to broker ----------
-        order_id = self.broker.place_order(intent)
+        order_id = self.broker.place_order(
+            intent=intent,
+            execution_price=exec_price,  # 🔥 pass explicitly
+        )
 
         # ---------- 4️⃣ Update IntentStore ----------
-        self.intent_store.update(intent["intent_id"], "SENT", broker_order_id=order_id)
+        self.intent_store.update(
+            intent.intent_id,
+            "SENT",
+            broker_order_id=order_id,
+        )

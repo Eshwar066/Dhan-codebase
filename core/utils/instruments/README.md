@@ -58,3 +58,61 @@
     #     (nifty_options["SEM_STRIKE_PRICE"] - target_strike).abs().argmin()
     # ]
     # print(nearest_row)
+
+
+    #==============================================================================
+    # instrument_store.df.columns.tolist()
+# [
+#     "Unnamed: 0",
+#     "SEM_EXM_EXCH_ID",
+#     "SEM_SEGMENT",
+#     "SEM_SMST_SECURITY_ID",
+#     "SEM_INSTRUMENT_NAME",
+#     "SEM_EXPIRY_CODE",
+#     "SEM_TRADING_SYMBOL",
+#     "SEM_LOT_UNITS",
+#     "SEM_CUSTOM_SYMBOL",
+#     "SEM_EXPIRY_DATE",
+#     "SEM_STRIKE_PRICE",
+#     "SEM_OPTION_TYPE",
+#     "SEM_TICK_SIZE",
+#     "SEM_EXPIRY_FLAG",
+#     "SEM_EXCH_INSTRUMENT_TYPE",
+#     "SEM_SERIES",
+#     "SM_SYMBOL_NAME",
+# ]
+
+#  instrument_store.df[instrument_store.df["SM_SYMBOL_NAME"] == "NIFTY" ].head()
+# instrument_store.df[instrument_store.df["SEM_EXCH_INSTRUMENT_TYPE"] == "OPTIDX"]["SM_SYMBOL_NAME"].value_counts().head(10)
+
+
+# 2️⃣ Filter NIFTY PE options
+# nifty_options = instrument_store.df[
+#     instrument_store.df["SEM_TRADING_SYMBOL"].str.contains("NIFTY")
+#     & (instrument_store.df["SEM_OPTION_TYPE"] == "PE")
+# ]
+
+# # 3️⃣ Pick nearest strike to your target
+# target_strike = 25000
+# nearest_row = nifty_options.iloc[
+#     (nifty_options["SEM_STRIKE_PRICE"] - target_strike).abs().argmin()
+# ]
+
+# ✅ Found security row:
+# Unnamed: 0                                  216446
+# SEM_EXM_EXCH_ID                                NSE
+# SEM_SEGMENT                                      D
+# SEM_SMST_SECURITY_ID                         62925
+# SEM_INSTRUMENT_NAME                         OPTIDX
+# SEM_EXPIRY_CODE                                  0
+# SEM_TRADING_SYMBOL          NIFTY-Mar2026-24000-PE
+# SEM_LOT_UNITS                                 65.0
+# SEM_CUSTOM_SYMBOL           NIFTY 30 MAR 24000 PUT
+# SEM_EXPIRY_DATE                         2026-03-30
+# SEM_STRIKE_PRICE                           24000.0
+# SEM_OPTION_TYPE                                 PE
+# SEM_TICK_SIZE                                  5.0
+# SEM_EXPIRY_FLAG                                  M
+# SEM_EXCH_INSTRUMENT_TYPE                        OP
+# SEM_SERIES                                     NaN
+# SM_SYMBOL_NAME                                 NaN

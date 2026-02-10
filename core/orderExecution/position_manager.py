@@ -5,6 +5,7 @@ from logs.logger.trade_logger import TradeLogger
 from datetime import datetime
 import uuid
 import pdb
+from core.utils.instruments.instrument_store import Instrument
 
 # use
 # How to Run Auto-Reconciliation
@@ -36,29 +37,6 @@ import pdb
 
 #     3️⃣ Log every correction
 #     This helps debug broker/API issues.
-
-
-# =========================
-# INSTRUMENT
-# =========================
-
-
-class Instrument:
-    def __init__(
-        self,
-        symbol,
-        segment="EQ",  # EQ/FUT/OPT/CRYPTO/MCX
-        lot_size=1,
-        strike=None,
-        option_type=None,
-        expiry=None,
-    ):
-        self.symbol = symbol
-        self.segment = segment
-        self.lot_size = lot_size
-        self.strike = strike
-        self.option_type = option_type
-        self.expiry = expiry
 
 
 # =========================
@@ -176,7 +154,7 @@ class PositionManager:
 
     def on_fill(
         self,
-        instrument,
+        instrument: Instrument,
         side,
         qty,
         price,
@@ -188,26 +166,24 @@ class PositionManager:
         candle_ts=None,
         action=None,
     ):
+        assert isinstance(instrument, Instrument), "on_fill expects Instrument"
+        assert instrument.trading_symbol, "Instrument must have trading_symbol"
+        assert instrument.custom_symbol, "Instrument must have custom_symbol"
+        if not isinstance(instrument, Instrument):
+            raise TypeError(f"on_fill expects Instrument, got {type(instrument)}")
+
         with self._lock:
-            if isinstance(instrument, Instrument):
-                sym = instrument.symbol
-                lot_size = instrument.lot_size
-            else:
-                sym = instrument["SEM_CUSTOM_SYMBOL"]
-                lot_size = int(instrument.get("SEM_LOT_UNITS", 1))
+            sym = instrument.trading_symbol
+            lot_size = instrument.lot_size
 
             prev_qty = self.positions[sym].net_qty if sym in self.positions else 0
 
             if sym not in self.positions:
-                inst = self._to_instrument(instrument)
-                self.positions[sym] = Position(inst)
+                self.positions[sym] = Position(
+                    instrument=instrument  # 🔥 STORE FULL OBJECT
+                )
 
             pos = self.positions[sym]
-
-            if not isinstance(pos.instrument, Instrument):
-                raise TypeError(
-                    f"Position.instrument must be Instrument, got {type(pos.instrument)}"
-                )
             pos.update_fill(side, qty, price)
 
             new_qty = pos.net_qty
@@ -216,7 +192,6 @@ class PositionManager:
                 signed = qty if side == "BUY" else -qty
                 self.strategy_pos[strategy][sym] += signed
 
-            # helps in postions array
             if prev_qty == 0 and new_qty != 0:
                 pos.strategy = strategy
                 pos.structure_id = structure_id
@@ -224,59 +199,49 @@ class PositionManager:
 
             if action == "ENTRY" and prev_qty != 0:
                 raise RuntimeError(
-                    f"ENTRY received for open position {sym}. "
-                    f"Use SCALE_IN explicitly."
+                    f"ENTRY received for open position {sym}. Use SCALE_IN."
                 )
-        # -------- TRADE TYPE --------
-        if action:
-            trade_type = action
-        else:
-            # fallback only if action is missing (should not happen)
-            if prev_qty == 0 and new_qty != 0:
-                trade_type = "ENTRY"
-            elif prev_qty != 0 and new_qty == 0:
-                trade_type = "EXIT"
+
+            # -------- TRADE TYPE --------
+            if action:
+                trade_type = action
             else:
-                trade_type = "UNKNOWN"
+                # fallback only if action is missing (should not happen)
+                if prev_qty == 0 and new_qty != 0:
+                    trade_type = "ENTRY"
+                elif prev_qty != 0 and new_qty == 0:
+                    trade_type = "EXIT"
+                else:
+                    trade_type = "UNKNOWN"
 
-        # -------- LOG --------
-        if self.logger:
-            row = {
-                "candle_timestamp": (
-                    candle_ts.isoformat()
-                    if isinstance(candle_ts, datetime)
-                    else candle_ts
-                ),
-                "execution_timestamp": datetime.now().isoformat(),
-                "strategy": strategy,
-                "tag": tag,
-                "symbol": sym,
-                "trade_id": pos.trade_id,
-                "trade_type": trade_type,
-                "side": side,
-                "qty": qty,
-                "price": price,
-                "net_qty_after": new_qty,
-                "order_id": order_id,
-                "intent_id": intent_id,
-            }
+            # -------- LOG --------
+            if self.logger:
+                row = {
+                    "candle_timestamp": (
+                        candle_ts.isoformat()
+                        if isinstance(candle_ts, datetime)
+                        else candle_ts
+                    ),
+                    "execution_timestamp": datetime.now().isoformat(),
+                    "strategy": strategy,
+                    "tag": tag,
+                    "symbol": sym,
+                    "trade_id": pos.trade_id,
+                    "trade_type": trade_type,
+                    "side": side,
+                    "qty": qty,
+                    "price": price,
+                    "net_qty_after": new_qty,
+                    "order_id": order_id,
+                    "intent_id": intent_id,
+                }
 
-            if trade_type == "EXIT":
-                row["pnl"] = pos.realized_pnl
-                row["mae"] = pos.mae
-                row["mfe"] = pos.mfe
+                if trade_type == "EXIT":
+                    row["pnl"] = pos.realized_pnl
+                    row["mae"] = pos.mae
+                    row["mfe"] = pos.mfe
 
-            self.logger.log(strategy=strategy, row=row)
-
-    def _to_instrument(self, row):
-        return Instrument(
-            symbol=row["SEM_CUSTOM_SYMBOL"],
-            segment=row["SEM_SEGMENT"],
-            lot_size=int(row["SEM_LOT_UNITS"]),
-            strike=row.get("SEM_STRIKE_PRICE"),
-            option_type=row.get("SEM_OPTION_TYPE"),
-            expiry=row.get("SEM_EXPIRY_DATE"),
-        )
+                self.logger.log(strategy=strategy, row=row)
 
     def has_open_structure(self, strategy: str, structure_id: str, tag: str) -> bool:
         for pos in self.positions.values():
@@ -451,7 +416,6 @@ class PositionManager:
         positions = []
 
         for pos in self.positions.values():
-            # pdb.set_trace()
 
             if pos.net_qty == 0:
                 continue
@@ -460,7 +424,7 @@ class PositionManager:
                 continue
 
             if underlying:
-                if not pos.instrument.symbol.startswith(underlying):
+                if underlying and pos.instrument.custom_symbol.split()[0] != underlying:
                     continue
 
             positions.append(pos)
