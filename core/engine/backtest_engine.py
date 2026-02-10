@@ -21,6 +21,8 @@ class BacktestEngine(BaseEngine):
         )
         self.order_router = order_router
         self.position_manager = position_manager
+        # 🔔 Wire structure-exit callback (ONE TIME)
+        self.position_manager.on_structure_exit = strategy.on_structure_exit
 
     # ==========================================================
     # MAIN RUN LOOP

@@ -59,6 +59,7 @@ class Position:
         self.strategy = None
         self.structure_id = None
         self.tag = None
+        self.on_structure_exit = None
 
         self.last_updated = time.time()
 
@@ -188,6 +189,16 @@ class PositionManager:
 
             new_qty = pos.net_qty
 
+            # 🔔 STRUCTURE EXIT HOOK (ONLY ON FULL MAIN EXIT) # used to remove state of rollover ids on full exit of position
+            if prev_qty != 0 and new_qty == 0 and pos.tag == "MAIN":
+                if callable(self.on_structure_exit):
+                    self.on_structure_exit(
+                        strategy=strategy,
+                        structure_id=pos.structure_id,
+                        instrument=instrument,
+                        candle_ts=candle_ts,
+                    )
+
             if strategy:
                 signed = qty if side == "BUY" else -qty
                 self.strategy_pos[strategy][sym] += signed
@@ -196,6 +207,7 @@ class PositionManager:
                 pos.strategy = strategy
                 pos.structure_id = structure_id
                 pos.tag = tag
+                pos.intent_id = intent_id
 
             if action == "ENTRY" and prev_qty != 0:
                 raise RuntimeError(

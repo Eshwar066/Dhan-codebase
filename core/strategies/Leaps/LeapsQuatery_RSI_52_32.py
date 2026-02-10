@@ -25,6 +25,12 @@ class LeapsQuarterly(BaseStrategy):
     api = "NSE"
     expiryType = "QUARTERLY"
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # 🔒 rollover memory (CRITICAL)
+        self.rolled_hedges = set()
+
     # ==================================================
     # INDICATORS
     # ==================================================
@@ -246,16 +252,13 @@ class LeapsQuarterly(BaseStrategy):
         )
 
         # Enters into if condition on main entry and into else for rollover logic
-        if not parent_sell_intent.instrument.custom_symbol:
-            hedge_symbol = ExpiryResolver.build_option_symbol(
-                self,
-                parent_sell_intent.symbol,
-                hedge_expiry,
-                hedge_strike,
-                parent_sell_intent.instrument.option_type,
-            )
-        else:
-            hedge_symbol = parent_sell_intent.instrument.custom_symbol
+        hedge_symbol = ExpiryResolver.build_option_symbol(
+            self,
+            candle["symbol"],
+            hedge_expiry,
+            hedge_strike,
+            parent_sell_intent.instrument.option_type,
+        )
 
         inst = ctx["instrument_store"].intent_creation_details(
             hedge_symbol,
@@ -541,6 +544,12 @@ class LeapsQuarterly(BaseStrategy):
         intents = []
 
         for hedge in [p for p in open_positions if p.tag == "HEDGE" and p.net_qty != 0]:
+
+            roll_key = self._hedge_roll_key(hedge)
+
+            # 🚫 Already rolled → skip forever
+            if roll_key in self.rolled_hedges:
+                continue
             if not self.should_roll_hedge(hedge, ts):
                 continue
 
@@ -564,4 +573,31 @@ class LeapsQuarterly(BaseStrategy):
             if new_hedge:
                 intents.append(new_hedge)
 
+            # 🔒 LOCK rollover
+            self.rolled_hedges.add(roll_key)
+
         return intents
+
+    def _hedge_roll_key(self, hedge):
+        inst = hedge.instrument
+        return (
+            hedge.strategy,
+            hedge.structure_id,
+            inst.expiry,
+            inst.strike,
+            inst.option_type,
+        )
+
+    # rollover cleanup function
+    def on_structure_exit(self, structure_id, **kwargs):
+        """
+        Called when a structure is fully exited.
+        kwargs may include:
+        - strategy
+        - instrument
+        - candle_ts
+        - reason (future)
+        """
+
+        # Clear rolled hedges linked to this structure
+        self.rolled_hedges = {k for k in self.rolled_hedges if k[1] != structure_id}
