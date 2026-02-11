@@ -8,7 +8,7 @@ import traceback
 import talib
 
 import pandas as pd
-from Dhan_Tradehull import Tradehull
+from core.library.dhan_tradehull import Tradehull
 
 
 # https://pypi.org/project/Dhan-Tradehull/#history

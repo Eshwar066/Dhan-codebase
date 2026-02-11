@@ -10,18 +10,17 @@ class DhanAdapter(BaseAdapter):
             symbol=ctx["symbol"],
             exchange=ctx["exchange"],
         )
-
-        # invariant
-        if not all(isinstance(e, int) for e in expiries):
-            raise ValueError("DHAN expiries must be expiry index integers")
-
+        if not expiries:
+            return []
+        # Dhan can return list of dates or indices; return as-is for resolver/strategy
         return expiries
 
     def get_option_chain(self, ctx, params):
-        expiry_index = ctx["selected_expiry"]
-
-        if not isinstance(expiry_index, int):
-            raise ValueError("DHAN selected_expiry must be expiry index")
+        expiry_index = ctx.get("selected_expiry", 0)
+        if isinstance(expiry_index, (int, float)):
+            expiry_index = int(expiry_index)
+        else:
+            expiry_index = 0
 
         return self.data.get_live_option_chain(
             symbol=ctx["symbol"],
