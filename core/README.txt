@@ -1,151 +1,46 @@
-algo_trading/
-│
-├── core/
-│   │
-│   ├── execution/
-│   │   ├── backtest.py          # BacktestEngine
-│   │   └── live.py              # LiveEngine
-│   │
-│   ├── strategies/
-│   │   ├── leaps_quarterly.py   # Your RSI 52/32 logic
-│   │   ├── live_adapter.py      # Converts live → df
-│   │   └── base.py              # Optional BaseStrategy
-│   │
-│   ├── data/
-│   │   ├── historical_data.py   # CSV / DB / API
-│   │   └── live_data.py         # Tradehull live fetch
-│   │
-│   ├── broker/
-│   │   ├── dhan.py              # Real broker
-│   │   └── paper.py             # Paper broker (optional)
-│   │
-│   ├── portfolio/
-│   │   ├── backtest_portfolio.py
-│   │   └── live_portfolio.py
-│   │
-│   ├── risk/
-│   │   └── manager.py           # RiskManager
-│   │
-│   ├── utils/
-│   │   ├── expiry_calendar.py
-│   │   ├── time_utils.py
-│   │   └── logger.py
-│   │
-│   └── models/
-│       └── position.py          # Position dataclass
-│
-├── configs/
-│   ├── live.yaml
-│   ├── backtest.yaml
-│   └── symbols.yaml
-│
-├── scripts/
-│   ├── run_backtest.py
-│   └── run_live.py
-│
-├── logs/
-│   └── trades.log
-│
-├── requirements.txt
-└── README.md
+core/ – Algo trading core
+========================
 
+Current layout (matches this codebase):
 
-algo_trading/
-│
-├── core/
-│   ├── execution/
-│   │   ├── backtest.py
-│   │   ├── live.py
-│   │   └── runner.py
-│   │
-│   ├── strategies/
-│   │   ├── momentum/
-│   │   ├── options/
-│   │   ├── volatility/
-│   │   ├── factory.py
-│   │   └── base.py
-│   │
-│   ├── data/
-│   ├── broker/
-│   ├── portfolio/
-│   ├── risk/
-│   ├── utils/
-│   └── models/
-│
-├── configs/
-│   ├── strategies/
-│   │   ├── rsi_quarterly.yaml
-│   │   ├── strangle.yaml
-│   │   └── ironfly.yaml
-│   ├── live.yaml
-│   └── backtest.yaml
-│
-├── scripts/
-│   ├── run_live.py
-│   └── run_backtest.py
-│
-└── logs/
+core/
+├── data/
+│   ├── datalayer/           IDataProvider, DhanDataProvider – data feed for engines
+│   ├── sources/             DhanSource (Dhan API via library), NSEClient
+│   ├── adapters/             NSEAdapter, DhanAdapter – option chain per API
+│   ├── data_router.py        Picks adapter by api (NSE/DHAN)
+│   ├── option_chain_service.py  get_expiries, get_chain (uses StrategyContext)
+│   └── candle_service.py    Latest closed candle for live
+├── engine/
+│   ├── base_engine.py        build_context() → StrategyContext, strategy.on_candle
+│   ├── backtest_engine.py    Candle loop, exits, rollover, entry
+│   └── live_engine.py       Live/paper loop
+├── library/
+│   └── dhan_tradehull.py    In-project Dhan Tradehull (OHLC, option chain, orders)
+├── models/
+│   ├── order_intent.py      OrderIntent dataclass
+│   └── strategy_context.py StrategyContext dataclass (typed ctx for strategies)
+├── broker/                   Order placement only (see broker/README.md)
+│   ├── broker_api.py        IBrokerApi
+│   ├── dhan_broker_api.py, dhanbroker.py
+│   ├── delta_broker_api.py, delta_broker.py
+│   └── simulated_broker.py
+├── orderExecution/           Intent → risk → broker → PositionManager (see orderExecution/README.md)
+│   ├── order_router.py
+│   ├── risk_manager.py, intent_store.py, position_manager.py
+│   ├── order_state.py, slippage.py
+├── strategies/
+│   ├── base.py              BaseStrategy (on_candle(candle, ctx: StrategyContext))
+│   ├── IndiaMktMixins.py    Shared option/hedge/rollover logic for India strategies
+│   ├── registry.py          STRATEGY_MAP
+│   ├── runtime_spec.py      STRATEGY_RUNTIME_SPEC
+│   ├── Leaps/               LeapsQuatery_RSI_52_32, readme
+│   └── Inside_bar_candle/   inside_bar, historical_dhan, readme
+├── utils/
+│   ├── expiry_resolver.py   Expiry resolution (NSE/Dhan, monthly/quarterly)
+│   ├── instruments/         instrument_store.py, README
+│   └── session/            holidays, market_calendar, session_manager
+└── instruments.py           (legacy/convenience if used)
 
-strategies/
-├── __init__.py
-├── base.py
-├── live_adapter.py
-├── adapters/
-│   ├── __init__.py
-│   ├── multi_symbol.py
-│   ├── tick_adapter.py
-│   └── options_adapter.py
-├── momentum/
-│   ├── __init__.py
-│   ├── rsi_breakout.py
-│   └── macd_trend.py
-├── options/
-│   ├── __init__.py
-│   ├── leaps_quarterly.py
-│   └── short_strangle.py
-
-data/
-├── historical/        # Expired and past data
-├── live/              # Live feed from APIs
-├── instruments/       # Metadata about symbols, strikes, expiries
-├── processed/         # Preprocessed / merged data for strategies
-├── logs/              # Data fetching or API errors
-└── config/            # API configs, holidays, symbols
-
-
-data/
-├── historical/                 # Historical OHLC, indicators, options chains
-│   ├── nifty/                  # Nifty index data
-│   │   ├── 1min/               # 1-min candles
-│   │   ├── 5min/
-│   │   ├── 15min/
-│   │   └── 1hr/
-│   ├── stocks/                 # Individual stock historical data
-│   │   ├── AAPL.csv
-│   │   └── ACC.csv
-│   └── options/                # Option chain history
-│       ├── NIFTY_2026-01-31_CE.csv
-│       └── NIFTY_2026-01-31_PE.csv
-│
-├── live/                       # Temporary live feeds saved (optional)
-│   ├── tick_data/              # Raw tick data from adapter
-│   └── order_book/             # Market depth snapshots
-│
-├── instruments/                # Metadata for symbols, option series, contracts
-│   ├── nifty_symbols.csv
-│   ├── stock_symbols.csv
-│   └── options_metadata.csv    # expiry dates, strike list, lot sizes
-│
-├── processed/                  # Cleaned / resampled / merged data for strategies
-│   ├── indicators/             # OHLC + calculated indicators (RSI, MACD)
-│   └── signals/                # Strategy signals (for backtesting)
-│
-├── logs/                       # Strategy & trade logs
-│   ├── trades/                 # Filled / rejected orders
-│   ├── strategy/               # Backtesting logs
-│   └── errors/                 # Errors & exceptions
-│
-└── config/                     # Configs for data paths, instruments, market holidays
-    └── holidays.json
-
-
+Data flow:  IDataProvider → Engine → Strategy.on_candle(candle, StrategyContext) → OrderIntent
+Order flow: OrderRouter.process_intent(intent) → RiskManager → Broker.place_order() → PositionManager

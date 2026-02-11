@@ -200,36 +200,46 @@ python run/main.py
 
 ---
 
+## StrategyContext (typed context)
+
+Strategies receive a **typed `StrategyContext`** (not a dict) so the IDE can autocomplete and refactor safely:
+
+- **`core/models/strategy_context.py`** – `StrategyContext` dataclass: `symbol`, `exchange`, `timestamp`, `spot_price`, `instrument_store`, `position_store`, `option_chain_service`, plus mutable `expiry_list`, `selected_expiry`, `otm_strikes`, `instrument`.
+- **`on_candle(self, candle, ctx: StrategyContext)`** – use `ctx.position_store`, `ctx.option_chain_service`, etc., instead of `ctx["key"]`.
+
 ## Project Layout (summary)
 
 ```
 core/
 ├── data/
-│   ├── datalayer/          # IDataProvider, DhanDataProvider (feed for engines)
-│   ├── sources/             # DhanSource, NSEClient
-│   ├── adapters/            # NSE/Dhan adapters for option chain
+│   ├── datalayer/           # IDataProvider, DhanDataProvider (feed for engines)
+│   ├── sources/             # DhanSource (uses core/library/dhan_tradehull), NSEClient
+│   ├── adapters/            # NSE/Dhan adapters (take StrategyContext)
 │   ├── data_router.py       # NSE vs Dhan adapter selection
 │   ├── option_chain_service.py
 │   └── candle_service.py   # Latest closed candle (live)
 ├── engine/
-│   ├── base_engine.py      # build_context, strategy.on_candle
-│   ├── backtest_engine.py  # Candle loop, exits, rollover, entry
-│   └── live_engine.py     # Live loop, candle/tick mode
+│   ├── base_engine.py       # build_context → StrategyContext, strategy.on_candle
+│   ├── backtest_engine.py   # Candle loop, exits, rollover, entry
+│   └── live_engine.py      # Live loop, candle/tick mode
+├── library/                 # In-project Dhan Tradehull (dhan_tradehull.py)
+├── models/
+│   ├── order_intent.py      # OrderIntent dataclass
+│   └── strategy_context.py # StrategyContext dataclass
 ├── broker/                  # Order placement only
-│   ├── broker_api.py       # IBrokerApi
-│   ├── dhan_broker_api.py / dhanbroker.py
-│   ├── delta_broker_api.py / delta_broker.py
+│   ├── broker_api.py        # IBrokerApi
+│   ├── dhan_broker_api.py, dhanbroker.py
+│   ├── delta_broker_api.py, delta_broker.py
 │   └── simulated_broker.py
 ├── orderExecution/
-│   ├── order_router.py     # process_intent → risk → broker
-│   ├── risk_manager.py
-│   ├── intent_store.py
-│   └── position_manager.py
-├── strategies/              # LEAPS, Inside Bar, IndiaMktMixins, etc.
-└── ...
+│   ├── order_router.py      # process_intent → risk → broker
+│   ├── risk_manager.py, intent_store.py, position_manager.py
+│   └── order_state.py, slippage.py
+├── strategies/              # base.py, IndiaMktMixins, Leaps/, Inside_bar_candle/, registry
+└── utils/                   # expiry_resolver, instruments/instrument_store, session
 run/
-├── config.py               # RUN_MODE, STRATEGY_JOBS
-└── main.py                 # Wire data_provider, broker, engine, order_router
+├── config.py                # RUN_MODE, STRATEGY_JOBS
+└── main.py                  # Wire data_provider, broker, engine, order_router
 ```
 
-For more detail on intent flow and risk, see `core/orderExecution/README.md` and `core/broker/README.md`.
+For more detail see: `core/README.txt`, `core/orderExecution/README.md`, `core/broker/README.md`, `core/data/datalayer/README.md`, `core/library/README.md`, `core/models/README.md`, `PROJECT_STRUCTURE.md`.

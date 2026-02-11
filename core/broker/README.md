@@ -24,6 +24,18 @@ Strategy → Intent → RiskManager → OrderRouter → Broker.place_order()
                                               → Fill → PositionManager
 ```
 
+## Files
+
+| File | Role |
+|------|------|
+| `base_broker.py` | BaseBroker ABC: place_order(intent, execution_price, retries), exit_position(...) |
+| `broker_api.py` | IBrokerApi: place_order(...), get_positions(), get_order_list() |
+| `dhan_broker_api.py` | DhanBrokerApi – wraps DhanSource for orders only |
+| `dhanbroker.py` | DhanBroker – converts OrderIntent to payload, calls api.place_order |
+| `delta_broker_api.py` | DeltaBrokerApi (stub) |
+| `delta_broker.py` | DeltaBroker |
+| `simulated_broker.py` | SimulatedBroker – backtest; on_fill → PositionManager |
+
 ## Adding Delta Exchange
 
 1. Implement real `DeltaBrokerApi` (place_order, get_positions, get_order_list) using Delta SDK/API.
