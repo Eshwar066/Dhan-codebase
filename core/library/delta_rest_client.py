@@ -114,6 +114,16 @@ class DeltaRestClient:
         product = parseResponse(response)
         return product
 
+    def get_products(self, auth=False):
+        """List all tradable products (perpetuals, futures, options)."""
+        response = self.request("GET", "/v2/products", auth=auth)
+        return parseResponse(response)
+
+    def get_all_positions(self):
+        """All open positions (no product_id filter)."""
+        response = self.request("GET", "/v2/positions", auth=True)
+        return parseResponse(response)
+
     def batch_create(self, product_id, orders):
         response = self.request(
             "POST",

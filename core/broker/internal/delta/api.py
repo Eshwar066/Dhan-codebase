@@ -1,15 +1,15 @@
-"""Delta Exchange broker API (stub)."""
+"""Delta Exchange broker API: order placement and position/order lookup via delta_rest_client."""
 
 from typing import Any, Dict, List, Optional
 
+from core.data.sources.delta_source import DeltaSource
+
 
 class DeltaBrokerApi:
-    """IBrokerApi stub for Delta Exchange. Replace with real client when integrating."""
+    """IBrokerApi implementation for Delta Exchange. Uses DeltaSource (wraps DeltaRestClient)."""
 
-    def __init__(self, api_key: str = "", api_secret: str = "", testnet: bool = True):
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.testnet = testnet
+    def __init__(self, delta_source: DeltaSource):
+        self._source = delta_source
 
     def place_order(
         self,
@@ -28,11 +28,25 @@ class DeltaBrokerApi:
         bo_profit_value: Optional[float] = None,
         bo_stop_loss_value: Optional[float] = None,
         tag: Optional[str] = None,
+        reduce_only: str = "false",
     ) -> Dict[str, Any]:
-        return {"status": "error", "message": "Delta Exchange not implemented"}
+        product_id = self._source.product_id_for_symbol(tradingsymbol)
+        if product_id is None:
+            return {"status": "error", "order_id": None, "message": f"Unknown symbol: {tradingsymbol}"}
+        side = (transaction_type or "BUY").lower()
+        limit_price = float(price) if price and (order_type or "MARKET").upper() == "LIMIT" else None
+        return self._source.place_order(
+            product_id=int(product_id),
+            size=int(quantity),
+            side="buy" if side == "buy" else "sell",
+            limit_price=limit_price,
+            order_type=order_type or "MARKET",
+            client_order_id=tag,
+            reduce_only=reduce_only,
+        )
 
     def get_positions(self, debug: str = "NO") -> Any:
-        return []
+        return self._source.get_positions(debug=debug)
 
     def get_order_list(self) -> List[Dict[str, Any]]:
-        return []
+        return self._source.get_order_list()

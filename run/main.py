@@ -7,7 +7,8 @@ from core.engine.backtest_engine import BacktestEngine
 from core.engine.live_engine import LiveEngine
 from core.orderExecution.risk_manager import RiskManager
 from core.data.sources.dhan_source import DhanSource
-from core.data.datalayer import DhanDataProvider
+from core.data.sources.delta_source import DeltaSource
+from core.data.datalayer import DhanDataProvider, DeltaDataProvider
 from core.broker import (
     DhanBroker,
     DhanBrokerApi,
@@ -23,7 +24,7 @@ from core.utils.instruments.instrument_store import InstrumentStore
 from logs.logger.trade_logger import TradeLogger
 
 
-# Select broker: "DHAN" | "DELTA" (Delta is stub until API wired)
+# Select broker: "DHAN" | "DELTA" (Delta uses core/library/delta_rest_client)
 BROKER_NAME = "DHAN"
 
 
@@ -38,8 +39,12 @@ def run_job(job):
     strategy = cfg["strategy"]()
 
     # ---------- Data layer (feeds engines: LTP, option chain, expiry, candles) ----------
-    dhan_source = DhanSource()
-    data_provider = DhanDataProvider(dhan_source)
+    if BROKER_NAME == "DELTA":
+        delta_source = DeltaSource(testnet=True, india=False)
+        data_provider = DeltaDataProvider(delta_source)
+    else:
+        dhan_source = DhanSource()
+        data_provider = DhanDataProvider(dhan_source)
 
     # ---------- Order management ----------
     position_manager = PositionManager(logger=TradeLogger())
@@ -82,9 +87,10 @@ def run_job(job):
         live_cfg = job["live"]
         candle_service = CandleService(data_provider)
         if BROKER_NAME == "DELTA":
-            broker_api = DeltaBrokerApi(api_key="", api_secret="", testnet=True)
+            broker_api = DeltaBrokerApi(delta_source)
             broker = DeltaBroker(api=broker_api, position_manager=position_manager, intent_store=intent_store)
         else:
+            dhan_source = DhanSource()
             broker_api = DhanBrokerApi(dhan_source)
             broker = DhanBroker(api=broker_api, position_manager=position_manager, intent_store=intent_store)
         order_router = OrderRouter(
