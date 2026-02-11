@@ -10,6 +10,27 @@
 
 Engines get **data** from `IDataProvider`; **OrderRouter** sends intents to a **Broker** (which uses an `IBrokerApi`).
 
+## File structure (internal layout)
+
+```
+core/broker/
+  base.py              # IBrokerApi, BaseBroker (abstract contracts)
+  __init__.py          # Public API: re-exports all brokers and base
+  internal/
+    __init__.py        # Re-exports DhanBroker, DhanBrokerApi, DeltaBroker, DeltaBrokerApi, SimulatedBroker
+    dhan/
+      api.py           # DhanBrokerApi
+      broker.py        # DhanBroker
+    delta/
+      api.py           # DeltaBrokerApi (stub)
+      broker.py        # DeltaBroker
+    simulated/
+      broker.py        # SimulatedBroker (backtest)
+```
+
+**Use in app code:** `from core.broker import DhanBroker, DhanBrokerApi, DeltaBroker, DeltaBrokerApi, SimulatedBroker, BaseBroker, IBrokerApi`  
+Do not import from `core.broker.internal.*` in application code; use the package root.
+
 ## Brokers
 
 - **DhanBroker** – uses `DhanBrokerApi` (wraps Dhan for orders only).
@@ -24,21 +45,8 @@ Strategy → Intent → RiskManager → OrderRouter → Broker.place_order()
                                               → Fill → PositionManager
 ```
 
-## Files
-
-| File | Role |
-|------|------|
-| `base_broker.py` | BaseBroker ABC: place_order(intent, execution_price, retries), exit_position(...) |
-| `broker_api.py` | IBrokerApi: place_order(...), get_positions(), get_order_list() |
-| `dhan_broker_api.py` | DhanBrokerApi – wraps DhanSource for orders only |
-| `dhanbroker.py` | DhanBroker – converts OrderIntent to payload, calls api.place_order |
-| `delta_broker_api.py` | DeltaBrokerApi (stub) |
-| `delta_broker.py` | DeltaBroker |
-| `simulated_broker.py` | SimulatedBroker – backtest; on_fill → PositionManager |
-
 ## Adding Delta Exchange
 
-1. Implement real `DeltaBrokerApi` (place_order, get_positions, get_order_list) using Delta SDK/API.
+1. Implement real `DeltaBrokerApi` in `internal/delta/api.py` (place_order, get_positions, get_order_list) using Delta SDK/API.
 2. In `run/main.py`, set `BROKER_NAME = "DELTA"` and pass `DeltaBrokerApi(...)` into `DeltaBroker`.
 3. Data can stay on Dhan/NSE until Delta provides a data feed; then add `DeltaDataProvider` in the data layer.
-

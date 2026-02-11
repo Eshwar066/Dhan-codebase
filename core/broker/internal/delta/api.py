@@ -1,23 +1,15 @@
-"""
-Delta Exchange broker API (stub).
-Placeholder for future Delta Exchange integration; feeds engines and order management
-when selected as the broker.
-"""
+"""Delta Exchange broker API (stub)."""
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 class DeltaBrokerApi:
-    """
-    IBrokerApi stub for Delta Exchange.
-    Replace with real Delta API client when integrating.
-    """
+    """IBrokerApi stub for Delta Exchange. Replace with real client when integrating."""
 
     def __init__(self, api_key: str = "", api_secret: str = "", testnet: bool = True):
         self.api_key = api_key
         self.api_secret = api_secret
         self.testnet = testnet
-        # TODO: init Delta Exchange client when SDK/API is available
 
     def place_order(
         self,
@@ -33,15 +25,14 @@ class DeltaBrokerApi:
         after_market_order: bool = False,
         validity: str = "DAY",
         amo_time: str = "OPEN",
-        bo_profit_value: float | None = None,
-        bo_stop_loss_value: float | None = None,
-        tag: str | None = None,
+        bo_profit_value: Optional[float] = None,
+        bo_stop_loss_value: Optional[float] = None,
+        tag: Optional[str] = None,
     ) -> Dict[str, Any]:
-        # Stub: no real order until Delta client is wired
         return {"status": "error", "message": "Delta Exchange not implemented"}
 
     def get_positions(self, debug: str = "NO") -> Any:
-        return []  # or empty DataFrame
+        return []
 
     def get_order_list(self) -> List[Dict[str, Any]]:
         return []

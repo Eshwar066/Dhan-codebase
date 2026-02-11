@@ -1,132 +1,9 @@
-# from core.data.sources.dhan_source import DhanSource
-# from core.portfolio import Portfolio
-
-
-# class DhanBroker:
-#     def __init__(self, dhan_source, portfolio):
-#         self.source = dhan_source
-#         self.portfolio = portfolio
-
-#     def place_order(self, position):
-#         """
-#         Convert Position → Dhan order
-#         """
-
-#         tradingsymbol = position.symbol
-#         exchange = "NFO" if position.option_type else "NSE"
-
-#         quantity = position.qty
-#         transaction_type = position.side  # BUY / SELL
-
-#         # ---- Pricing ----
-#         price = 0
-#         trigger_price = 0
-#         order_type = "MARKET"  # live default
-
-#         trade_type = "MARGIN"  # or MIS / CNC
-
-#         order_id = self.source.place_order(
-#             tradingsymbol=tradingsymbol,
-#             exchange=exchange,
-#             quantity=quantity,
-#             price=price,
-#             trigger_price=trigger_price,
-#             order_type=order_type,
-#             transaction_type=transaction_type,
-#             trade_type=trade_type,
-#             tag="LIVE_STRATEGY",
-#         )
-
-#         if order_id:
-#             self.portfolio.enter(position)
-
-#         return order_id
-
-#     def get_positions(self, symbol: str | None = None):
-#         """
-#         Returns list[Position] for LIVE trades
-#         """
-#         df = self.source.get_positions()
-
-#         if df is None or df.empty:
-#             return []
-
-#         positions = []
-
-#         for _, row in df.iterrows():
-#             tradingsymbol = row["tradingSymbol"]
-
-#             if symbol and tradingsymbol != symbol:
-#                 continue
-
-#             side = "BUY" if row["buySell"] == "BUY" else "SELL"
-#             qty = abs(int(row["netQty"]))
-#             entry_price = float(row["avgPrice"])
-
-#             if qty == 0:
-#                 continue  # closed position
-
-#             pos = Position(
-#                 symbol=tradingsymbol,
-#                 side=side,
-#                 entry_price=entry_price,
-#                 qty=qty,
-#                 exchange=row["exchange"],
-#                 order_id=row.get("orderId"),
-#             )
-
-#             positions.append(pos)
-
-#         return positions
-
-#     def exit_position(self, position, exit_signal):
-#         """
-#         Exit a live position using MARKET or SL
-#         """
-
-#         tradingsymbol = position.symbol
-#         exchange = position.exchange
-#         quantity = position.qty
-
-#         # ---- Reverse side ----
-#         transaction_type = "SELL" if position.side == "BUY" else "BUY"
-
-#         # ---- Defaults ----
-#         order_type = "MARKET"
-#         price = 0
-#         trigger_price = 0
-
-#         # ---- SL Exit ----
-#         if exit_signal["type"] == "SL":
-#             order_type = "STOPMARKET"  # SLM
-#             trigger_price = exit_signal["price"]
-
-#         order_id = self.source.place_order(
-#             tradingsymbol=tradingsymbol,
-#             exchange=exchange,
-#             quantity=quantity,
-#             price=price,
-#             trigger_price=trigger_price,
-#             order_type=order_type,
-#             transaction_type=transaction_type,
-#             trade_type="MARGIN",  # or MIS / CNC
-#             tag="EXIT",
-#         )
-
-#         if order_id:
-#             print(
-#                 f"EXIT ORDER PLACED | {tradingsymbol} | "
-#                 f"{order_type} | Qty {quantity}"
-#             )
-#             self.portfolio.exit_live(tradingsymbol)
-
-#         return order_id
-
-# Above is older code.
+"""Dhan broker: order placement via DhanBrokerApi."""
 
 import time
 import uuid
-from core.broker.base_broker import BaseBroker
+
+from core.broker.base import BaseBroker
 
 
 def _order_intent_to_payload(intent, execution_price=None):
@@ -163,20 +40,15 @@ def _order_intent_to_payload(intent, execution_price=None):
 
 
 class DhanBroker(BaseBroker):
-    """Order placement via Dhan broker API. Uses IBrokerApi (DhanBrokerApi)."""
+    """Order placement via Dhan. Uses IBrokerApi (DhanBrokerApi)."""
 
     def __init__(self, api, position_manager=None, intent_store=None):
-        """
-        Args:
-            api: IBrokerApi implementation (e.g. DhanBrokerApi)
-        """
         super().__init__(position_manager=position_manager, intent_store=intent_store)
         self.api = api
 
     def _build_payload(self, intent, execution_price=None):
         if hasattr(intent, "instrument"):
             return _order_intent_to_payload(intent, execution_price)
-        # Legacy dict intent
         segment_map = {
             "EQ": "NSE", "FUT": "NSE", "OPT": "NSE", "MCX": "MCX",
             "CRYPTO": "CRYPTO", "D": "NSE", "NSE": "NSE", "NFO": "NSE",
@@ -211,9 +83,6 @@ class DhanBroker(BaseBroker):
         }
 
     def place_order(self, intent, execution_price=None, retries=2):
-        """
-        Place order from OrderIntent or dict. Uses execution_price when provided.
-        """
         order_payload = self._build_payload(intent, execution_price)
         intent_id = order_payload["intent_id"]
         for attempt in range(retries + 1):
@@ -256,52 +125,33 @@ class DhanBroker(BaseBroker):
                 return None
         return None
 
-    # =========================
-    # ORDER SEARCH (Idempotency)
-    # =========================
     def find_order_by_client_id(self, client_order_id):
         orders = self.api.get_order_list() or []
-
         for o in orders:
             if o.get("tag") == client_order_id:
                 return o
-
         return None
 
-    # =========================
-    # POSITION SYNC
-    # =========================
     def get_positions(self):
         return self.api.get_positions()
 
     def sync_positions(self):
-        """
-        Broker truth → PositionManager
-        """
         if not self.position_manager:
             return
-
         df = self.api.get_positions()
         if df is None or df.empty:
             return
-
         broker_positions = {}
-
         for _, row in df.iterrows():
             sym = row["tradingSymbol"]
-
             broker_positions[sym] = {
                 "qty": int(row["netQty"]),
                 "avg_price": float(row["avgPrice"]),
                 "segment": row.get("segment", "EQ"),
                 "lot_size": int(row.get("lotSize", 1)),
             }
-
         self.position_manager.reconcile_with_broker(broker_positions)
 
-    # =========================
-    # EXIT POSITION
-    # =========================
     def exit_position(self, trading_symbol, qty, side, segment="EQ", lot_size=1):
         exit_side = "SELL" if side == "BUY" else "BUY"
         intent = {

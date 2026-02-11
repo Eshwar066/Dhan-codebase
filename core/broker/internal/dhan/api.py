@@ -1,7 +1,4 @@
-"""
-Dhan broker API: order placement and position/order lookup via Dhan.
-Uses DhanSource (or equivalent) for execution only — no market data here.
-"""
+"""Dhan broker API: order placement and position/order lookup via Dhan."""
 
 from typing import Any, Dict, List, Optional
 
@@ -10,10 +7,6 @@ class DhanBrokerApi:
     """IBrokerApi implementation for Dhan. Order placement + positions + order list."""
 
     def __init__(self, dhan_source):
-        """
-        Args:
-            dhan_source: Object with place_order, get_positions, get_order_list.
-        """
         self._source = dhan_source
 
     def place_order(

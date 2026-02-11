@@ -1,22 +1,14 @@
-"""
-Delta Exchange broker: order placement and position/exit via DeltaBrokerApi.
-Same BaseBroker contract as DhanBroker; feeds engines and order management when
-Delta is selected as the broker.
-"""
+"""Delta Exchange broker (stub)."""
 
 from typing import Any, Optional
 
-from core.broker.base_broker import BaseBroker
+from core.broker.base import BaseBroker
 
 
 class DeltaBroker(BaseBroker):
     """Order placement via Delta Exchange. Uses DeltaBrokerApi (stub until API wired)."""
 
     def __init__(self, api, position_manager=None, intent_store=None):
-        """
-        Args:
-            api: DeltaBrokerApi instance (or future real Delta client).
-        """
         super().__init__(position_manager=position_manager, intent_store=intent_store)
         self.api = api
 
@@ -26,8 +18,6 @@ class DeltaBroker(BaseBroker):
         execution_price: Optional[float] = None,
         retries: int = 0,
     ) -> Optional[str]:
-        """Place order on Delta Exchange. Currently stub returns None."""
-        # TODO: convert OrderIntent to Delta payload and call self.api.place_order(...)
         result = self.api.place_order(
             tradingsymbol=getattr(intent.instrument, "trading_symbol", ""),
             exchange=getattr(intent.instrument, "exchange", "NSE"),
@@ -44,6 +34,4 @@ class DeltaBroker(BaseBroker):
         return None
 
     def exit_position(self, trading_symbol, qty, side, segment="EQ", lot_size=1):
-        """Exit a position. Stub until Delta API supports it."""
-        # TODO: build exit order and call place_order
         return None
