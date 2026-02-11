@@ -62,7 +62,7 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         structure_id = self.build_structure_id(candle, regime)
 
         # Check if structure is already open
-        if ctx["position_store"].has_open_structure(
+        if ctx.position_store.has_open_structure(
             strategy=self.name, structure_id=structure_id, tag="MAIN"
         ):
             return None
@@ -77,7 +77,7 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         if not strike:
             return None
 
-        expiry = ctx["selected_expiry"]
+        expiry = ctx.selected_expiry
 
         # Build the trading symbol
         trading_symbol = ExpiryResolver.build_option_symbol(
@@ -89,9 +89,9 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         )
 
         # Fetch Instrument object from InstrumentStore
-        inst = ctx["instrument_store"].intent_creation_details(
+        inst = ctx.instrument_store.intent_creation_details(
             trading_symbol,
-            ctx["exchange"],
+            ctx.exchange,
             expiry,
             option_type,
             strike,

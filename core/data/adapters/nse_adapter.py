@@ -1,30 +1,29 @@
 from datetime import datetime, date
+
 from .base import BaseAdapter
-import pdb
+from core.models.strategy_context import StrategyContext
 
 
 class NSEAdapter(BaseAdapter):
 
-    def get_expiries(self, ctx):
-        ts = ctx["timestamp"]
+    def get_expiries(self, ctx: StrategyContext):
+        ts = ctx.timestamp
         years = [ts.year]
-
         if ts.month > 6:
             years.append(ts.year + 1)
 
         raw_expiries = []
-
+        instrument = ctx.instrument or "OPTIDX"
         for year in years:
             raw_expiries.extend(
                 self.data.get_nse_expiries(
-                    symbol=ctx["symbol"],
+                    symbol=ctx.symbol,
                     year=year,
-                    instrument=ctx["instrument"],
+                    instrument=instrument,
                 )
             )
 
         expiries = []
-
         for exp in raw_expiries:
             if isinstance(exp, date):
                 expiries.append(exp)
@@ -35,28 +34,23 @@ class NSEAdapter(BaseAdapter):
             else:
                 raise ValueError(f"Unsupported expiry type: {type(exp)}")
 
-        # Optional but recommended: unique + sorted
         expiries = sorted(set(expiries))
-
-        ctx["expiry_list"] = expiries
+        ctx.expiry_list = expiries
         return expiries
 
-    def get_option_chain(self, ctx, params):
-        expiry = ctx["selected_expiry"]
-
-        # if not isinstance(expiry, date):
-        #     raise ValueError("NSE selected_expiry must be date")
-
+    def get_option_chain(self, ctx: StrategyContext, params: dict):
         return "Needs to implemented"
 
-    def get_historical_option_chain(self, ctx, params):
-
+    def get_historical_option_chain(self, ctx: StrategyContext, params: dict):
+        ts = ctx.timestamp
+        from_date = ts.date() if hasattr(ts, "date") else ts
+        expiry_date = params.get("expiry_code")
         return self.data.get_nse_optionchain_historical(
-            symbol=ctx["symbol"],
-            from_date=ctx["timestamp"].date(),
+            symbol=ctx.symbol,
+            from_date=from_date,
             instrumentType=params["instrument"],
-            expiry_date=params["expiry_code"],
-            spot_price=ctx["spot_price"],
+            expiry_date=expiry_date,
+            spot_price=ctx.spot_price,
             option_type=params["option_type"],
             strikes=params["strike"],
         )

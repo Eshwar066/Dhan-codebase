@@ -92,7 +92,7 @@ class IndiaMktMixins:
     # ==================================================
     def get_option_price_at_candle(self, candle, ctx, strike, option_type, expiry):
         params = {
-            "exchange": ctx["exchange"],
+            "exchange": ctx.exchange,
             "interval": self.timeframe,
             "expiry_code": expiry,
             "strike": [str(int(float(strike)))],
@@ -103,7 +103,7 @@ class IndiaMktMixins:
             "securityId": "13",
         }
 
-        chain = ctx["option_chain_service"].get_chain(
+        chain = ctx.option_chain_service.get_chain(
             api=self.api, ctx=ctx, params=params
         )
 
@@ -127,16 +127,16 @@ class IndiaMktMixins:
     # OPTION CHAIN & STRIKE SELECTION
     # ==================================================
     def fetch_option_chain(self, candle, ctx, option_type):
-        ocs = ctx["option_chain_service"]
+        ocs = ctx.option_chain_service
 
         if self.api == "NSE":
-            ctx["expiry_list"] = ocs.get_expiries(
+            ctx.expiry_list = ocs.get_expiries(
                 api=self.api, ctx=ctx, instrument="FUTIDX"
             )
 
         expiry_code = ExpiryResolver.resolve(
-            expiry_list=ctx.get("expiry_list"),
-            trade_date=ctx["timestamp"],
+            expiry_list=ctx.get_expiry_list(),
+            trade_date=ctx.timestamp,
             api=self.api,
             expiry_pref=self.expiryType,
         )
@@ -146,8 +146,8 @@ class IndiaMktMixins:
         otm_strikes = ExpiryResolver.get_otm_strikes(
             self, spot=spot, option_type=option_type, step=step, count=4
         )
-        ctx["selected_expiry"] = expiry_code
-        ctx["otm_strikes"] = otm_strikes
+        ctx.selected_expiry = expiry_code
+        ctx.otm_strikes = otm_strikes
 
         return otm_strikes
 
@@ -159,9 +159,9 @@ class IndiaMktMixins:
         candle_time = candle["timestamp"].replace(tzinfo=None)
 
         params = {
-            "exchange": ctx["exchange"],
+            "exchange": ctx.exchange,
             "interval": self.timeframe,
-            "expiry_code": ctx["selected_expiry"],
+            "expiry_code": ctx.selected_expiry,
             "strike": otm_strikes,
             "option_type": option_type,
             "instrument": "OPTIDX",
@@ -170,7 +170,7 @@ class IndiaMktMixins:
             "securityId": "13",
         }
 
-        chain = ctx["option_chain_service"].get_chain(
+        chain = ctx.option_chain_service.get_chain(
             api=self.api, ctx=ctx, params=params
         )
         if not chain:
@@ -292,9 +292,9 @@ class IndiaMktMixins:
             parent_sell_intent.instrument.option_type,
         )
 
-        inst = ctx["instrument_store"].intent_creation_details(
+        inst = ctx.instrument_store.intent_creation_details(
             hedge_symbol,
-            ctx["exchange"],
+            ctx.exchange,
             hedge_expiry,
             parent_sell_intent.instrument.option_type,
             hedge_strike,
@@ -329,7 +329,7 @@ class IndiaMktMixins:
         )
 
     def create_hedge_exit_intent(self, position, candle, ctx):
-        hedge = ctx["position_store"].get_hedge_for(position)
+        hedge = ctx.position_store.get_hedge_for(position)
         if not hedge or hedge.net_qty == 0:
             return None
 
