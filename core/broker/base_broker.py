@@ -1,11 +1,12 @@
 from abc import ABC, abstractmethod
-from typing import Optional, Dict
+from typing import Any, Dict, Optional, Union
 
 
 class BaseBroker(ABC):
     """
-    Abstract broker contract.
-    All brokers (LIVE / SIMULATED / PAPER) must implement this.
+    Abstract broker contract for order placement and position/exit.
+    All brokers (Dhan, Delta, Simulated) must implement this.
+    Engines and OrderRouter use brokers; they do not call the data layer for orders.
     """
 
     def __init__(self, position_manager=None, intent_store=None):
@@ -16,13 +17,19 @@ class BaseBroker(ABC):
     # ORDER PLACEMENT
     # =========================
     @abstractmethod
-    def place_order(self, intent: Dict, retries: int = 0) -> Optional[str]:
+    def place_order(
+        self,
+        intent: Union[Dict, Any],
+        execution_price: Optional[float] = None,
+        retries: int = 0,
+    ) -> Optional[str]:
         """
-        Place an order using intent.
+        Place an order from an intent (OrderIntent or dict).
 
         Args:
-            intent (dict): normalized trading intent
-            retries (int): retry count (LIVE brokers only)
+            intent: OrderIntent object or normalized dict
+            execution_price: fill price (e.g. after slippage); optional for live
+            retries: retry count (LIVE brokers only)
 
         Returns:
             order_id (str) or None

@@ -151,6 +151,10 @@ class DhanSource:
     def get_positions(self, debug="NO"):
         return self.tsl.get_positions(debug=debug)
 
+    def get_order_list(self):
+        """For idempotency / order lookup. Uses Tradehull if available."""
+        return getattr(self.tsl, "get_order_list", lambda: [])()
+
     def exit_position(position):
         print(position)
 
@@ -159,8 +163,8 @@ class DhanSource:
         tradingsymbol: str,
         exchange: str,
         quantity: int,
-        price: int = 0,
-        trigger_price: int = 0,
+        price: float = 0,
+        trigger_price: float = 0,
         order_type: str = "MARKET",
         transaction_type: str = "BUY",
         trade_type: str = "MARGIN",
@@ -173,46 +177,27 @@ class DhanSource:
         tag: str | None = None,
     ):
         """
-        Thin execution wrapper for Dhan.
-        No strategy / portfolio logic here.
+        Thin execution wrapper for Dhan. Used only via broker layer (DhanBrokerApi).
+        Returns dict with "status" and "order_id" on success.
         """
-        # pdb.set_trace()
-        # tradingsymbol.upper(),
-        return self.tsl.order_placement(
-            tradingsymbol="NIFTY-Mar2026-24500-PE",
-            exchange="NFO",
-            quantity=65,
-            price=0.0,  # MARKET → price ignored
-            trigger_price=0.0,
-            order_type="MARKET",
-            transaction_type="SELL",
-            trade_type="MARGIN",
-            disclosed_quantity=0,
-            after_market_order=False,
-            validity="DAY",
-            amo_time="OPEN",
-            bo_profit_value=None,
-            bo_stop_loss_Value=None,
-            tag="73f0f9a6ce3943ca82c59f9c1be74290",
+        result = self.tsl.order_placement(
+            tradingsymbol=tradingsymbol,
+            exchange=exchange.upper(),
+            quantity=int(quantity),
+            price=float(price),
+            trigger_price=float(trigger_price),
+            order_type=order_type.upper(),
+            transaction_type=transaction_type.upper(),
+            trade_type=trade_type.upper(),
+            disclosed_quantity=int(disclosed_quantity),
+            after_market_order=bool(after_market_order),
+            validity=validity,
+            amo_time=amo_time,
+            bo_profit_value=bo_profit_value,
+            bo_stop_loss_Value=bo_stop_loss_value,
+            tag=tag or "",
         )
-
-        # (
-        #     tradingsymbol="NIFTY-Mar2026-25000-CE",
-        #     exchange=exchange.upper(),
-        #     quantity=int(quantity),
-        #     price=int(price),
-        #     trigger_price=int(trigger_price),
-        #     order_type=order_type.upper(),
-        #     transaction_type=transaction_type.upper(),
-        #     trade_type=trade_type.upper(),
-        #     # disclosed_quantity=disclosed_quantity,
-        #     # after_market_order=after_market_order,
-        #     validity=validity,
-        #     # amo_time=amo_time,
-        #     # bo_profit_value=bo_profit_value,
-        #     # bo_stop_loss_Value=bo_stop_loss_value,  # ✅ Capital V
-        #     tag=tag,
-        # )
+        return result if isinstance(result, dict) else {"status": "error", "order_id": None}
 
     # =============================================================================
     # NSE API

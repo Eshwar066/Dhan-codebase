@@ -126,69 +126,79 @@
 
 import time
 import uuid
-import pdb
 from core.broker.base_broker import BaseBroker
 
 
-# ✅ Idempotent orders
-# ✅ Retry-safe
-# ✅ Intent-linked
-# ✅ PositionManager compatible
-# ✅ Dhan-friendly
-# ✅ Segment aware (EQ/FNO/MCX/CRYPTO)
-# ✅ Safe for leveraged trading
-
-# SLM dhan Order
-# order_type = "STOP_LOSS_MARKET"
-# trigger_price = X
-# price = None or 0
+def _order_intent_to_payload(intent, execution_price=None):
+    """Convert OrderIntent to dict for Dhan payload."""
+    inst = intent.instrument
+    segment_map = {
+        "EQ": "NSE", "FUT": "NSE", "OPT": "NSE", "MCX": "MCX",
+        "CRYPTO": "CRYPTO", "D": "NSE", "NSE": "NSE", "NFO": "NSE",
+    }
+    segment = getattr(inst, "segment", "NFO")
+    exchange = segment_map.get(segment, "NSE")
+    price = execution_price if execution_price is not None else (intent.price or 0)
+    qty = getattr(intent, "qty", inst.lot_size)
+    lot_size = int(getattr(inst, "lot_size", 1))
+    total_qty = int(qty) * lot_size
+    return {
+        "tradingsymbol": inst.trading_symbol,
+        "exchange": exchange,
+        "quantity": total_qty,
+        "price": float(price),
+        "trigger_price": float(getattr(intent, "trigger_price", 0) or 0),
+        "order_type": getattr(intent, "order_type", "MARKET"),
+        "transaction_type": intent.side,
+        "trade_type": getattr(intent, "trade_type", "MARGIN"),
+        "disclosed_quantity": 0,
+        "after_market_order": False,
+        "validity": "DAY",
+        "amo_time": "OPEN",
+        "bo_profit_value": None,
+        "bo_stop_loss_value": None,
+        "tag": intent.intent_id,
+        "intent_id": intent.intent_id,
+    }
 
 
 class DhanBroker(BaseBroker):
-    def __init__(self, dhan_api, position_manager=None, intent_store=None):
-        self.api = dhan_api
-        self.position_manager = position_manager
-        self.intent_store = intent_store
+    """Order placement via Dhan broker API. Uses IBrokerApi (DhanBrokerApi)."""
 
-    # =========================
-    # BUILD DHAN PAYLOAD
-    # =========================
-    def _build_payload(self, intent):
+    def __init__(self, api, position_manager=None, intent_store=None):
         """
-        Convert intent into broker payload for Dhan API.
+        Args:
+            api: IBrokerApi implementation (e.g. DhanBrokerApi)
         """
+        super().__init__(position_manager=position_manager, intent_store=intent_store)
+        self.api = api
 
-        # Map segment to exchange for Dhan API
+    def _build_payload(self, intent, execution_price=None):
+        if hasattr(intent, "instrument"):
+            return _order_intent_to_payload(intent, execution_price)
+        # Legacy dict intent
         segment_map = {
-            "EQ": "NSE",
-            "FUT": "NSE",
-            "OPT": "NSE",
-            "MCX": "MCX",
-            "CRYPTO": "CRYPTO",
-            "D": "NSE",
-            "NSE": "NSE",
-            "NFO": "NSE",
+            "EQ": "NSE", "FUT": "NSE", "OPT": "NSE", "MCX": "MCX",
+            "CRYPTO": "CRYPTO", "D": "NSE", "NSE": "NSE", "NFO": "NSE",
         }
         segment = intent.get("segment", "EQ")
         exchange = segment_map.get(segment, "NSE")
-
         required = ["trading_symbol", "side", "qty"]
         for r in required:
             if r not in intent or intent[r] is None:
                 raise ValueError(f"❌ Missing required intent field: {r}")
-
         qty = int(intent["qty"])
         lot_size = int(intent.get("lot_size", 1))
         total_qty = qty * lot_size
-
-        payload = {
+        price = execution_price if execution_price is not None else float(intent.get("price", 0) or 0)
+        return {
             "tradingsymbol": intent["trading_symbol"],
             "exchange": exchange,
             "quantity": total_qty,
-            "price": float(intent.get("price", 0) or 0),
+            "price": price,
             "trigger_price": float(intent.get("trigger_price", 0) or 0),
             "order_type": intent.get("order_type", "MARKET"),
-            "transaction_type": intent["side"],  # BUY / SELL
+            "transaction_type": intent["side"],
             "trade_type": intent.get("trade_type", "MARGIN"),
             "disclosed_quantity": int(intent.get("disclosed_quantity", 0)),
             "after_market_order": bool(intent.get("after_market_order", False)),
@@ -196,20 +206,16 @@ class DhanBroker(BaseBroker):
             "amo_time": intent.get("amo_time", "OPEN"),
             "bo_profit_value": intent.get("bo_profit_value", 0),
             "bo_stop_loss_value": intent.get("bo_stop_loss_value", 0),
-            "tag": intent.get("intent_id"),  # idempotency
+            "tag": intent.get("intent_id"),
+            "intent_id": intent.get("intent_id"),
         }
 
-        return payload
-
-    # =========================
-    # ORDER PLACEMENT
-    # =========================
-    def place_order(self, intent, retries=2):
+    def place_order(self, intent, execution_price=None, retries=2):
         """
-        Intent → Safe Dhan Order
+        Place order from OrderIntent or dict. Uses execution_price when provided.
         """
-        order_payload = self._build_payload(intent)
-        # pdb.set_trace()
+        order_payload = self._build_payload(intent, execution_price)
+        intent_id = order_payload["intent_id"]
         for attempt in range(retries + 1):
             try:
                 resp = self.api.place_order(
@@ -229,40 +235,25 @@ class DhanBroker(BaseBroker):
                     bo_stop_loss_value=order_payload["bo_stop_loss_value"],
                     tag=order_payload["tag"],
                 )
-
                 if not isinstance(resp, dict):
-                    raise Exception(f"Invalid broker response: {resp},{order_payload}")
-
+                    raise Exception(f"Invalid broker response: {resp}")
                 if resp.get("status") != "success":
                     print("❌ Broker rejection:", resp)
                     return None
-
-                order_id = resp["order_id"]
-
+                order_id = resp.get("order_id")
                 if self.intent_store:
-                    self.intent_store.update(
-                        intent["intent_id"],
-                        "SENT",
-                    )
-
+                    self.intent_store.update(intent_id, "SENT")
                 return order_id
-
             except TimeoutError:
-
-                # 🔑 Idempotency recovery
-                existing = self.find_order_by_client_id(client_order_id)
-
+                existing = self.find_order_by_client_id(intent_id)
                 if existing:
-                    return existing["order_id"]
-
+                    return existing.get("order_id")
                 if attempt == retries:
                     raise Exception("Order failed after retries")
-
                 time.sleep(0.4)
             except Exception as e:
                 print("❌ place_order exception:", e)
                 return None
-
         return None
 
     # =========================
@@ -313,7 +304,6 @@ class DhanBroker(BaseBroker):
     # =========================
     def exit_position(self, trading_symbol, qty, side, segment="EQ", lot_size=1):
         exit_side = "SELL" if side == "BUY" else "BUY"
-
         intent = {
             "intent_id": f"exit_{uuid.uuid4().hex[:6]}",
             "trading_symbol": trading_symbol,
@@ -324,5 +314,4 @@ class DhanBroker(BaseBroker):
             "order_type": "MARKET",
             "trade_type": "MARGIN",
         }
-
-        return self.place_order(intent)
+        return self.place_order(intent, execution_price=None)
