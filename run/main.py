@@ -90,7 +90,6 @@ def run_job(job):
             broker_api = DeltaBrokerApi(delta_source)
             broker = DeltaBroker(api=broker_api, position_manager=position_manager, intent_store=intent_store)
         else:
-            dhan_source = DhanSource()
             broker_api = DhanBrokerApi(dhan_source)
             broker = DhanBroker(api=broker_api, position_manager=position_manager, intent_store=intent_store)
         order_router = OrderRouter(

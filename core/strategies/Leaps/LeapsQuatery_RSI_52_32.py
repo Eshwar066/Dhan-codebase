@@ -26,6 +26,9 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     # ==================================================
     # INDICATORS
     # ==================================================
+    def get_warmup_period(self):
+        return 0
+
     def prepare_indicators(self, df):
         df["rsi"] = talib.RSI(df["close"], 14)
         df["prev_rsi"] = df["rsi"].shift(1)

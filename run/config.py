@@ -36,4 +36,19 @@ STRATEGY_JOBS = [
             "end_date": "2024-12-31",
         },
     },
+    {
+        "name": "FuturesEMAHighLow",
+        "enabled": False,
+        "capital": 200000,
+        "symbols": ["NIFTY"],
+        "instrument": "FUTURES",
+        "live": {"exchange": "INDEX", "sector": "YES"},
+        "backtest": {
+            "start_date": "2023-10-19",
+            "end_date": "2024-02-28",
+            "timeframe": "60",
+            "exchange": "INDEX",
+            "sector": "YES",
+        },
+    },
 ]

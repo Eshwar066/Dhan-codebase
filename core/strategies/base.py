@@ -14,5 +14,10 @@ class BaseStrategy:
     def on_candle(self, candle: Any, ctx: "StrategyContext") -> Any:
         raise NotImplementedError
 
-    def should_exit(self, position: Any, candle: Any, ctx: Optional["StrategyContext"] = None) -> bool:
+    def should_exit(
+        self, position: Any, candle: Any, ctx: Optional["StrategyContext"] = None
+    ) -> bool:
         return False
+
+    def get_warmup_period(self):
+        return 0

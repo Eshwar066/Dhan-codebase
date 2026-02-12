@@ -36,7 +36,11 @@ class StrategyContext:
     expiry_list: Optional[List[Any]] = None
     selected_expiry: Optional[Any] = None
     otm_strikes: Optional[List[Any]] = None
-    instrument: Optional[str] = None
+    instrument: Optional[Any] = None  # Instrument instance for futures/options
+
+    # ---- Optional; set by engine for strategies that need them (e.g. Futures) ----
+    qty: Optional[int] = None
+    intent_builder: Optional[Any] = None
 
     def get_expiry_list(self) -> Optional[List[Any]]:
         """Safe access for expiry_list (may not be set yet)."""
