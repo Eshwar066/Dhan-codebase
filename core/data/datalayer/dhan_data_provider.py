@@ -38,6 +38,29 @@ class DhanDataProvider(IDataProvider):
             sector=sector,
         )
 
+    # not providing exact data
+    def get_Futures_historical_intraday_data(
+        self,
+        securityId: str,
+        exchangeSegment: str,
+        instrument: str,
+        interval: str,
+        oi: bool,
+        fromDate: str,
+        toDate: str,
+    ) -> Optional[pd.DataFrame]:
+        df= self._source.get_Futures_historical_intraday_data(
+            security_id=securityId,
+            exchange_segment=exchangeSegment,
+            instrument=instrument,
+            interval=interval,
+            oi=oi,
+            from_date=fromDate,
+            to_date=toDate,
+        )
+        
+        return df
+
     def get_latest_candles(
         self, symbols: List[str], debug: str = "NO"
     ) -> Optional[dict]:

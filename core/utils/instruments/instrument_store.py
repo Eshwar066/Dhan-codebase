@@ -154,3 +154,57 @@ class InstrumentStore:
         }
 
         return self.map_row_to_instrument(pd.Series(dummy_row))
+
+    def futures_intent_creation_details(
+        self,
+        trading_symbol: str,
+        exchange: str,
+        expiry,
+    ) -> Instrument | None:
+
+        instrument_exchange = {
+            "NSE": "NSE",
+            "BSE": "BSE",
+            "NFO": "NSE",
+            "BFO": "BSE",
+            "MCX": "MCX",
+            "CUR": "NSE",
+        }
+
+        if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
+            df = self.df[
+                (
+                    (self.df["SEM_TRADING_SYMBOL"] == trading_symbol)
+                    | (self.df["SEM_CUSTOM_SYMBOL"] == trading_symbol)
+                )
+                & (self.df["SEM_EXM_EXCH_ID"] == instrument_exchange[exchange])
+            ]
+
+            if df.empty:
+                print(f"❌ No FUT instrument found for {trading_symbol} on {exchange}")
+                return None
+
+            return self.map_row_to_instrument(df.iloc[0])
+
+        # -----------------------------------
+        # BACKTEST / SIMULATION MODE
+        # -----------------------------------
+        InstrumentStore.dummy_security_counter += 1
+
+        dummy_row = {
+            "SEM_EXM_EXCH_ID": instrument_exchange.get(exchange, exchange),
+            "SEM_SEGMENT": "D",
+            "SEM_SMST_SECURITY_ID": InstrumentStore.dummy_security_counter,
+            "SEM_TRADING_SYMBOL": trading_symbol,
+            "SEM_CUSTOM_SYMBOL": trading_symbol,
+            "SM_SYMBOL_NAME": trading_symbol.split("-")[0],
+            "SEM_EXCH_INSTRUMENT_TYPE": "FUT",
+            "SEM_OPTION_TYPE": None,
+            "SEM_STRIKE_PRICE": None,
+            "SEM_EXPIRY_DATE": expiry,
+            "SEM_LOT_UNITS": 65,  # consider making dynamic later
+            "SEM_TICK_SIZE": 0.05,  # NIFTY futures tick
+            "SEM_SERIES": "FUT",
+        }
+
+        return self.map_row_to_instrument(pd.Series(dummy_row))

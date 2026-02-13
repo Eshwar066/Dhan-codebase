@@ -10,6 +10,9 @@ import sys
 import pandas as pd
 from pathlib import Path
 from dotenv import load_dotenv
+import requests
+import json
+import pdb
 
 # Use in-project Dhan Tradehull library
 from core.library.dhan_tradehull import Tradehull
@@ -33,7 +36,9 @@ class DhanSource:
         client_id = client_id or os.getenv("DHAN_CLIENT_CODE")
         access_token = access_token or os.getenv("DHAN_ACCESS_TOKEN")
         if not client_id or not access_token:
-            raise RuntimeError("❌ Dhan credentials missing (DHAN_CLIENT_CODE, DHAN_ACCESS_TOKEN)")
+            raise RuntimeError(
+                "❌ Dhan credentials missing (DHAN_CLIENT_CODE, DHAN_ACCESS_TOKEN)"
+            )
 
         self._deps_path = Path(dependencies_path or PROJECT_ROOT / "Dependencies")
         self._ensure_deps_path()
@@ -81,6 +86,65 @@ class DhanSource:
         df = df.sort_values("timestamp").reset_index(drop=True)
         df["time"] = df["timestamp"].dt.time
         return df.reset_index(drop=True)
+
+    # not providing exact data
+    def get_Futures_historical_intraday_data(
+        self,
+        security_id: str,
+        exchange_segment: str,
+        instrument: str,
+        interval: str,
+        from_date: str,
+        to_date: str,
+        oi: bool = False,
+    ):
+
+        payload = {
+            "securityId": str(security_id),
+            "exchangeSegment": exchange_segment,
+            "instrument": instrument,
+            "interval": str(interval),
+            "oi": oi,
+            "fromDate": from_date,
+            "toDate": to_date,
+            "exchange": "NSE",
+            "sector": "NO",
+        }
+
+        headers = {
+            "Content-Type": "application/json",
+            "access-token": os.getenv("DHAN_ACCESS_TOKEN"),
+            "client-id": os.getenv("DHAN_CLIENT_CODE"),
+        }
+
+        response = requests.post(
+            "https://api.dhan.co/v2/charts/intraday",
+            headers=headers,
+            data=json.dumps(payload),
+        )
+
+        if response.status_code != 200:
+            raise Exception(f"API Error {response.status_code}: {response.text}")
+        data = response.json()
+
+        if not data or "timestamp" not in data:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(
+            {
+                "timestamp": data["timestamp"],
+                "open": data["open"],
+                "high": data["high"],
+                "low": data["low"],
+                "close": data["close"],
+                "volume": data["volume"],
+            }
+        )
+
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+        df["timestamp"] = df["timestamp"].dt.tz_convert("Asia/Kolkata")
+        pdb.set_trace()
+        return df
 
     # -------------------------------------------------------------------------
     # Data: Expiries
@@ -153,7 +217,11 @@ class DhanSource:
             fromDate=from_date,
             toDate=to_date,
             exchange=exchange,
-            interval=int(interval) if isinstance(interval, str) and interval.isdigit() else interval,
+            interval=(
+                int(interval)
+                if isinstance(interval, str) and interval.isdigit()
+                else interval
+            ),
             securityId=securityId,
             expiry_flag=expiry_flag,
             expiry_code=int(expiry_code),
@@ -194,32 +262,59 @@ class DhanSource:
     def get_nse_expiries(self, symbol, year, instrument="OPTIDX"):
         key = (symbol, year, instrument)
         if key not in self.expiry_cache:
-            self.expiry_cache[key] = self.nse_client.get_expiries(symbol, year, instrument)
+            self.expiry_cache[key] = self.nse_client.get_expiries(
+                symbol, year, instrument
+            )
         return self.expiry_cache[key]
 
     def get_nse_optionchain_historical(
-        self, symbol, from_date, expiry_date, instrumentType, spot_price, option_type, strikes
+        self,
+        symbol,
+        from_date,
+        expiry_date,
+        instrumentType,
+        spot_price,
+        option_type,
+        strikes,
     ):
         records = []
         for strike in strikes:
             try:
                 hist = self.nse_client.get_options_history(
                     symbol=symbol,
-                    from_date=from_date.strftime("%Y-%m-%d") if hasattr(from_date, "strftime") else from_date,
-                    to_date=expiry_date.strftime("%Y-%m-%d") if hasattr(expiry_date, "strftime") else expiry_date,
+                    from_date=(
+                        from_date.strftime("%Y-%m-%d")
+                        if hasattr(from_date, "strftime")
+                        else from_date
+                    ),
+                    to_date=(
+                        expiry_date.strftime("%Y-%m-%d")
+                        if hasattr(expiry_date, "strftime")
+                        else expiry_date
+                    ),
                     instrumentType=instrumentType,
-                    expiry_date=expiry_date.strftime("%Y-%m-%d") if hasattr(expiry_date, "strftime") else str(expiry_date),
+                    expiry_date=(
+                        expiry_date.strftime("%Y-%m-%d")
+                        if hasattr(expiry_date, "strftime")
+                        else str(expiry_date)
+                    ),
                     strike=int(float(strike)),
                     option_type=option_type,
-                    year=expiry_date.year if hasattr(expiry_date, "year") else pd.Timestamp(expiry_date).year,
+                    year=(
+                        expiry_date.year
+                        if hasattr(expiry_date, "year")
+                        else pd.Timestamp(expiry_date).year
+                    ),
                 )
                 if not hist:
                     continue
                 row = hist[0]
-                records.append({
-                    "Strike Price": strike,
-                    f"{option_type} LTP": row.get("FH_LAST_TRADED_PRICE", 0),
-                })
+                records.append(
+                    {
+                        "Strike Price": strike,
+                        f"{option_type} LTP": row.get("FH_LAST_TRADED_PRICE", 0),
+                    }
+                )
             except Exception:
                 continue
         if not records:
@@ -308,7 +403,9 @@ class DhanSource:
 
     def get_order_detail(self, order_id, debug="NO"):
         """Single order detail."""
-        return getattr(self.tsl, "get_order_detail", lambda *a, **k: None)(order_id, debug)
+        return getattr(self.tsl, "get_order_detail", lambda *a, **k: None)(
+            order_id, debug
+        )
 
     def get_holdings(self, debug="NO"):
         return self.tsl.get_holdings(debug=debug)

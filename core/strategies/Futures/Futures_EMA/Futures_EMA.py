@@ -1,22 +1,24 @@
 import pandas as pd
 from typing import TYPE_CHECKING, Optional
+from core.strategies.base import BaseStrategy
+from core.strategies.IndiaMktMixins import IndiaMktMixins
+import pdb
 
 if TYPE_CHECKING:
     from core.models.strategy_context import StrategyContext
 
 
-class FuturesEMAHighLow:
+class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
 
     name = "FuturesEMAHighLow"
     timeframe = "60"
     required_context = ["instrument", "qty", "intent_builder"]
-    api = "DHAN"
+    api = "NSE"
 
     def __init__(self):
-        self.ema_period = 8
+        self.ema_period = 20
         self.target_pct = 0.006
         self.sl_pct = 0.004
-        self.ema_period = 20
 
         # State
         self.last_exit_reason = None
@@ -56,12 +58,15 @@ class FuturesEMAHighLow:
         ema_low = candle.get("ema_low")
         timestamp = candle.get("timestamp")
 
-        # Indicator validity
+        if self.api in ("NSE", "DHAN"):
+            if timestamp.hour == 9 and timestamp.minute == 15:
+                self._update_previous(candle)
+                return False
+
         if pd.isna(ema_high) or pd.isna(ema_low):
             self._update_previous(candle)
             return False
 
-        # Need previous values
         if (
             self.prev_close is None
             or self.prev_ema_high is None
@@ -70,22 +75,17 @@ class FuturesEMAHighLow:
             self._update_previous(candle)
             return False
 
-        # Prevent same-candle re-entry after SL
         if self.last_exit_reason == "SL" and timestamp == self.last_exit_time:
             self._update_previous(candle)
             return False
 
         signal = None
 
-        # --------------------------
-        # LONG Breakout (Crossover)
-        # --------------------------
+        # LONG breakout
         if self.prev_close <= self.prev_ema_high and close > ema_high:
             signal = "LONG"
 
-        # --------------------------
-        # SHORT Breakdown (Crossover)
-        # --------------------------
+        # SHORT breakdown
         elif self.prev_close >= self.prev_ema_low and close < ema_low:
             signal = "SHORT"
 
@@ -94,27 +94,68 @@ class FuturesEMAHighLow:
 
         return signal is not None
 
+    # ----------------- Regime -----------------
+
+    def compute_regime(self, candle):
+        ema_high = candle.get("ema_high")
+        ema_low = candle.get("ema_low")
+
+        if ema_high > ema_low:
+            return "BULL"
+        elif ema_high < ema_low:
+            return "BEAR"
+        else:
+            return "NEUTRAL"
+
     # ----------------- Entry -----------------
 
     def on_candle(self, candle, ctx: "StrategyContext"):
 
-        if ctx.instrument is None or ctx.intent_builder is None or ctx.qty is None:
-            return None
-
         if not self.current_signal:
             return None
+
+        regime = self.compute_regime(candle)
+        structure_id = self.build_structure_id(candle, regime)
 
         side = "BUY" if self.current_signal == "LONG" else "SELL"
         self.last_direction = self.current_signal
 
-        return [
-            ctx.intent_builder.build_entry(
-                instrument=ctx.instrument,
-                side=side,
-                qty=ctx.qty,
-                tag="MAIN",
+        # ---------------------------------
+        # 1️⃣ Prefer engine provided instrument
+        # ---------------------------------
+        inst = ctx.instrument
+
+        # ---------------------------------
+        # 2️⃣ Fallback (Backtest sandbox only)
+        # ---------------------------------
+        if inst is None:
+            expiry = self.getExpiry(ctx)
+
+            inst = ctx.instrument_store.futures_intent_creation_details(
+                trading_symbol="NIFTY FUT",
+                exchange="NSE",
+                expiry=expiry,
             )
-        ]
+
+            if inst is None:
+                return None
+
+        # ---------------------------------
+        # 3️⃣ Map to OrderIntent
+        # ---------------------------------
+        buy_intent = self.map_futures_instrument_to_intent(
+            inst=inst,
+            strike_row=candle,  # ✅ use candle as price source
+            strategy=self.name,
+            side=side,
+            structure_id=structure_id,
+            candle_ts=candle["timestamp"],
+            symbol=candle["symbol"],
+            action="ENTRY",
+            tag="MAIN",
+        )
+
+        return [buy_intent]
 
     # ----------------- Exit -----------------
 
@@ -122,7 +163,10 @@ class FuturesEMAHighLow:
 
         close = candle["close"]
 
-        if pos.side == "BUY":
+        is_long = pos.net_qty > 0
+        is_short = pos.net_qty < 0
+
+        if is_long:
             target = pos.entry_price * (1 + self.target_pct)
             stop = pos.entry_price * (1 - self.sl_pct)
 
@@ -136,7 +180,7 @@ class FuturesEMAHighLow:
                 self.last_exit_time = candle["timestamp"]
                 return True
 
-        else:  # SELL
+        elif is_short:
             target = pos.entry_price * (1 - self.target_pct)
             stop = pos.entry_price * (1 + self.sl_pct)
 
@@ -154,56 +198,28 @@ class FuturesEMAHighLow:
 
     def on_position_exit(self, pos, candle, ctx: "StrategyContext"):
 
-        if ctx.intent_builder is None:
+        if pos.instrument is None:
             return None
 
-        return [
-            ctx.intent_builder.build_exit(
-                instrument=pos.instrument,
-                qty=abs(pos.net_qty),
-                tag="MAIN",
-            )
-        ]
+        # Reverse side
+        exit_side = "SELL" if pos.net_qty > 0 else "BUY"
 
-    # ----------------- Target Re-entry -----------------
+        structure_id = pos.structure_id  # keep same structure
 
-    def on_candle_rollover(self, open_positions, candle, ctx: "StrategyContext"):
+        exit_intent = self.map_futures_instrument_to_intent(
+            inst=pos.instrument,
+            strike_row=candle,
+            strategy=self.name,
+            side=exit_side,
+            structure_id=structure_id,
+            candle_ts=candle["timestamp"],
+            symbol=candle["symbol"],
+            action="EXIT",
+            tag="MAIN",
+            parent_intent_id=None,
+        )
 
-        if open_positions:
-            return None
-
-        if self.last_exit_reason != "TARGET":
-            return None
-
-        close = candle["close"]
-        ema_high = candle["ema_high"]
-        ema_low = candle["ema_low"]
-
-        if ctx.instrument is None or ctx.intent_builder is None:
-            return None
-
-        # Re-enter only in same direction after EMA touch + continuation
-        if self.last_direction == "LONG" and close > ema_high:
-            return [
-                ctx.intent_builder.build_entry(
-                    instrument=ctx.instrument,
-                    side="BUY",
-                    qty=ctx.qty,
-                    tag="REENTRY",
-                )
-            ]
-
-        if self.last_direction == "SHORT" and close < ema_low:
-            return [
-                ctx.intent_builder.build_entry(
-                    instrument=ctx.instrument,
-                    side="SELL",
-                    qty=ctx.qty,
-                    tag="REENTRY",
-                )
-            ]
-
-        return None
+        return [exit_intent]
 
     # ----------------- Structure Exit -----------------
 

@@ -44,7 +44,11 @@ class IndiaMktMixins:
     # TIME FILTER (override valid_times in strategy)
     # ==================================================
     def _is_valid_time(self, ts, valid_times=None):
-        times = valid_times if valid_times is not None else getattr(self, "valid_times", set())
+        times = (
+            valid_times
+            if valid_times is not None
+            else getattr(self, "valid_times", set())
+        )
         return ts.strftime("%H:%M") in times
 
     # ==================================================
@@ -103,9 +107,7 @@ class IndiaMktMixins:
             "securityId": "13",
         }
 
-        chain = ctx.option_chain_service.get_chain(
-            api=self.api, ctx=ctx, params=params
-        )
+        chain = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
 
         if not chain or "chain" not in chain:
             return None
@@ -126,6 +128,21 @@ class IndiaMktMixins:
     # ==================================================
     # OPTION CHAIN & STRIKE SELECTION
     # ==================================================
+    def getExpiry(self, ctx):
+        ocs = ctx.option_chain_service
+        if self.api == "NSE":
+            ctx.expiry_list = ocs.get_expiries(
+                api=self.api, ctx=ctx, instrument="FUTIDX"
+            )
+            expiry_date = ExpiryResolver.resolve(
+                expiry_list=ctx.get_expiry_list(),
+                trade_date=ctx.timestamp,
+                api=self.api,
+                expiry_pref=self.expiryType,
+            )
+
+        return expiry_date
+
     def fetch_option_chain(self, candle, ctx, option_type):
         ocs = ctx.option_chain_service
 
@@ -170,9 +187,7 @@ class IndiaMktMixins:
             "securityId": "13",
         }
 
-        chain = ctx.option_chain_service.get_chain(
-            api=self.api, ctx=ctx, params=params
-        )
+        chain = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
         if not chain:
             print(">>no option chain data", ctx, params)
             return None
@@ -242,6 +257,40 @@ class IndiaMktMixins:
 
         assert inst.trading_symbol
         assert inst.custom_symbol
+
+        return OrderIntent(
+            intent_id=uuid.uuid4().hex,
+            instrument=inst,
+            side=side,
+            qty=int(inst.lot_size),
+            price=ltp,
+            order_type="LIMIT",
+            strategy=strategy,
+            structure_id=structure_id,
+            trade_type="MARGIN",
+            tag=tag,
+            candle_ts=candle_ts,
+            parent_intent_id=parent_intent_id,
+            symbol=symbol,
+            action=action,
+        )
+
+    def map_futures_instrument_to_intent(
+        self,
+        inst,
+        strike_row,
+        strategy,
+        side,
+        structure_id,
+        candle_ts,
+        symbol,
+        action,
+        tag=None,
+        parent_intent_id=None,
+    ):
+
+        # Futures always use candle close
+        ltp = float(strike_row["close"])
 
         return OrderIntent(
             intent_id=uuid.uuid4().hex,

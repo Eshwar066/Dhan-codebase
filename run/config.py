@@ -14,7 +14,7 @@ RUN_MODE = RunMode.BACKTEST
 STRATEGY_JOBS = [
     {
         "name": "LEAPS_RSI",
-        "enabled": True,
+        "enabled": False,
         "capital": 200000,
         "symbols": ["NIFTY"],
         "live": {"exchange": "INDEX", "sector": "YES", "rsi": "YES"},
@@ -38,14 +38,14 @@ STRATEGY_JOBS = [
     },
     {
         "name": "FuturesEMAHighLow",
-        "enabled": False,
+        "enabled": True,
         "capital": 200000,
         "symbols": ["NIFTY"],
         "instrument": "FUTURES",
         "live": {"exchange": "INDEX", "sector": "YES"},
         "backtest": {
             "start_date": "2023-10-19",
-            "end_date": "2024-02-28",
+            "end_date": "2024-08-12",
             "timeframe": "60",
             "exchange": "INDEX",
             "sector": "YES",
