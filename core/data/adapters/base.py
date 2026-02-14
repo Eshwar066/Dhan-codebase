@@ -1,4 +1,8 @@
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from core.models.strategy_context import StrategyContext
 
 
 class BaseAdapter(ABC):
@@ -6,13 +10,13 @@ class BaseAdapter(ABC):
         self.data = data_service
 
     @abstractmethod
-    def get_expiries(self, ctx):
+    def get_expiries(self, ctx: "StrategyContext"):
         pass
 
     @abstractmethod
-    def get_option_chain(self, ctx, params):
+    def get_option_chain(self, ctx: "StrategyContext", params: dict):
         pass
 
     @abstractmethod
-    def get_historical_option_chain(self, ctx, params):
+    def get_historical_option_chain(self, ctx: "StrategyContext", params: dict):
         pass

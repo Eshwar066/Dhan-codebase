@@ -180,9 +180,7 @@ class PositionManager:
             prev_qty = self.positions[sym].net_qty if sym in self.positions else 0
 
             if sym not in self.positions:
-                self.positions[sym] = Position(
-                    instrument=instrument  # 🔥 STORE FULL OBJECT
-                )
+                self.positions[sym] = Position(instrument=instrument)
 
             pos = self.positions[sym]
             pos.update_fill(side, qty, price)
@@ -241,11 +239,11 @@ class PositionManager:
                     "qty": qty,
                     "price": price,
                     "net_qty_after": new_qty,
-                    "order_id": order_id,
-                    "intent_id": intent_id,
-                    "trade_id": pos.trade_id,
-                    "execution_timestamp": datetime.now().isoformat(),
-                    "strategy": strategy,
+                    # "order_id": order_id,
+                    # "intent_id": intent_id,
+                    # "trade_id": pos.trade_id,
+                    # "execution_timestamp": datetime.now().isoformat(),
+                    # "strategy": strategy,
                 }
 
                 if trade_type == "EXIT":
@@ -261,7 +259,7 @@ class PositionManager:
                 pos.net_qty != 0
                 and pos.strategy == strategy
                 and pos.structure_id == structure_id
-                and pos.tag != tag
+                and pos.tag == tag
             ):
                 return True
         return False

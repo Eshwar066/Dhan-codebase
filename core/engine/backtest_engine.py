@@ -47,6 +47,8 @@ class BacktestEngine(BaseEngine):
 
             # -------- Indicators --------
             df = self.strategy.prepare_indicators(df)
+            warmup = self.strategy.get_warmup_period()
+            df = df.iloc[warmup:].reset_index(drop=True)
 
             # -------- Candle loop --------
             for _, row in df.iterrows():
@@ -58,7 +60,7 @@ class BacktestEngine(BaseEngine):
 
                 # -------- Runtime context --------
                 ctx, entry_intent = self.build_context(candle)
-
+                # pdb.set_trace()
                 # 🔥 ALWAYS run exits + rollover
                 self._run_risk_and_rollover(symbol, candle, ctx)
 

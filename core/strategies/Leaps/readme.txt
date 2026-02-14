@@ -1,4 +1,10 @@
+LEAPS Quarterly RSI – Strategy module
+======================================
+Implementation: LeapsQuatery_RSI_52_32.py (class LeapsQuarterly)
+Shared logic:   core/strategies/IndiaMktMixins.py (IndiaMktMixins)
+Registry:       core/strategies/registry.STRATEGY_MAP["LEAPS_RSI"]
 
+---
 wire parent–child linkage (parent_intent_id)
 
 enforce exactly one hedge per sell

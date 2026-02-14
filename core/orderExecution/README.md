@@ -1,140 +1,45 @@
-Final Model:
-    Strategy
-      ↓
-    IntentStore (CREATED)
-      ↓
-    RiskManager (VALIDATED)
-      ↓
-    ExecutionEngine
-      ↓
-    Slippage Model
-      ↓
-    DhanBroker.place_order()
-      ↓
-    ACKNOWLEDGED
-      ↓
-    Broker Fill
-      ↓
-    PositionManager Update
-      ↓
-    IntentStore → FILLED
+# Order Execution
 
-======================================
+**Purpose:** Route intents from strategies through risk checks to the broker and update positions. Uses **OrderIntent** (dataclass) and **StrategyContext** (typed context from engine).
 
-execution/
-│
-├── execution_engine.py
-├── order_state.py
-├── dhan_broker.py
-├── risk_manager.py
-├── position_manager.py
-├── intent_store.py
-├── slippage.py
-└── logger.py
+## Flow
 
+```
+Strategy.on_candle(candle, ctx: StrategyContext)
+    → returns OrderIntent(s)
+        → OrderRouter.process_intent(intent, price_map)
+            → RiskManager.allow_intent(intent, price_map)
+            → Broker.place_order(intent, execution_price)
+            → IntentStore.update(...)
+            → (on fill) PositionManager.on_fill(...)
+```
 
+## Files
 
-**Intent:**
-    Strategy → Intent Store → Risk Manager → Execution Engine → Broker
+| File | Role |
+|------|------|
+| `order_router.py` | `process_intent(intent, price_map)` – risk check, slippage, broker.place_order, intent_store update |
+| `risk_manager.py` | `allow_intent(intent, price_map, candle_ts)` – position limits, exposure, duplicate prevention |
+| `intent_store.py` | Intent lifecycle: CREATED → SENT → FILLED / REJECTED; idempotency |
+| `position_manager.py` | Positions, `on_fill()`, `get_open_positions()`, `get_hedge_for()`, `has_open_structure()`, reconcile_with_broker |
+| `order_state.py` | Order state tracking (if used) |
+| `slippage.py` | Slippage model for execution price |
 
-    Risk manager reads intents from store:
-        position limits
-        daily loss limits
-        exposure caps
-        margin checks
-        duplicate order prevention
+## Intent lifecycle
 
-        Only approved intents move forward
+- **CREATED** – strategy produced intent
+- **VALIDATED** – risk manager allowed (conceptually; router may not persist this)
+- **SENT** – passed to broker
+- **FILLED** / **REJECTED** – after broker response / fill
 
+## Dependencies
 
-    State tracking & lifecycle
-        CREATED
-        → VALIDATED
-    strategy.py
-      → generate_signal()
-      → create_intent()
+- **OrderIntent** from `core.models.order_intent`
+- **Broker** (BaseBroker impl) from `core.broker`
+- **StrategyContext** built in `core.engine.base_engine.build_context()`
 
-    intent_store.py
-      → save_intent()
-      → mark_status()
+## Risk Manager
 
-    risk_manager.py
-      → validate_intent()
+Answers: *“Is this intent safe to execute given current positions and limits?”*
 
-    execution.py
-      → place_order()
-        → ACKNOWLEDGED
-        → FILLED / REJECTED
-
-    🔹 Pro-level features (optional but powerful)
-
-    Advanced intent stores include:
-
-    🔹 Priority queue
-
-    Urgent exits first.
-
-    🔹 Idempotency keys
-
-    Avoid duplicate orders.
-
-    🔹 Intent throttling
-
-    Control order burst.
-
-    🔹 Intent expiration
-
-    Cancel stale signals.
-
-**PositionManager**
-    Strategy
-        ↓
-      Create Intent
-        ↓
-      Intent Store
-        ↓
-      Risk Manager checks vs PositionManager
-        ↓
-      Execution Engine places order
-        ↓
-      Broker Fill
-        ↓
-      PositionManager updates
-        ↓
-      Intent status updated to FILLED
-
-**Risk Manager**
-    A RiskManager sits between:
-    IntentStore → RiskManager → Execution
-                 ↑
-          PositionManager
-
-    It answers one question:
-
-    ✅ “Is this intent safe to execute given current positions and limits?”
-
-    Below is a practical, production-style risk_manager.py that plugs directly into your PositionManager.
-
-    It includes:
-
-    ✅ Portfolio exposure limits
-    ✅ Per-symbol limits
-    ✅ Max position size
-    ✅ No double-direction entries
-    ✅ Strategy-level limits
-    ✅ Simple cooldown protection
-    ✅ Easy to extend
-
-    Strategy → Intent
-    intent = {
-    "symbol": "NIFTY24FEB22000CE",
-    "side": "BUY",
-    "qty": 50,
-    "price": 120,
-    "instrument": instrument,
-    "strategy": "RSI"
-    }
-
-
-<!-- Next -->
-Dhan SLM order
+Can include: portfolio exposure, per-symbol limits, max position size, no double-direction entries, strategy-level limits, cooldown. Extend in `risk_manager.py`.

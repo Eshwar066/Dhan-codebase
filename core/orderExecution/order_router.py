@@ -24,10 +24,7 @@ class OrderRouter:
         exec_price = self.slippage_model(intent.price)
 
         # ---------- 3️⃣ Send to broker ----------
-        order_id = self.broker.place_order(
-            intent=intent,
-            execution_price=exec_price,  # 🔥 pass explicitly
-        )
+        order_id = self.broker.place_order(intent, execution_price=exec_price)
 
         # ---------- 4️⃣ Update IntentStore ----------
         self.intent_store.update(

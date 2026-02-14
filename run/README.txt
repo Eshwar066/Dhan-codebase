@@ -1,70 +1,33 @@
+run/ – Entry point and config
+=============================
+
 main.py
- └── run_job()
-      └── BacktestEngine.run()
-            ├── load historical data
-            ├── for each candle:
-            │     └── strategy.on_candle()
-            ├── place virtual orders
-            └── update portfolio
+-------
+- Loads STRATEGY_JOBS from run/config.py.
+- For each enabled job:
+  - Builds data_provider = DhanDataProvider(DhanSource())  [data layer]
+  - Builds broker = DhanBroker(DhanBrokerApi(dhan_source)) or DeltaBroker/SimulatedBroker
+  - Builds order_router, position_manager, intent_store, risk_manager, instrument_store
+  - BACKTEST: BacktestEngine(data_provider, strategy, order_router, ...).run(...)
+  - LIVE/PAPER: LiveEngine(..., candle_service=CandleService(data_provider), ...).start(...)
 
+Broker choice: set BROKER_NAME = "DHAN" or "DELTA" in main.py (Delta is stub).
 
+config.py
+---------
+- RUN_MODE: RunMode.BACKTEST | RunMode.PAPER | RunMode.LIVE
+- STRATEGY_JOBS: list of { name, enabled, capital, symbols, backtest: {...}, live: {...} }
 
-To get instrument symbols
-#     import time
-    # import pandas as pd
-    # from pathlib import Path
-    # import pdb
+Strategy config is wired via core/strategies/registry.STRATEGY_MAP and runtime_spec.
 
-    # # ---- instrument dataframe ----
-    # df = instrument_store.df
+Dependencies
+------------
+- DhanSource uses core/library/dhan_tradehull.Tradehull, which expects:
+  - Dependencies/ at project root
+  - all_instrument{date}.csv (created/fetched by Tradehull on login)
+- InstrumentStore in main.py loads: Dependencies/all_instrument{current_date}.csv
+- Run from project root (or DhanSource will chdir to project root for Dependencies).
 
-    # # ---- pick required columns safely ----
-    # cols = ["SEM_TRADING_SYMBOL", "SEM_CUSTOM_SYMBOL", "SEM_EXM_EXCH_ID"]
-    # df_symbols = df[cols].dropna(how="all").copy()
-
-    # # normalize (important for later matching)
-    # df_symbols["SEM_TRADING_SYMBOL"] = (
-    #     df_symbols["SEM_TRADING_SYMBOL"].astype(str).str.strip()
-    # )
-    # df_symbols["SEM_CUSTOM_SYMBOL"] = (
-    #     df_symbols["SEM_CUSTOM_SYMBOL"].astype(str).str.strip()
-    # )
-    # df_symbols["SEM_EXM_EXCH_ID"] = (
-    #     df_symbols["SEM_EXM_EXCH_ID"].astype(str).str.strip()
-    # )
-
-    # # remove fully empty symbol rows
-    # df_symbols = df_symbols[
-    #     (df_symbols["SEM_TRADING_SYMBOL"] != "")
-    #     | (df_symbols["SEM_CUSTOM_SYMBOL"] != "")
-    # ]
-
-    # # ---- paths ----
-    # BASE_DIR = Path(__file__).resolve().parents[1]
-    # current_date = time.strftime("%Y-%m-%d")
-
-    # log_path = BASE_DIR / "logs" / f"instrument_symbols_{current_date}.log"
-    # csv_path = BASE_DIR / "logs" / f"instrument_symbols_{current_date}.csv"
-
-    # log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # # ---- save LOG (human readable) ----
-    # with open(log_path, "w", encoding="utf-8") as f:
-    #     f.write("SEM_TRADING_SYMBOL | SEM_CUSTOM_SYMBOL | SEM_EXM_EXCH_ID\n")
-    #     f.write("-" * 80 + "\n")
-
-    #     for _, row in df_symbols.iterrows():
-    #         f.write(
-    #             f"{row['SEM_TRADING_SYMBOL']} | "
-    #             f"{row['SEM_CUSTOM_SYMBOL']} | "
-    #             f"{row['SEM_EXM_EXCH_ID']}\n"
-    #         )
-
-    # # ---- save CSV (machine readable) ----
-    # df_symbols.to_csv(csv_path, index=False)
-
-    # print(f"✅ Saved {len(df_symbols)} instrument rows")
-    # print(f"📄 Log : {log_path}")
-    # print(f"📊 CSV : {csv_path}")
-
-    # pdb.set_trace()
+Credentials
+-----------
+- .env: DHAN_CLIENT_CODE, DHAN_ACCESS_TOKEN (used by DhanSource).

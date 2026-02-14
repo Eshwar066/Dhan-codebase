@@ -1,21 +1,31 @@
 import time
-import pdb
 from pathlib import Path
-import pandas as pd
+
 from run.config import RUN_MODE, RunMode, STRATEGY_JOBS
 from core.strategies.registry import STRATEGY_MAP
 from core.engine.backtest_engine import BacktestEngine
 from core.engine.live_engine import LiveEngine
 from core.orderExecution.risk_manager import RiskManager
 from core.data.sources.dhan_source import DhanSource
-from core.broker.dhanbroker import DhanBroker
-from core.broker.simulated_broker import SimulatedBroker
+from core.data.sources.delta_source import DeltaSource
+from core.data.datalayer import DhanDataProvider, DeltaDataProvider
+from core.broker import (
+    DhanBroker,
+    DhanBrokerApi,
+    DeltaBroker,
+    DeltaBrokerApi,
+    SimulatedBroker,
+)
 from core.data.candle_service import CandleService
 from core.orderExecution.order_router import OrderRouter
 from core.orderExecution.intent_store import IntentStore
 from core.orderExecution.position_manager import PositionManager
 from core.utils.instruments.instrument_store import InstrumentStore
 from logs.logger.trade_logger import TradeLogger
+
+
+# Select broker: "DHAN" | "DELTA" (Delta uses core/library/delta_rest_client)
+BROKER_NAME = "DHAN"
 
 
 def run_job(job):
@@ -25,14 +35,23 @@ def run_job(job):
         print(f"❌ {job['name']} not allowed in {RUN_MODE}")
         return
 
-    # ---------- CORE ----------
+    # ---------- Strategy ----------
     strategy = cfg["strategy"]()
-    # ---------- DATA / BROKER ----------
-    api_data = DhanSource()
+
+    # ---------- Data layer (feeds engines: LTP, option chain, expiry, candles) ----------
+    if BROKER_NAME == "DELTA":
+        delta_source = DeltaSource(testnet=True, india=False)
+        data_provider = DeltaDataProvider(delta_source)
+    else:
+        dhan_source = DhanSource()
+        data_provider = DhanDataProvider(dhan_source)
+
+    # ---------- Order management ----------
     position_manager = PositionManager(logger=TradeLogger())
     intent_store = IntentStore()
     risk_manager = RiskManager(position_manager=position_manager)
-    # ------------- Instruments File --------------
+
+    # ---------- Instruments ----------
     current_date = time.strftime("%Y-%m-%d")
     expected_file = "all_instrument" + str(current_date) + ".csv"
     BASE_DIR = Path(__file__).resolve().parents[1]
@@ -41,21 +60,19 @@ def run_job(job):
     # ---------- BACKTEST ----------
     if RUN_MODE == RunMode.BACKTEST:
         bt_cfg = job["backtest"]
-        simulatedBroker = SimulatedBroker(position_manager=position_manager)
+        broker = SimulatedBroker(position_manager=position_manager, intent_store=intent_store)
         order_router = OrderRouter(
             risk_manager=risk_manager,
-            broker=simulatedBroker,
+            broker=broker,
             intent_store=intent_store,
         )
-
         engine = BacktestEngine(
-            data_provider=api_data,
+            data_provider=data_provider,
             strategy=strategy,
             order_router=order_router,
             instrument_store=instrument_store,
             position_manager=position_manager,
         )
-
         engine.run(
             symbols=job["symbols"],
             start_date=bt_cfg["start_date"],
@@ -68,24 +85,27 @@ def run_job(job):
     # ---------- LIVE / PAPER ----------
     else:
         live_cfg = job["live"]
-        candle_service = CandleService(api_data)
-        broker = DhanBroker(dhan_api=api_data)
+        candle_service = CandleService(data_provider)
+        if BROKER_NAME == "DELTA":
+            broker_api = DeltaBrokerApi(delta_source)
+            broker = DeltaBroker(api=broker_api, position_manager=position_manager, intent_store=intent_store)
+        else:
+            broker_api = DhanBrokerApi(dhan_source)
+            broker = DhanBroker(api=broker_api, position_manager=position_manager, intent_store=intent_store)
         order_router = OrderRouter(
             risk_manager=risk_manager,
             broker=broker,
             intent_store=intent_store,
         )
-
         engine = LiveEngine(
             strategy=strategy,
-            data=api_data,
+            data=data_provider,
             candle_service=candle_service,
             symbols=job["symbols"],
             order_router=order_router,
             instrument_store=instrument_store,
             position_manager=position_manager,
         )
-
         engine.start(
             exchange=live_cfg["exchange"],
             sector=live_cfg["sector"],
