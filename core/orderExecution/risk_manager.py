@@ -7,7 +7,7 @@ class RiskManager:
         self,
         position_manager,
         max_portfolio_exposure=10000000,
-        max_symbol_exposure=2000000,
+        max_symbol_exposure=9000000,
         max_qty_per_symbol=10000,
         max_open_positions=20,
         cooldown_seconds=5,
@@ -83,8 +83,9 @@ class RiskManager:
 
         # 5️⃣ Symbol exposure check
         sym_exposure = future_qty * price * lot_size
+        # pdb.set_trace()
         if sym_exposure > self.max_symbol_exposure:
-            print(f"❌ Symbol exposure breach {symbol}")
+            print(f"❌ Symbol exposure breach {symbol},{sym_exposure}")
             return False
 
         # 6️⃣ Portfolio exposure check

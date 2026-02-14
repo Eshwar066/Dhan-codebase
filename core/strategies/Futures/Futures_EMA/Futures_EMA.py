@@ -58,10 +58,10 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
         ema_low = candle.get("ema_low")
         timestamp = candle.get("timestamp")
 
-        if self.api in ("NSE", "DHAN"):
-            if timestamp.hour == 9 and timestamp.minute == 15:
-                self._update_previous(candle)
-                return False
+        # if self.api in ("NSE", "DHAN"):
+        #     if timestamp.hour == 9 and timestamp.minute == 15:
+        #         self._update_previous(candle)
+        #         return False
 
         if pd.isna(ema_high) or pd.isna(ema_low):
             self._update_previous(candle)
@@ -82,11 +82,13 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
         signal = None
 
         # LONG breakout
-        if self.prev_close <= self.prev_ema_high and close > ema_high:
+        # if self.prev_close <= self.prev_ema_high and close > ema_high:
+        if close > ema_high:
             signal = "LONG"
 
         # SHORT breakdown
-        elif self.prev_close >= self.prev_ema_low and close < ema_low:
+        # elif self.prev_close >= self.prev_ema_low and close < ema_low:
+        elif close < ema_low:
             signal = "SHORT"
 
         self.current_signal = signal
@@ -116,6 +118,13 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
 
         regime = self.compute_regime(candle)
         structure_id = self.build_structure_id(candle, regime)
+
+        hasOpenPosition = ctx.position_store.has_open_structure(
+            strategy=self.name, structure_id=structure_id, tag="MAIN"
+        )
+        # pdb.set_trace()
+        if hasOpenPosition:
+            return None
 
         side = "BUY" if self.current_signal == "LONG" else "SELL"
         self.last_direction = self.current_signal

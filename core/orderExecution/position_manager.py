@@ -180,9 +180,7 @@ class PositionManager:
             prev_qty = self.positions[sym].net_qty if sym in self.positions else 0
 
             if sym not in self.positions:
-                self.positions[sym] = Position(
-                    instrument=instrument
-                )
+                self.positions[sym] = Position(instrument=instrument)
 
             pos = self.positions[sym]
             pos.update_fill(side, qty, price)
@@ -261,7 +259,7 @@ class PositionManager:
                 pos.net_qty != 0
                 and pos.strategy == strategy
                 and pos.structure_id == structure_id
-                and pos.tag != tag
+                and pos.tag == tag
             ):
                 return True
         return False
