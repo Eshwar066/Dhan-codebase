@@ -238,6 +238,7 @@ class PositionManager:
                     "side": side,
                     "qty": qty,
                     "price": price,
+                    "pnl": pos.realized_pnl,
                     "net_qty_after": new_qty,
                     # "order_id": order_id,
                     # "intent_id": intent_id,

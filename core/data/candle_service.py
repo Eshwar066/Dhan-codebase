@@ -4,7 +4,6 @@ import datetime as dt
 import pandas as pd
 import talib as ta
 import math
-import pdb
 
 
 class CandleService:
@@ -16,12 +15,20 @@ class CandleService:
     def get_latest_closed(self, symbol, timeframe, exchange, sector, rsi):
 
         now = SessionManager._now(exchange)
-        # if not SessionManager.is_market_open(exchange):
-        #     return None
         # ---------- Throttle API calls ----------
         next_time = self.next_fetch_time.get(symbol)
-        if next_time and now < next_time:
-            return None
+        if next_time is not None:
+            # Ensure comparable: both must be timezone-aware in same tz
+            next_dt = next_time.to_pydatetime() if hasattr(next_time, "to_pydatetime") else next_time
+            if not isinstance(next_dt, dt.datetime):
+                next_dt = pd.Timestamp(next_time).to_pydatetime()
+            if next_dt.tzinfo is None and now.tzinfo is not None:
+                tz = SessionManager._tz(exchange)
+                next_dt = tz.localize(next_dt)
+            elif next_dt.tzinfo is not None and now.tzinfo is not None:
+                next_dt = next_dt.astimezone(now.tzinfo)
+            if now < next_dt:
+                return None
 
         start_date, end_date = self._get_intraday_range(timeframe, 100)
 
@@ -41,7 +48,6 @@ class CandleService:
         if bool(rsi):
             candles = self.attach_RSIindicators(candles)
 
-        pdb.set_trace()
         # ---------- Choose closed candle ----------
         is_open = SessionManager.is_market_open(exchange)
         closed = candles.iloc[-2] if is_open else candles.iloc[-1]
@@ -63,7 +69,15 @@ class CandleService:
         self.last_processed[symbol] = ts
 
         tf_min = self._tf_to_minutes(timeframe)
-        self.next_fetch_time[symbol] = ts + dt.timedelta(minutes=tf_min)
+        ts_dt = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+        if not isinstance(ts_dt, dt.datetime):
+            ts_dt = pd.Timestamp(ts).to_pydatetime()
+        tz = SessionManager._tz(exchange)
+        if ts_dt.tzinfo is None:
+            ts_dt = tz.localize(ts_dt)
+        else:
+            ts_dt = ts_dt.astimezone(tz)
+        self.next_fetch_time[symbol] = ts_dt + dt.timedelta(minutes=tf_min)
 
         return closed
 

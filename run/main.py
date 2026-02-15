@@ -1,7 +1,8 @@
+import os
 import time
 from pathlib import Path
-import pdb
 
+from dotenv import load_dotenv
 from run.config import RUN_MODE, RunMode, STRATEGY_JOBS
 from core.strategies.registry import STRATEGY_MAP
 from core.engine.backtest_engine import BacktestEngine
@@ -10,6 +11,7 @@ from core.orderExecution.risk_manager import RiskManager
 from core.data.sources.dhan_source import DhanSource
 from core.data.sources.delta_source import DeltaSource
 from core.data.datalayer import DhanDataProvider, DeltaDataProvider
+from core.data.feeds import DeltaWebSocketFeed
 from core.broker import (
     DhanBroker,
     DhanBrokerApi,
@@ -91,8 +93,11 @@ def run_job(job):
 
     # ---------- LIVE / PAPER ----------
     else:
+        load_dotenv()
         live_cfg = job["live"]
         candle_service = CandleService(data_provider)
+        realtime_feed = None
+
         if BROKER_NAME == "DELTA":
             broker_api = DeltaBrokerApi(delta_source)
             broker = DeltaBroker(
@@ -100,6 +105,21 @@ def run_job(job):
                 position_manager=position_manager,
                 intent_store=intent_store,
             )
+            # Delta WebSocket feed for real-time ticker/candles (and optional orders/positions)
+            delta_api_key = os.getenv("DELTA_API_KEY")
+            delta_api_secret = os.getenv("DELTA_API_SECRET")
+            if delta_api_key and delta_api_secret:
+                realtime_feed = DeltaWebSocketFeed(
+                    api_key=delta_api_key,
+                    api_secret=delta_api_secret,
+                    symbols=job["symbols"],
+                    timeframe=job.get("backtest", {}).get("timeframe", "60"),
+                    testnet=False,
+                    india=True,
+                    subscribe_private=True,
+                )
+                realtime_feed.start()
+            # When Dhan WebSocket is added, create DhanWebSocketFeed here for BROKER_NAME == "DHAN"
         else:
             broker_api = DhanBrokerApi(dhan_source)
             broker = DhanBroker(
@@ -107,6 +127,8 @@ def run_job(job):
                 position_manager=position_manager,
                 intent_store=intent_store,
             )
+            # TODO: add DhanWebSocketFeed when Dhan WebSocket API is integrated
+
         order_router = OrderRouter(
             risk_manager=risk_manager,
             broker=broker,
@@ -120,11 +142,12 @@ def run_job(job):
             order_router=order_router,
             instrument_store=instrument_store,
             position_manager=position_manager,
+            realtime_feed=realtime_feed,
         )
         engine.start(
             exchange=live_cfg["exchange"],
             sector=live_cfg["sector"],
-            rsi=live_cfg["rsi"],
+            rsi=live_cfg.get("rsi", "NO"),
         )
 
 

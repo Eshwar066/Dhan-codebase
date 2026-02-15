@@ -8,7 +8,7 @@ class RunMode(str, Enum):
 
 
 # 🔁 CHANGE ONLY THIS
-RUN_MODE = RunMode.BACKTEST
+RUN_MODE = RunMode.LIVE
 
 
 STRATEGY_JOBS = [

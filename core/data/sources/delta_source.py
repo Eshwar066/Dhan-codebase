@@ -155,12 +155,13 @@ class DeltaSource:
 
             # Map timeframe (if needed)
             resolution_map = {
-                "1m": "1m",
-                "3m": "3m",
-                "5m": "5m",
-                "15m": "15m",
-                "30m": "30m",
+                "1": "1m",
+                "3": "3m",
+                "5": "5m",
+                "15": "15m",
+                "30": "30m",
                 "1h": "1h",
+                "60": "1h",
                 "2h": "2h",
                 "4h": "4h",
                 "6h": "6h",
