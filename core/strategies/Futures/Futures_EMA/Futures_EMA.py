@@ -14,7 +14,7 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
     name = "FuturesEMAHighLow"
     timeframe = "60"
     required_context = ["instrument", "qty", "intent_builder"]
-    api = "NSE"
+    api = "DELTA"
 
     def __init__(self):
         self.ema_period = 8
@@ -143,20 +143,29 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
         inst = ctx.instrument
 
         if inst is None:
-            expiry = self.getExpiry(ctx)
+            expiry = None
+            if self.api == "NSE":
+                expiry = self.getExpiry(ctx)
+
+            elif self.api == "DELTA":
+                product_type = getattr(ctx, "product_type", None)
+                if product_type != "PERPETUALFUTURES":
+                    expiry = self.getExpiry(ctx)
 
             inst = ctx.instrument_store.futures_intent_creation_details(
                 trading_symbol=candle["symbol"],
-                exchange="NSE",
+                exchange="NSE" if self.api == "NSE" else "DELTA",
                 expiry=expiry,
             )
+            if inst.lot_size <= 0:
+                raise ValueError(f"Invalid lot_size for {self.trading_symbol}")
 
             if inst is None:
                 return None
 
         buy_intent = self.map_futures_instrument_to_intent(
             inst=inst,
-            strike_row=candle,  # ✅ use candle as price source
+            strike_row=candle,
             strategy=self.name,
             side=side,
             structure_id=structure_id,

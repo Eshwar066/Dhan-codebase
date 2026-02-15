@@ -1,0 +1,160 @@
+"""
+Delta Exchange broker: instrument loading (API) and lookup logic.
+Product id / symbol, Delta API schema, backtest dummy rows.
+"""
+
+from pathlib import Path
+from datetime import datetime
+from typing import Optional
+import pdb
+
+import pandas as pd
+import requests
+from run.config import RUN_MODE, RunMode
+
+from .base import BaseInstrumentStore, Instrument
+
+
+def fetch_delta_products(
+    base_url: str = "https://api.india.delta.exchange",
+) -> pd.DataFrame:
+    """Fetch product list from Delta /v2/products. Returns raw result as DataFrame."""
+    r = requests.get(f"{base_url.rstrip('/')}/v2/products", timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    result = data.get("result", data) if isinstance(data, dict) else data
+    return pd.DataFrame(result) if result else pd.DataFrame()
+
+
+class DeltaInstrumentProvider:
+    """Load Delta Exchange product list from API or from cache CSV in Dependencies."""
+
+    DEFAULT_BASE_URL = "https://api.india.delta.exchange"
+
+    def __init__(self, base_url: Optional[str] = None):
+        self.base_url = (base_url or self.DEFAULT_BASE_URL).rstrip("/")
+
+    def fetch_products(self) -> pd.DataFrame:
+        return fetch_delta_products(self.base_url)
+
+    def load(self) -> pd.DataFrame:
+        return self.fetch_products()
+
+
+class DeltaInstrumentStore(BaseInstrumentStore):
+    """Instrument store for Delta: product id/symbol lookup, Delta-specific backtest dummies. Uses Dependencies cache when cache_path is set."""
+
+    dummy_security_counter = 100000
+
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        cache_path: Optional[Path] = None,
+    ):
+        cache = Path(cache_path).resolve() if cache_path else None
+        today = datetime.now().date()
+        cache_stale = False
+        if cache and cache.exists():
+            try:
+                mtime = cache.stat().st_mtime
+                cache_date = datetime.fromtimestamp(mtime).date()
+                if cache_date < today:
+                    cache_stale = True
+            except OSError:
+                cache_stale = True
+        if cache and cache.exists() and not cache_stale:
+            self.df = pd.read_csv(cache, low_memory=False)
+        else:
+            provider = DeltaInstrumentProvider(base_url)
+            self.df = provider.load()
+            if cache and not self.df.empty:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                self.df.to_csv(cache, index=False)
+        self._symbol_to_row = {}
+        if not self.df.empty and "symbol" in self.df.columns:
+            for idx, row in self.df.iterrows():
+                sym = row.get("symbol") or row.get("short_name", "")
+                self._symbol_to_row[str(sym).upper()] = row
+                pid = row.get("id")
+                if pid is not None:
+                    self._symbol_to_row[str(pid)] = row
+
+    def _row_to_instrument(self, row: pd.Series) -> Instrument:
+        symbol = row.get("symbol") or row.get("short_name", "")
+        contract_multiplier = float(
+            pd.to_numeric(row.get("contract_value", 1), errors="coerce") or 1
+        )
+        return Instrument(
+            trading_symbol=str(symbol),
+            custom_symbol=str(symbol),
+            exchange="DELTA",
+            segment="D",
+            instrument_type=str(row.get("contract_type", "future"))
+            .replace("_", "")
+            .upper(),
+            expiry=row.get("settlement_time") or row.get("expiry_date"),
+            strike=(
+                pd.to_numeric(row.get("strike_price"), errors="coerce")
+                if row.get("strike_price") is not None
+                else None
+            ),
+            option_type=row.get("option_type"),
+            lot_size=1,
+            contract_multiplier=contract_multiplier,
+            instrument_id=row.get("id"),
+            series=row.get("series"),
+        )
+
+    def intent_creation_details(
+        self, trading_symbol, exchange, expiry, option_type, strike
+    ) -> Optional[Instrument]:
+        key = (str(trading_symbol)).upper()
+        row = self._symbol_to_row.get(key)
+        if row is not None:
+            return self._row_to_instrument(row)
+
+        if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
+            print(f"❌ No Delta instrument found for {trading_symbol}")
+            return None
+
+        DeltaInstrumentStore.dummy_security_counter += 1
+        return Instrument(
+            trading_symbol=trading_symbol,
+            custom_symbol=trading_symbol,
+            exchange="DELTA",
+            segment="D",
+            instrument_type="OP",
+            expiry=expiry,
+            strike=strike,
+            option_type=option_type,
+            lot_size=1,
+            instrument_id=DeltaInstrumentStore.dummy_security_counter,
+            series=None,
+        )
+
+    def futures_intent_creation_details(
+        self, trading_symbol: str, exchange: str, expiry
+    ) -> Optional[Instrument]:
+        key = (str(trading_symbol)).upper()
+        row = self._symbol_to_row.get(key)
+        if row is not None:
+            return self._row_to_instrument(row)
+
+        if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
+            print(f"❌ No Delta FUT instrument found for {trading_symbol}")
+            return None
+
+        DeltaInstrumentStore.dummy_security_counter += 1
+        return Instrument(
+            trading_symbol=trading_symbol,
+            custom_symbol=trading_symbol,
+            exchange="DELTA",
+            segment="D",
+            instrument_type="FUT",
+            expiry=expiry,
+            strike=None,
+            option_type=None,
+            lot_size=1,
+            instrument_id=DeltaInstrumentStore.dummy_security_counter,
+            series="FUT",
+        )

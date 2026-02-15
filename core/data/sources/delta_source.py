@@ -156,7 +156,7 @@ class DeltaSource:
             # Map timeframe (if needed)
             resolution_map = {
                 "1m": "1m",
-                "3m":"3m",
+                "3m": "3m",
                 "5m": "5m",
                 "15m": "15m",
                 "30m": "30m",
@@ -167,7 +167,6 @@ class DeltaSource:
                 "1d": "1d",
                 "1w": "1w",
             }
-
 
             resolution = resolution_map.get(timeframe, "5m")
 

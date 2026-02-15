@@ -28,7 +28,6 @@ class BacktestEngine(BaseEngine):
     # MAIN RUN LOOP
     # ==========================================================
     def run(self, symbols, start_date, end_date, timeframe, exchange, sector):
-
         for symbol in symbols:
             df = self.data.get_intraday(
                 symbol=symbol,
@@ -38,6 +37,11 @@ class BacktestEngine(BaseEngine):
                 exchange=exchange,
                 sector=sector,
             )
+            # df1 = self.data.get_products()
+            # df2 = self.data.product_id_for_symbol("BTCUSD")
+            # df3 = self.data.get_latest_candles({"BTCUSD", "ETHUSD"})
+            # df4 = self.data.get_live_expiry("BTCUSD")
+            # pdb.set_trace()
 
             if df is None or len(df) < 50:
                 continue

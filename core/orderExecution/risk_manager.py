@@ -35,7 +35,7 @@ class RiskManager:
         side = intent.side
         qty = intent.qty
         price = intent.price or 0
-        lot_size = getattr(intent, "lot_size", 65)
+        lot_size = intent.instrument.lot_size
         strategy = getattr(intent, "strategy", None)
         structure_id = getattr(intent, "structure_id", None)
         tag = getattr(intent, "tag", None)
@@ -82,15 +82,16 @@ class RiskManager:
             return False
 
         # 5️⃣ Symbol exposure check
-        sym_exposure = future_qty * price * lot_size
-        # pdb.set_trace()
+        multiplier = getattr(intent.instrument, "contract_multiplier", 1)
+        sym_exposure = future_qty * price * multiplier
+
         if sym_exposure > self.max_symbol_exposure:
             print(f"❌ Symbol exposure breach {symbol},{sym_exposure}")
             return False
 
         # 6️⃣ Portfolio exposure check
         portfolio_exposure = self.pm.total_exposure(price_map)
-        new_exposure = portfolio_exposure + (qty * price * lot_size)
+        new_exposure = portfolio_exposure + (qty * price * multiplier)
         if new_exposure > self.max_portfolio_exposure:
             print("❌ Portfolio exposure breach")
             return False

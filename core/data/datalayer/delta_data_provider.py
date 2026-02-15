@@ -50,13 +50,6 @@ class DeltaDataProvider(IDataProvider):
     def get_live_expiry(self, symbol: str, exchange: str = None) -> Any:
         return self._source.get_live_expiry(symbol=symbol, exchange=exchange)
 
-    def get_nse_expiries(
-        self, symbol: str, year: int, instrument: str = "OPTIDX"
-    ) -> List[Any]:
-        return self._source.get_nse_expiries(
-            symbol=symbol, year=year, instrument=instrument
-        )
-
     def get_live_option_chain(
         self,
         symbol: str,

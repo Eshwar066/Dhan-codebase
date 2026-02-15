@@ -14,7 +14,8 @@ Example:
 
 import uuid
 import pandas as pd
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
+import calendar
 
 from run.config import RUN_MODE, RunMode
 from core.utils.expiry_resolver import ExpiryResolver
@@ -128,6 +129,16 @@ class IndiaMktMixins:
     # ==================================================
     # OPTION CHAIN & STRIKE SELECTION
     # ==================================================
+
+    def get_last_friday(self, year: int, month: int) -> datetime:
+        # Get last day of month
+        last_day = calendar.monthrange(year, month)[1]
+        last_date = datetime(year, month, last_day)
+
+        # Move backward to Friday
+        offset = (last_date.weekday() - 4) % 7  # Friday = 4
+        return last_date - timedelta(days=offset)
+
     def getExpiry(self, ctx):
         ocs = ctx.option_chain_service
         if self.api == "NSE":
@@ -140,6 +151,26 @@ class IndiaMktMixins:
                 api=self.api,
                 expiry_pref=self.expiryType,
             )
+
+        elif self.api == "DELTA":
+
+            trade_dt = ctx.timestamp
+
+            year = trade_dt.year
+            month = trade_dt.month
+
+            expiry_date = self.get_last_friday(year, month)
+
+            # If trade date already past expiry → move to next month
+            if trade_dt.date() > expiry_date.date():
+
+                if month == 12:
+                    year += 1
+                    month = 1
+                else:
+                    month += 1
+
+                expiry_date = self.get_last_friday(year, month)
 
         return expiry_date
 

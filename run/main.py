@@ -1,5 +1,6 @@
 import time
 from pathlib import Path
+import pdb
 
 from run.config import RUN_MODE, RunMode, STRATEGY_JOBS
 from core.strategies.registry import STRATEGY_MAP
@@ -25,7 +26,7 @@ from logs.logger.trade_logger import TradeLogger
 
 
 # Select broker: "DHAN" | "DELTA" (Delta uses core/library/delta_rest_client)
-BROKER_NAME = "DHAN"
+BROKER_NAME = "DELTA"
 
 
 def run_job(job):
@@ -51,16 +52,22 @@ def run_job(job):
     intent_store = IntentStore()
     risk_manager = RiskManager(position_manager=position_manager)
 
-    # ---------- Instruments ----------
+    # ---------- Instruments (broker-specific: Dhan CSV or Delta cache in Dependencies) ----------
     current_date = time.strftime("%Y-%m-%d")
-    expected_file = "all_instrument" + str(current_date) + ".csv"
     BASE_DIR = Path(__file__).resolve().parents[1]
-    instrument_store = InstrumentStore(BASE_DIR / "Dependencies" / expected_file)
-
+    deps = BASE_DIR / "Dependencies"
+    if BROKER_NAME == "DELTA":
+        delta_cache = deps / ("delta_instrument_" + current_date + ".csv")
+        instrument_store = InstrumentStore(broker="DELTA", csv_path=delta_cache)
+    else:
+        expected_file = "all_instrument" + current_date + ".csv"
+        instrument_store = InstrumentStore(csv_path=deps / expected_file)
     # ---------- BACKTEST ----------
     if RUN_MODE == RunMode.BACKTEST:
         bt_cfg = job["backtest"]
-        broker = SimulatedBroker(position_manager=position_manager, intent_store=intent_store)
+        broker = SimulatedBroker(
+            position_manager=position_manager, intent_store=intent_store
+        )
         order_router = OrderRouter(
             risk_manager=risk_manager,
             broker=broker,
@@ -88,10 +95,18 @@ def run_job(job):
         candle_service = CandleService(data_provider)
         if BROKER_NAME == "DELTA":
             broker_api = DeltaBrokerApi(delta_source)
-            broker = DeltaBroker(api=broker_api, position_manager=position_manager, intent_store=intent_store)
+            broker = DeltaBroker(
+                api=broker_api,
+                position_manager=position_manager,
+                intent_store=intent_store,
+            )
         else:
             broker_api = DhanBrokerApi(dhan_source)
-            broker = DhanBroker(api=broker_api, position_manager=position_manager, intent_store=intent_store)
+            broker = DhanBroker(
+                api=broker_api,
+                position_manager=position_manager,
+                intent_store=intent_store,
+            )
         order_router = OrderRouter(
             risk_manager=risk_manager,
             broker=broker,

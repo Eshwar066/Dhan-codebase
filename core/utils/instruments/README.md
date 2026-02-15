@@ -2,13 +2,15 @@
 
 **Purpose:** Load and query the instrument master (symbols, strikes, expiries, lot sizes) for order building and symbol resolution.
 
-## File
+## Layout (broker-specific)
 
-- **`instrument_store.py`**
-  - **Instrument** – dataclass-like object: `trading_symbol`, `custom_symbol`, `exchange`, `segment`, `instrument_type`, `expiry`, `strike`, `option_type`, `lot_size`, etc. `contract_key` property for uniqueness.
-  - **InstrumentStore** – loads CSV (e.g. `all_instrument{date}.csv` from Dependencies), provides:
-    - `intent_creation_details(trading_symbol, exchange, expiry, option_type, strike)` → Instrument or None
-    - Other lookup helpers as needed.
+- **`base.py`** – **Instrument** (shared), **BaseInstrumentStore** (abstract: `intent_creation_details`, `futures_intent_creation_details`).
+- **`dhan.py`** – **DhanInstrumentProvider** (CSV), **DhanInstrumentStore** (SEM_*, NSE/NFO/BSE, backtest dummies).
+- **`delta.py`** – **DeltaInstrumentProvider** (Delta `/v2/products`), **DeltaInstrumentStore** (product id/symbol, Delta dummies).
+- **`instrument_store.py`** – Facade: **Instrument**, **InstrumentStore(broker=..., csv_path=..., base_url=...)** → Dhan or Delta store.
+- **`providers.py`** – **fetch_delta_products**, **get_provider_for_path** (Dhan CSV vs Delta fallback).
+
+Use **InstrumentStore(csv_path=path)** for Dhan or **InstrumentStore(broker="DELTA")** for Delta; same interface for `intent_creation_details` and `futures_intent_creation_details`.
 
 ## CSV columns (Dhan / project convention)
 
