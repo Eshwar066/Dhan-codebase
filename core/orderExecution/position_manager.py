@@ -110,7 +110,7 @@ class Position:
                 pnl *= -1
 
             pnl *= self.instrument.lot_size
-            self.realized_pnl += pnl
+            self.realized_pnl = pnl
 
             self.net_qty += signed_qty
 
@@ -250,6 +250,35 @@ class PositionManager:
                     row["pnl"] = pos.realized_pnl
                     row["mae"] = pos.mae
                     row["mfe"] = pos.mfe
+
+                    # Log complete trade for performance analytics (trade log)
+                    entry_time_str = (
+                        datetime.fromtimestamp(pos.entry_time).strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
+                        if pos.entry_time is not None
+                        else ""
+                    )
+                    exit_time_str = (
+                        candle_ts.strftime("%Y-%m-%d %H:%M:%S")
+                        if candle_ts is not None and isinstance(candle_ts, datetime)
+                        else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    )
+                    # Entry side: long position was entered with BUY, short with SELL
+                    entry_side = "BUY" if prev_qty > 0 else "SELL"
+                    trade_row = {
+                        "trade_id": pos.trade_id,
+                        "entry_time": entry_time_str,
+                        "exit_time": exit_time_str,
+                        "side": entry_side,
+                        "entry_price": pos.entry_price,
+                        "exit_price": price,
+                        "qty": qty,
+                        "pnl": pos.realized_pnl,
+                        "symbol": sym,
+                        "strategy": strategy or "GLOBAL",
+                    }
+                    self.logger.log_trade(trade_row)
 
                 self.logger.log(strategy=strategy, row=row)
 
