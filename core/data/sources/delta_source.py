@@ -5,6 +5,12 @@ Used by DeltaDataProvider (data layer) and DeltaBrokerApi (broker layer).
 
 import os
 from typing import Any, Dict, List, Optional
+from dotenv import load_dotenv
+import requests
+import pandas as pd
+from datetime import datetime
+from typing import Optional, Any
+
 
 from core.library.delta_rest_client import (
     DeltaRestClient,
@@ -28,19 +34,27 @@ class DeltaSource:
 
     def __init__(
         self,
-        base_url: Optional[str] = None,
-        api_key: Optional[str] = None,
-        api_secret: Optional[str] = None,
         testnet: bool = True,
         india: bool = False,
     ):
+        load_dotenv()
+        base_url = os.getenv("DELTA_BASE_URL")
+        api_key = os.getenv("DELTA_API_KEY")
+        api_secret = os.getenv("DELTA_API_SECRET")
+
+        if not api_key or not api_secret:
+            raise ValueError("Delta API credentials not found in environment variables")
         if base_url is None:
             if india:
-                base_url = DELTA_BASE_URL_INDIA_TEST if testnet else DELTA_BASE_URL_INDIA_PROD
+                base_url = (
+                    DELTA_BASE_URL_INDIA_TEST if testnet else DELTA_BASE_URL_INDIA_PROD
+                )
             else:
-                base_url = DELTA_BASE_URL_GLOBAL_TEST if testnet else DELTA_BASE_URL_GLOBAL_PROD
-        api_key = api_key or os.getenv("DELTA_API_KEY", "")
-        api_secret = api_secret or os.getenv("DELTA_API_SECRET", "")
+                base_url = (
+                    DELTA_BASE_URL_GLOBAL_TEST
+                    if testnet
+                    else DELTA_BASE_URL_GLOBAL_PROD
+                )
         self._client = DeltaRestClient(
             base_url=base_url,
             api_key=api_key,
@@ -78,7 +92,7 @@ class DeltaSource:
         p = self._symbol_to_product.get(symbol)
         if p is not None:
             return p.get("id")
-        for prod in (self._products_cache or []):
+        for prod in self._products_cache or []:
             if (prod.get("symbol") or "").upper() == str(symbol).upper():
                 return prod.get("id")
         return None
@@ -94,7 +108,9 @@ class DeltaSource:
         """L2 orderbook by symbol or product identifier."""
         return self._client.get_l2_orderbook(identifier, auth=False)
 
-    def get_latest_candles(self, symbols: List[str], debug: str = "NO") -> Optional[Dict[str, Dict]]:
+    def get_latest_candles(
+        self, symbols: List[str], debug: str = "NO"
+    ) -> Optional[Dict[str, Dict]]:
         """
         Latest price/candle-like data per symbol from ticker.
         Returns { symbol: { open, high, low, close, ltp, volume, ... } }.
@@ -108,7 +124,9 @@ class DeltaSource:
                 if not t:
                     continue
                 # Delta ticker often has: mark_price, last_price, open_interest, etc.
-                ltp = float(t.get("mark_price") or t.get("last_price") or t.get("close") or 0)
+                ltp = float(
+                    t.get("mark_price") or t.get("last_price") or t.get("close") or 0
+                )
                 out[sym] = {
                     "open": ltp,
                     "high": ltp,
@@ -128,13 +146,81 @@ class DeltaSource:
         start_date: str,
         end_date: str,
         timeframe: str,
-        exchange: str,
-        sector: str,
     ) -> Optional[Any]:
-        """Historical intraday. Delta REST client does not expose this; return None."""
-        return None
 
-    def get_live_expiry(self, symbol: str, exchange: str) -> List[Any]:
+        try:
+            # Convert to UNIX timestamps
+            start_ts = int(datetime.fromisoformat(start_date).timestamp())
+            end_ts = int(datetime.fromisoformat(end_date).timestamp())
+
+            # Map timeframe (if needed)
+            resolution_map = {
+                "1m": "1m",
+                "3m":"3m",
+                "5m": "5m",
+                "15m": "15m",
+                "30m": "30m",
+                "1h": "1h",
+                "2h": "2h",
+                "4h": "4h",
+                "6h": "6h",
+                "1d": "1d",
+                "1w": "1w",
+            }
+
+
+            resolution = resolution_map.get(timeframe, "5m")
+
+            url = "https://api.india.delta.exchange/v2/history/candles"
+
+            headers = {"Accept": "application/json"}
+
+            params = {
+                "resolution": resolution,
+                "symbol": symbol,
+                "start": start_ts,
+                "end": end_ts,
+            }
+
+            response = requests.get(url, params=params, headers=headers)
+            response.raise_for_status()
+
+            data = response.json()
+
+            if not data.get("success"):
+                return None
+
+            candles = data["result"]
+
+            # Convert to DataFrame
+            df = pd.DataFrame(candles)
+
+            # Rename columns to match your engine standard
+            df.rename(
+                columns={
+                    "time": "timestamp",
+                    "open": "open",
+                    "high": "high",
+                    "low": "low",
+                    "close": "close",
+                    "volume": "volume",
+                },
+                inplace=True,
+            )
+
+            # Convert timestamp to datetime
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
+
+            df.sort_values("timestamp", inplace=True)
+            df.reset_index(drop=True, inplace=True)
+
+            return df
+
+        except Exception as e:
+            print(f"Delta get_intraday error: {e}")
+            return None
+
+    def get_live_expiry(self, symbol: str, exchange: str = None) -> List[Any]:
         """Expiry list from products (e.g. futures/options expiries)."""
         products = self.get_products(use_cache=True)
         expiries = set()
@@ -155,21 +241,17 @@ class DeltaSource:
     ) -> Optional[Dict]:
         """Minimal option chain from products (Delta options)."""
         products = self.get_products(use_cache=True)
-        chain = [p for p in products if (p.get("symbol") or "").upper().startswith(symbol.upper())]
+        chain = [
+            p
+            for p in products
+            if (p.get("symbol") or "").upper().startswith(symbol.upper())
+        ]
         if not chain:
             return None
         return {"symbol": symbol, "exchange": exchange, "chain": chain}
 
     def get_expired_optionchain(self, *args, **kwargs) -> Any:
         """Not provided by Delta REST in this client."""
-        return None
-
-    def get_nse_expiries(self, symbol: str, year: int, instrument: str = "OPTIDX") -> List[Any]:
-        """NSE-specific; Delta uses different model."""
-        return []
-
-    def get_nse_optionchain_historical(self, *args, **kwargs) -> Optional[Dict]:
-        """NSE-specific."""
         return None
 
     # -------------------------------------------------------------------------
@@ -200,15 +282,21 @@ class DeltaSource:
         for p in raw:
             product_id = p.get("product_id") or p.get("id")
             size = int(p.get("size") or 0)
-            entry_price = float(p.get("entry_price") or p.get("average_fill_price") or 0)
-            rows.append({
-                "tradingSymbol": str(p.get("product", {}).get("symbol", product_id)),
-                "product_id": product_id,
-                "netQty": size,
-                "avgPrice": entry_price,
-                "segment": "DELTA",
-                "lotSize": 1,
-            })
+            entry_price = float(
+                p.get("entry_price") or p.get("average_fill_price") or 0
+            )
+            rows.append(
+                {
+                    "tradingSymbol": str(
+                        p.get("product", {}).get("symbol", product_id)
+                    ),
+                    "product_id": product_id,
+                    "netQty": size,
+                    "avgPrice": entry_price,
+                    "segment": "DELTA",
+                    "lotSize": 1,
+                }
+            )
         return rows
 
     # -------------------------------------------------------------------------
@@ -232,7 +320,11 @@ class DeltaSource:
         order_type: MARKET | LIMIT.
         """
         side = (side or "buy").lower()
-        ot = OrderType.MARKET if (order_type or "MARKET").upper() == "MARKET" else OrderType.LIMIT
+        ot = (
+            OrderType.MARKET
+            if (order_type or "MARKET").upper() == "MARKET"
+            else OrderType.LIMIT
+        )
         tif = None
         if time_in_force:
             tif = getattr(TimeInForce, time_in_force.upper(), None)
@@ -249,7 +341,10 @@ class DeltaSource:
                 reduce_only=reduce_only,
             )
             oid = result.get("id") or result.get("order_id")
-            return {"status": "success", "order_id": str(oid) if oid is not None else None}
+            return {
+                "status": "success",
+                "order_id": str(oid) if oid is not None else None,
+            }
         except Exception as e:
             return {"status": "error", "order_id": None, "message": str(e)}
 
@@ -320,8 +415,14 @@ class DeltaSource:
     def batch_edit(self, product_id: int, orders: List[Dict]) -> Any:
         return self._client.batch_edit(product_id=product_id, orders=orders)
 
-    def order_history(self, query: Optional[Dict] = None, page_size: int = 100, after: Any = None) -> Any:
-        return self._client.order_history(query=query or {}, page_size=page_size, after=after)
+    def order_history(
+        self, query: Optional[Dict] = None, page_size: int = 100, after: Any = None
+    ) -> Any:
+        return self._client.order_history(
+            query=query or {}, page_size=page_size, after=after
+        )
 
-    def fills(self, query: Optional[Dict] = None, page_size: int = 100, after: Any = None) -> Any:
+    def fills(
+        self, query: Optional[Dict] = None, page_size: int = 100, after: Any = None
+    ) -> Any:
         return self._client.fills(query=query or {}, page_size=page_size, after=after)
