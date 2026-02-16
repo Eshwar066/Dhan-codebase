@@ -109,12 +109,10 @@ class DeltaBroker(BaseBroker):
     def get_positions(self):
         return self.api.get_positions()
 
-    def sync_positions(self):
-        if not self.position_manager:
-            return
+    def get_positions_for_recon(self):
         positions = self.api.get_positions()
         if not positions:
-            return
+            return {}
         broker_positions = {}
         for row in positions:
             sym = row.get("tradingSymbol") or row.get("trading_symbol") or str(row.get("product_id", ""))
@@ -124,4 +122,11 @@ class DeltaBroker(BaseBroker):
                 "segment": row.get("segment", "DELTA"),
                 "lot_size": int(row.get("lotSize", 1)),
             }
-        self.position_manager.reconcile_with_broker(broker_positions)
+        return broker_positions
+
+    def sync_positions(self):
+        if not self.position_manager:
+            return
+        broker_positions = self.get_positions_for_recon()
+        if broker_positions:
+            self.position_manager.reconcile_with_broker(broker_positions)

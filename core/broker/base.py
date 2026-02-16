@@ -81,6 +81,10 @@ class BaseBroker(ABC):
         """Optional. LIVE brokers may override to reconcile broker truth."""
         return None
 
+    def get_positions_for_recon(self) -> dict:
+        """Return normalized { symbol: { qty, avg_price, segment, lot_size } } for reconciliation."""
+        return {}
+
     def find_order_by_client_id(self, client_order_id: str):
         """Optional idempotency hook. LIVE brokers may override."""
         return None

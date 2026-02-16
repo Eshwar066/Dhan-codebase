@@ -40,6 +40,7 @@ from core.orderExecution.position_manager import PositionManager
 from core.orderExecution.risk_manager import RiskManager
 from core.utils.instruments.instrument_store import InstrumentStore
 from logs.logger.trade_logger import TradeLogger
+from logs.engine_logger import EngineLogger
 
 
 class EngineFactory:
@@ -142,7 +143,18 @@ class EngineFactory:
         logger = TradeLogger()
         position_manager = PositionManager(logger=logger)
         intent_store = IntentStore()
-        risk_manager = RiskManager(position_manager=position_manager)
+        engine_logger = EngineLogger(
+            engine_id=config.engine_id,
+            venue=config.broker_name,
+            strategy=config.strategy_name,
+        )
+        risk_manager = RiskManager(
+            position_manager=position_manager,
+            capital=config.capital,
+            risk_per_trade_percent=config.risk_per_trade_percent,
+            daily_max_loss=config.daily_max_loss,
+            engine_logger=engine_logger,
+        )
 
         # ---------- Broker + OrderRouter (venue-specific) ----------
         if config.broker_name == "DELTA":
@@ -164,6 +176,7 @@ class EngineFactory:
             risk_manager=risk_manager,
             broker=broker,
             intent_store=intent_store,
+            engine_logger=engine_logger,
         )
 
         # ---------- Instruments ----------
@@ -200,6 +213,9 @@ class EngineFactory:
             instrument_store=instrument_store,
             position_manager=position_manager,
             realtime_feed=realtime_feed,
+            engine_id=config.engine_id,
+            venue=config.broker_name,
+            engine_logger=engine_logger,
         )
 
     @staticmethod

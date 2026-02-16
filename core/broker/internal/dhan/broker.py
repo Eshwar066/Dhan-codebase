@@ -135,12 +135,10 @@ class DhanBroker(BaseBroker):
     def get_positions(self):
         return self.api.get_positions()
 
-    def sync_positions(self):
-        if not self.position_manager:
-            return
+    def get_positions_for_recon(self):
         df = self.api.get_positions()
         if df is None or df.empty:
-            return
+            return {}
         broker_positions = {}
         for _, row in df.iterrows():
             sym = row["tradingSymbol"]
@@ -150,7 +148,14 @@ class DhanBroker(BaseBroker):
                 "segment": row.get("segment", "EQ"),
                 "lot_size": int(row.get("lotSize", 1)),
             }
-        self.position_manager.reconcile_with_broker(broker_positions)
+        return broker_positions
+
+    def sync_positions(self):
+        if not self.position_manager:
+            return
+        broker_positions = self.get_positions_for_recon()
+        if broker_positions:
+            self.position_manager.reconcile_with_broker(broker_positions)
 
     def exit_position(self, trading_symbol, qty, side, segment="EQ", lot_size=1):
         exit_side = "SELL" if side == "BUY" else "BUY"

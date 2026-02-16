@@ -28,6 +28,16 @@ class EngineConfig:
     symbols: List[str]
     enabled: bool = True
 
+    # Engine identity (for logging and reports)
+    engine_id: Optional[str] = None
+
+    # Capital bucket (per-engine; no shared capital)
+    capital: Optional[float] = None
+    risk_per_trade_percent: Optional[float] = None
+
+    # Risk limits (optional)
+    daily_max_loss: Optional[float] = None
+
     # Backtest params (used when run_mode == BACKTEST)
     backtest: Optional[Dict[str, Any]] = None
 
@@ -35,8 +45,6 @@ class EngineConfig:
     live: Optional[Dict[str, Any]] = None
 
     # Venue-specific options (optional overrides)
-    # Dhan: no extra required
-    # Delta:
     delta_testnet: bool = True
     delta_india: bool = False
 
@@ -50,6 +58,8 @@ class EngineConfig:
             self.backtest = {}
         if self.live is None:
             self.live = {}
+        if self.engine_id is None:
+            self.engine_id = f"{self.broker_name}_{self.strategy_name}".lower()
 
     @property
     def dependencies_dir(self) -> Path:
@@ -61,13 +71,16 @@ class EngineConfig:
 # ---------------------------------------------------------------------------
 
 def example_dhan_live_config() -> EngineConfig:
-    """Example: Dhan live engine for India markets (NIFTY, equities)."""
+    """Example: Dhan live engine for India markets (NIFTY, equities) with capital."""
     return EngineConfig(
         broker_name="DHAN",
         run_mode=RunMode.LIVE,
         strategy_name="LEAPS_RSI",
         symbols=["NIFTY"],
         enabled=True,
+        engine_id="dhan_leaps_rsi",
+        capital=200_000.0,
+        risk_per_trade_percent=0.5,
         backtest={
             "start_date": "2023-10-19",
             "end_date": "2024-02-28",
@@ -103,13 +116,16 @@ def example_dhan_backtest_config() -> EngineConfig:
 
 
 def example_delta_live_config() -> EngineConfig:
-    """Example: Delta live engine for crypto (BTCUSD, etc.)."""
+    """Example: Delta live engine for crypto (BTCUSD, etc.) with capital bucket."""
     return EngineConfig(
         broker_name="DELTA",
         run_mode=RunMode.LIVE,
         strategy_name="FuturesEMAHighLow",
         symbols=["BTCUSD"],
         enabled=True,
+        engine_id="delta_futures_ema",
+        capital=200_000.0,
+        risk_per_trade_percent=1.0,
         delta_testnet=True,
         delta_india=False,
         backtest={

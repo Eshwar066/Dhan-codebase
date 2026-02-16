@@ -148,6 +148,7 @@ class PositionManager:
         self.strategy_pos = defaultdict(lambda: defaultdict(int))
 
         self.last_recon_time = 0
+        self.trading_paused = False
 
     # ---------------------
     # LOCAL FILL UPDATE
@@ -324,69 +325,49 @@ class PositionManager:
     # ---------------------
     # BROKER RECONCILIATION
     # ---------------------
-    def reconcile_with_broker(self, broker_positions):
+    def reconcile_with_broker(self, broker_positions, drift_threshold: int = 0):
         """
-        broker_positions format:
-        {
-            symbol: {
-                "qty": int,
-                "avg_price": float,
-                "segment": str,
-                "lot_size": int
-            }
-        }
+        Sync PositionManager to broker truth.
+        broker_positions: { symbol: { "qty": int, "avg_price": float, "segment": str, "lot_size": int } }
+        drift_threshold: if |local_qty - broker_qty| > this, set trading_paused.
         """
-
         with self._lock:
             self.last_recon_time = time.time()
-
             broker_symbols = set(broker_positions.keys())
             local_symbols = set(self.positions.keys())
 
-            # 1) Sync broker → local
             for sym, bp in broker_positions.items():
-
+                segment = bp.get("segment", "EQ")
+                lot_size = int(bp.get("lot_size", 1))
                 inst = Instrument(
-                    symbol=sym,
-                    segment=bp.get("segment", "EQ"),
-                    lot_size=bp.get("lot_size", 1),
+                    trading_symbol=sym,
+                    custom_symbol=sym,
+                    exchange=bp.get("exchange", ""),
+                    segment=segment,
+                    instrument_type=bp.get("instrument_type", "EQ"),
+                    lot_size=lot_size,
                 )
 
                 if sym not in self.positions:
-                    # Ghost broker position
-                    print(f"⚠ Ghost broker position detected: {sym}")
-
                     pos = Position(inst)
-                    pos.net_qty = bp["qty"]
-                    pos.avg_price = bp["avg_price"]
-
+                    pos.net_qty = int(bp["qty"])
+                    pos.avg_price = float(bp.get("avg_price", 0))
                     self.positions[sym] = pos
                     continue
 
                 local = self.positions[sym]
-
-                # Drift detection
                 if (
-                    local.net_qty != bp["qty"]
-                    or abs(local.avg_price - bp["avg_price"]) > 0.5
+                    local.net_qty != int(bp["qty"])
+                    or abs(local.avg_price - float(bp.get("avg_price", 0))) > 0.5
                 ):
-                    print(f"⚠ Drift corrected: {sym}")
-
-                    local.net_qty = bp["qty"]
-                    local.avg_price = bp["avg_price"]
+                    local.net_qty = int(bp["qty"])
+                    local.avg_price = float(bp.get("avg_price", 0))
                     local.last_updated = time.time()
-
-                if abs(local.net_qty - bp["qty"]) > threshold:
+                if abs(local.net_qty - int(bp["qty"])) > drift_threshold:
                     self.trading_paused = True
 
-            # 2) Remove ghost locals
             for sym in local_symbols - broker_symbols:
-                local = self.positions[sym]
-
-                if local.net_qty != 0:
-                    print(f"⚠ Ghost local removed: {sym}")
-
-                self.positions.pop(sym)
+                self.positions.pop(sym, None)
 
     # ---------------------
     # POSITION CHECKS

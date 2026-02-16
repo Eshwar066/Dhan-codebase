@@ -1,28 +1,81 @@
+"""
+RiskManager: per-engine limits, kill switch, capital-based exposure.
+Exits always allowed; entries blocked when limits or kill switch triggered.
+"""
+
 import time
-import pdb
+from typing import Optional, Any
 
 
 class RiskManager:
     def __init__(
         self,
         position_manager,
-        max_portfolio_exposure=10000000,
-        max_symbol_exposure=9000000,
-        max_qty_per_symbol=10000,
-        max_open_positions=20,
-        cooldown_seconds=5,
+        max_portfolio_exposure: float = 10000000,
+        max_symbol_exposure: float = 9000000,
+        max_qty_per_symbol: int = 10000,
+        max_open_positions: int = 20,
+        cooldown_seconds: int = 5,
+        daily_max_loss: Optional[float] = None,
+        capital: Optional[float] = None,
+        risk_per_trade_percent: Optional[float] = None,
+        engine_logger: Optional[Any] = None,
     ):
         self.pm = position_manager
+        self.engine_logger = engine_logger
 
         # Limits
         self.max_portfolio_exposure = max_portfolio_exposure
         self.max_symbol_exposure = max_symbol_exposure
         self.max_qty_per_symbol = max_qty_per_symbol
         self.max_open_positions = max_open_positions
+        self.daily_max_loss = daily_max_loss
+        self.capital = capital
+        self.risk_per_trade_percent = risk_per_trade_percent or 0.0
+        self.max_risk_amount: Optional[float] = None
+        if capital is not None and risk_per_trade_percent is not None:
+            self.max_risk_amount = capital * (risk_per_trade_percent / 100.0)
+
+        # Max total exposure (alias; use max_portfolio_exposure)
+        self.max_total_exposure = max_portfolio_exposure
+
+        # Kill switch
+        self._kill_switch_blocked = False
+        self._kill_switch_reason: Optional[str] = None
+
+        # Daily PnL (for daily_max_loss)
+        self.daily_realized_pnl = 0.0
 
         # Anti-overtrading
         self.cooldown_seconds = cooldown_seconds
         self.last_trade_time = {}
+
+    def is_engine_blocked(self) -> bool:
+        """True if kill switch is triggered. Block new entries; exits still allowed."""
+        return self._kill_switch_blocked
+
+    def trigger_kill_switch(self, reason: str) -> None:
+        """Block all new entry intents. Log critical event. Exits remain allowed."""
+        self._kill_switch_blocked = True
+        self._kill_switch_reason = reason
+        if self.engine_logger:
+            self.engine_logger.kill_switch(reason)
+        else:
+            print(f"CRITICAL Kill switch: {reason}")
+
+    def record_realized_pnl(self, amount: float) -> None:
+        """Call when a position is closed and PnL is realized (e.g. from PositionManager)."""
+        self.daily_realized_pnl += amount
+
+    def reset_daily(self) -> None:
+        """Reset daily PnL (call at start of new trading day)."""
+        self.daily_realized_pnl = 0.0
+
+    def _log_block(self, msg: str, symbol: Optional[str] = None) -> None:
+        if self.engine_logger:
+            self.engine_logger.risk_block(msg, symbol=symbol)
+        else:
+            print(msg)
 
     # -------------------------
     # MAIN CHECK
@@ -30,7 +83,16 @@ class RiskManager:
     def allow_intent(self, intent, price_map, candle_ts=None):
         """
         intent: OrderIntent object
+        Exit/force exit always allowed. Entry blocked if kill switch or limits breached.
         """
+        action = getattr(intent, "action", "ENTRY")
+        if action in ("EXIT", "FORCE_EXIT"):
+            return True
+
+        if self._kill_switch_blocked:
+            self._log_block("Entry blocked: kill switch active")
+            return False
+
         symbol = intent.instrument.trading_symbol
         side = intent.side
         qty = intent.qty
@@ -39,65 +101,73 @@ class RiskManager:
         strategy = getattr(intent, "strategy", None)
         structure_id = getattr(intent, "structure_id", None)
         tag = getattr(intent, "tag", None)
-        action = getattr(intent, "action", "ENTRY")
         if action is None:
             raise ValueError(
                 f"Intent {intent.intent_id} missing action " f"(ENTRY / EXIT / ROLL)"
             )
 
-        # Exit/force exit always allowed
-        if action in ("EXIT", "FORCE_EXIT"):
-            return True
-
-        # 0️⃣ STRUCTURE LOCK (🔥 IMPORTANT)
+        # 0️⃣ STRUCTURE LOCK
         if strategy and structure_id and action == "ENTRY" and tag == "MAIN":
             if self.pm.has_open_structure(
                 structure_id=structure_id,
                 tag="MAIN",
                 strategy=strategy,
             ):
-                print(f"❌ Structure already open {strategy} | {structure_id}")
+                self._log_block(f"Structure already open {strategy} | {structure_id}")
                 return False
 
-        # 1️⃣ Cooldown check
+        # 1️⃣ Daily loss limit
+        if self.daily_max_loss is not None and self.daily_realized_pnl <= -self.daily_max_loss:
+            self._log_block("Daily max loss reached")
+            return False
+
+        # 2️⃣ Cooldown check
         now_ts = self._get_event_time(candle_ts)
         if not self._cooldown_ok(symbol, now_ts):
-            print(f"❌ Cooldown active {symbol}")
+            self._log_block("Cooldown active", symbol=symbol)
             return False
 
-        # 2️⃣ Position count limit
+        # 3️⃣ Position count limit
         if self._open_positions_count() >= self.max_open_positions:
-            print("❌ Max open positions reached")
+            self._log_block("Max open positions reached")
             return False
 
-        # 3️⃣ Per-symbol qty limit
+        # 4️⃣ Per-symbol qty limit
         future_qty = abs(self.pm.get_qty(symbol)) + qty
         if future_qty > self.max_qty_per_symbol:
-            print(f"❌ Qty limit breach {symbol}")
+            self._log_block("Qty limit breach", symbol=symbol)
             return False
 
-        # 4️⃣ No double-direction entries
+        # 5️⃣ No double-direction entries
         if not self._direction_ok(intent.instrument, side):
-            print(f"❌ Opposite position exists {symbol}")
+            self._log_block("Opposite position exists", symbol=symbol)
             return False
 
-        # 5️⃣ Symbol exposure check
         multiplier = getattr(intent.instrument, "contract_multiplier", 1)
-        sym_exposure = future_qty * price * multiplier
+        trade_exposure = abs(qty) * price * multiplier
 
-        if sym_exposure > self.max_symbol_exposure:
-            print(f"❌ Symbol exposure breach {symbol},{sym_exposure}")
+        # 6️⃣ Per-trade risk (capital bucket)
+        if self.max_risk_amount is not None and trade_exposure > self.max_risk_amount:
+            self._log_block(
+                f"Trade exposure {trade_exposure} exceeds max_risk_amount {self.max_risk_amount}",
+                symbol=symbol,
+            )
             return False
 
-        # 6️⃣ Portfolio exposure check
+        # 7️⃣ Symbol exposure check
+        sym_exposure = future_qty * price * multiplier
+        if sym_exposure > self.max_symbol_exposure:
+            self._log_block(f"Symbol exposure breach {sym_exposure}", symbol=symbol)
+            return False
+
+        # 8️⃣ Portfolio exposure check
         portfolio_exposure = self.pm.total_exposure(price_map)
         new_exposure = portfolio_exposure + (qty * price * multiplier)
         if new_exposure > self.max_portfolio_exposure:
-            print("❌ Portfolio exposure breach")
+            self._log_block("Portfolio exposure breach")
             return False
 
-        # Passed all checks
-        key = (intent.strategy, intent.structure_id, intent.instrument.contract_key)
+        key = (getattr(intent, "strategy", None), getattr(intent, "structure_id", None), intent.instrument.contract_key)
         self.last_trade_time[key] = now_ts
         return True
 
@@ -108,13 +178,10 @@ class RiskManager:
         for pos in self.pm.get_open_positions():
             if pos.instrument.contract_key != instrument.contract_key:
                 continue
-
             if side == "BUY" and pos.net_qty < 0:
                 return False
-
             if side == "SELL" and pos.net_qty > 0:
                 return False
-
         return True
 
     def _open_positions_count(self):
