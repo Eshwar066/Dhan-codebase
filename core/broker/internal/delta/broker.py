@@ -130,3 +130,13 @@ class DeltaBroker(BaseBroker):
         broker_positions = self.get_positions_for_recon()
         if broker_positions:
             self.position_manager.reconcile_with_broker(broker_positions)
+
+    def get_open_orders(self):
+        """Open/pending orders for order-state consistency. Delta: state in ('open', 'pending', 'placed')."""
+        orders = self.api.get_order_list() or []
+        open_states = {"open", "pending", "placed", "trigger pending"}
+        return [
+            {"order_id": o.get("order_id"), "tag": o.get("tag"), "status": o.get("status")}
+            for o in orders
+            if (o.get("status") or "").lower() in open_states
+        ]

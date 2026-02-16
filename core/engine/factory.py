@@ -177,6 +177,8 @@ class EngineFactory:
             broker=broker,
             intent_store=intent_store,
             engine_logger=engine_logger,
+            circuit_breaker_threshold=getattr(config, "circuit_breaker_threshold", 5),
+            slippage_threshold_pct=getattr(config, "slippage_threshold_pct", None),
         )
 
         # ---------- Instruments ----------
@@ -216,6 +218,13 @@ class EngineFactory:
             engine_id=config.engine_id,
             venue=config.broker_name,
             engine_logger=engine_logger,
+            allowed_trading_hours=getattr(config, "allowed_trading_hours", None),
+            order_state_check_interval_min=getattr(config, "order_state_check_interval_min", 0),
+            memory_threshold_percent=getattr(config, "memory_threshold_percent", None),
+            strategy_timeout_seconds=getattr(config, "strategy_timeout_seconds", None),
+            latency_critical_ms=getattr(config, "latency_critical_ms", 150.0),
+            latency_critical_cycles=getattr(config, "latency_critical_cycles", 3),
+            symbol_error_threshold=getattr(config, "symbol_error_threshold", 5),
         )
 
     @staticmethod

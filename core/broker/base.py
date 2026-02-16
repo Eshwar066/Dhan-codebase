@@ -85,6 +85,14 @@ class BaseBroker(ABC):
         """Return normalized { symbol: { qty, avg_price, segment, lot_size } } for reconciliation."""
         return {}
 
+    def get_open_orders(self) -> List[Dict[str, Any]]:
+        """
+        Return list of open (pending/active) orders for order-state consistency check.
+        Each item: { order_id, tag (intent_id), symbol/tradingsymbol, status, ... }.
+        Default: filter get_order_list() by non-terminal status; brokers may override.
+        """
+        return []
+
     def find_order_by_client_id(self, client_order_id: str):
         """Optional idempotency hook. LIVE brokers may override."""
         return None

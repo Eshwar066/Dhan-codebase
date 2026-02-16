@@ -7,12 +7,16 @@ Use EngineFactory.create_engine(config) to build an isolated BacktestEngine or L
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from run.config import RunMode
 
 
 BrokerName = Literal["DHAN", "DELTA"]
+
+# Allowed trading hours: list of (start_time, end_time) as "HH:MM" in UTC (or configurable timezone).
+# E.g. [("09:15", "15:30")] for India NSE.
+TradingHoursType = List[Tuple[str, str]]
 
 
 @dataclass
@@ -50,6 +54,25 @@ class EngineConfig:
 
     # Paths (defaults; override for tests)
     base_dir: Optional[Path] = None
+
+    # ---------- Production safeguards (live only; no change to BacktestEngine) ----------
+    # Order state consistency: run verify_open_orders_with_broker every N minutes (0 = disabled).
+    order_state_check_interval_min: int = 0
+    # Broker circuit breaker: after this many consecutive broker failures, trigger kill switch.
+    circuit_breaker_threshold: int = 5
+    # Time-of-day guard: only allow entry within these windows. Exits always allowed. "HH:MM" UTC.
+    allowed_trading_hours: Optional[TradingHoursType] = None
+    # Slippage monitor: log high_slippage_warning when |fill_price - expected_price| / expected_price > this (e.g. 0.005 = 0.5%).
+    slippage_threshold_pct: Optional[float] = None
+    # Memory guard: pause new entries when process memory usage exceeds this percent (0 = disabled).
+    memory_threshold_percent: Optional[float] = None
+    # Strategy timeout: if strategy evaluation exceeds this many seconds, log and skip order placement.
+    strategy_timeout_seconds: Optional[float] = None
+    # Latency: pause entries if total_latency_ms > this for N consecutive cycles.
+    latency_critical_ms: float = 150.0
+    latency_critical_cycles: int = 3
+    # Symbol-level failure: pause only this symbol after this many consecutive errors.
+    symbol_error_threshold: int = 5
 
     def __post_init__(self):
         if self.base_dir is None:

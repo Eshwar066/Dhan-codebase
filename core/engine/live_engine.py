@@ -1,13 +1,16 @@
 """
 LiveEngine: production-grade live/paper engine with reconciliation,
 kill switch, closed-candle validation, feed health, EOD export, and structured logging.
+Includes: duplicate signal protection, time-of-day guard, memory guard, graceful shutdown,
+symbol-level failure isolation, strategy timeout, latency alert levels, candle integrity.
 """
 
 import csv
 import os
+import signal
 import time
 import datetime as dt
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from core.engine.base_engine import BaseEngine
 
@@ -19,11 +22,41 @@ except ImportError:
 DEFAULT_FEED_STALE_SECONDS = 60
 
 
+def _parse_time(s: str) -> Tuple[int, int]:
+    """Parse 'HH:MM' to (hour, minute)."""
+    parts = s.strip().split(":")
+    h = int(parts[0]) if parts else 0
+    m = int(parts[1]) if len(parts) > 1 else 0
+    return h, m
+
+
+def _within_trading_hours_utc(now: dt.datetime, windows: List[Tuple[str, str]]) -> bool:
+    """True if now (UTC) falls within any (start, end) window. Times in 'HH:MM' UTC."""
+    if not windows:
+        return True
+    hour, minute = now.hour, now.minute
+    now_mins = hour * 60 + minute
+    for start, end in windows:
+        sh, sm = _parse_time(start)
+        eh, em = _parse_time(end)
+        start_mins = sh * 60 + sm
+        end_mins = eh * 60 + em
+        if start_mins <= end_mins:
+            if start_mins <= now_mins <= end_mins:
+                return True
+        else:
+            if now_mins >= start_mins or now_mins <= end_mins:
+                return True
+    return False
+
+
 class LiveEngine(BaseEngine):
     """
     Live/paper engine. Optional realtime_feed (WebSocket); falls back to
     candle_service / data.get_latest_candles. Supports broker reconciliation,
     risk kill switch, closed-candle validation, feed health, EOD export.
+    Plus: duplicate signal protection, time-of-day guard, memory guard, graceful shutdown,
+    symbol-level pause, strategy timeout, latency levels, candle integrity.
     """
 
     def __init__(
@@ -40,6 +73,13 @@ class LiveEngine(BaseEngine):
         venue: Optional[str] = None,
         engine_logger: Optional[Any] = None,
         feed_stale_seconds: float = DEFAULT_FEED_STALE_SECONDS,
+        allowed_trading_hours: Optional[List[Tuple[str, str]]] = None,
+        order_state_check_interval_min: int = 0,
+        memory_threshold_percent: Optional[float] = None,
+        strategy_timeout_seconds: Optional[float] = None,
+        latency_critical_ms: float = 150.0,
+        latency_critical_cycles: int = 3,
+        symbol_error_threshold: int = 5,
     ):
         super().__init__(strategy, data, instrument_store, position_manager)
         self.symbols = symbols
@@ -55,6 +95,91 @@ class LiveEngine(BaseEngine):
         self._last_candle_timestamp: Dict[str, float] = {}
         self._last_eod_date: Optional[str] = None
         self._entries_paused_feed_stale = False
+        # Duplicate signal protection
+        self._last_signal_hash_per_symbol: Dict[str, int] = {}
+        # Time-of-day guard
+        self.allowed_trading_hours = allowed_trading_hours or []
+        # Order state check
+        self.order_state_check_interval_min = order_state_check_interval_min
+        self._last_order_state_check_time: float = 0
+        self._entries_paused_order_mismatch = False
+        # Memory guard
+        self.memory_threshold_percent = memory_threshold_percent
+        self._entries_paused_memory = False
+        # Strategy timeout
+        self.strategy_timeout_seconds = strategy_timeout_seconds
+        # Latency critical pause
+        self.latency_critical_ms = latency_critical_ms
+        self.latency_critical_cycles = latency_critical_cycles
+        self._latency_critical_count = 0
+        self._entries_paused_latency = False
+        # Symbol-level failure isolation
+        self.symbol_error_threshold = symbol_error_threshold
+        self._symbol_state: Dict[str, Dict[str, Any]] = {}
+        for sym in self.symbols:
+            self._symbol_state[sym] = {"paused": False, "feed_stale": False, "error_count": 0}
+        # Graceful shutdown
+        self._shutdown_requested = False
+
+    def _signal_hash(self, symbol: str, timeframe: str, candle_ts: Any, signal_type: str) -> int:
+        """Hash for duplicate signal detection. Override candle_ts for bar identity."""
+        ts = getattr(candle_ts, "timestamp", None) or (candle_ts if isinstance(candle_ts, (int, float)) else str(candle_ts))
+        return hash((symbol, str(timeframe), str(ts), str(signal_type)))
+
+    def _within_trading_hours(self) -> bool:
+        if not self.allowed_trading_hours:
+            return True
+        now = dt.datetime.utcnow()
+        return _within_trading_hours_utc(now, self.allowed_trading_hours)
+
+    def _check_memory(self) -> None:
+        if self.memory_threshold_percent is None or self.memory_threshold_percent <= 0:
+            return
+        try:
+            import psutil
+            proc = psutil.Process()
+            usage = proc.memory_percent()
+            if usage >= self.memory_threshold_percent:
+                self._entries_paused_memory = True
+                if self.engine_logger:
+                    self.engine_logger.memory_pressure_warning(
+                        f"Memory usage {usage:.1f}% >= {self.memory_threshold_percent}%",
+                        usage_percent=usage,
+                    )
+        except Exception:
+            pass
+
+    def _validate_candle_integrity(self, candle: Dict, symbol: Optional[str] = None) -> bool:
+        """
+        Validate OHLC consistency: high >= max(open,close), low <= min(open,close).
+        If aggregating tick volumes: volume would equal sum(ticks); we only check OHLC here.
+        Returns True if valid; on failure logs candle_integrity_error and returns False.
+        """
+        o = candle.get("open")
+        h = candle.get("high")
+        l = candle.get("low")
+        c = candle.get("close")
+        if o is None or h is None or l is None or c is None:
+            return True
+        try:
+            o, h, l, c = float(o), float(h), float(l), float(c)
+        except (TypeError, ValueError):
+            return True
+        if h < max(o, c) or l > min(o, c):
+            if self.engine_logger:
+                self.engine_logger.candle_integrity_error(
+                    "OHLC inconsistent: high < max(o,c) or low > min(o,c)",
+                    symbol=symbol,
+                    details={"open": o, "high": h, "low": l, "close": c},
+                )
+            return False
+        return True
+
+    def _graceful_shutdown_handler(self, signum: int, frame: Any) -> None:
+        """Per-engine: set flag so main loop exits; snapshot and flush in loop or on exit."""
+        self._shutdown_requested = True
+        if self.engine_logger:
+            self.engine_logger.graceful_shutdown(f"Signal {signum} received")
 
     def reconcile_positions_on_start(self) -> None:
         """
@@ -162,19 +287,41 @@ class LiveEngine(BaseEngine):
         if self.engine_logger:
             self.engine_logger.eod_export(path)
 
+    def _do_order_state_check(self) -> None:
+        if self.order_state_check_interval_min <= 0:
+            return
+        now = time.time()
+        if now - self._last_order_state_check_time < self.order_state_check_interval_min * 60:
+            return
+        self._last_order_state_check_time = now
+        ok, _ = self.order_router.verify_open_orders_with_broker(self.position_manager)
+        if not ok:
+            self._entries_paused_order_mismatch = True
+            self.reconcile_positions_on_start()
+
     def start(self, exchange, sector, rsi):
         if self.engine_logger:
-            self.engine_logger.log("engine_start", "Live engine started")
+            self.engine_logger.engine_start("Live engine started")
         else:
             print("Live engine started")
 
+        try:
+            signal.signal(signal.SIGINT, self._graceful_shutdown_handler)
+        except (AttributeError, ValueError):
+            pass
+        try:
+            signal.signal(signal.SIGTERM, self._graceful_shutdown_handler)
+        except (AttributeError, ValueError):
+            pass
+
         self.reconcile_positions_on_start()
+        self._do_order_state_check()
         tf = getattr(self.strategy, "timeframe", None)
         use_feed = self.realtime_feed and self.realtime_feed.is_connected()
         risk_manager = getattr(self.order_router, "risk", None)
         loop_count = 0
 
-        while True:
+        while not self._shutdown_requested:
             loop_count += 1
             if risk_manager and risk_manager.is_engine_blocked():
                 if self.engine_logger:
@@ -182,7 +329,9 @@ class LiveEngine(BaseEngine):
                 time.sleep(1)
                 continue
 
+            self._check_memory()
             self.check_feed_health()
+            self._do_order_state_check()
             if loop_count % 60 == 0:
                 today = dt.datetime.utcnow().strftime("%Y%m%d")
                 if self._last_eod_date and self._last_eod_date != today:
@@ -214,6 +363,8 @@ class LiveEngine(BaseEngine):
                     candle["symbol"] = symbol
                     candle["exchange"] = exchange
 
+                    if not self._validate_candle_integrity(candle, symbol):
+                        continue
                     if not self._is_closed_candle(candle, tf):
                         if self.engine_logger:
                             self.engine_logger.closed_candle_skip(symbol, "Forming or misaligned candle; skip evaluation")
@@ -223,11 +374,21 @@ class LiveEngine(BaseEngine):
                         continue
 
                     t0 = time.perf_counter()
-                    ctx, intent = self.build_context(candle)
+                    try:
+                        ctx, intent = self.build_context(candle)
+                    except Exception as e:
+                        self._symbol_state[symbol]["error_count"] = self._symbol_state[symbol].get("error_count", 0) + 1
+                        if self._symbol_state[symbol]["error_count"] >= self.symbol_error_threshold:
+                            self._symbol_state[symbol]["paused"] = True
+                            if self.engine_logger:
+                                self.engine_logger.symbol_paused(symbol, f"Repeated errors: {e}")
+                        continue
                     strategy_time_ms = (time.perf_counter() - t0) * 1000
                     if intent and self._entries_paused_feed_stale:
                         continue
-                    self._run_strategy(symbol, candle, ctx, intent, strategy_time_ms=strategy_time_ms)
+                    if intent and (self._entries_paused_order_mismatch or self._entries_paused_memory or self._entries_paused_latency):
+                        continue
+                    self._run_strategy(symbol, candle, ctx, intent, strategy_time_ms=strategy_time_ms, timeframe=tf)
             else:
                 candles = None
                 if use_feed:
@@ -255,13 +416,45 @@ class LiveEngine(BaseEngine):
                     candle["timestamp"] = dt.datetime.now()
                     candle["symbol"] = symbol
                     candle["exchange"] = exchange
+                    if not self._validate_candle_integrity(candle, symbol):
+                        continue
                     t0 = time.perf_counter()
-                    ctx, intent = self.build_context(candle)
+                    try:
+                        ctx, intent = self.build_context(candle)
+                    except Exception as e:
+                        self._symbol_state[symbol]["error_count"] = self._symbol_state[symbol].get("error_count", 0) + 1
+                        if self._symbol_state[symbol]["error_count"] >= self.symbol_error_threshold:
+                            self._symbol_state[symbol]["paused"] = True
+                            if self.engine_logger:
+                                self.engine_logger.symbol_paused(symbol, f"Repeated errors: {e}")
+                        continue
                     strategy_time_ms = (time.perf_counter() - t0) * 1000
-                    self._run_strategy(symbol, candle, ctx, intent, strategy_time_ms=strategy_time_ms)
+                    self._run_strategy(symbol, candle, ctx, intent, strategy_time_ms=strategy_time_ms, timeframe=None)
 
             use_feed = self.realtime_feed and self.realtime_feed.is_connected()
             time.sleep(1)
+
+        # Graceful shutdown: save position snapshot, flush logger, close broker
+        snapshot_path = None
+        try:
+            os.makedirs(REPORTS_DIR, exist_ok=True)
+            snapshot_path = os.path.join(REPORTS_DIR, f"{self.engine_id}_shutdown_{dt.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv")
+            with open(snapshot_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=["symbol", "qty", "avg_price", "realized_pnl"])
+                w.writeheader()
+                for sym, pos in self.position_manager.positions.items():
+                    if pos.net_qty != 0:
+                        w.writerow({"symbol": sym, "qty": pos.net_qty, "avg_price": pos.avg_price, "realized_pnl": pos.realized_pnl})
+        except Exception:
+            pass
+        if self.engine_logger:
+            self.engine_logger.graceful_shutdown("Graceful shutdown", snapshot_path=snapshot_path)
+        broker = getattr(self.order_router, "broker", None)
+        if broker and hasattr(broker, "close"):
+            try:
+                broker.close()
+            except Exception:
+                pass
 
     def get_price_map(self, symbol):
         if self.realtime_feed and self.realtime_feed.is_connected():
@@ -274,7 +467,7 @@ class LiveEngine(BaseEngine):
                 return candles[symbol]["close"]
         return None
 
-    def _run_strategy(self, symbol, candle, ctx, intent, strategy_time_ms: Optional[float] = None):
+    def _run_strategy(self, symbol, candle, ctx, intent, strategy_time_ms: Optional[float] = None, timeframe: Optional[str] = None):
         risk_manager = getattr(self.order_router, "risk", None)
         open_positions = self.position_manager.get_open_positions(
             symbol=symbol, strategy=self.strategy.name
@@ -293,17 +486,44 @@ class LiveEngine(BaseEngine):
         if intent:
             if risk_manager and risk_manager.is_engine_blocked():
                 return
+            if symbol not in self._symbol_state:
+                self._symbol_state[symbol] = {"paused": False, "feed_stale": False, "error_count": 0}
+            if self._symbol_state[symbol].get("paused"):
+                return
+            if not self._within_trading_hours():
+                if self.engine_logger:
+                    self.engine_logger.time_window_blocked("Outside allowed trading hours")
+                return
+            signal_hash = self._signal_hash(symbol, timeframe or "", candle.get("timestamp"), "entry")
+            if self._last_signal_hash_per_symbol.get(symbol) == signal_hash:
+                if self.engine_logger:
+                    self.engine_logger.duplicate_signal_blocked(symbol=symbol, signal_hash=str(signal_hash))
+                return
+            if self.strategy_timeout_seconds and strategy_time_ms is not None and strategy_time_ms > self.strategy_timeout_seconds * 1000:
+                if self.engine_logger:
+                    self.engine_logger.strategy_timeout(symbol=symbol, elapsed_ms=strategy_time_ms, threshold_ms=self.strategy_timeout_seconds * 1000.0)
+                return
             price_map = candle.get("close")
             if price_map is not None:
+                self._last_signal_hash_per_symbol[symbol] = signal_hash
                 t0 = time.perf_counter()
                 self.order_router.process_intent(intent, price_map)
                 broker_latency_ms = (time.perf_counter() - t0) * 1000
+                total_ms = (strategy_time_ms or 0) + broker_latency_ms
                 if self.engine_logger and strategy_time_ms is not None:
                     self.engine_logger.latency(
                         strategy_time_ms=strategy_time_ms,
                         broker_latency_ms=broker_latency_ms,
-                        total_latency_ms=strategy_time_ms + broker_latency_ms,
+                        total_latency_ms=total_ms,
                     )
+                if total_ms > self.latency_critical_ms:
+                    self._latency_critical_count += 1
+                    if self._latency_critical_count >= self.latency_critical_cycles:
+                        self._entries_paused_latency = True
+                        if self.engine_logger:
+                            self.engine_logger.latency_critical_pause("Latency critical for N cycles; entries paused")
+                else:
+                    self._latency_critical_count = 0
 
     def update_risk_metrics(self, symbol, ltp):
         pos = self.position_manager.positions.get(symbol)

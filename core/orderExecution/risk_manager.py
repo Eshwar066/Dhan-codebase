@@ -128,7 +128,10 @@ class RiskManager:
             return False
 
         # 3️⃣ Position count limit
-        if self._open_positions_count() >= self.max_open_positions:
+        open_count = self._open_positions_count()
+        if open_count >= self.max_open_positions:
+            if self.engine_logger:
+                self.engine_logger.max_positions_blocked(current_count=open_count, max_allowed=self.max_open_positions)
             self._log_block("Max open positions reached")
             return False
 

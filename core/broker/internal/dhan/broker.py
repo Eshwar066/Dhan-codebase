@@ -170,3 +170,22 @@ class DhanBroker(BaseBroker):
             "trade_type": "MARGIN",
         }
         return self.place_order(intent, execution_price=None)
+
+    def get_open_orders(self):
+        """Open/pending orders for order-state consistency. Dhan: filter by orderStatus not in filled/cancelled/rejected."""
+        orders = self.api.get_order_list() or []
+        if not orders:
+            return []
+        # Dhan orderbook: record may have orderStatus, orderId, tag, etc.
+        closed_statuses = {"filled", "cancelled", "rejected", "complete", "completed", "trigger cancelled"}
+        out = []
+        for o in orders if isinstance(orders, list) else []:
+            status = (o.get("orderStatus") or o.get("status") or "").lower()
+            if status in closed_statuses:
+                continue
+            out.append({
+                "order_id": o.get("orderId") or o.get("order_id"),
+                "tag": o.get("tag") or o.get("intent_id"),
+                "status": status or "open",
+            })
+        return out

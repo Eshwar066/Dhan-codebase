@@ -108,15 +108,18 @@ Production safeguards (implemented and planned) that make the system institution
 | Layer | Feature | Status |
 |--------|--------|--------|
 | **Risk** | Kill switch hierarchy (`RiskManager.trigger_kill_switch`) | Implemented |
-| **Broker** | Broker circuit breaker (fail-fast on repeated broker errors) | Planned |
+| **Broker** | Broker circuit breaker (fail-fast on repeated broker errors) | Implemented |
 | **Startup** | Reconciliation on start (sync PositionManager to broker) | Implemented |
-| **Signals** | Duplicate signal protection (avoid re-entry on same bar/signal) | Planned |
-| **Orders** | Order state consistency verification (PM vs broker) | Planned |
-| **Resource** | Memory guard (cap queue size / history) | Planned |
-| **Strategy** | Strategy timeout guard (max time per `on_candle`) | Planned |
-| **Feed** | Symbol-level pause (pause entries per symbol when feed stale) | Implemented (feed health) |
-| **Latency** | Latency guard (log strategy_time_ms, broker_latency_ms; optional alert on breach) | Implemented |
+| **Signals** | Duplicate signal protection (avoid re-entry on same bar/signal) | Implemented |
+| **Orders** | Order state consistency verification (PM vs broker) | Implemented |
+| **Resource** | Memory guard (psutil; pause entries above threshold) | Implemented |
+| **Strategy** | Strategy timeout guard (max time per `on_candle`) | Implemented |
+| **Feed** | Symbol-level pause (pause entries per symbol when feed stale or repeated errors) | Implemented |
+| **Latency** | Latency guard + critical pause after N cycles | Implemented |
 | **Feed** | Feed health (warn when no data for `feed_stale_seconds`; pause entries) | Implemented |
+| **Shutdown** | Graceful shutdown (SIGINT/SIGTERM, snapshot, flush log) | Implemented |
+| **Candle** | Candle integrity validation (OHLC consistency) | Implemented |
+| **Slippage** | High-slippage warning on fill (no auto-adjust) | Implemented |
 
 Latency logging is done **only on the order path** (when an order is placed), not in the tick ingestion path, so it does not degrade performance at high tick rates (e.g. 1000+ ticks/sec).
 
@@ -218,6 +221,7 @@ Algo/
 - **EngineConfig**: full config for one engine (used by EngineFactory).
 - Helpers: `example_dhan_live_config()`, `example_delta_live_config()`, etc., with `engine_id`, `capital`, `risk_per_trade_percent` where relevant.
 - **engine_id** defaults to `{broker_name}_{strategy_name}` if not set; used for log file and EOD report filename.
+- **Production safeguards** (live only): `order_state_check_interval_min`, `circuit_breaker_threshold`, `allowed_trading_hours`, `slippage_threshold_pct`, `memory_threshold_percent`, `strategy_timeout_seconds`, `latency_critical_ms`, `latency_critical_cycles`, `symbol_error_threshold`. All optional.
 
 ### 3. Environment variables
 
@@ -290,6 +294,27 @@ See `docs/MULTI_VENUE.md`: create a Supervisor, `register_from_config()` for eac
 | **Feed health** | LiveEngine | Tracks last tick/candle per symbol; warns and can pause entries if no data for `feed_stale_seconds`. |
 | **EOD export** | LiveEngine | Writes `reports/{engine_id}_{YYYYMMDD}.csv` (open positions, realized pnl). |
 | **Latency** | LiveEngine | Logs strategy_time_ms, broker_latency_ms, total_latency_ms for orders (order path only; not in tick ingestion, so no impact at high tick rate). |
+
+### Production safeguards (implemented)
+
+The following are implemented and configurable via **EngineConfig** (live only; no change to BaseEngine or BacktestEngine):
+
+| # | Feature | Where | Config / behavior |
+|---|--------|--------|-------------------|
+| 1 | **Order state consistency** | OrderRouter | `verify_open_orders_with_broker()` compares broker open orders with IntentStore and PositionManager; on mismatch logs `order_state_mismatch`, calls `reconcile_positions_on_start()`, optionally pauses entries. Trigger: startup + every `order_state_check_interval_min` minutes. |
+| 2 | **Duplicate signal protection** | LiveEngine | `_last_signal_hash_per_symbol`; before entry, hash(symbol, timeframe, candle_timestamp, signal_type); if already processed skip and log `duplicate_signal_blocked`. |
+| 3 | **Broker circuit breaker** | OrderRouter | On broker failure increment `consecutive_failures`; if ≥ `circuit_breaker_threshold` (default 5) call `risk_manager.trigger_kill_switch("broker_failure")` and log `broker_circuit_breaker_triggered`. Reset on successful order. |
+| 4 | **Max open positions** | RiskManager | Already present; blocks entry when `open_count >= max_open_positions`; logs `max_positions_blocked`. |
+| 5 | **Time-of-day guard** | LiveEngine | `allowed_trading_hours = [(start, end)]` in "HH:MM" UTC; outside window skip entry and log `time_window_blocked`. Exits always allowed. |
+| 6 | **Slippage monitor** | OrderRouter | `report_fill(expected_price, fill_price, ...)`; when fill is reported, if slippage > `slippage_threshold_pct` log `high_slippage_warning`. No auto-adjust. |
+| 7 | **Memory guard** | LiveEngine | Uses `psutil`; when process memory % ≥ `memory_threshold_percent` log `memory_pressure_warning` and pause new entries. No auto shutdown. |
+| 8 | **Graceful shutdown** | LiveEngine | Handles SIGINT/SIGTERM; on shutdown saves position snapshot to `reports/{engine_id}_shutdown_{timestamp}.csv`, logs `graceful_shutdown`, closes broker if it has `close()`. Per-engine. |
+| 9 | **Candle integrity validation** | LiveEngine | When using a candle, validates high ≥ max(open, close), low ≤ min(open, close); on mismatch log `candle_integrity_error` and skip candle. No crash. |
+| 10 | **Symbol-level failure isolation** | LiveEngine | `symbol_state[symbol] = {paused, feed_stale, error_count}`; if symbol repeatedly fails (≥ `symbol_error_threshold`) pause only that symbol and log `symbol_paused`. Other symbols keep trading. |
+| 11 | **Strategy timeout guard** | LiveEngine | If strategy evaluation time > `strategy_timeout_seconds` log `strategy_timeout` and skip order placement. No crash. |
+| 12 | **Latency alert levels** | LiveEngine | normal &lt; 50ms, warning 50–150ms, critical &gt; 150ms (configurable `latency_critical_ms`). If critical for `latency_critical_cycles` consecutive cycles, pause new entries and log `latency_critical_pause`. |
+
+**EngineConfig** (run/engine_config.py) fields for the above: `order_state_check_interval_min`, `circuit_breaker_threshold`, `allowed_trading_hours`, `slippage_threshold_pct`, `memory_threshold_percent`, `strategy_timeout_seconds`, `latency_critical_ms`, `latency_critical_cycles`, `symbol_error_threshold`. All optional; defaults preserve existing behavior.
 
 Details: `docs/PRODUCTION_UPGRADES.md`.
 

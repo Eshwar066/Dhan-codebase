@@ -108,3 +108,43 @@ class EngineLogger:
 
     def eod_export(self, path: str, message: str = "EOD export written") -> None:
         self.log("eod_export", message=message, export_path=path)
+
+    def engine_start(self, message: str = "Live engine started") -> None:
+        self.log("engine_start", message=message)
+
+    # ---------- Production safeguards (cursor.md) ----------
+    def order_state_mismatch(self, message: str, details: Optional[Dict] = None) -> None:
+        self.log("order_state_mismatch", message=message, **(details or {}))
+
+    def duplicate_signal_blocked(self, symbol: Optional[str] = None, signal_hash: Optional[str] = None) -> None:
+        self.log("duplicate_signal_blocked", message="Duplicate signal skipped", symbol=symbol, signal_hash=signal_hash)
+
+    def broker_circuit_breaker_triggered(self, reason: str) -> None:
+        self.log("broker_circuit_breaker_triggered", message=reason)
+
+    def max_positions_blocked(self, current_count: Optional[int] = None, max_allowed: Optional[int] = None) -> None:
+        self.log("max_positions_blocked", message="Max open positions reached", current_count=current_count, max_allowed=max_allowed)
+
+    def time_window_blocked(self, message: str = "Outside allowed trading hours") -> None:
+        self.log("time_window_blocked", message=message)
+
+    def high_slippage_warning(self, symbol: Optional[str] = None, expected_price: Optional[float] = None, fill_price: Optional[float] = None, slippage_pct: Optional[float] = None) -> None:
+        self.log("high_slippage_warning", message="Slippage above threshold", symbol=symbol, expected_price=expected_price, fill_price=fill_price, slippage_pct=slippage_pct)
+
+    def memory_pressure_warning(self, message: str, usage_percent: Optional[float] = None) -> None:
+        self.log("memory_pressure_warning", message=message, usage_percent=usage_percent)
+
+    def graceful_shutdown(self, message: str = "Graceful shutdown", snapshot_path: Optional[str] = None) -> None:
+        self.log("graceful_shutdown", message=message, snapshot_path=snapshot_path)
+
+    def candle_integrity_error(self, message: str, symbol: Optional[str] = None, details: Optional[Dict] = None) -> None:
+        self.log("candle_integrity_error", message=message, symbol=symbol, **(details or {}))
+
+    def symbol_paused(self, symbol: str, reason: str) -> None:
+        self.log("symbol_paused", message=reason, symbol=symbol)
+
+    def strategy_timeout(self, symbol: Optional[str] = None, elapsed_ms: Optional[float] = None, threshold_ms: Optional[float] = None) -> None:
+        self.log("strategy_timeout", message="Strategy evaluation exceeded threshold", symbol=symbol, elapsed_ms=elapsed_ms, threshold_ms=threshold_ms)
+
+    def latency_critical_pause(self, message: str = "Latency critical for N cycles; entries paused") -> None:
+        self.log("latency_critical_pause", message=message)
