@@ -10,10 +10,13 @@ class RunMode(str, Enum):
 # 🔁 CHANGE ONLY THIS
 RUN_MODE = RunMode.LIVE
 
+# Default venue when job does not specify "venue". Used for single-venue runs.
+DEFAULT_VENUE = "DELTA"  # "DHAN" | "DELTA"
 
 STRATEGY_JOBS = [
     {
         "name": "LEAPS_RSI",
+        "venue": "DHAN",
         "enabled": False,
         "capital": 200000,
         "symbols": ["NIFTY"],
@@ -28,6 +31,7 @@ STRATEGY_JOBS = [
     },
     {
         "name": "INSIDE_BAR",
+        "venue": "DHAN",
         "enabled": False,
         "capital": 100000,
         "symbols": ["INFY", "ITC"],
@@ -38,9 +42,9 @@ STRATEGY_JOBS = [
     },
     {
         "name": "FuturesEMAHighLow",
+        "venue": "DELTA",
         "enabled": True,
         "capital": 200000,
-        # "symbols": ["NIFTY"],
         "symbols": ["BTCUSD"],
         "instrument": "FUTURES",
         "live": {"exchange": "INDEX", "sector": "YES"},

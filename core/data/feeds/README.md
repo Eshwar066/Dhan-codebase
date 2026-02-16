@@ -30,3 +30,39 @@ print('OK')
 "
 
 cd "c:\Users\eshwa\Desktop\Dhan\Algo"; python -c "from core.data.feeds import RealtimeFeed, DeltaWebSocketFeed; from core.library.delta_websocket import DeltaWebSocket; print('OK')"
+
+
+<!-- Next plans -->
+⚠ Architectural Weaknesses
+1️⃣ while True + sleep(1) is blocking
+
+This limits:
+
+Scalability
+
+Latency
+
+Multi-symbol expansion
+
+Async would be better.
+
+2️⃣ No duplicate candle guard
+
+If feed returns same closed candle twice,
+strategy may trigger twice.
+
+You should store last processed timestamp per symbol.
+
+3️⃣ No reconnection logic shown
+
+If feed disconnects mid-loop,
+behavior depends on is_connected().
+
+Better to auto-reconnect.
+
+4️⃣ No position sync on restart
+
+If engine restarts,
+does it reload open positions?
+
+Important for live trading.
