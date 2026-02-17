@@ -1,5 +1,5 @@
 """
-Dhan Live Market Feed WebSocket client (cursor.md).
+Dhan Live Market Feed WebSocket client.
 
 - Connect: wss://api-feed.dhan.co?version=2&token=...&clientId=...&authType=2
 - Subscribe: JSON RequestCode 15, InstrumentList (ExchangeSegment, SecurityId); max 100 per message, 5000 per connection.

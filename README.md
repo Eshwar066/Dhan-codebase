@@ -49,7 +49,7 @@ The **Dhan v2 Market Quote API** (LTP, OHLC, market depth) is integrated for the
 
 ### Dhan Live Market Feed WebSocket (implemented)
 
-Real-time tick-by-tick data over WebSocket (cursor.md) is integrated for the Dhan broker:
+Real-time tick-by-tick data over WebSocket is integrated for the Dhan broker:
 
 | Component | Location | What was implemented |
 | --------- | -------- | --------------------- |
@@ -59,6 +59,18 @@ Real-time tick-by-tick data over WebSocket (cursor.md) is integrated for the Dha
 | **Engine factory** | `core/engine/factory.py` | For live DHAN engine, if credentials and instrument store have `get_feed_instruments`, builds instruments from config.symbols and starts `DhanWebSocketFeed`. |
 
 Up to 5 connections per user, 5000 instruments per connection. Server pings every 10s; no response for 40s closes the connection.
+
+### Dhan Full Market Depth WebSocket (implemented)
+
+Level 3 market depth (20 or 200 levels) for demand/supply zones and strategies beyond 5-level depth. NSE Equity and NSE Derivatives only. Request/response: JSON for subscribe, binary for depth packets.
+
+| Component | Location | What was implemented |
+| --------- | -------- | --------------------- |
+| **WebSocket client** | `core/library/dhan_depth_websocket.py` | **20 level:** `wss://depth-api-feed.dhan.co/twentydepth` — up to 50 instruments per connection. **200 level:** `wss://full-depth-api.dhan.co/twohundreddepth` — 1 instrument per connection. Subscribe via JSON (RequestCode 23, InstrumentList for 20 level; single ExchangeSegment + SecurityId for 200 level). Parse binary: 12-byte header (msg_len, response_code 41=Bid/51=Ask, segment, security_id), then N×16-byte rows (float64 price, uint32 quantity, uint32 num_orders). Ping/pong keep-alive; disconnect RequestCode 12. |
+| **Feed** | `core/data/feeds/dhan_depth_feed.py` | `DhanDepthFeed(RealtimeFeed)`: takes access_token, client_id, instruments list, level=20 or 200. `get_market_depth(symbol)` returns `{symbol, bids: [{price, quantity, num_orders}, ...], asks: [...]}`. Implements `get_last_ticker` from best bid/ask mid. Use when strategies need full depth; can run alongside `DhanWebSocketFeed` (separate connection). |
+| **Instrument resolution** | `core/utils/instruments/dhan.py` | Same `get_feed_instruments(symbols)` as Live Market Feed; use NSE_EQ / NSE_FNO symbols for depth. |
+
+**Usage:** Build instruments with `instrument_store.get_feed_instruments(symbols)`, then `DhanDepthFeed(access_token=..., client_id=..., instruments=instruments, level=20).start()`. Read depth via `feed.get_market_depth(symbol)`. Server pings every 10s; no response for 40s closes the connection. Max 5 WebSocket connections per user across all Dhan feeds.
 
 ---
 
@@ -185,7 +197,7 @@ Algo/
 │   ├── data/
 │   │   ├── sources/         # DhanSource, DeltaSource
 │   │   ├── datalayer/       # DhanDataProvider, DeltaDataProvider
-│   │   ├── feeds/           # DeltaWebSocketFeed, RealtimeFeed base
+│   │   ├── feeds/           # DeltaWebSocketFeed, DhanWebSocketFeed, DhanDepthFeed, RealtimeFeed base
 │   │   ├── candle_service.py
 │   │   └── data_router.py
 │   │
@@ -201,7 +213,7 @@ Algo/
 │   │
 │   ├── utils/instruments/   # InstrumentStore, Dhan/Delta instrument loaders
 │   ├── models/              # StrategyContext, OrderIntent
-│   └── library/             # delta_rest_client, delta_websocket, dhan_tradehull
+│   └── library/             # delta_rest_client, delta_websocket, dhan_websocket, dhan_depth_websocket, dhan_tradehull
 │
 ├── logs/
 │   ├── engine_logger.py     # Structured JSON per engine: logs/{engine_id}.log

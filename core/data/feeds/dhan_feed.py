@@ -1,5 +1,5 @@
 """
-Dhan Live Market Feed WebSocket implementing RealtimeFeed (cursor.md).
+Dhan Live Market Feed WebSocket implementing RealtimeFeed.
 
 - Connects to wss://api-feed.dhan.co (version=2, token, clientId, authType=2).
 - Subscribes to instruments (ExchangeSegment + SecurityId); max 100 per message, 5000 per connection.
