@@ -208,7 +208,7 @@ class EngineFactory:
                     subscribe_private=True,
                 )
                 if getattr(strategy, "timeframe", None):
-                    tick_queue = queue.Queue()
+                    tick_queue = queue.Queue(maxsize=50000)
                     candle_aggregator = CandleAggregator()
                     realtime_feed.set_tick_queue(tick_queue)
                 realtime_feed.start()
@@ -224,7 +224,7 @@ class EngineFactory:
                         instruments=instruments,
                     )
                     if getattr(strategy, "timeframe", None):
-                        tick_queue = queue.Queue()
+                        tick_queue = queue.Queue(maxsize=50000)
                         candle_aggregator = CandleAggregator()
                         realtime_feed.set_tick_queue(tick_queue)
                     realtime_feed.start()

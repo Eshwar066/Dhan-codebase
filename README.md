@@ -425,7 +425,7 @@ Use this as a reference for setup and next steps.
 
 ### Optional next steps
 
-18. Add **DhanWebSocketFeed** (in `core/data/feeds/`) when Dhan exposes a WebSocket API; wire it in EngineFactory for `broker_name == "DHAN"`.
+18. **DhanWebSocketFeed** is implemented; use **DhanDepthFeed** when strategies need full market depth (20/200 level).
 19. Use **Supervisor** (see `docs/MULTI_VENUE.md`) if you want both venues in one process (e.g. for dev).
 20. Hook **RiskManager.record_realized_pnl(amount)** when a position is closed (e.g. from PositionManager or broker callback) so daily_max_loss is accurate.
 
@@ -461,6 +461,7 @@ Use this as a reference for setup and next steps.
 
 - **docs/MULTI_VENUE.md** – Multi-venue design, EngineFactory usage, two-process run, Supervisor.
 - **docs/PRODUCTION_UPGRADES.md** – Reconciliation, kill switch, logging, EOD, capital bucket, latency.
+- **docs/OPTIMIZATION_AUDIT.md** – Optimization audit: queue sizing, pause resets, pandas in live path, backtest perf, etc.
 - **core/engine/factory.py** – How each stack is built from EngineConfig.
 - **run/engine_config.py** – EngineConfig fields and example configs.
 

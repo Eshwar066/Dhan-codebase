@@ -173,6 +173,8 @@ class LiveEngine(BaseEngine):
                         f"Memory usage {usage:.1f}% >= {self.memory_threshold_percent}%",
                         usage_percent=usage,
                     )
+            else:
+                self._entries_paused_memory = False
         except Exception:
             pass
 
@@ -280,16 +282,19 @@ class LiveEngine(BaseEngine):
         if not self.realtime_feed or not self.realtime_feed.is_connected():
             return
         now = time.time()
+        any_stale = False
         for symbol in self.symbols:
             last_tick = self._last_tick_timestamp.get(symbol, 0)
             last_candle = self._last_candle_timestamp.get(symbol, 0)
             stale = (now - max(last_tick, last_candle)) > self.feed_stale_seconds
-            if stale and (last_tick or last_candle) and self.engine_logger:
-                self.engine_logger.feed_health_warning(
-                    f"No data for {symbol} in {self.feed_stale_seconds}s",
-                    symbol=symbol,
-                )
-                self._entries_paused_feed_stale = True
+            if stale and (last_tick or last_candle):
+                any_stale = True
+                if self.engine_logger:
+                    self.engine_logger.feed_health_warning(
+                        f"No data for {symbol} in {self.feed_stale_seconds}s",
+                        symbol=symbol,
+                    )
+        self._entries_paused_feed_stale = any_stale
 
     def _export_eod(self, date_str: str) -> None:
         """Export open positions, realized pnl to reports/{engine_id}_{date}.csv."""
@@ -350,6 +355,7 @@ class LiveEngine(BaseEngine):
 
         while not self._shutdown_requested:
             loop_count += 1
+            _now = dt.datetime.utcnow()
             if risk_manager and risk_manager.is_engine_blocked():
                 if self.engine_logger:
                     self.engine_logger.log("risk_block", "Engine blocked by kill switch; skipping entries")
@@ -406,7 +412,7 @@ class LiveEngine(BaseEngine):
 
                     if not self._validate_candle_integrity(candle, symbol):
                         continue
-                    if not self._is_closed_candle(candle, tf):
+                    if not self._is_closed_candle(candle, tf, now=_now):
                         if self.engine_logger:
                             self.engine_logger.closed_candle_skip(symbol, "Forming or misaligned candle; skip evaluation")
                         continue
@@ -476,7 +482,10 @@ class LiveEngine(BaseEngine):
                     self._run_strategy(symbol, candle, ctx, intent, strategy_time_ms=strategy_time_ms, timeframe=None)
 
             use_feed = self.realtime_feed and self.realtime_feed.is_connected()
-            time.sleep(1)
+            if self.tick_queue is not None and self.candle_aggregator is not None:
+                time.sleep(0.1)
+            else:
+                time.sleep(1)
 
         # Graceful shutdown: save position snapshot, flush logger, close broker
         snapshot_path = None
