@@ -4,9 +4,10 @@ Dhan Live Market Feed WebSocket implementing RealtimeFeed.
 - Connects to wss://api-feed.dhan.co (version=2, token, clientId, authType=2).
 - Subscribes to instruments (ExchangeSegment + SecurityId); max 100 per message, 5000 per connection.
 - Receives binary packets (Ticker, Quote, Full, OI, Prev close); exposes get_last_ticker(symbol), get_last_candle(symbol).
-- Used by LiveEngine when broker is DHAN and credentials are set.
+- Optional set_tick_queue(queue): pushes normalized ticks for CandleAggregator. Used by LiveEngine when broker is DHAN.
 """
 
+import time
 from typing import Any, Dict, List, Optional
 
 from core.data.feeds.base_feed import RealtimeFeed
@@ -33,16 +34,53 @@ class DhanWebSocketFeed(RealtimeFeed):
         self.client_id = client_id
         self.instruments = list(instruments)
         self._ws: Optional[DhanWebSocket] = None
+        self._tick_queue: Optional[Any] = None
+
+    def set_tick_queue(self, queue: Any) -> None:
+        """Push normalized ticks to queue for CandleAggregator. Set before start()."""
+        self._tick_queue = queue
+
+    def _push_tick(self, symbol: str, data: Dict[str, Any]) -> None:
+        if self._tick_queue is None:
+            return
+        try:
+            price = data.get("last_price")
+            if price is None:
+                return
+            price = float(price)
+            vol = float(data.get("volume") or data.get("last_traded_quantity") or 0)
+            ts = data.get("last_trade_time")
+            if ts is not None and isinstance(ts, (int, float)):
+                if ts > 1e12:
+                    ts = ts / 1e3
+                elif ts > 1e9:
+                    pass
+                else:
+                    ts = time.time()
+            else:
+                ts = time.time()
+            self._tick_queue.put_nowait({
+                "symbol": symbol,
+                "price": price,
+                "volume": vol,
+                "timestamp": float(ts),
+            })
+        except Exception:
+            pass
 
     def start(self) -> None:
         if self._ws:
             return
         if not self.instruments:
             return
+        on_ticker = (lambda s, d: self._push_tick(s, d)) if self._tick_queue else None
+        on_quote = (lambda s, d: self._push_tick(s, d)) if self._tick_queue else None
         self._ws = DhanWebSocket(
             access_token=self.access_token,
             client_id=self.client_id,
             instruments=self.instruments,
+            on_ticker=on_ticker,
+            on_quote=on_quote,
         )
         self._ws.connect()
 

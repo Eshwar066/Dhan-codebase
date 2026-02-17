@@ -11,6 +11,7 @@ Usage:
 """
 
 import os
+import queue
 from pathlib import Path
 from typing import Union
 
@@ -26,6 +27,7 @@ from core.data.sources.dhan_source import DhanSource
 from core.data.sources.delta_source import DeltaSource
 from core.data.datalayer import DhanDataProvider, DeltaDataProvider
 from core.data.candle_service import CandleService
+from core.data.candle_aggregator import CandleAggregator
 from core.data.feeds import DeltaWebSocketFeed, DhanWebSocketFeed
 from core.broker import (
     DhanBroker,
@@ -189,6 +191,8 @@ class EngineFactory:
 
         # ---------- Realtime feed ----------
         realtime_feed = None
+        tick_queue = None
+        candle_aggregator = None
         if config.broker_name == "DELTA":
             api_key = os.getenv("DELTA_API_KEY")
             api_secret = os.getenv("DELTA_API_SECRET")
@@ -203,6 +207,10 @@ class EngineFactory:
                     india=config.delta_india,
                     subscribe_private=True,
                 )
+                if getattr(strategy, "timeframe", None):
+                    tick_queue = queue.Queue()
+                    candle_aggregator = CandleAggregator()
+                    realtime_feed.set_tick_queue(tick_queue)
                 realtime_feed.start()
         elif config.broker_name == "DHAN":
             access_token = os.getenv("DHAN_ACCESS_TOKEN")
@@ -215,6 +223,10 @@ class EngineFactory:
                         client_id=client_id,
                         instruments=instruments,
                     )
+                    if getattr(strategy, "timeframe", None):
+                        tick_queue = queue.Queue()
+                        candle_aggregator = CandleAggregator()
+                        realtime_feed.set_tick_queue(tick_queue)
                     realtime_feed.start()
 
         return LiveEngine(
@@ -226,6 +238,8 @@ class EngineFactory:
             instrument_store=instrument_store,
             position_manager=position_manager,
             realtime_feed=realtime_feed,
+            tick_queue=tick_queue,
+            candle_aggregator=candle_aggregator,
             engine_id=config.engine_id,
             venue=config.broker_name,
             engine_logger=engine_logger,

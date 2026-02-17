@@ -80,6 +80,8 @@ class LiveEngine(BaseEngine):
         latency_critical_ms: float = 150.0,
         latency_critical_cycles: int = 3,
         symbol_error_threshold: int = 5,
+        tick_queue: Optional[Any] = None,
+        candle_aggregator: Optional[Any] = None,
     ):
         super().__init__(strategy, data, instrument_store, position_manager)
         self.symbols = symbols
@@ -87,6 +89,8 @@ class LiveEngine(BaseEngine):
         self.order_router = order_router
         self.position_manager = position_manager
         self.realtime_feed = realtime_feed
+        self.tick_queue = tick_queue
+        self.candle_aggregator = candle_aggregator
         self.engine_id = engine_id or "live"
         self.venue = venue or ""
         self.engine_logger = engine_logger
@@ -120,6 +124,29 @@ class LiveEngine(BaseEngine):
             self._symbol_state[sym] = {"paused": False, "feed_stale": False, "error_count": 0}
         # Graceful shutdown
         self._shutdown_requested = False
+        # Candle aggregator: last evaluated closed-candle timestamp per symbol (avoid re-eval same bar)
+        self._last_evaluated_candle_ts: Dict[str, Any] = {}
+        self._max_ticks_per_cycle = 10000
+
+    def _drain_tick_queue(self) -> None:
+        """Drain tick queue into candle_aggregator (single state owner). Non-blocking; cap per cycle."""
+        if not self.tick_queue or not self.candle_aggregator:
+            return
+        for _ in range(self._max_ticks_per_cycle):
+            try:
+                tick = self.tick_queue.get_nowait()
+            except Exception:
+                break
+            try:
+                s = tick.get("symbol")
+                p = tick.get("price")
+                v = tick.get("volume", 0)
+                ts = tick.get("timestamp")
+                if s is not None and p is not None and ts is not None:
+                    self.candle_aggregator.on_tick(s, p, v, ts)
+                    self._last_tick_timestamp[s] = time.time()
+            except Exception:
+                pass
 
     def _signal_hash(self, symbol: str, timeframe: str, candle_ts: Any, signal_type: str) -> int:
         """Hash for duplicate signal detection. Override candle_ts for bar identity."""
@@ -339,9 +366,23 @@ class LiveEngine(BaseEngine):
                 self._last_eod_date = today
 
             if tf:
+                use_aggregator = (
+                    use_feed
+                    and self.tick_queue is not None
+                    and self.candle_aggregator is not None
+                )
+                if use_aggregator:
+                    self._drain_tick_queue()
+
                 for symbol in self.symbols:
                     candle = None
-                    if use_feed:
+                    if use_aggregator:
+                        candle = self.candle_aggregator.get_last_closed_candle(symbol, tf)
+                        if candle:
+                            self._last_candle_timestamp[symbol] = time.time()
+                        if candle and candle.get("bucket_ts") == self._last_evaluated_candle_ts.get(symbol):
+                            continue
+                    if candle is None and use_feed and not use_aggregator:
                         candle = self.realtime_feed.get_last_candle(symbol, tf)
                         if candle:
                             ts = candle.get("timestamp")
@@ -369,6 +410,9 @@ class LiveEngine(BaseEngine):
                         if self.engine_logger:
                             self.engine_logger.closed_candle_skip(symbol, "Forming or misaligned candle; skip evaluation")
                         continue
+
+                    if use_aggregator:
+                        self._last_evaluated_candle_ts[symbol] = candle.get("bucket_ts")
 
                     if not self.strategy.should_evaluate(candle):
                         continue

@@ -124,7 +124,7 @@ Level 3 market depth (20 or 200 levels) for demand/supply zones and strategies b
 ## Concurrency model
 
 - **LiveEngine** uses a **single-threaded event loop** per engine; there is no multi-threading or async event loop within one engine.
-- **WebSocket feeds** (e.g. Delta) push events into an **engine-owned queue** (or equivalent); the main loop consumes from that queue. The feed may run on a separate thread, but the strategy and OMS run on the engine thread.
+- **WebSocket feeds** (Dhan, Delta) push ticks into an **engine-owned queue** when CandleAggregator is used; the main loop drains the queue and updates the aggregator (single state owner). The feed may run on a separate thread, but the strategy and OMS run on the engine thread.
 - **No shared mutable state across engines**: each process/engine has its own PositionManager, RiskManager, OrderRouter, and Broker. Running Dhan and Delta in two processes gives full fault isolation; the optional Supervisor runs multiple engines in one process (e.g. one thread per engine) with no shared OMS state.
 
 ---
@@ -132,7 +132,21 @@ Level 3 market depth (20 or 200 levels) for demand/supply zones and strategies b
 ## Candle aggregation model
 
 - The engine **consumes only closed candles**: `LiveEngine._is_closed_candle()` ensures the candle timestamp is aligned to the timeframe boundary and not in the future, so forming (incomplete) candles are skipped. **No repainting**—strategy logic sees only completed bars.
-- If a prop-style **CandleAggregator** is added (tick → 1m → higher timeframes), the same rule applies: the engine receives only closed, aggregated candles.
+
+### CandleAggregator (implemented)
+
+A **prop-grade candle engine** is implemented for both **Dhan** and **Delta** (broker-agnostic). The feed and aggregated candles feed multiple brokers by giving each engine its own aggregator instance and tick queue—no shared state across venues.
+
+| Component | Location | What it does |
+| --------- | -------- | ------------ |
+| **CandleAggregator** | `core/data/candle_aggregator.py` | Ticks → 1m only; higher timeframes (5m, 15m, 30m, 1h, 2h, 4h, 1d) aggregate **only from closed 1m** candles. Integer bucket math; O(1) per tick. Closed candles immutable; `get_last_closed_candle(symbol, resolution)` returns last closed bar only—never forming, no repainting. |
+| **Tick queue** | LiveEngine / EngineFactory | Engine-owned `queue.Queue`. WebSocket feeds push normalized ticks `{symbol, price, volume, timestamp}` (timestamp in Unix sec). Only the processor loop mutates candle state; no locks. |
+| **Feed integration** | `core/data/feeds/delta_feed.py`, `dhan_feed.py` | `set_tick_queue(queue)`: when set (before `start()`), feed pushes ticks on each ticker/quote. Same tick format for both brokers. |
+| **LiveEngine** | `core/engine/live_engine.py` | When `tick_queue` and `candle_aggregator` are set and strategy has `timeframe`: drain queue → `aggregator.on_tick()` → evaluate only on new closed candles (tracked per symbol). All existing safety layers (kill switch, duplicate signal, candle integrity, etc.) unchanged. |
+
+**Flow (lock-free):** WebSocket (thread) → put tick on queue → Processor loop (engine thread) → `get_nowait` → `CandleAggregator.on_tick()` → on 1m boundary close 1m and propagate to higher TFs from closed 1m only → strategy sees only closed candles.
+
+**Supported resolutions:** 1m, 5m, 15m, 30m, 1h, 2h, 4h, 1d (and aliases e.g. `"1"`, `"60"`). Per-symbol state: `current` (forming) + `closed` deque (maxlen=300). No pandas in live path; no heavy datetime in tick loop.
 
 ---
 
@@ -199,6 +213,7 @@ Algo/
 │   │   ├── datalayer/       # DhanDataProvider, DeltaDataProvider
 │   │   ├── feeds/           # DeltaWebSocketFeed, DhanWebSocketFeed, DhanDepthFeed, RealtimeFeed base
 │   │   ├── candle_service.py
+│   │   ├── candle_aggregator.py   # Tick→1m; higher TFs from closed 1m; broker-agnostic
 │   │   └── data_router.py
 │   │
 │   ├── broker/

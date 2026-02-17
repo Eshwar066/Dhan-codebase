@@ -54,6 +54,24 @@ class DeltaWebSocketFeed(RealtimeFeed):
 
         self._ws: Optional[DeltaWebSocket] = None
         self._auth_done = False
+        self._tick_queue: Optional[Any] = None
+
+    def set_tick_queue(self, queue: Any) -> None:
+        """Push normalized ticks to queue for CandleAggregator. Set before start()."""
+        self._tick_queue = queue
+
+    def _push_tick(self, symbol: str, price: float, volume: float, timestamp_sec: float) -> None:
+        if self._tick_queue is None:
+            return
+        try:
+            self._tick_queue.put_nowait({
+                "symbol": symbol,
+                "price": price,
+                "volume": volume,
+                "timestamp": timestamp_sec,
+            })
+        except Exception:
+            pass
 
     def _channel_candlestick(self) -> str:
         res = RESOLUTION_MAP.get(self.timeframe, "1h")
@@ -62,12 +80,14 @@ class DeltaWebSocketFeed(RealtimeFeed):
     def start(self) -> None:
         if self._ws:
             return
+        on_tick = self._push_tick if self._tick_queue else None
         self._ws = DeltaWebSocket(
             api_key=self.api_key,
             api_secret=self.api_secret,
             testnet=self.testnet,
             india=self.india,
             on_auth=self._on_auth,
+            on_tick=on_tick,
         )
         self._ws.connect()
         # Subscribe to public channels after socket is ready; private after auth success.

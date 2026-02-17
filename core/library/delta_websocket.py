@@ -70,9 +70,11 @@ class DeltaWebSocket:
         on_subscriptions: Optional[Callable[[Dict], None]] = None,
         on_error: Optional[Callable[[Exception], None]] = None,
         on_close: Optional[Callable[[int, str], None]] = None,
+        on_tick: Optional[Callable[[str, float, float, float], None]] = None,
     ):
         self.api_key = api_key
         self.api_secret = api_secret
+        self.on_tick = on_tick
         if india:
             self.ws_url = DELTA_WS_INDIA_TEST if testnet else DELTA_WS_INDIA_PROD
         else:
@@ -195,6 +197,18 @@ class DeltaWebSocket:
             if sym:
                 with self._lock:
                     self._last_ticker[sym] = msg
+                if self.on_tick:
+                    try:
+                        price = float(msg.get("mark_price") or msg.get("close") or msg.get("last_price") or 0)
+                        vol = float(msg.get("volume") or msg.get("size") or 0)
+                        ts = msg.get("timestamp") or msg.get("generated_at") or time.time()
+                        if isinstance(ts, (int, float)) and ts > 1e12:
+                            ts = ts / 1e6
+                        elif not isinstance(ts, (int, float)):
+                            ts = time.time()
+                        self.on_tick(sym, price, vol, float(ts))
+                    except Exception:
+                        pass
             if self.on_message:
                 self.on_message(msg)
             return
