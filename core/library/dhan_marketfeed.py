@@ -100,60 +100,61 @@ class DhanMarketFeedClient:
         """
         return self._post("/marketfeed/quote", instruments)
 
-    def parse_ltp_response(response: Dict[str, Any]) -> Dict[str, float]:
-        """
-        Flatten LTP API response to { symbol_or_id: last_price }.
-        Caller must pass instrument_names mapping security_id (str) -> symbol if they want symbols as keys.
-        """
-        result: Dict[str, float] = {}
-        if response.get("status") != "success":
-            return result
-        data = response.get("data") or {}
-        for segment, sec_dict in data.items():
-            if not isinstance(sec_dict, dict):
-                continue
-            for sec_id, obj in sec_dict.items():
-                if isinstance(obj, dict) and "last_price" in obj:
-                    result[str(sec_id)] = float(obj["last_price"])
-        return result
 
-    def parse_ohlc_response(
-        response: Dict[str, Any],
-    ) -> Dict[str, Dict[str, Any]]:
-        """
-        Flatten OHLC API response to { symbol_or_id: { last_price, open, high, low, close } }.
-        """
-        result: Dict[str, Dict[str, Any]] = {}
-        if response.get("status") != "success":
-            return result
-        data = response.get("data") or {}
-        for segment, sec_dict in data.items():
-            if not isinstance(sec_dict, dict):
-                continue
-            for sec_id, obj in sec_dict.items():
-                if not isinstance(obj, dict):
-                    continue
-                row = {"last_price": obj.get("last_price")}
-                ohlc = obj.get("ohlc") or {}
-                row["open"] = ohlc.get("open")
-                row["high"] = ohlc.get("high")
-                row["low"] = ohlc.get("low")
-                row["close"] = ohlc.get("close")
-                result[str(sec_id)] = row
+def parse_ltp_response(response: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Flatten LTP API response to { symbol_or_id: last_price }.
+    Caller must pass instrument_names mapping security_id (str) -> symbol if they want symbols as keys.
+    """
+    result: Dict[str, float] = {}
+    if response.get("status") != "success":
         return result
+    data = response.get("data") or {}
+    for segment, sec_dict in data.items():
+        if not isinstance(sec_dict, dict):
+            continue
+        for sec_id, obj in sec_dict.items():
+            if isinstance(obj, dict) and "last_price" in obj:
+                result[str(sec_id)] = float(obj["last_price"])
+    return result
 
-    def parse_quote_response(response: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-        """
-        Flatten Quote API response to { symbol_or_id: { last_price, ohlc, depth, oi, volume, ... } }.
-        """
-        result: Dict[str, Dict[str, Any]] = {}
-        if response.get("status") != "success":
-            return result
-        data = response.get("data") or {}
-        for segment, sec_dict in data.items():
-            if not isinstance(sec_dict, dict):
-                continue
-            for sec_id, obj in sec_dict.items():
-                if isinstance(obj, dict):
-                    result[str(sec_id)] = dict(obj)
+
+def parse_ohlc_response(response: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """
+    Flatten OHLC API response to { symbol_or_id: { last_price, open, high, low, close } }.
+    """
+    result: Dict[str, Dict[str, Any]] = {}
+    if response.get("status") != "success":
         return result
+    data = response.get("data") or {}
+    for segment, sec_dict in data.items():
+        if not isinstance(sec_dict, dict):
+            continue
+        for sec_id, obj in sec_dict.items():
+            if not isinstance(obj, dict):
+                continue
+            row = {"last_price": obj.get("last_price")}
+            ohlc = obj.get("ohlc") or {}
+            row["open"] = ohlc.get("open")
+            row["high"] = ohlc.get("high")
+            row["low"] = ohlc.get("low")
+            row["close"] = ohlc.get("close")
+            result[str(sec_id)] = row
+    return result
+
+
+def parse_quote_response(response: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """
+    Flatten Quote API response to { symbol_or_id: { last_price, ohlc, depth, oi, volume, ... } }.
+    """
+    result: Dict[str, Dict[str, Any]] = {}
+    if response.get("status") != "success":
+        return result
+    data = response.get("data") or {}
+    for segment, sec_dict in data.items():
+        if not isinstance(sec_dict, dict):
+            continue
+        for sec_id, obj in sec_dict.items():
+            if isinstance(obj, dict):
+                result[str(sec_id)] = dict(obj)
+    return result
