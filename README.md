@@ -317,7 +317,8 @@ Algo/
    # or
    python -m run.main --venue DHAN
    ```
-4. Live engine will:
+4. **PAPER** (`RUN_MODE = RunMode.PAPER`): Uses **SimulatedBroker**—same LiveEngine stack and logs as LIVE (engine logger, order_placed, fills, reconciliation, EOD), but no real orders. Feed and candle aggregator still use live data when credentials are set.
+5. **LIVE**: Live engine will:
    - Reconcile broker positions with PositionManager on startup.
    - Use Delta WebSocket feed for Delta if credentials are set; otherwise candle_service / REST.
    - Check risk kill switch and limits each loop; block entries when blocked.

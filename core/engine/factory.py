@@ -118,8 +118,9 @@ class EngineFactory:
     def create_live_engine(config: EngineConfig) -> LiveEngine:
         """
         Build LiveEngine with isolated stack for config.broker_name.
-        Dhan: DhanDataProvider, DhanBroker, no WebSocket feed (until DhanWebSocketFeed exists).
-        Delta: DeltaDataProvider, DeltaBroker, DeltaWebSocketFeed.
+        PAPER: SimulatedBroker (same stack and logs as LIVE; no real orders).
+        LIVE + Dhan: DhanDataProvider, DhanBroker, DhanWebSocketFeed when credentials set.
+        LIVE + Delta: DeltaDataProvider, DeltaBroker, DeltaWebSocketFeed when credentials set.
         """
         load_dotenv()
         cfg = STRATEGY_MAP.get(config.strategy_name)
@@ -161,7 +162,13 @@ class EngineFactory:
         )
 
         # ---------- Broker + OrderRouter (venue-specific) ----------
-        if config.broker_name == "DELTA":
+        # PAPER: use SimulatedBroker (same logs/safeguards as LIVE; no real orders).
+        if config.run_mode == RunMode.PAPER:
+            broker = SimulatedBroker(
+                position_manager=position_manager,
+                intent_store=intent_store,
+            )
+        elif config.broker_name == "DELTA":
             broker_api = DeltaBrokerApi(delta_source)
             broker = DeltaBroker(
                 api=broker_api,

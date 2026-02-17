@@ -56,6 +56,25 @@ class SimulatedBroker(BaseBroker):
                 self.intent_store.update(intent.intent_id, "FILLED")
         return order_id
 
+    def get_positions_for_recon(self):
+        """Return PositionManager state in same format as live brokers so reconcile is a no-op (paper truth = PM)."""
+        if not self.position_manager:
+            return {}
+        out = {}
+        for sym, pos in self.position_manager.positions.items():
+            if pos.net_qty == 0:
+                continue
+            inst = pos.instrument
+            segment = getattr(inst, "segment", "EQ") or "EQ"
+            lot_size = int(getattr(inst, "lot_size", 1) or 1)
+            out[sym] = {
+                "qty": pos.net_qty,
+                "avg_price": float(pos.avg_price),
+                "segment": segment,
+                "lot_size": lot_size,
+            }
+        return out
+
     def exit_position(self, trading_symbol, qty, side, segment="EQ", lot_size=1):
         exit_side = "SELL" if side == "BUY" else "BUY"
         # Minimal intent for simulated exit; real OrderIntent requires instrument
