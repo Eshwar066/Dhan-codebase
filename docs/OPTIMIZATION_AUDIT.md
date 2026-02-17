@@ -16,11 +16,11 @@ Deep-dive against README and codebase. Recommendations are ordered by impact and
 
 ---
 
-### 1.2 Hook `record_realized_pnl` when a position closes
+### 1.2 Hook `record_realized_pnl` when a position closes — **IMPLEMENTED**
 
-**Issue:** README (checklist #20) says: “Hook RiskManager.record_realized_pnl(amount) when a position is closed … so daily_max_loss is accurate.” PositionManager computes `realized_pnl` in `Position.update_fill()` when `net_qty` goes to 0, but nothing calls `risk_manager.record_realized_pnl(pnl)`.
+**Issue:** README (checklist #20) says: “Hook RiskManager.record_realized_pnl(amount) when a position is closed … so daily_max_loss is accurate.” PositionManager computed `realized_pnl` in `Position.update_fill()` when `net_qty` went to 0, but nothing called `risk_manager.record_realized_pnl(pnl)`.
 
-**Fix:** When/where position closes (e.g. in OrderRouter when processing a fill, or in PositionManager if it has a reference to risk_manager), call `risk_manager.record_realized_pnl(realized_pnl)`. Requires a clean wiring point (e.g. OrderRouter or LiveEngine gets fill callback and calls risk_manager.record_realized_pnl).
+**Implemented:** OrderRouter is the single fill-processing boundary. `OrderRouter.process_fill(instrument, side, qty, price, ...)` calls `PositionManager.on_fill()` (which now returns `(position_closed, realized_pnl)`); when `position_closed`, calls `risk_manager.record_realized_pnl(realized_pnl)`. SimulatedBroker and factory wire broker → `order_router.process_fill()`. BaseBroker has `set_order_router()` so live brokers (Dhan/Delta) can call `order_router.process_fill()` when they add fill callbacks. No RiskManager in PositionManager; domain layers stay clean.
 
 ---
 
@@ -135,3 +135,38 @@ Deep-dive against README and codebase. Recommendations are ordered by impact and
 | 3.3 | Feed health log throttle    | LiveEngine     | Low    | Log volume    |
 
 Implementing 1.1 (bounded queue), 1.3 (reset pause flags), 3.1 (README), and 2.1 (shorter sleep with aggregator) gives the best balance of safety and behavior with minimal risk.
+
+
+
+
+<!-- Double check this -->
+
+If multiple fills complete the close:
+
+Example:
+
+Long 100
+Sell 40
+Sell 30
+Sell 30
+
+On final 30:
+
+prev_qty = 30
+
+new_qty = 0
+
+position_closed = True
+
+You must ensure:
+
+pos.realized_pnl contains the full accumulated realized PnL,
+not just last leg PnL.
+
+If that is true → system is correct.
+
+If you only store per-fill realized PnL → you must accumulate before reporting.
+
+Double-check that.
+
+

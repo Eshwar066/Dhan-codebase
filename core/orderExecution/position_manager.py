@@ -284,6 +284,10 @@ class PositionManager:
 
                 self.logger.log(strategy=strategy, row=row)
 
+            position_closed = prev_qty != 0 and new_qty == 0
+            realized_pnl_for_risk = pos.realized_pnl if position_closed else 0.0
+            return (position_closed, realized_pnl_for_risk)
+
     def has_open_structure(self, strategy: str, structure_id: str, tag: str) -> bool:
         for pos in self.positions.values():
             if (

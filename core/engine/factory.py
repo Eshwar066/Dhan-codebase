@@ -99,7 +99,9 @@ class EngineFactory:
             risk_manager=risk_manager,
             broker=broker,
             intent_store=intent_store,
+            position_manager=position_manager,
         )
+        broker.set_order_router(order_router)
 
         # ---------- Instruments (venue-specific path) ----------
         instrument_store = EngineFactory._instrument_store(config)
@@ -178,10 +180,12 @@ class EngineFactory:
             risk_manager=risk_manager,
             broker=broker,
             intent_store=intent_store,
+            position_manager=position_manager,
             engine_logger=engine_logger,
             circuit_breaker_threshold=getattr(config, "circuit_breaker_threshold", 5),
             slippage_threshold_pct=getattr(config, "slippage_threshold_pct", None),
         )
+        broker.set_order_router(order_router)
 
         # ---------- Instruments ----------
         instrument_store = EngineFactory._instrument_store(config)

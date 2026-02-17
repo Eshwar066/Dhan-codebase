@@ -54,6 +54,11 @@ class BaseBroker(ABC):
     def __init__(self, position_manager=None, intent_store=None):
         self.position_manager = position_manager
         self.intent_store = intent_store
+        self.order_router = None
+
+    def set_order_router(self, order_router):
+        """Set OrderRouter for fill processing (record_realized_pnl, logging). Call from factory after construction."""
+        self.order_router = order_router
 
     @abstractmethod
     def place_order(
