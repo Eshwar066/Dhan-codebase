@@ -8,5 +8,6 @@ Real-time WebSocket feeds for market data and account updates.
 
 from core.data.feeds.base_feed import RealtimeFeed
 from core.data.feeds.delta_feed import DeltaWebSocketFeed
+from core.data.feeds.dhan_feed import DhanWebSocketFeed
 
-__all__ = ["RealtimeFeed", "DeltaWebSocketFeed"]
+__all__ = ["RealtimeFeed", "DeltaWebSocketFeed", "DhanWebSocketFeed"]

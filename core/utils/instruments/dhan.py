@@ -4,7 +4,7 @@ SEM_* schema, NSE/NFO/BSE exchange mapping, backtest dummy rows.
 """
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 from run.config import RUN_MODE, RunMode
@@ -103,6 +103,88 @@ class DhanInstrumentStore(BaseInstrumentStore):
             "SEM_SERIES": None,
         }
         return self.map_row_to_instrument(pd.Series(dummy_row))
+
+    # Dhan WebSocket feed segment enums (cursor.md)
+    FEED_SEGMENT_INDEX = "IDX_I"
+    FEED_SEGMENT_NSE_EQ = "NSE_EQ"
+    FEED_SEGMENT_NSE_FNO = "NSE_FNO"
+    FEED_SEGMENT_NSE_CURRENCY = "NSE_CURRENCY"
+    FEED_SEGMENT_BSE_EQ = "BSE_EQ"
+    FEED_SEGMENT_BSE_FNO = "BSE_FNO"
+    FEED_SEGMENT_BSE_CURRENCY = "BSE_CURRENCY"
+    FEED_SEGMENT_MCX = "MCX_COMM"
+
+    INDEX_SYMBOLS = {"NIFTY", "NIFTY 50", "BANKNIFTY", "NIFTY BANK", "MIDCPNIFTY", "NIFTY MID SELECT", "FINNIFTY", "NIFTY FIN SERVICE", "SENSEX", "BANKEX", "INDIA VIX"}
+
+    def _exchange_to_feed_segment(self, row: pd.Series) -> str:
+        """Map CSV row (SEM_EXM_EXCH_ID, SEM_EXCH_INSTRUMENT_TYPE / SEM_SEGMENT) to feed ExchangeSegment."""
+        exchange = str(row.get("SEM_EXM_EXCH_ID", "")).upper()
+        seg = str(row.get("SEM_SEGMENT") or "").strip().upper()
+        itype = str(row.get("SEM_EXCH_INSTRUMENT_TYPE") or "").strip().upper()
+        if exchange == "NSE":
+            if itype in ("OP", "FUT", "FUTCOM") or seg == "FNO":
+                return self.FEED_SEGMENT_NSE_FNO
+            if seg == "CUR" or itype == "CUR":
+                return self.FEED_SEGMENT_NSE_CURRENCY
+            return self.FEED_SEGMENT_NSE_EQ
+        if exchange == "BSE":
+            if itype in ("OP", "FUT") or seg == "FNO":
+                return self.FEED_SEGMENT_BSE_FNO
+            if seg == "CUR":
+                return self.FEED_SEGMENT_BSE_CURRENCY
+            return self.FEED_SEGMENT_BSE_EQ
+        if exchange == "MCX":
+            return self.FEED_SEGMENT_MCX
+        return self.FEED_SEGMENT_NSE_EQ
+
+    def get_feed_instruments(self, symbols: List[str]) -> List[Dict[str, Any]]:
+        """
+        Resolve symbols to WebSocket feed instrument list.
+        Returns list of {"ExchangeSegment": "NSE_EQ", "SecurityId": "11536", "symbol": "RELIANCE"}.
+        Used by DhanWebSocketFeed. For indices (NIFTY, BANKNIFTY, etc.) uses IDX_I.
+        """
+        result: List[Dict[str, Any]] = []
+        seen: set = set()
+        symbols_upper = [s.strip().upper() for s in symbols if s]
+        df = self.df
+        for sym in symbols_upper:
+            if sym in seen:
+                continue
+            # Index: single row per name, use IDX_I
+            if sym in self.INDEX_SYMBOLS:
+                match = df[
+                    (df["SEM_CUSTOM_SYMBOL"].str.upper() == sym)
+                    | (df["SEM_TRADING_SYMBOL"].str.upper() == sym)
+                ]
+                if not match.empty:
+                    row = match.iloc[-1]
+                    sid = int(row["SEM_SMST_SECURITY_ID"])
+                    result.append({
+                        "ExchangeSegment": self.FEED_SEGMENT_INDEX,
+                        "SecurityId": str(sid),
+                        "symbol": sym,
+                    })
+                    seen.add(sym)
+                continue
+            # Equity/FNO: take first match (or nearest expiry for FNO)
+            match = df[
+                (df["SEM_CUSTOM_SYMBOL"].str.upper() == sym)
+                | (df["SEM_TRADING_SYMBOL"].str.upper() == sym)
+            ]
+            if match.empty:
+                continue
+            if "SEM_EXPIRY_DATE" in match.columns and match["SEM_EXPIRY_DATE"].notna().any():
+                match = match.sort_values("SEM_EXPIRY_DATE").reset_index(drop=True)
+            row = match.iloc[0]
+            feed_seg = self._exchange_to_feed_segment(row)
+            sid = int(row["SEM_SMST_SECURITY_ID"])
+            result.append({
+                "ExchangeSegment": feed_seg,
+                "SecurityId": str(sid),
+                "symbol": sym,
+            })
+            seen.add(sym)
+        return result
 
     def futures_intent_creation_details(
         self, trading_symbol: str, exchange: str, expiry

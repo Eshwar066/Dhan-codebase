@@ -27,7 +27,7 @@ A production-grade, modular trading system that supports **India markets (Dhan)*
 ## What this project does
 
 - **Backtest** strategies on historical candles (single venue per run).
-- **Live / paper trade** with real-time data: **Delta** uses WebSocket; **Dhan** is currently **REST/candle service only** (**DhanWebSocketFeed** planned when Dhan exposes a WebSocket API).
+- **Live / paper trade** with real-time data: **Delta** uses WebSocket; **Dhan** supports **DhanWebSocketFeed** (Live Market Feed WebSocket per cursor.md) when credentials and instrument file are set, otherwise REST/candle service.
 - **Two venues in parallel**: run Dhan (India) and Delta (crypto) in separate processes or in one process via a Supervisor.
 - **Per-engine OMS**: each engine has its own PositionManager, RiskManager, OrderRouter, and Broker—no shared orders or positions across venues.
 - **Production safeguards**: broker reconciliation on startup, risk kill switch, closed-candle validation, feed health checks, structured JSON logs, EOD CSV export, capital and risk limits per engine.
@@ -46,6 +46,19 @@ The **Dhan v2 Market Quote API** (LTP, OHLC, market depth) is integrated for the
 | **Parsers** | `core/library/dhan_marketfeed.py` | `parse_ltp_response()`, `parse_ohlc_response()`, `parse_quote_response()` to flatten API responses. |
 
 **Instruments format:** `{ "NSE_EQ": [11536], "NSE_FNO": [49081, 49082], ... }` — exchange segment → list of security IDs. Use when you have segment + IDs (e.g. from positions or instrument store). For symbol names, continue using `get_ltp_data(names)`, `get_latest_candles(symbols)`, `get_quote_data(names)` via Tradehull.
+
+### Dhan Live Market Feed WebSocket (implemented)
+
+Real-time tick-by-tick data over WebSocket (cursor.md) is integrated for the Dhan broker:
+
+| Component | Location | What was implemented |
+| --------- | -------- | --------------------- |
+| **WebSocket client** | `core/library/dhan_websocket.py` | Connect to `wss://api-feed.dhan.co` (version=2, token, clientId, authType=2). Subscribe via JSON (RequestCode 15, InstrumentList; max 100 per message). Parse binary Little Endian packets: Ticker (2), Quote (4), OI (5), Prev close (6), Full (8), Disconnect (50). Ping/pong keep-alive; disconnect RequestCode 12. |
+| **Feed** | `core/data/feeds/dhan_feed.py` | `DhanWebSocketFeed(RealtimeFeed)`: takes access_token, client_id, instruments list. `get_last_ticker(symbol)`, `get_last_candle(symbol, resolution)`. Used by LiveEngine when broker is DHAN and `DHAN_ACCESS_TOKEN` / `DHAN_CLIENT_CODE` are set. |
+| **Instrument resolution** | `core/utils/instruments/dhan.py` | `DhanInstrumentStore.get_feed_instruments(symbols)` returns list of `{ExchangeSegment, SecurityId, symbol}` for WebSocket subscribe. Maps NSE/BSE/MCX and segment to NSE_EQ, NSE_FNO, IDX_I, etc. |
+| **Engine factory** | `core/engine/factory.py` | For live DHAN engine, if credentials and instrument store have `get_feed_instruments`, builds instruments from config.symbols and starts `DhanWebSocketFeed`. |
+
+Up to 5 connections per user, 5000 instruments per connection. Server pings every 10s; no response for 40s closes the connection.
 
 ---
 
@@ -66,7 +79,7 @@ The **Dhan v2 Market Quote API** (LTP, OHLC, market depth) is integrated for the
          │  PositionManager #1  │                  │  PositionManager #2 │
          │  RiskManager #1      │                  │  RiskManager #2     │
          │  OrderRouter → Dhan  │                  │  OrderRouter → Delta │
-         │  (Dhan WS planned)   │                  │  DeltaWebSocketFeed  │
+         │  DhanWebSocketFeed   │                  │  DeltaWebSocketFeed  │
          └──────────────────────┘                  └──────────────────────┘
                     │                                           │
                     └─────────────────────┬─────────────────────┘

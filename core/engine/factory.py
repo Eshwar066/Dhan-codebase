@@ -26,7 +26,7 @@ from core.data.sources.dhan_source import DhanSource
 from core.data.sources.delta_source import DeltaSource
 from core.data.datalayer import DhanDataProvider, DeltaDataProvider
 from core.data.candle_service import CandleService
-from core.data.feeds import DeltaWebSocketFeed
+from core.data.feeds import DeltaWebSocketFeed, DhanWebSocketFeed
 from core.broker import (
     DhanBroker,
     DhanBrokerApi,
@@ -187,7 +187,7 @@ class EngineFactory:
         # ---------- CandleService (uses same data_provider) ----------
         candle_service = CandleService(data_provider)
 
-        # ---------- Realtime feed (Delta only for now) ----------
+        # ---------- Realtime feed ----------
         realtime_feed = None
         if config.broker_name == "DELTA":
             api_key = os.getenv("DELTA_API_KEY")
@@ -204,7 +204,18 @@ class EngineFactory:
                     subscribe_private=True,
                 )
                 realtime_feed.start()
-        # When DhanWebSocketFeed exists, instantiate here for config.broker_name == "DHAN"
+        elif config.broker_name == "DHAN":
+            access_token = os.getenv("DHAN_ACCESS_TOKEN")
+            client_id = os.getenv("DHAN_CLIENT_CODE")
+            if access_token and client_id and hasattr(instrument_store, "get_feed_instruments"):
+                instruments = instrument_store.get_feed_instruments(config.symbols)
+                if instruments:
+                    realtime_feed = DhanWebSocketFeed(
+                        access_token=access_token,
+                        client_id=client_id,
+                        instruments=instruments,
+                    )
+                    realtime_feed.start()
 
         return LiveEngine(
             strategy=strategy,
