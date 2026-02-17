@@ -7,19 +7,20 @@ A production-grade, modular trading system that supports **India markets (Dhan)*
 ## Table of contents
 
 1. [What this project does](#what-this-project-does)
-2. [Architecture at a glance](#architecture-at-a-glance)
-3. [Concurrency model](#concurrency-model)
-4. [Candle aggregation model](#candle-aggregation-model)
-5. [Determinism guarantee](#determinism-guarantee)
-6. [Engine safety model](#engine-safety-model)
-7. [Directory structure](#directory-structure)
-8. [Key concepts](#key-concepts)
-9. [Configuration](#configuration)
-10. [How to run](#how-to-run)
-11. [Production features](#production-features)
-12. [Steps to take (checklist)](#steps-to-take-checklist)
-13. [Environment and dependencies](#environment-and-dependencies)
-14. [Further reading](#further-reading)
+2. [Dhan Market Quote API (implemented)](#dhan-market-quote-api-implemented)
+3. [Architecture at a glance](#architecture-at-a-glance)
+4. [Concurrency model](#concurrency-model)
+5. [Candle aggregation model](#candle-aggregation-model)
+6. [Determinism guarantee](#determinism-guarantee)
+7. [Engine safety model](#engine-safety-model)
+8. [Directory structure](#directory-structure)
+9. [Key concepts](#key-concepts)
+10. [Configuration](#configuration)
+11. [How to run](#how-to-run)
+12. [Production features](#production-features)
+13. [Steps to take (checklist)](#steps-to-take-checklist)
+14. [Environment and dependencies](#environment-and-dependencies)
+15. [Further reading](#further-reading)
 
 ---
 
@@ -30,6 +31,21 @@ A production-grade, modular trading system that supports **India markets (Dhan)*
 - **Two venues in parallel**: run Dhan (India) and Delta (crypto) in separate processes or in one process via a Supervisor.
 - **Per-engine OMS**: each engine has its own PositionManager, RiskManager, OrderRouter, and Broker—no shared orders or positions across venues.
 - **Production safeguards**: broker reconciliation on startup, risk kill switch, closed-candle validation, feed health checks, structured JSON logs, EOD CSV export, capital and risk limits per engine.
+
+---
+
+## Dhan Market Quote API (implemented)
+
+The **Dhan v2 Market Quote API** (LTP, OHLC, market depth) is integrated for the Dhan broker:
+
+| Component | Location | What was implemented |
+| --------- | -------- | --------------------- |
+| **Client** | `core/library/dhan_marketfeed.py` | `DhanMarketFeedClient` with `ltp()`, `ohlc()`, `quote()` calling `POST /marketfeed/ltp`, `/marketfeed/ohlc`, `/marketfeed/quote`. Optional 1 req/s rate limit. |
+| **Source** | `core/data/sources/dhan_source.py` | `get_ltp_v2(instruments)`, `get_ohlc_v2(instruments)`, `get_quote_v2(instruments)` using the v2 client. |
+| **Data provider** | `core/data/datalayer/dhan_data_provider.py` | Same v2 methods exposed so engines can fetch LTP/OHLC/quote by segment + security IDs. |
+| **Parsers** | `core/library/dhan_marketfeed.py` | `parse_ltp_response()`, `parse_ohlc_response()`, `parse_quote_response()` to flatten API responses. |
+
+**Instruments format:** `{ "NSE_EQ": [11536], "NSE_FNO": [49081, 49082], ... }` — exchange segment → list of security IDs. Use when you have segment + IDs (e.g. from positions or instrument store). For symbol names, continue using `get_ltp_data(names)`, `get_latest_candles(symbols)`, `get_quote_data(names)` via Tradehull.
 
 ---
 
@@ -75,7 +91,7 @@ A production-grade, modular trading system that supports **India markets (Dhan)*
 
 - **BaseEngine**: shared foundation; builds `DataRouter`, `OptionChainService`, and `StrategyContext`; calls `strategy.on_candle(candle, ctx)` → intent.
 - **BacktestEngine**: replays history per symbol; runs exits/rollover then entry; uses `SimulatedBroker`.
-- **LiveEngine**: infinite loop; optional WebSocket feed or candle_service; reconciles positions on start; checks kill switch; validates closed candles; logs to `logs/{engine_id}.log`; exports EOD to `reports/{engine_id}_{date}.csv`.
+- **LiveEngine**: infinite loop; optional WebSocket feed or candle*service; reconciles positions on start; checks kill switch; validates closed candles; logs to `logs/{engine_id}.log`; exports EOD to `reports/{engine_id}*{date}.csv`.
 - **EngineFactory**: from `EngineConfig` builds the full stack (data, instruments, OMS, broker, feed) for one venue. No shared instances.
 
 ---
@@ -105,21 +121,21 @@ A production-grade, modular trading system that supports **India markets (Dhan)*
 
 Production safeguards (implemented and planned) that make the system institutional-grade:
 
-| Layer | Feature | Status |
-|--------|--------|--------|
-| **Risk** | Kill switch hierarchy (`RiskManager.trigger_kill_switch`) | Implemented |
-| **Broker** | Broker circuit breaker (fail-fast on repeated broker errors) | Implemented |
-| **Startup** | Reconciliation on start (sync PositionManager to broker) | Implemented |
-| **Signals** | Duplicate signal protection (avoid re-entry on same bar/signal) | Implemented |
-| **Orders** | Order state consistency verification (PM vs broker) | Implemented |
-| **Resource** | Memory guard (psutil; pause entries above threshold) | Implemented |
-| **Strategy** | Strategy timeout guard (max time per `on_candle`) | Implemented |
-| **Feed** | Symbol-level pause (pause entries per symbol when feed stale or repeated errors) | Implemented |
-| **Latency** | Latency guard + critical pause after N cycles | Implemented |
-| **Feed** | Feed health (warn when no data for `feed_stale_seconds`; pause entries) | Implemented |
-| **Shutdown** | Graceful shutdown (SIGINT/SIGTERM, snapshot, flush log) | Implemented |
-| **Candle** | Candle integrity validation (OHLC consistency) | Implemented |
-| **Slippage** | High-slippage warning on fill (no auto-adjust) | Implemented |
+| Layer        | Feature                                                                          | Status      |
+| ------------ | -------------------------------------------------------------------------------- | ----------- |
+| **Risk**     | Kill switch hierarchy (`RiskManager.trigger_kill_switch`)                        | Implemented |
+| **Broker**   | Broker circuit breaker (fail-fast on repeated broker errors)                     | Implemented |
+| **Startup**  | Reconciliation on start (sync PositionManager to broker)                         | Implemented |
+| **Signals**  | Duplicate signal protection (avoid re-entry on same bar/signal)                  | Implemented |
+| **Orders**   | Order state consistency verification (PM vs broker)                              | Implemented |
+| **Resource** | Memory guard (psutil; pause entries above threshold)                             | Implemented |
+| **Strategy** | Strategy timeout guard (max time per `on_candle`)                                | Implemented |
+| **Feed**     | Symbol-level pause (pause entries per symbol when feed stale or repeated errors) | Implemented |
+| **Latency**  | Latency guard + critical pause after N cycles                                    | Implemented |
+| **Feed**     | Feed health (warn when no data for `feed_stale_seconds`; pause entries)          | Implemented |
+| **Shutdown** | Graceful shutdown (SIGINT/SIGTERM, snapshot, flush log)                          | Implemented |
+| **Candle**   | Candle integrity validation (OHLC consistency)                                   | Implemented |
+| **Slippage** | High-slippage warning on fill (no auto-adjust)                                   | Implemented |
 
 Latency logging is done **only on the order path** (when an order is placed), not in the tick ingestion path, so it does not degrade performance at high tick rates (e.g. 1000+ ticks/sec).
 
@@ -190,14 +206,14 @@ Algo/
 
 ## Key concepts
 
-| Concept | Meaning |
-|--------|--------|
-| **Venue** | Broker/market: `DHAN` (India) or `DELTA` (crypto). Each job in config has a `venue`. |
-| **Engine** | One BacktestEngine or LiveEngine instance. Built by EngineFactory from an EngineConfig. |
-| **OMS** | Order management: PositionManager, RiskManager, IntentStore, OrderRouter, Broker. One OMS per engine. |
-| **Strategy** | Class registered in `STRATEGY_MAP`; implements `on_candle`, `should_evaluate`, `should_exit`, etc. |
+| Concept          | Meaning                                                                                                                     |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| **Venue**        | Broker/market: `DHAN` (India) or `DELTA` (crypto). Each job in config has a `venue`.                                        |
+| **Engine**       | One BacktestEngine or LiveEngine instance. Built by EngineFactory from an EngineConfig.                                     |
+| **OMS**          | Order management: PositionManager, RiskManager, IntentStore, OrderRouter, Broker. One OMS per engine.                       |
+| **Strategy**     | Class registered in `STRATEGY_MAP`; implements `on_candle`, `should_evaluate`, `should_exit`, etc.                          |
 | **EngineConfig** | Dataclass: broker_name, run_mode, strategy_name, symbols, capital, risk_per_trade_percent, backtest/live params, engine_id. |
-| **Run mode** | `BACKTEST` \| `PAPER` \| `LIVE`. Set in `run/config.py` as `RUN_MODE`. |
+| **Run mode**     | `BACKTEST` \| `PAPER` \| `LIVE`. Set in `run/config.py` as `RUN_MODE`.                                                      |
 
 ---
 
@@ -284,35 +300,35 @@ See `docs/MULTI_VENUE.md`: create a Supervisor, `register_from_config()` for eac
 
 ## Production features
 
-| Feature | Where | What it does |
-|--------|--------|----------------|
-| **Broker reconciliation** | LiveEngine | On start, fetches broker positions, syncs PositionManager, logs mismatches to engine log. |
-| **Kill switch** | RiskManager | `trigger_kill_switch(reason)` blocks all new entries; exits still allowed; logged. |
-| **Risk limits** | RiskManager | daily_max_loss, max_open_positions, max_symbol_exposure, max_portfolio_exposure; capital × risk_per_trade_percent → max_risk_amount per trade. |
-| **Closed-candle validation** | LiveEngine | Only evaluates candles that are closed and aligned to timeframe; skips forming candles. |
-| **Structured logging** | EngineLogger | One JSON line per event in `logs/{engine_id}.log` (order_placed, risk_block, reconciliation, kill_switch, latency, etc.). |
-| **Feed health** | LiveEngine | Tracks last tick/candle per symbol; warns and can pause entries if no data for `feed_stale_seconds`. |
-| **EOD export** | LiveEngine | Writes `reports/{engine_id}_{YYYYMMDD}.csv` (open positions, realized pnl). |
-| **Latency** | LiveEngine | Logs strategy_time_ms, broker_latency_ms, total_latency_ms for orders (order path only; not in tick ingestion, so no impact at high tick rate). |
+| Feature                      | Where        | What it does                                                                                                                                    |
+| ---------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Broker reconciliation**    | LiveEngine   | On start, fetches broker positions, syncs PositionManager, logs mismatches to engine log.                                                       |
+| **Kill switch**              | RiskManager  | `trigger_kill_switch(reason)` blocks all new entries; exits still allowed; logged.                                                              |
+| **Risk limits**              | RiskManager  | daily_max_loss, max_open_positions, max_symbol_exposure, max_portfolio_exposure; capital × risk_per_trade_percent → max_risk_amount per trade.  |
+| **Closed-candle validation** | LiveEngine   | Only evaluates candles that are closed and aligned to timeframe; skips forming candles.                                                         |
+| **Structured logging**       | EngineLogger | One JSON line per event in `logs/{engine_id}.log` (order_placed, risk_block, reconciliation, kill_switch, latency, etc.).                       |
+| **Feed health**              | LiveEngine   | Tracks last tick/candle per symbol; warns and can pause entries if no data for `feed_stale_seconds`.                                            |
+| **EOD export**               | LiveEngine   | Writes `reports/{engine_id}_{YYYYMMDD}.csv` (open positions, realized pnl).                                                                     |
+| **Latency**                  | LiveEngine   | Logs strategy_time_ms, broker_latency_ms, total_latency_ms for orders (order path only; not in tick ingestion, so no impact at high tick rate). |
 
 ### Production safeguards (implemented)
 
 The following are implemented and configurable via **EngineConfig** (live only; no change to BaseEngine or BacktestEngine):
 
-| # | Feature | Where | Config / behavior |
-|---|--------|--------|-------------------|
-| 1 | **Order state consistency** | OrderRouter | `verify_open_orders_with_broker()` compares broker open orders with IntentStore and PositionManager; on mismatch logs `order_state_mismatch`, calls `reconcile_positions_on_start()`, optionally pauses entries. Trigger: startup + every `order_state_check_interval_min` minutes. |
-| 2 | **Duplicate signal protection** | LiveEngine | `_last_signal_hash_per_symbol`; before entry, hash(symbol, timeframe, candle_timestamp, signal_type); if already processed skip and log `duplicate_signal_blocked`. |
-| 3 | **Broker circuit breaker** | OrderRouter | On broker failure increment `consecutive_failures`; if ≥ `circuit_breaker_threshold` (default 5) call `risk_manager.trigger_kill_switch("broker_failure")` and log `broker_circuit_breaker_triggered`. Reset on successful order. |
-| 4 | **Max open positions** | RiskManager | Already present; blocks entry when `open_count >= max_open_positions`; logs `max_positions_blocked`. |
-| 5 | **Time-of-day guard** | LiveEngine | `allowed_trading_hours = [(start, end)]` in "HH:MM" UTC; outside window skip entry and log `time_window_blocked`. Exits always allowed. |
-| 6 | **Slippage monitor** | OrderRouter | `report_fill(expected_price, fill_price, ...)`; when fill is reported, if slippage > `slippage_threshold_pct` log `high_slippage_warning`. No auto-adjust. |
-| 7 | **Memory guard** | LiveEngine | Uses `psutil`; when process memory % ≥ `memory_threshold_percent` log `memory_pressure_warning` and pause new entries. No auto shutdown. |
-| 8 | **Graceful shutdown** | LiveEngine | Handles SIGINT/SIGTERM; on shutdown saves position snapshot to `reports/{engine_id}_shutdown_{timestamp}.csv`, logs `graceful_shutdown`, closes broker if it has `close()`. Per-engine. |
-| 9 | **Candle integrity validation** | LiveEngine | When using a candle, validates high ≥ max(open, close), low ≤ min(open, close); on mismatch log `candle_integrity_error` and skip candle. No crash. |
-| 10 | **Symbol-level failure isolation** | LiveEngine | `symbol_state[symbol] = {paused, feed_stale, error_count}`; if symbol repeatedly fails (≥ `symbol_error_threshold`) pause only that symbol and log `symbol_paused`. Other symbols keep trading. |
-| 11 | **Strategy timeout guard** | LiveEngine | If strategy evaluation time > `strategy_timeout_seconds` log `strategy_timeout` and skip order placement. No crash. |
-| 12 | **Latency alert levels** | LiveEngine | normal &lt; 50ms, warning 50–150ms, critical &gt; 150ms (configurable `latency_critical_ms`). If critical for `latency_critical_cycles` consecutive cycles, pause new entries and log `latency_critical_pause`. |
+| #   | Feature                            | Where       | Config / behavior                                                                                                                                                                                                                                                                   |
+| --- | ---------------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | **Order state consistency**        | OrderRouter | `verify_open_orders_with_broker()` compares broker open orders with IntentStore and PositionManager; on mismatch logs `order_state_mismatch`, calls `reconcile_positions_on_start()`, optionally pauses entries. Trigger: startup + every `order_state_check_interval_min` minutes. |
+| 2   | **Duplicate signal protection**    | LiveEngine  | `_last_signal_hash_per_symbol`; before entry, hash(symbol, timeframe, candle_timestamp, signal_type); if already processed skip and log `duplicate_signal_blocked`.                                                                                                                 |
+| 3   | **Broker circuit breaker**         | OrderRouter | On broker failure increment `consecutive_failures`; if ≥ `circuit_breaker_threshold` (default 5) call `risk_manager.trigger_kill_switch("broker_failure")` and log `broker_circuit_breaker_triggered`. Reset on successful order.                                                   |
+| 4   | **Max open positions**             | RiskManager | Already present; blocks entry when `open_count >= max_open_positions`; logs `max_positions_blocked`.                                                                                                                                                                                |
+| 5   | **Time-of-day guard**              | LiveEngine  | `allowed_trading_hours = [(start, end)]` in "HH:MM" UTC; outside window skip entry and log `time_window_blocked`. Exits always allowed.                                                                                                                                             |
+| 6   | **Slippage monitor**               | OrderRouter | `report_fill(expected_price, fill_price, ...)`; when fill is reported, if slippage > `slippage_threshold_pct` log `high_slippage_warning`. No auto-adjust.                                                                                                                          |
+| 7   | **Memory guard**                   | LiveEngine  | Uses `psutil`; when process memory % ≥ `memory_threshold_percent` log `memory_pressure_warning` and pause new entries. No auto shutdown.                                                                                                                                            |
+| 8   | **Graceful shutdown**              | LiveEngine  | Handles SIGINT/SIGTERM; on shutdown saves position snapshot to `reports/{engine_id}_shutdown_{timestamp}.csv`, logs `graceful_shutdown`, closes broker if it has `close()`. Per-engine.                                                                                             |
+| 9   | **Candle integrity validation**    | LiveEngine  | When using a candle, validates high ≥ max(open, close), low ≤ min(open, close); on mismatch log `candle_integrity_error` and skip candle. No crash.                                                                                                                                 |
+| 10  | **Symbol-level failure isolation** | LiveEngine  | `symbol_state[symbol] = {paused, feed_stale, error_count}`; if symbol repeatedly fails (≥ `symbol_error_threshold`) pause only that symbol and log `symbol_paused`. Other symbols keep trading.                                                                                     |
+| 11  | **Strategy timeout guard**         | LiveEngine  | If strategy evaluation time > `strategy_timeout_seconds` log `strategy_timeout` and skip order placement. No crash.                                                                                                                                                                 |
+| 12  | **Latency alert levels**           | LiveEngine  | normal &lt; 50ms, warning 50–150ms, critical &gt; 150ms (configurable `latency_critical_ms`). If critical for `latency_critical_cycles` consecutive cycles, pause new entries and log `latency_critical_pause`.                                                                     |
 
 **EngineConfig** (run/engine_config.py) fields for the above: `order_state_check_interval_min`, `circuit_breaker_threshold`, `allowed_trading_hours`, `slippage_threshold_pct`, `memory_threshold_percent`, `strategy_timeout_seconds`, `latency_critical_ms`, `latency_critical_cycles`, `symbol_error_threshold`. All optional; defaults preserve existing behavior.
 
@@ -327,10 +343,12 @@ Use this as a reference for setup and next steps.
 ### Initial setup
 
 1. **Clone and install**
+
    - `pip install -r requirements.txt`
    - Create `.env` with Dhan and/or Delta credentials (see Environment and dependencies below).
 
 2. **Configure run mode and jobs**
+
    - Open `run/config.py`; set `RUN_MODE` (BACKTEST / PAPER / LIVE).
    - Set `DEFAULT_VENUE` if you rely on default venue for jobs.
    - In `STRATEGY_JOBS`, set `enabled: True` for the strategy you want; set `venue`, `symbols`, `backtest`, `live`, and optionally `capital`, `risk_per_trade_percent`.
@@ -427,12 +445,13 @@ python -m run.main --venue DELTA
 Logs: `logs/{engine_id}.log` (JSON). EOD: `reports/{engine_id}_{YYYYMMDD}.csv`.
 
 <!-- this is when engine should work -->
-Time (IST)      | 09:00  | 12:00  | 15:30  | 19:00  | 22:00  | 03:00  | 09:00
-----------------|--------|--------|--------|--------|--------|--------|--------
-Office Hours    |  🏢     |  🏢     |  🏢     |        |        |        |        
-Home Hours      |        |        |        |  🏠     |  🏠     |  🏠     |  🏠     
-Dhan Engine     |  🔵    |  🔵    |  🔵    |  ⬜     |  ⬜     |  ⬜     |  ⬜     
-Delta Engine    |  ⬜    |  ⬜    |  ⬜    |  🔴    |  🔴    |  🔴    |  🔴   
+
+| Time (IST)   | 09:00 | 12:00 | 15:30 | 19:00 | 22:00 | 03:00 | 09:00 |
+| ------------ | ----- | ----- | ----- | ----- | ----- | ----- | ----- |
+| Office Hours | 🏢    | 🏢    | 🏢    |       |       |       |
+| Home Hours   |       |       |       | 🏠    | 🏠    | 🏠    | 🏠    |
+| Dhan Engine  | 🔵    | 🔵    | 🔵    | ⬜    | ⬜    | ⬜    | ⬜    |
+| Delta Engine | ⬜    | ⬜    | ⬜    | 🔴    | 🔴    | 🔴    | 🔴    |
 
 🏢 – Office hours (light monitoring only)
 
@@ -443,3 +462,52 @@ Delta Engine    |  ⬜    |  ⬜    |  ⬜    |  🔴    |  🔴    |  🔴    |
 🔴 – Delta engine active (evening/night crypto strategies)
 
 ⬜ – Engine OFF
+
+<!-- Multi-Venue Engine Lifecycle & Safeguards -->
+
+                      ┌─────────────────────────┐
+                      │   Engine Startup        │
+                      │------------------------│
+                      │ - Load EngineConfig     │
+                      │ - Reconcile broker      │
+                      │   positions → PM        │
+                      │ - Init logs/reports     │
+                      └──────────┬────────────┘
+                                 │
+                                 ▼
+                     ┌──────────────────────────┐
+                     │   Event Loop (LiveEngine) │
+                     │--------------------------│
+                     │  1. Receive Candle/Feed  │
+                     │  2. Validate candle      │
+                     │     (_validate_candle)   │
+                     │  3. Check feed health    │
+                     │  4. Strategy evaluation  │
+                     │     (on_candle)          │
+                     │  5. Strategy timeout     │
+                     │     guard                 │
+                     │  6. Generate Intent      │
+                     │  7. Duplicate signal     │
+                     │     protection           │
+                     │  8. Risk & time-of-day   │
+                     │     checks               │
+                     │  9. Memory & latency     │
+                     │     monitors             │
+                     │ 10. Broker circuit       │
+                     │     breaker              │
+                     │ 11. Place orders via OMS │
+                     │ 12. Slippage monitor     │
+                     │ 13. Update PositionMgr   │
+                     │ 14. Log event (JSON)     │
+                     └──────────┬─────────────┘
+                                 │
+               ┌─────────────────┴─────────────────┐
+               ▼                                   ▼
+      ┌──────────────────┐                  ┌──────────────────┐
+      │ Exits & Cleanup   │                  │ Graceful Shutdown │
+      │------------------│                  │------------------│
+      │ - Close positions │                  │ - SIGINT/SIGTERM │
+      │   if needed       │                  │ - Dump snapshot  │
+      │ - Record realized │                  │ - Close broker   │
+      │   PnL to reports  │                  │ - Flush logs     │
+      └──────────────────┘                  └──────────────────┘

@@ -12,10 +12,15 @@ from pathlib import Path
 from dotenv import load_dotenv
 import requests
 import json
-import pdb
 
-# Use in-project Dhan Tradehull library
+# Use in-project Dhan Tradehull library and v2 Market Quote API (cursor.md)
 from core.library.dhan_tradehull import Tradehull
+from core.library.dhan_marketfeed import (
+    DhanMarketFeedClient,
+    parse_ltp_response,
+    parse_ohlc_response,
+    parse_quote_response,
+)
 from core.data.sources.NSEClient import NSEClient
 
 load_dotenv()
@@ -44,6 +49,11 @@ class DhanSource:
         self._ensure_deps_path()
 
         self.tsl = Tradehull(client_id, access_token)
+        self._marketfeed = DhanMarketFeedClient(
+            client_id=client_id,
+            access_token=access_token,
+            rate_limit_seconds=1.0,
+        )
         self.expiry_cache = {}
         self.nse_client = NSEClient()
 
@@ -143,7 +153,6 @@ class DhanSource:
 
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
         df["timestamp"] = df["timestamp"].dt.tz_convert("Asia/Kolkata")
-        pdb.set_trace()
         return df
 
     # -------------------------------------------------------------------------
@@ -255,6 +264,31 @@ class DhanSource:
     def get_quote_data(self, names, debug="NO"):
         """Quote (bid/ask etc.) for symbols."""
         return self.tsl.get_quote_data(names, debug)
+
+    # -------------------------------------------------------------------------
+    # Dhan v2 Market Quote API (cursor.md) – use when you have segment + security IDs
+    # -------------------------------------------------------------------------
+    def get_ltp_v2(self, instruments):
+        """
+        LTP via v2 /marketfeed/ltp. instruments: { "NSE_EQ": [11536], "NSE_FNO": [49081], ... }.
+        Returns raw API response; use parse_ltp_response() for { sec_id: last_price }.
+        """
+        r = self._marketfeed.ltp(instruments)
+        return r
+
+    def get_ohlc_v2(self, instruments):
+        """
+        OHLC + LTP via v2 /marketfeed/ohlc. instruments: { "NSE_EQ": [11536], ... }.
+        Returns raw API response; use parse_ohlc_response() for { sec_id: { last_price, open, high, low, close } }.
+        """
+        return self._marketfeed.ohlc(instruments)
+
+    def get_quote_v2(self, instruments):
+        """
+        Full quote (depth, OHLC, OI, volume) via v2 /marketfeed/quote.
+        Returns raw API response; use parse_quote_response() for flattened dict.
+        """
+        return self._marketfeed.quote(instruments)
 
     # -------------------------------------------------------------------------
     # Data: NSE (historical option chain / expiries)
