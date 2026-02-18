@@ -650,15 +650,15 @@ class LiveEngine(BaseEngine):
     ):
         risk_manager = getattr(self.order_router, "risk", None)
         open_positions = self.position_manager.get_open_positions(
-            symbol=symbol, strategy=self.strategy.name
+            underlying=symbol, strategy=self.strategy.name
         )
 
         for position in open_positions:
             exit_signal = self.strategy.should_exit(position, candle, ctx)
             if exit_signal:
-                exit_intent = self.strategy.create_exit_intent(position, exit_signal)
+                exit_intents = self.strategy.on_position_exit(position, candle, ctx) or []
                 price_map = self.get_price_map(symbol)
-                if price_map is not None:
+                if price_map is not None and exit_intents:
                     if self.engine_logger:
                         self.engine_logger.exit_triggered(
                             symbol,
@@ -666,9 +666,11 @@ class LiveEngine(BaseEngine):
                             abs(position.net_qty),
                             "Strategy exit",
                         )
-                    self.order_router.process_intent(exit_intent, price_map)
+                    for exit_intent in exit_intents:
+                        self.order_router.process_intent(exit_intent, price_map)
 
-        if intent:
+        entry_intents = [intent] if intent is not None and not isinstance(intent, list) else (intent or [])
+        for single_intent in entry_intents:
             if risk_manager and risk_manager.is_engine_blocked():
                 return
             if symbol not in self._symbol_state:
@@ -693,7 +695,7 @@ class LiveEngine(BaseEngine):
                     self.engine_logger.duplicate_signal_blocked(
                         symbol=symbol, signal_hash=str(signal_hash)
                     )
-                return
+                continue
             if (
                 self.strategy_timeout_seconds
                 and strategy_time_ms is not None
@@ -710,7 +712,7 @@ class LiveEngine(BaseEngine):
             if price_map is not None:
                 self._last_signal_hash_per_symbol[symbol] = signal_hash
                 t0 = time.perf_counter()
-                self.order_router.process_intent(intent, price_map)
+                self.order_router.process_intent(single_intent, price_map)
                 broker_latency_ms = (time.perf_counter() - t0) * 1000
                 total_ms = (strategy_time_ms or 0) + broker_latency_ms
                 if self.engine_logger and strategy_time_ms is not None:

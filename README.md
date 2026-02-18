@@ -277,7 +277,16 @@ Algo/
 - **EngineConfig**: full config for one engine (used by EngineFactory).
 - Helpers: `example_dhan_live_config()`, `example_delta_live_config()`, etc., with `engine_id`, `capital`, `risk_per_trade_percent` where relevant.
 - **engine_id** defaults to `{broker_name}_{strategy_name}` if not set; used for log file and EOD report filename.
-- **Production safeguards** (live only): `order_state_check_interval_min`, `circuit_breaker_threshold`, `allowed_trading_hours`, `slippage_threshold_pct`, `memory_threshold_percent`, `strategy_timeout_seconds`, `latency_critical_ms`, `latency_critical_cycles`, `symbol_error_threshold`. All optional.
+- **Production safeguards** (live only): `order_state_check_interval_min`, `circuit_breaker_threshold`, `allowed_trading_hours`, `slippage_threshold_pct`, `memory_threshold_percent`, `strategy_timeout_seconds`, `latency_critical_ms`, `latency_critical_cycles`, `symbol_error_threshold`, `feed_stale_seconds`, `max_open_positions`. All optional.
+
+### 2.1 Pipeline test configs
+
+Two jobs in `STRATEGY_JOBS` exercise the full pipeline (Signal → Risk → OMS → Router → Broker → PositionManager → reconciliation) for both venues:
+
+- **Delta**: `name: "SignalFloodTest"`, `venue: "DELTA"`, `engine_id: "delta_test_pipeline"`, `symbols: ["BTCUSD"]`, timeframe `1m`, tight risk limits and aggressive safeguards so blocks (duplicate, max positions, feed stale, latency, etc.) can be observed. Disabled by default; set `enabled: True` for that job to run.
+- **Dhan**: same strategy with `venue: "DHAN"`, `engine_id: "dhan_test_pipeline"`, `symbols: ["NIFTY"]`.
+
+Use **PAPER** or **LIVE** run mode. The strategy (`SignalFloodTest`) generates entry/exit every 1m candle and optionally triggers oversize (risk rejection) and duplicate-signal blocks for verification.
 
 ### 3. Environment variables
 

@@ -35,10 +35,19 @@ def job_to_engine_config(job: dict) -> EngineConfig:
         engine_id=job.get("engine_id"),
         capital=job.get("capital"),
         risk_per_trade_percent=job.get("risk_per_trade_percent"),
+        daily_max_loss=job.get("daily_max_loss"),
+        max_open_positions=job.get("max_open_positions"),
+        feed_stale_seconds=job.get("feed_stale_seconds"),
         backtest=backtest,
         live=live,
         delta_testnet=job.get("delta_testnet", True),
         delta_india=job.get("delta_india", False),
+        order_state_check_interval_min=job.get("order_state_check_interval_min", 0),
+        memory_threshold_percent=job.get("memory_threshold_percent"),
+        strategy_timeout_seconds=job.get("strategy_timeout_seconds"),
+        latency_critical_ms=job.get("latency_critical_ms", 150.0),
+        latency_critical_cycles=job.get("latency_critical_cycles", 3),
+        symbol_error_threshold=job.get("symbol_error_threshold", 5),
     )
 
 

@@ -158,6 +158,7 @@ class EngineFactory:
             capital=config.capital,
             risk_per_trade_percent=config.risk_per_trade_percent,
             daily_max_loss=config.daily_max_loss,
+            max_open_positions=getattr(config, "max_open_positions", None) or 20,
             engine_logger=engine_logger,
         )
 
@@ -254,6 +255,7 @@ class EngineFactory:
             engine_id=config.engine_id,
             venue=config.broker_name,
             engine_logger=engine_logger,
+            feed_stale_seconds=getattr(config, "feed_stale_seconds", None) or 60,
             allowed_trading_hours=getattr(config, "allowed_trading_hours", None),
             order_state_check_interval_min=getattr(config, "order_state_check_interval_min", 0),
             memory_threshold_percent=getattr(config, "memory_threshold_percent", None),

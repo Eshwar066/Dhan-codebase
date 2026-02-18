@@ -3,6 +3,7 @@ from run.config import RunMode
 from core.strategies.Inside_bar_candle.inside_bar import InsideBarStrategy
 from core.strategies.Leaps.LeapsQuatery_RSI_52_32 import LeapsQuarterly
 from core.strategies.Futures.Futures_EMA.Futures_EMA import FuturesEMAHighLow
+from core.strategies.PipelineTest.signal_flood_test import SignalFloodTestStrategy
 from core.instruments import EquityInstrument, OptionInstrument, FutureInstrument
 
 
@@ -35,6 +36,14 @@ STRATEGY_MAP = {
         "instrument": "FUTURE",
         "allowed_modes": [
             RunMode.BACKTEST,
+            RunMode.PAPER,
+            RunMode.LIVE,
+        ],
+    },
+    "SignalFloodTest": {
+        "strategy": SignalFloodTestStrategy,
+        "instrument": "FUTURE",
+        "allowed_modes": [
             RunMode.PAPER,
             RunMode.LIVE,
         ],

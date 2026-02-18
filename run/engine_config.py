@@ -41,6 +41,10 @@ class EngineConfig:
 
     # Risk limits (optional)
     daily_max_loss: Optional[float] = None
+    max_open_positions: Optional[int] = None
+
+    # Feed health: warn/pause when no data for this many seconds (live only).
+    feed_stale_seconds: Optional[float] = None
 
     # Backtest params (used when run_mode == BACKTEST)
     backtest: Optional[Dict[str, Any]] = None

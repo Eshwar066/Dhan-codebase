@@ -40,4 +40,8 @@ STRATEGY_RUNTIME_SPEC = {
             }
         },
     },
+    "SignalFloodTest": {
+        RunMode.PAPER: {"data": {}},
+        RunMode.LIVE: {"data": {}},
+    },
 }
