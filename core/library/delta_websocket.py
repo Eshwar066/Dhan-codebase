@@ -21,11 +21,25 @@ import hashlib
 import hmac
 import json
 import logging
+import socket
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
 import websocket
+
+# Force IPv4 for WebSocket connections. When IPv6 is enabled but not routed (e.g. some home/office networks),
+# getaddrinfo can return IPv6 first and the connection fails with "getaddrinfo failed" even though ping works.
+_original_getaddrinfo = socket.getaddrinfo
+
+
+def _getaddrinfo_ipv4_fallback(host, port, family=0, type=0, proto=0, flags=0):
+    if family == 0:
+        family = socket.AF_INET
+    return _original_getaddrinfo(host, port, family, type, proto, flags)
+
+
+socket.getaddrinfo = _getaddrinfo_ipv4_fallback
 
 from core.library.delta_rest_client import generate_signature
 
@@ -39,6 +53,8 @@ DELTA_WS_GLOBAL_TEST = "wss://socket.testnet.delta.exchange"
 
 # Heartbeat: server sends every 30s; client should reconnect if no heartbeat in 35s
 HEARTBEAT_TIMEOUT_SEC = 35
+# Warn if no tick/candle received for this many seconds (feed stall)
+FEED_STALL_SEC = 10
 # Reconnect backoff after 429
 RECONNECT_AFTER_429_SEC = 300  # 5 min
 # Stop reconnecting after this many consecutive connection failures (e.g. DNS unreachable)
@@ -63,7 +79,7 @@ class DeltaWebSocket:
         self,
         api_key: str,
         api_secret: str,
-        testnet: bool = True,
+        testnet: bool = False,
         india: bool = True,
         on_message: Optional[Callable[[Dict], None]] = None,
         on_auth: Optional[Callable[[bool, Dict], None]] = None,
@@ -96,6 +112,11 @@ class DeltaWebSocket:
         self._subscribed_channels: List[Dict] = []
         self._connect_failures = 0
         self._gave_up = False
+        self._reconnecting = False
+        self._feed_data_logged = False
+        self._last_feed_log_time = 0.0
+        self._last_tick_time = 0.0
+        self._feed_stall_warned = False
 
         # Last received data (for polling from live engine)
         self._last_ticker: Dict[str, Dict] = {}
@@ -127,6 +148,18 @@ class DeltaWebSocket:
                     )
                     self._reconnect()
                     return
+                # Feed stall: warn if we had data before but no ticks for FEED_STALL_SEC
+                if (
+                    self._feed_data_logged
+                    and self._last_tick_time > 0
+                    and time.time() - self._last_tick_time > FEED_STALL_SEC
+                ):
+                    if not self._feed_stall_warned:
+                        self._feed_stall_warned = True
+                        logger.warning(
+                            "[WARNING] No ticks received for %.0f seconds!",
+                            time.time() - self._last_tick_time,
+                        )
             self._heartbeat_timer = threading.Timer(15, check)
             self._heartbeat_timer.daemon = True
             self._heartbeat_timer.start()
@@ -134,21 +167,6 @@ class DeltaWebSocket:
         self._heartbeat_timer = threading.Timer(15, check)
         self._heartbeat_timer.daemon = True
         self._heartbeat_timer.start()
-
-    def _reconnect(self) -> None:
-        if self._heartbeat_timer:
-            self._heartbeat_timer.cancel()
-            self._heartbeat_timer = None
-        if self._ws:
-            try:
-                self._ws.close()
-            except Exception:
-                pass
-            self._ws = None
-        if not self._stop.is_set():
-            logger.info("Delta WebSocket: reconnecting in 2s...")
-            time.sleep(2)
-            self.connect()
 
     def _on_ws_message(self, _ws, raw: str) -> None:
         try:
@@ -193,15 +211,37 @@ class DeltaWebSocket:
 
         # Public market data
         if msg_type == "v2/ticker" or "ticker" in (msg_type or ""):
+            self._last_tick_time = time.time()
+            self._feed_stall_warned = False
+            if not self._feed_data_logged:
+                self._feed_data_logged = True
+                self._last_feed_log_time = self._last_tick_time
+                logger.info(
+                    "Delta WebSocket feed: receiving market data (ticker/candle)."
+                )
+            else:
+                now = self._last_tick_time
+                if now - self._last_feed_log_time >= 30:
+                    self._last_feed_log_time = now
+                    logger.info("Delta WebSocket feed: receiving data.")
             sym = msg.get("symbol")
             if sym:
                 with self._lock:
                     self._last_ticker[sym] = msg
                 if self.on_tick:
                     try:
-                        price = float(msg.get("mark_price") or msg.get("close") or msg.get("last_price") or 0)
+                        price = float(
+                            msg.get("mark_price")
+                            or msg.get("close")
+                            or msg.get("last_price")
+                            or 0
+                        )
                         vol = float(msg.get("volume") or msg.get("size") or 0)
-                        ts = msg.get("timestamp") or msg.get("generated_at") or time.time()
+                        ts = (
+                            msg.get("timestamp")
+                            or msg.get("generated_at")
+                            or time.time()
+                        )
                         if isinstance(ts, (int, float)) and ts > 1e12:
                             ts = ts / 1e6
                         elif not isinstance(ts, (int, float)):
@@ -214,6 +254,19 @@ class DeltaWebSocket:
             return
 
         if msg_type and msg_type.startswith("candlestick_"):
+            self._last_tick_time = time.time()
+            self._feed_stall_warned = False
+            if not self._feed_data_logged:
+                self._feed_data_logged = True
+                self._last_feed_log_time = self._last_tick_time
+                logger.info(
+                    "Delta WebSocket feed: receiving market data (ticker/candle)."
+                )
+            else:
+                now = self._last_tick_time
+                if now - self._last_feed_log_time >= 30:
+                    self._last_feed_log_time = now
+                    logger.info("Delta WebSocket feed: receiving data.")
             sym = msg.get("symbol")
             if sym:
                 candle = {
@@ -255,7 +308,11 @@ class DeltaWebSocket:
                 self.on_message(msg)
             return
 
-        if msg_type == "mark_price" or msg_type == "spot_price" or msg_type == "v2/spot_price":
+        if (
+            msg_type == "mark_price"
+            or msg_type == "spot_price"
+            or msg_type == "v2/spot_price"
+        ):
             if self.on_message:
                 self.on_message(msg)
             return
@@ -302,7 +359,13 @@ class DeltaWebSocket:
                 self.on_message(msg)
             return
 
-        if msg_type in ("margins", "v2/user_trades", "user_trades", "portfolio_margins", "mmp_trigger"):
+        if msg_type in (
+            "margins",
+            "v2/user_trades",
+            "user_trades",
+            "portfolio_margins",
+            "mmp_trigger",
+        ):
             if self.on_message:
                 self.on_message(msg)
             return
@@ -315,27 +378,37 @@ class DeltaWebSocket:
         logger.info("Delta WebSocket connected to %s", self.ws_url)
         self._enable_heartbeat()
         timestamp, signature = _ws_signature(self.api_secret)
-        self._send({
-            "type": "key-auth",
-            "payload": {
-                "api-key": self.api_key,
-                "timestamp": timestamp,
-                "signature": signature,
-            },
-        })
+        self._send(
+            {
+                "type": "key-auth",
+                "payload": {
+                    "api-key": self.api_key,
+                    "timestamp": timestamp,
+                    "signature": signature,
+                },
+            }
+        )
 
     def _on_error(self, _ws, error: Exception) -> None:
         self._connect_failures += 1
-        if self._connect_failures <= 1:
-            logger.warning("Delta WebSocket error: %s", error)
+        if self._connect_failures == 1:
+            logger.warning(
+                "Delta WebSocket connection failed: %s. Engine will use candle_service/REST for data. Reconnects will be attempted in background.",
+                error,
+            )
         elif self._connect_failures >= MAX_CONNECT_FAILURES:
             if not self._gave_up:
                 self._gave_up = True
-                logger.warning(
-                    "Delta WebSocket unavailable after %s attempts (%s). Using REST fallback; reconnect stopped.",
+                logger.info(
+                    "Delta WebSocket unavailable after %s attempts. Using REST/candle fallback; reconnect stopped.",
                     MAX_CONNECT_FAILURES,
-                    error,
                 )
+        else:
+            logger.debug(
+                "Delta WebSocket reconnect attempt %s failed: %s",
+                self._connect_failures,
+                error,
+            )
         if self.on_error_cb:
             self.on_error_cb(error)
 
@@ -352,20 +425,43 @@ class DeltaWebSocket:
         if not self._stop.is_set() and not self._gave_up:
             self._reconnect()
 
-    def connect(self) -> None:
-        """Start WebSocket connection in a background thread."""
-        self._stop.clear()
-        self._gave_up = False
-        self._connect_failures = 0
-        self._ws = websocket.WebSocketApp(
+    def _make_ws_app(self) -> websocket.WebSocketApp:
+        """Create a new WebSocketApp (used by connect() and _reconnect())."""
+        return websocket.WebSocketApp(
             self.ws_url,
             on_message=self._on_ws_message,
             on_error=self._on_error,
             on_close=self._on_close,
             on_open=self._on_open,
         )
+
+    def connect(self) -> None:
+        """Start WebSocket connection in a background thread."""
+        logger.info("Delta WebSocket URL: %s", self.ws_url)
+        self._stop.clear()
+        if self._thread is None:
+            self._gave_up = False
+            self._connect_failures = 0
+        self._ws = self._make_ws_app()
         self._thread = threading.Thread(target=self._run_forever, daemon=True)
         self._thread.start()
+
+    def _reconnect(self) -> None:
+        """Replace WebSocket app and let the same thread run run_forever again (no second thread)."""
+        if self._heartbeat_timer:
+            self._heartbeat_timer.cancel()
+            self._heartbeat_timer = None
+        if self._ws:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+        logger.debug("Delta WebSocket: reconnecting in 2s...")
+        time.sleep(2)
+        if self._stop.is_set() or self._gave_up:
+            return
+        self._ws = self._make_ws_app()
 
     def _run_forever(self) -> None:
         while not self._stop.is_set() and self._ws and not self._gave_up:

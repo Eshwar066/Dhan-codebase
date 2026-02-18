@@ -121,7 +121,11 @@ class LiveEngine(BaseEngine):
         self.symbol_error_threshold = symbol_error_threshold
         self._symbol_state: Dict[str, Dict[str, Any]] = {}
         for sym in self.symbols:
-            self._symbol_state[sym] = {"paused": False, "feed_stale": False, "error_count": 0}
+            self._symbol_state[sym] = {
+                "paused": False,
+                "feed_stale": False,
+                "error_count": 0,
+            }
         # Graceful shutdown
         self._shutdown_requested = False
         # Candle aggregator: last evaluated closed-candle timestamp per symbol (avoid re-eval same bar)
@@ -132,6 +136,9 @@ class LiveEngine(BaseEngine):
         """Drain tick queue into candle_aggregator (single state owner). Non-blocking; cap per cycle."""
         if not self.tick_queue or not self.candle_aggregator:
             return
+        if not hasattr(self, "_tick_debug_count"):
+            self._tick_debug_count = 0
+            self._tick_debug_last_log = time.time()
         for _ in range(self._max_ticks_per_cycle):
             try:
                 tick = self.tick_queue.get_nowait()
@@ -145,12 +152,22 @@ class LiveEngine(BaseEngine):
                 if s is not None and p is not None and ts is not None:
                     self.candle_aggregator.on_tick(s, p, v, ts)
                     self._last_tick_timestamp[s] = time.time()
+                    self._tick_debug_count += 1
+                    now = time.time()
+                    if now - self._tick_debug_last_log >= 5:
+                        print(f"[TICK HEALTH] {self._tick_debug_count} ticks in last 5s")
+                        self._tick_debug_count = 0
+                        self._tick_debug_last_log = now
             except Exception:
                 pass
 
-    def _signal_hash(self, symbol: str, timeframe: str, candle_ts: Any, signal_type: str) -> int:
+    def _signal_hash(
+        self, symbol: str, timeframe: str, candle_ts: Any, signal_type: str
+    ) -> int:
         """Hash for duplicate signal detection. Override candle_ts for bar identity."""
-        ts = getattr(candle_ts, "timestamp", None) or (candle_ts if isinstance(candle_ts, (int, float)) else str(candle_ts))
+        ts = getattr(candle_ts, "timestamp", None) or (
+            candle_ts if isinstance(candle_ts, (int, float)) else str(candle_ts)
+        )
         return hash((symbol, str(timeframe), str(ts), str(signal_type)))
 
     def _within_trading_hours(self) -> bool:
@@ -178,7 +195,9 @@ class LiveEngine(BaseEngine):
         except Exception:
             pass
 
-    def _validate_candle_integrity(self, candle: Dict, symbol: Optional[str] = None) -> bool:
+    def _validate_candle_integrity(
+        self, candle: Dict, symbol: Optional[str] = None
+    ) -> bool:
         """
         Validate OHLC consistency: high >= max(open,close), low <= min(open,close).
         If aggregating tick volumes: volume would equal sum(ticks); we only check OHLC here.
@@ -188,6 +207,7 @@ class LiveEngine(BaseEngine):
         h = candle.get("high")
         l = candle.get("low")
         c = candle.get("close")
+        print(candle)
         if o is None or h is None or l is None or c is None:
             return True
         try:
@@ -218,13 +238,17 @@ class LiveEngine(BaseEngine):
         broker = getattr(self.order_router, "broker", None)
         if not broker or not hasattr(broker, "get_positions_for_recon"):
             if self.engine_logger:
-                self.engine_logger.reconciliation("No broker or get_positions_for_recon; skip reconcile")
+                self.engine_logger.reconciliation(
+                    "No broker or get_positions_for_recon; skip reconcile"
+                )
             return
         try:
             broker_positions = broker.get_positions_for_recon()
         except Exception as e:
             if self.engine_logger:
-                self.engine_logger.reconciliation(f"Failed to fetch broker positions: {e}")
+                self.engine_logger.reconciliation(
+                    f"Failed to fetch broker positions: {e}"
+                )
             return
         local_snapshot = self.position_manager.snapshot()
         diff = []
@@ -232,16 +256,36 @@ class LiveEngine(BaseEngine):
             local = local_snapshot.get(sym, {})
             lq = local.get("qty", 0)
             bq = int(bp.get("qty", 0))
-            if lq != bq or abs(local.get("avg_price", 0) - float(bp.get("avg_price", 0))) > 0.01:
-                diff.append({"symbol": sym, "local_qty": lq, "broker_qty": bq, "broker_avg": bp.get("avg_price")})
+            if (
+                lq != bq
+                or abs(local.get("avg_price", 0) - float(bp.get("avg_price", 0))) > 0.01
+            ):
+                diff.append(
+                    {
+                        "symbol": sym,
+                        "local_qty": lq,
+                        "broker_qty": bq,
+                        "broker_avg": bp.get("avg_price"),
+                    }
+                )
         for sym in set(local_snapshot.keys()) - set(broker_positions.keys()):
             if local_snapshot[sym].get("qty", 0) != 0:
-                diff.append({"symbol": sym, "local_qty": local_snapshot[sym].get("qty"), "broker_qty": 0})
+                diff.append(
+                    {
+                        "symbol": sym,
+                        "local_qty": local_snapshot[sym].get("qty"),
+                        "broker_qty": 0,
+                    }
+                )
         if diff and self.engine_logger:
-            self.engine_logger.reconciliation("Position mismatch; syncing PM to broker", details={"diff": diff})
+            self.engine_logger.reconciliation(
+                "Position mismatch; syncing PM to broker", details={"diff": diff}
+            )
         self.position_manager.reconcile_with_broker(broker_positions)
 
-    def _is_closed_candle(self, candle: Dict, timeframe: str, now: Optional[dt.datetime] = None) -> bool:
+    def _is_closed_candle(
+        self, candle: Dict, timeframe: str, now: Optional[dt.datetime] = None
+    ) -> bool:
         """
         True if candle timestamp is on timeframe boundary and not in the future.
         Reject forming candles (timestamp > expected close time).
@@ -255,7 +299,11 @@ class LiveEngine(BaseEngine):
             else:
                 ts_dt = dt.datetime.utcfromtimestamp(ts)
         else:
-            ts_dt = ts if isinstance(ts, dt.datetime) else dt.datetime.fromisoformat(str(ts))
+            ts_dt = (
+                ts
+                if isinstance(ts, dt.datetime)
+                else dt.datetime.fromisoformat(str(ts))
+            )
         now = now or dt.datetime.utcnow()
         if ts_dt.tzinfo:
             now = now.replace(tzinfo=ts_dt.tzinfo) if not now.tzinfo else now
@@ -305,15 +353,26 @@ class LiveEngine(BaseEngine):
         for sym, pos in self.position_manager.positions.items():
             if pos.net_qty == 0:
                 continue
-            rows.append({
-                "symbol": sym,
-                "qty": pos.net_qty,
-                "avg_price": pos.avg_price,
-                "realized_pnl": pos.realized_pnl,
-                "unrealized_pnl": "",
-            })
+            rows.append(
+                {
+                    "symbol": sym,
+                    "qty": pos.net_qty,
+                    "avg_price": pos.avg_price,
+                    "realized_pnl": pos.realized_pnl,
+                    "unrealized_pnl": "",
+                }
+            )
         with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["symbol", "qty", "avg_price", "realized_pnl", "unrealized_pnl"])
+            w = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "symbol",
+                    "qty",
+                    "avg_price",
+                    "realized_pnl",
+                    "unrealized_pnl",
+                ],
+            )
             w.writeheader()
             w.writerows(rows)
         if self.engine_logger:
@@ -323,7 +382,10 @@ class LiveEngine(BaseEngine):
         if self.order_state_check_interval_min <= 0:
             return
         now = time.time()
-        if now - self._last_order_state_check_time < self.order_state_check_interval_min * 60:
+        if (
+            now - self._last_order_state_check_time
+            < self.order_state_check_interval_min * 60
+        ):
             return
         self._last_order_state_check_time = now
         ok, _ = self.order_router.verify_open_orders_with_broker(self.position_manager)
@@ -352,13 +414,14 @@ class LiveEngine(BaseEngine):
         use_feed = self.realtime_feed and self.realtime_feed.is_connected()
         risk_manager = getattr(self.order_router, "risk", None)
         loop_count = 0
-
         while not self._shutdown_requested:
             loop_count += 1
             _now = dt.datetime.utcnow()
             if risk_manager and risk_manager.is_engine_blocked():
                 if self.engine_logger:
-                    self.engine_logger.log("risk_block", "Engine blocked by kill switch; skipping entries")
+                    self.engine_logger.log(
+                        "risk_block", "Engine blocked by kill switch; skipping entries"
+                    )
                 time.sleep(1)
                 continue
 
@@ -383,10 +446,14 @@ class LiveEngine(BaseEngine):
                 for symbol in self.symbols:
                     candle = None
                     if use_aggregator:
-                        candle = self.candle_aggregator.get_last_closed_candle(symbol, tf)
+                        candle = self.candle_aggregator.get_last_closed_candle(
+                            symbol, tf
+                        )
                         if candle:
                             self._last_candle_timestamp[symbol] = time.time()
-                        if candle and candle.get("bucket_ts") == self._last_evaluated_candle_ts.get(symbol):
+                        if candle and candle.get(
+                            "bucket_ts"
+                        ) == self._last_evaluated_candle_ts.get(symbol):
                             continue
                     if candle is None and use_feed and not use_aggregator:
                         candle = self.realtime_feed.get_last_candle(symbol, tf)
@@ -414,7 +481,9 @@ class LiveEngine(BaseEngine):
                         continue
                     if not self._is_closed_candle(candle, tf, now=_now):
                         if self.engine_logger:
-                            self.engine_logger.closed_candle_skip(symbol, "Forming or misaligned candle; skip evaluation")
+                            self.engine_logger.closed_candle_skip(
+                                symbol, "Forming or misaligned candle; skip evaluation"
+                            )
                         continue
 
                     if use_aggregator:
@@ -427,18 +496,36 @@ class LiveEngine(BaseEngine):
                     try:
                         ctx, intent = self.build_context(candle)
                     except Exception as e:
-                        self._symbol_state[symbol]["error_count"] = self._symbol_state[symbol].get("error_count", 0) + 1
-                        if self._symbol_state[symbol]["error_count"] >= self.symbol_error_threshold:
+                        self._symbol_state[symbol]["error_count"] = (
+                            self._symbol_state[symbol].get("error_count", 0) + 1
+                        )
+                        if (
+                            self._symbol_state[symbol]["error_count"]
+                            >= self.symbol_error_threshold
+                        ):
                             self._symbol_state[symbol]["paused"] = True
                             if self.engine_logger:
-                                self.engine_logger.symbol_paused(symbol, f"Repeated errors: {e}")
+                                self.engine_logger.symbol_paused(
+                                    symbol, f"Repeated errors: {e}"
+                                )
                         continue
                     strategy_time_ms = (time.perf_counter() - t0) * 1000
                     if intent and self._entries_paused_feed_stale:
                         continue
-                    if intent and (self._entries_paused_order_mismatch or self._entries_paused_memory or self._entries_paused_latency):
+                    if intent and (
+                        self._entries_paused_order_mismatch
+                        or self._entries_paused_memory
+                        or self._entries_paused_latency
+                    ):
                         continue
-                    self._run_strategy(symbol, candle, ctx, intent, strategy_time_ms=strategy_time_ms, timeframe=tf)
+                    self._run_strategy(
+                        symbol,
+                        candle,
+                        ctx,
+                        intent,
+                        strategy_time_ms=strategy_time_ms,
+                        timeframe=tf,
+                    )
             else:
                 candles = None
                 if use_feed:
@@ -472,14 +559,28 @@ class LiveEngine(BaseEngine):
                     try:
                         ctx, intent = self.build_context(candle)
                     except Exception as e:
-                        self._symbol_state[symbol]["error_count"] = self._symbol_state[symbol].get("error_count", 0) + 1
-                        if self._symbol_state[symbol]["error_count"] >= self.symbol_error_threshold:
+                        self._symbol_state[symbol]["error_count"] = (
+                            self._symbol_state[symbol].get("error_count", 0) + 1
+                        )
+                        if (
+                            self._symbol_state[symbol]["error_count"]
+                            >= self.symbol_error_threshold
+                        ):
                             self._symbol_state[symbol]["paused"] = True
                             if self.engine_logger:
-                                self.engine_logger.symbol_paused(symbol, f"Repeated errors: {e}")
+                                self.engine_logger.symbol_paused(
+                                    symbol, f"Repeated errors: {e}"
+                                )
                         continue
                     strategy_time_ms = (time.perf_counter() - t0) * 1000
-                    self._run_strategy(symbol, candle, ctx, intent, strategy_time_ms=strategy_time_ms, timeframe=None)
+                    self._run_strategy(
+                        symbol,
+                        candle,
+                        ctx,
+                        intent,
+                        strategy_time_ms=strategy_time_ms,
+                        timeframe=None,
+                    )
 
             use_feed = self.realtime_feed and self.realtime_feed.is_connected()
             if self.tick_queue is not None and self.candle_aggregator is not None:
@@ -491,17 +592,31 @@ class LiveEngine(BaseEngine):
         snapshot_path = None
         try:
             os.makedirs(REPORTS_DIR, exist_ok=True)
-            snapshot_path = os.path.join(REPORTS_DIR, f"{self.engine_id}_shutdown_{dt.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv")
+            snapshot_path = os.path.join(
+                REPORTS_DIR,
+                f"{self.engine_id}_shutdown_{dt.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv",
+            )
             with open(snapshot_path, "w", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=["symbol", "qty", "avg_price", "realized_pnl"])
+                w = csv.DictWriter(
+                    f, fieldnames=["symbol", "qty", "avg_price", "realized_pnl"]
+                )
                 w.writeheader()
                 for sym, pos in self.position_manager.positions.items():
                     if pos.net_qty != 0:
-                        w.writerow({"symbol": sym, "qty": pos.net_qty, "avg_price": pos.avg_price, "realized_pnl": pos.realized_pnl})
+                        w.writerow(
+                            {
+                                "symbol": sym,
+                                "qty": pos.net_qty,
+                                "avg_price": pos.avg_price,
+                                "realized_pnl": pos.realized_pnl,
+                            }
+                        )
         except Exception:
             pass
         if self.engine_logger:
-            self.engine_logger.graceful_shutdown("Graceful shutdown", snapshot_path=snapshot_path)
+            self.engine_logger.graceful_shutdown(
+                "Graceful shutdown", snapshot_path=snapshot_path
+            )
         broker = getattr(self.order_router, "broker", None)
         if broker and hasattr(broker, "close"):
             try:
@@ -516,11 +631,23 @@ class LiveEngine(BaseEngine):
                 return ticker["close"]
         if self.data:
             candles = self.data.get_latest_candles([symbol])
-            if candles and symbol in candles and candles[symbol].get("close") is not None:
+            if (
+                candles
+                and symbol in candles
+                and candles[symbol].get("close") is not None
+            ):
                 return candles[symbol]["close"]
         return None
 
-    def _run_strategy(self, symbol, candle, ctx, intent, strategy_time_ms: Optional[float] = None, timeframe: Optional[str] = None):
+    def _run_strategy(
+        self,
+        symbol,
+        candle,
+        ctx,
+        intent,
+        strategy_time_ms: Optional[float] = None,
+        timeframe: Optional[str] = None,
+    ):
         risk_manager = getattr(self.order_router, "risk", None)
         open_positions = self.position_manager.get_open_positions(
             symbol=symbol, strategy=self.strategy.name
@@ -533,28 +660,51 @@ class LiveEngine(BaseEngine):
                 price_map = self.get_price_map(symbol)
                 if price_map is not None:
                     if self.engine_logger:
-                        self.engine_logger.exit_triggered(symbol, "SELL" if position.net_qty > 0 else "BUY", abs(position.net_qty), "Strategy exit")
+                        self.engine_logger.exit_triggered(
+                            symbol,
+                            "SELL" if position.net_qty > 0 else "BUY",
+                            abs(position.net_qty),
+                            "Strategy exit",
+                        )
                     self.order_router.process_intent(exit_intent, price_map)
 
         if intent:
             if risk_manager and risk_manager.is_engine_blocked():
                 return
             if symbol not in self._symbol_state:
-                self._symbol_state[symbol] = {"paused": False, "feed_stale": False, "error_count": 0}
+                self._symbol_state[symbol] = {
+                    "paused": False,
+                    "feed_stale": False,
+                    "error_count": 0,
+                }
             if self._symbol_state[symbol].get("paused"):
                 return
             if not self._within_trading_hours():
                 if self.engine_logger:
-                    self.engine_logger.time_window_blocked("Outside allowed trading hours")
+                    self.engine_logger.time_window_blocked(
+                        "Outside allowed trading hours"
+                    )
                 return
-            signal_hash = self._signal_hash(symbol, timeframe or "", candle.get("timestamp"), "entry")
+            signal_hash = self._signal_hash(
+                symbol, timeframe or "", candle.get("timestamp"), "entry"
+            )
             if self._last_signal_hash_per_symbol.get(symbol) == signal_hash:
                 if self.engine_logger:
-                    self.engine_logger.duplicate_signal_blocked(symbol=symbol, signal_hash=str(signal_hash))
+                    self.engine_logger.duplicate_signal_blocked(
+                        symbol=symbol, signal_hash=str(signal_hash)
+                    )
                 return
-            if self.strategy_timeout_seconds and strategy_time_ms is not None and strategy_time_ms > self.strategy_timeout_seconds * 1000:
+            if (
+                self.strategy_timeout_seconds
+                and strategy_time_ms is not None
+                and strategy_time_ms > self.strategy_timeout_seconds * 1000
+            ):
                 if self.engine_logger:
-                    self.engine_logger.strategy_timeout(symbol=symbol, elapsed_ms=strategy_time_ms, threshold_ms=self.strategy_timeout_seconds * 1000.0)
+                    self.engine_logger.strategy_timeout(
+                        symbol=symbol,
+                        elapsed_ms=strategy_time_ms,
+                        threshold_ms=self.strategy_timeout_seconds * 1000.0,
+                    )
                 return
             price_map = candle.get("close")
             if price_map is not None:
@@ -574,7 +724,9 @@ class LiveEngine(BaseEngine):
                     if self._latency_critical_count >= self.latency_critical_cycles:
                         self._entries_paused_latency = True
                         if self.engine_logger:
-                            self.engine_logger.latency_critical_pause("Latency critical for N cycles; entries paused")
+                            self.engine_logger.latency_critical_pause(
+                                "Latency critical for N cycles; entries paused"
+                            )
                 else:
                     self._latency_critical_count = 0
 
