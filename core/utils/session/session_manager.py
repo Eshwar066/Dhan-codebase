@@ -14,6 +14,7 @@ class SessionManager:
             "INDEX": "NSE_INDEX",
             "NSE_EQ": "NSE",
             "NSE_FNO": "NSE",
+            "DELTA": "DELTA",
         }
         return mapping.get(exchange, exchange)
 

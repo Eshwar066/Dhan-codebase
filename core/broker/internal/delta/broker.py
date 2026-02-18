@@ -11,7 +11,9 @@ def _intent_to_delta_payload(intent, execution_price=None):
     """Build payload for DeltaBrokerApi.place_order from OrderIntent or dict."""
     if hasattr(intent, "instrument"):
         inst = intent.instrument
-        trading_symbol = getattr(inst, "trading_symbol", "") or getattr(inst, "custom_symbol", "")
+        trading_symbol = getattr(inst, "trading_symbol", "") or getattr(
+            inst, "custom_symbol", ""
+        )
         segment = getattr(inst, "segment", "EQ")
         qty = int(getattr(intent, "qty", getattr(inst, "lot_size", 1)))
         lot_size = int(getattr(inst, "lot_size", 1))
@@ -27,11 +29,17 @@ def _intent_to_delta_payload(intent, execution_price=None):
             "transaction_type": intent.side,
             "trade_type": getattr(intent, "trade_type", "MARGIN"),
             "tag": intent.intent_id,
-            "reduce_only": "true" if getattr(intent, "action", "") == "EXIT" else "false",
+            "reduce_only": (
+                "true" if getattr(intent, "action", "") == "EXIT" else "false"
+            ),
         }
     # Dict intent
     total_qty = int(intent.get("qty", 1)) * int(intent.get("lot_size", 1))
-    price = execution_price if execution_price is not None else float(intent.get("price", 0) or 0)
+    price = (
+        execution_price
+        if execution_price is not None
+        else float(intent.get("price", 0) or 0)
+    )
     return {
         "tradingsymbol": intent.get("trading_symbol", ""),
         "exchange": intent.get("segment", "EQ"),
@@ -85,7 +93,14 @@ class DeltaBroker(BaseBroker):
                 time.sleep(0.3)
         return None
 
-    def exit_position(self, trading_symbol: str, qty: int, side: str, segment: str = "EQ", lot_size: int = 1) -> Optional[str]:
+    def exit_position(
+        self,
+        trading_symbol: str,
+        qty: int,
+        side: str,
+        segment: str = "EQ",
+        lot_size: int = 1,
+    ) -> Optional[str]:
         exit_side = "SELL" if side == "BUY" else "BUY"
         intent = {
             "intent_id": f"exit_{uuid.uuid4().hex[:6]}",
@@ -109,13 +124,18 @@ class DeltaBroker(BaseBroker):
     def get_positions(self):
         return self.api.get_positions()
 
+    # used in live engine
     def get_positions_for_recon(self):
         positions = self.api.get_positions()
         if not positions:
             return {}
         broker_positions = {}
         for row in positions:
-            sym = row.get("tradingSymbol") or row.get("trading_symbol") or str(row.get("product_id", ""))
+            sym = (
+                row.get("tradingSymbol")
+                or row.get("trading_symbol")
+                or str(row.get("product_id", ""))
+            )
             broker_positions[sym] = {
                 "qty": int(row.get("netQty", row.get("size", 0))),
                 "avg_price": float(row.get("avgPrice", row.get("entry_price", 0))),
@@ -136,7 +156,11 @@ class DeltaBroker(BaseBroker):
         orders = self.api.get_order_list() or []
         open_states = {"open", "pending", "placed", "trigger pending"}
         return [
-            {"order_id": o.get("order_id"), "tag": o.get("tag"), "status": o.get("status")}
+            {
+                "order_id": o.get("order_id"),
+                "tag": o.get("tag"),
+                "status": o.get("status"),
+            }
             for o in orders
             if (o.get("status") or "").lower() in open_states
         ]

@@ -22,4 +22,11 @@ MARKET_SESSIONS = {
             "end": dt.time(23, 30),
         },
     },
+    "DELTA": {
+        "timezone": "Asia/Kolkata",
+        "regular": {
+            "start": dt.time(0, 0),
+            "end": dt.time(23, 59, 59),
+        },
+    },
 }

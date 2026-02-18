@@ -11,6 +11,7 @@ SignalFloodTestStrategy: pipeline test strategy for both Delta and Dhan.
 import random
 from dataclasses import replace
 from typing import Any, List, Optional, TYPE_CHECKING
+import pdb
 
 from core.strategies.base import BaseStrategy
 from core.strategies.IndiaMktMixins import IndiaMktMixins
@@ -46,6 +47,7 @@ class SignalFloodTestStrategy(IndiaMktMixins, BaseStrategy):
 
     def on_candle(self, candle: Any, ctx: "StrategyContext") -> Optional[Any]:
         """Alternate BUY/SELL when flat; return exit handled by should_exit + on_position_exit."""
+
         self._last_candle = candle
         self.api = self._exchange_from_store(ctx)
         symbol = candle.get("symbol")
@@ -64,6 +66,7 @@ class SignalFloodTestStrategy(IndiaMktMixins, BaseStrategy):
         expiry = None
         if exchange == "NSE":
             from core.strategies.IndiaMktMixins import IndiaMktMixins
+
             if hasattr(self, "getExpiry"):
                 expiry = self.getExpiry(ctx)
         inst = ctx.instrument_store.futures_intent_creation_details(
@@ -99,9 +102,12 @@ class SignalFloodTestStrategy(IndiaMktMixins, BaseStrategy):
         # 10% return same intent twice to trigger duplicate_signal_blocked on second
         if random.random() < 0.10 and intent:
             return [intent, intent]
+        pdb.set_trace()
         return [intent] if intent else None
 
-    def should_exit(self, pos: Any, candle: Any, ctx: Optional["StrategyContext"] = None) -> bool:
+    def should_exit(
+        self, pos: Any, candle: Any, ctx: Optional["StrategyContext"] = None
+    ) -> bool:
         """Exit after one candle (always exit when in position for this test)."""
         return True
 
@@ -118,7 +124,8 @@ class SignalFloodTestStrategy(IndiaMktMixins, BaseStrategy):
             strike_row=strike_row,
             strategy=self.name,
             side=exit_side,
-            structure_id=pos.structure_id or f"{self.name}:{strike_row.get('symbol', '')}:FLAT",
+            structure_id=pos.structure_id
+            or f"{self.name}:{strike_row.get('symbol', '')}:FLAT",
             candle_ts=candle.get("timestamp"),
             symbol=candle.get("symbol", ""),
             action="EXIT",

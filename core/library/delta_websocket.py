@@ -28,18 +28,6 @@ from typing import Any, Callable, Dict, List, Optional
 
 import websocket
 
-# Force IPv4 for WebSocket connections. When IPv6 is enabled but not routed (e.g. some home/office networks),
-# getaddrinfo can return IPv6 first and the connection fails with "getaddrinfo failed" even though ping works.
-_original_getaddrinfo = socket.getaddrinfo
-
-
-def _getaddrinfo_ipv4_fallback(host, port, family=0, type=0, proto=0, flags=0):
-    if family == 0:
-        family = socket.AF_INET
-    return _original_getaddrinfo(host, port, family, type, proto, flags)
-
-
-socket.getaddrinfo = _getaddrinfo_ipv4_fallback
 
 from core.library.delta_rest_client import generate_signature
 

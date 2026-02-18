@@ -11,6 +11,7 @@ import signal
 import time
 import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple
+import pdb
 
 from core.engine.base_engine import BaseEngine
 
@@ -155,7 +156,9 @@ class LiveEngine(BaseEngine):
                     self._tick_debug_count += 1
                     now = time.time()
                     if now - self._tick_debug_last_log >= 5:
-                        print(f"[TICK HEALTH] {self._tick_debug_count} ticks in last 5s")
+                        print(
+                            f"[TICK HEALTH] {self._tick_debug_count} ticks in last 5s"
+                        )
                         self._tick_debug_count = 0
                         self._tick_debug_last_log = now
             except Exception:
@@ -181,6 +184,7 @@ class LiveEngine(BaseEngine):
             return
         try:
             import psutil
+
             proc = psutil.Process()
             usage = proc.memory_percent()
             if usage >= self.memory_threshold_percent:
@@ -409,6 +413,11 @@ class LiveEngine(BaseEngine):
             pass
 
         self.reconcile_positions_on_start()
+        pdb.set_trace()
+        # if not self.reconcile_positions_on_start():
+        #     self.engine_logger.log("critical", "Startup reconciliation failed")
+        #     return
+
         self._do_order_state_check()
         tf = getattr(self.strategy, "timeframe", None)
         use_feed = self.realtime_feed and self.realtime_feed.is_connected()
@@ -425,9 +434,12 @@ class LiveEngine(BaseEngine):
                 time.sleep(1)
                 continue
 
+            # move to  Memory → every 5s , Feed health → every 1s ,Order state → every N minutes
             self._check_memory()
             self.check_feed_health()
             self._do_order_state_check()
+
+            # move this logic based on date change
             if loop_count % 60 == 0:
                 today = dt.datetime.utcnow().strftime("%Y%m%d")
                 if self._last_eod_date and self._last_eod_date != today:
@@ -461,6 +473,7 @@ class LiveEngine(BaseEngine):
                             ts = candle.get("timestamp")
                             if isinstance(ts, (int, float)):
                                 self._last_candle_timestamp[symbol] = time.time()
+                    #  check this flow by commenting ws feed
                     if candle is None and self.candle_service:
                         candle = self.candle_service.get_latest_closed(
                             symbol, tf, exchange, sector, rsi
@@ -518,6 +531,8 @@ class LiveEngine(BaseEngine):
                         or self._entries_paused_latency
                     ):
                         continue
+
+                    pdb.set_trace()
                     self._run_strategy(
                         symbol,
                         candle,
@@ -656,7 +671,9 @@ class LiveEngine(BaseEngine):
         for position in open_positions:
             exit_signal = self.strategy.should_exit(position, candle, ctx)
             if exit_signal:
-                exit_intents = self.strategy.on_position_exit(position, candle, ctx) or []
+                exit_intents = (
+                    self.strategy.on_position_exit(position, candle, ctx) or []
+                )
                 price_map = self.get_price_map(symbol)
                 if price_map is not None and exit_intents:
                     if self.engine_logger:
@@ -669,7 +686,11 @@ class LiveEngine(BaseEngine):
                     for exit_intent in exit_intents:
                         self.order_router.process_intent(exit_intent, price_map)
 
-        entry_intents = [intent] if intent is not None and not isinstance(intent, list) else (intent or [])
+        entry_intents = (
+            [intent]
+            if intent is not None and not isinstance(intent, list)
+            else (intent or [])
+        )
         for single_intent in entry_intents:
             if risk_manager and risk_manager.is_engine_blocked():
                 return
