@@ -49,8 +49,8 @@ class EngineConfig:
     live: Optional[Dict[str, Any]] = None
 
     # Venue-specific options (optional overrides)
-    delta_testnet: bool = True
-    delta_india: bool = False
+    delta_testnet: bool = False
+    delta_india: bool = True
 
     # Paths (defaults; override for tests)
     base_dir: Optional[Path] = None
@@ -92,6 +92,7 @@ class EngineConfig:
 # ---------------------------------------------------------------------------
 # Example configs: Dhan (India) and Delta (Crypto)
 # ---------------------------------------------------------------------------
+
 
 def example_dhan_live_config() -> EngineConfig:
     """Example: Dhan live engine for India markets (NIFTY, equities) with capital."""

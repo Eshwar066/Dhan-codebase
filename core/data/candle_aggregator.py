@@ -7,6 +7,12 @@ Prop-grade Candle Aggregator: tick → 1m only; higher timeframes from closed 1m
 - Broker-agnostic: same aggregator for Dhan and Delta; feed and candles feed multiple brokers
   by giving each engine its own aggregator instance (per-engine isolation).
 """
+# Future upgrades:
+
+# 1️⃣ Add optional gap-filling logic
+# 2️⃣ Add timestamp monotonicity check
+# 3️⃣ Add health counter (ticks processed)
+# 4️⃣ Add late-tick rejection guard
 
 from collections import deque
 from typing import Any, Dict, List, Optional
