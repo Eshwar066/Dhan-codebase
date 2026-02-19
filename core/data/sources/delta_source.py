@@ -36,6 +36,7 @@ class DeltaSource:
         self,
         testnet: bool = True,
         india: bool = False,
+        symbols: Optional[List[str]] = None,
     ):
         load_dotenv()
         base_url = os.getenv("DELTA_BASE_URL")
@@ -61,6 +62,8 @@ class DeltaSource:
             api_secret=api_secret,
             raise_for_status=True,
         )
+        self._india = india
+        self._symbols = list(symbols) if symbols else []
         self._products_cache: Optional[List[Dict]] = None
         self._symbol_to_product: Dict[str, Dict] = {}
 
@@ -266,6 +269,13 @@ class DeltaSource:
     # -------------------------------------------------------------------------
     # Positions
     # -------------------------------------------------------------------------
+    def _underlying_from_symbol(self, symbol: str) -> str:
+        """Derive underlying_asset_symbol for Delta India (e.g. BTCUSD -> BTC)."""
+        s = (symbol or "").upper()
+        if s.endswith("USD"):
+            return s[:-3]
+        return s
+
     def get_position(self, product_id: int) -> Any:
         return self._client.get_position(product_id)
 
@@ -273,8 +283,26 @@ class DeltaSource:
         return self._client.get_margined_position(product_id)
 
     def get_positions(self, debug: str = "NO") -> Any:
-        """All positions in a list; normalize to Dhan-like rows for broker sync."""
-        raw = self._client.get_all_positions()
+        """All positions in a list; normalize to Dhan-like rows for broker sync.
+        Delta India API requires product_id or underlying_asset_symbol; we pass
+        underlying(s) derived from config symbols (or default BTC) and merge results.
+        """
+        if self._india:
+            underlyings = list(
+                dict.fromkeys(
+                    self._underlying_from_symbol(s) for s in self._symbols
+                )
+            )
+            if not underlyings:
+                underlyings = ["BTC"]
+            raw = []
+            for u in underlyings:
+                part = self._client.get_all_positions(underlying_asset_symbol=u)
+                if isinstance(part, list):
+                    raw.extend(part)
+            raw = raw if raw else []
+        else:
+            raw = self._client.get_all_positions()
         if not isinstance(raw, list):
             return []
         # Normalize to list of dicts with tradingSymbol, netQty, avgPrice, etc.

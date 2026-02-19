@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 import requests
 import json
 
-# Use in-project Dhan Tradehull library and v2 Market Quote API (cursor.md)
+# Use in-project Dhan Tradehull library and v2 Market Quote API
 from core.library.dhan_tradehull import Tradehull
 from core.library.dhan_marketfeed import (
     DhanMarketFeedClient,
@@ -266,7 +266,7 @@ class DhanSource:
         return self.tsl.get_quote_data(names, debug)
 
     # -------------------------------------------------------------------------
-    # Dhan v2 Market Quote API (cursor.md) – use when you have segment + security IDs
+    # Dhan v2 Market Quote API – use when you have segment + security IDs
     # -------------------------------------------------------------------------
     def get_ltp_v2(self, instruments):
         """

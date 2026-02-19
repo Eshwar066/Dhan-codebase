@@ -138,7 +138,7 @@ class DhanDataProvider(IDataProvider):
             strikes=strikes,
         )
 
-    # ---------- Dhan v2 Market Quote API (cursor.md) ----------
+    # ---------- Dhan v2 Market Quote API ----------
     def get_ltp_v2(self, instruments: dict) -> Any:
         """LTP via v2 /marketfeed/ltp. instruments: { 'NSE_EQ': [id], 'NSE_FNO': [id], ... }."""
         return self._source.get_ltp_v2(instruments)

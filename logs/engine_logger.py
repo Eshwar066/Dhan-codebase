@@ -112,7 +112,7 @@ class EngineLogger:
     def engine_start(self, message: str = "Live engine started") -> None:
         self.log("engine_start", message=message)
 
-    # ---------- Production safeguards (cursor.md) ----------
+    # ---------- Production safeguards ----------
     def order_state_mismatch(self, message: str, details: Optional[Dict] = None) -> None:
         self.log("order_state_mismatch", message=message, **(details or {}))
 

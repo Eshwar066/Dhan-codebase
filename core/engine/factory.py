@@ -138,6 +138,7 @@ class EngineFactory:
             delta_source = DeltaSource(
                 testnet=config.delta_testnet,
                 india=config.delta_india,
+                symbols=getattr(config, "symbols", None) or [],
             )
             data_provider = DeltaDataProvider(delta_source)
         else:

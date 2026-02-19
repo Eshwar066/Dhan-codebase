@@ -52,6 +52,7 @@ class DhanInstrumentStore(BaseInstrumentStore):
         )
 
     def map_row_to_instrument(self, row) -> Instrument:
+        lot = row.get("LOT_SIZE", row.get("SEM_LOT_UNITS", 1))
         return Instrument(
             trading_symbol=row["SEM_TRADING_SYMBOL"],
             custom_symbol=row["SEM_CUSTOM_SYMBOL"],
@@ -61,10 +62,34 @@ class DhanInstrumentStore(BaseInstrumentStore):
             expiry=row.get("SEM_EXPIRY_DATE"),
             strike=row.get("SEM_STRIKE_PRICE"),
             option_type=row.get("SEM_OPTION_TYPE"),
-            lot_size=row.get("LOT_SIZE", 1),
+            lot_size=int(lot) if lot is not None else 1,
             instrument_id=row.get("INSTRUMENT_ID"),
             series=row.get("SEM_SERIES"),
         )
+
+    def equity_intent_creation_details(
+        self, trading_symbol: str, exchange: str
+    ) -> Optional[Instrument]:
+        """Resolve equity (cash) scrip to Instrument for order intent. Used by equity strategies (e.g. IPO breakout)."""
+        ex = self.INSTRUMENT_EXCHANGE.get(exchange, exchange)
+        # Equity: EQ type or segment/type that indicates cash equity (no expiry)
+        eq_mask = (
+            (self.df["SEM_TRADING_SYMBOL"] == trading_symbol)
+            | (self.df["SEM_CUSTOM_SYMBOL"] == trading_symbol)
+        ) & (self.df["SEM_EXM_EXCH_ID"] == ex)
+        itype = self.df["SEM_EXCH_INSTRUMENT_TYPE"].astype(str).str.strip().str.upper()
+        equity_mask = eq_mask & (itype == "EQ")
+        df = self.df[equity_mask]
+        if df.empty:
+            # Fallback: same symbol+exchange and no expiry (cash segment)
+            no_expiry = self.df["SEM_EXPIRY_DATE"].isna()
+            df = self.df[eq_mask & no_expiry]
+        if df.empty:
+            if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
+                print(f"❌ No equity instrument found for {trading_symbol} on {exchange}")
+            return None
+        row = df.iloc[0]
+        return self.map_row_to_instrument(row)
 
     def intent_creation_details(
         self, trading_symbol, exchange, expiry, option_type, strike
@@ -104,7 +129,7 @@ class DhanInstrumentStore(BaseInstrumentStore):
         }
         return self.map_row_to_instrument(pd.Series(dummy_row))
 
-    # Dhan WebSocket feed segment enums (cursor.md)
+    # Dhan WebSocket feed segment enums
     FEED_SEGMENT_INDEX = "IDX_I"
     FEED_SEGMENT_NSE_EQ = "NSE_EQ"
     FEED_SEGMENT_NSE_FNO = "NSE_FNO"

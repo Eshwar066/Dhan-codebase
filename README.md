@@ -27,7 +27,7 @@ A production-grade, modular trading system that supports **India markets (Dhan)*
 ## What this project does
 
 - **Backtest** strategies on historical candles (single venue per run).
-- **Live / paper trade** with real-time data: **Delta** uses WebSocket; **Dhan** supports **DhanWebSocketFeed** (Live Market Feed WebSocket per cursor.md) when credentials and instrument file are set, otherwise REST/candle service.
+- **Live / paper trade** with real-time data: **Delta** uses WebSocket; **Dhan** supports **DhanWebSocketFeed** (Live Market Feed WebSocket) when credentials and instrument file are set, otherwise REST/candle service.
 - **Two venues in parallel**: run Dhan (India) and Delta (crypto) in separate processes or in one process via a Supervisor.
 - **Per-engine OMS**: each engine has its own PositionManager, RiskManager, OrderRouter, and Broker—no shared orders or positions across venues.
 - **Production safeguards**: broker reconciliation on startup, risk kill switch, closed-candle validation, feed health checks, structured JSON logs, EOD CSV export, capital and risk limits per engine.
@@ -204,9 +204,10 @@ Algo/
 │   ├── strategies/
 │   │   ├── registry.py      # STRATEGY_MAP: name → strategy class, allowed_modes
 │   │   ├── base.py          # BaseStrategy
+│   │   ├── Equity/IPOBreakout/   # IPO breakout (Dhan equity)
 │   │   ├── Futures/Futures_EMA/
 │   │   ├── Leaps/
-│   │   └── Inside_bar_candle/
+│   │   └── PipelineTest/
 │   │
 │   ├── data/
 │   │   ├── sources/         # DhanSource, DeltaSource
@@ -422,7 +423,7 @@ Use this as a reference for setup and next steps.
 
 ### Add or change a strategy
 
-11. Implement a strategy (subclass BaseStrategy, implement `on_candle`, etc.) and register it in `core/strategies/registry.py` under `STRATEGY_MAP` with `allowed_modes`.
+11. Implement a strategy (subclass BaseStrategy, implement `on_candle`, etc.) and register it in `core/strategies/registry.py` under `STRATEGY_MAP` with `allowed_modes`. Example: **IPOBreakout** (Dhan equity) in `core/strategies/Equity/IPOBreakout/`.
 12. Add a new job in `STRATEGY_JOBS` in `run/config.py` with `name`, `venue`, `symbols`, `backtest`, `live`, and optionally `capital`, `risk_per_trade_percent`.
 13. Run as above; the new job will get its own engine when its venue is selected.
 

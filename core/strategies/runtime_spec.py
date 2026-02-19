@@ -1,21 +1,15 @@
 from run.config import RunMode
 
 STRATEGY_RUNTIME_SPEC = {
-    "INSIDE_BAR": {
+    "IPOBreakout": {
         RunMode.BACKTEST: {
-            "data": {
-                "ohlc": {"exchange": "NSE", "interval": "5"},
-            }
+            "data": {"ohlc": {"exchange": "NSE", "interval": "5"}},
         },
         RunMode.PAPER: {
-            "data": {
-                "ohlc": {"exchange": "NSE", "interval": "1"},
-            }
+            "data": {"ohlc": {"exchange": "NSE", "interval": "5"}},
         },
         RunMode.LIVE: {
-            "data": {
-                "ohlc": {"exchange": "NSE", "interval": "1"},
-            }
+            "data": {"ohlc": {"exchange": "NSE", "interval": "5"}},
         },
     },
     "LEAPS_RSI": {

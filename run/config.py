@@ -30,17 +30,6 @@ STRATEGY_JOBS = [
         },
     },
     {
-        "name": "INSIDE_BAR",
-        "venue": "DHAN",
-        "enabled": False,
-        "capital": 100000,
-        "symbols": ["INFY", "ITC"],
-        "backtest": {
-            "start_date": "2023-01-01",
-            "end_date": "2024-12-31",
-        },
-    },
-    {
         "name": "FuturesEMAHighLow",
         "venue": "DELTA",
         "enabled": False,
@@ -85,6 +74,21 @@ STRATEGY_JOBS = [
             "exchange": "DELTA",
             "sector": "YES",
         },
+    },
+    {
+        "name": "IPOBreakout",
+        "venue": "DHAN",
+        "enabled": False,
+        "capital": 100000,
+        "symbols": ["RELIANCE"],
+        "backtest": {
+            "start_date": "2023-01-01",
+            "end_date": "2024-12-31",
+            "timeframe": "5",
+            "exchange": "NSE",
+            "sector": "NO",
+        },
+        "live": {"exchange": "NSE", "sector": "NO"},
     },
     {
         "name": "SignalFloodTest",
