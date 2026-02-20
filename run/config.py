@@ -8,10 +8,10 @@ class RunMode(str, Enum):
 
 
 # 🔁 CHANGE ONLY THIS
-RUN_MODE = RunMode.LIVE
+RUN_MODE = RunMode.BACKTEST
 
 # Default venue when job does not specify "venue". Used for single-venue runs.
-DEFAULT_VENUE = "DELTA"  # "DHAN" | "DELTA"
+DEFAULT_VENUE = "DHAN"  # "DHAN" | "DELTA"
 
 STRATEGY_JOBS = [
     {
@@ -51,7 +51,7 @@ STRATEGY_JOBS = [
     {
         "name": "SignalFloodTest",
         "venue": "DELTA",
-        "enabled": True,
+        "enabled": False,
         "engine_id": "delta_test_pipeline",
         "capital": 10000,
         "symbols": ["BTCUSD"],
@@ -78,17 +78,28 @@ STRATEGY_JOBS = [
     {
         "name": "IPOBreakout",
         "venue": "DHAN",
-        "enabled": False,
-        "capital": 100000,
-        "symbols": ["RELIANCE"],
+        "enabled": True,
+        "engine_id": "dhan_ipo_breakout",
+        "capital": 200000,
+        "symbols": None,
         "backtest": {
             "start_date": "2023-01-01",
             "end_date": "2024-12-31",
             "timeframe": "5",
             "exchange": "NSE",
             "sector": "NO",
+            "ipo_days": 365,
+            "ipo_filter": {"price_above": 200, "volume_above": 500000},
+            "ipo_max_symbols": 50,
+            "ipo_fallback_symbols": ["RELIANCE"],
         },
-        "live": {"exchange": "NSE", "sector": "NO"},
+        "live": {
+            "exchange": "NSE",
+            "sector": "NO",
+            "ipo_days": 365,
+            "ipo_filter": {"price_above": 200, "volume_above": 500000},
+            "ipo_max_symbols": 50,
+        },
     },
     {
         "name": "SignalFloodTest",

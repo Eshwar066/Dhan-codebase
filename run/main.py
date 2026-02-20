@@ -15,6 +15,7 @@ Optional: use Supervisor in code to run both venues in one process (two threads)
 import argparse
 import sys
 from pathlib import Path
+import pdb
 
 from run.config import RUN_MODE, RunMode, STRATEGY_JOBS, DEFAULT_VENUE
 from run.engine_config import EngineConfig
@@ -57,12 +58,20 @@ def run_engine(config: EngineConfig) -> None:
         print(f"⚠️ {config.strategy_name} ({config.broker_name}) is disabled. Skipping.")
         return
 
+    print(f"▶ Running {config.strategy_name} ({config.broker_name})...")
     engine = EngineFactory.create_engine(config)
+
+    symbols = config.symbols or []
+    if not symbols and config.strategy_name == "IPOBreakout":
+        print(
+            "⚠️ IPOBreakout: no symbols from universe (NSE EQUITY_L missing/failed or filter returned empty). "
+            "Strategy will not receive any candles. Ensure data_cache/EQUITY_L_latest.csv exists or set symbols in config."
+        )
 
     if RUN_MODE == RunMode.BACKTEST:
         bt = config.backtest or {}
         engine.run(
-            symbols=config.symbols,
+            symbols=symbols,
             start_date=bt.get("start_date", ""),
             end_date=bt.get("end_date", ""),
             timeframe=bt.get("timeframe", "60"),
@@ -79,7 +88,9 @@ def run_engine(config: EngineConfig) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Multi-venue trading: Dhan (India) + Delta (Crypto)")
+    parser = argparse.ArgumentParser(
+        description="Multi-venue trading: Dhan (India) + Delta (Crypto)"
+    )
     parser.add_argument(
         "--venue",
         choices=["DHAN", "DELTA"],

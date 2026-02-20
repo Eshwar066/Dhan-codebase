@@ -5,9 +5,10 @@ No Dhan instrument CSV for universe. Broker used only for order execution, LTP, 
 """
 
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
+import pdb
 
 from core.universe.models import EquityMeta
 from core.universe.nse_master_downloader import NseMasterDownloader
@@ -16,7 +17,7 @@ from core.universe.stock_filter_engine import StockFilterEngine
 logger = logging.getLogger(__name__)
 
 # DATE OF LISTING format in NSE file: 06-Oct-08
-LISTING_DATE_FMT = "%d-%b-%y"
+LISTING_DATE_FMT = "%d-%b-%Y"
 
 
 def _parse_nse_equity_l(csv_path: Path) -> List[EquityMeta]:
@@ -30,7 +31,7 @@ def _parse_nse_equity_l(csv_path: Path) -> List[EquityMeta]:
         raise FileNotFoundError(f"NSE equity file not found: {csv_path}")
     out: List[EquityMeta] = []
     with open(csv_path, "r", encoding="utf-8", newline="", errors="replace") as f:
-        reader = csv.DictReader(f)
+        reader = csv.DictReader(f, skipinitialspace=True)
         for row in reader:
             series = (row.get("SERIES") or "").strip().upper()
             if series != "EQ":
@@ -42,7 +43,7 @@ def _parse_nse_equity_l(csv_path: Path) -> List[EquityMeta]:
             raw = (row.get("DATE OF LISTING") or "").strip()
             if raw:
                 try:
-                    listing_date = datetime.strptime(raw, LISTING_DATE_FMT)
+                    listing_date = datetime.strptime(raw, LISTING_DATE_FMT).date()
                 except ValueError:
                     pass
             isin = (row.get("ISIN NUMBER") or "").strip() or None
@@ -116,7 +117,9 @@ class EquityUniverseService:
         if not latest_path.exists():
             downloaded = self._downloader.ensure_latest()
             if not downloaded:
-                self._log("universe_load_error", error="NSE file missing and download failed")
+                self._log(
+                    "universe_load_error", error="NSE file missing and download failed"
+                )
                 return
         try:
             meta_list = _parse_nse_equity_l(latest_path)
@@ -130,20 +133,56 @@ class EquityUniverseService:
         """Return list of all equity symbols."""
         return list(self.all_equities.keys())
 
-    def get_ipo_equities(self, days: int = 365) -> List[str]:
+    def get_ipo_equities(
+        self,
+        days: int = 365,
+        as_of: Optional[Union[date, datetime]] = None,
+    ) -> List[str]:
         """
-        Return symbols where (today - listing_date).days <= days.
-        No separate ipo_stocks.json; derived from NSE listing date.
+        Return symbols where (as_of - listing_date).days <= days.
+        If as_of is None, use today's date. Time-aware for deterministic backtest.
         """
-        today = datetime.now().date()
+        if as_of is None:
+            as_of = datetime.now().date()
+        elif isinstance(as_of, datetime):
+            as_of = as_of.date()
         out: List[str] = []
         for sym, meta in self.all_equities.items():
             if meta.listing_date is None:
                 continue
-            ld = meta.listing_date.date() if hasattr(meta.listing_date, "date") else meta.listing_date
-            if (today - ld).days <= days:
+            ld = (
+                meta.listing_date.date()
+                if hasattr(meta.listing_date, "date")
+                else meta.listing_date
+            )
+            if (as_of - ld).days <= days:
                 out.append(sym)
         return out
+
+    def get_listing_days(
+        self, symbol: str, as_of_date: Optional[Union[date, datetime]] = None
+    ) -> Optional[int]:
+        """
+        Days since listing for symbol. None if unknown or not in universe.
+        Pure in-memory lookup: equity master is cached at load; no IO, no CSV reads.
+
+        Use in strategy for lazy per-symbol IPO window (e.g. 30–90 days, 180–365 base).
+        Pass as_of_date in backtest (e.g. candle["timestamp"]) for deterministic results;
+        omit for live (uses today).
+        """
+        meta = self.all_equities.get(symbol)
+        if not meta or meta.listing_date is None:
+            return None
+        ld = (
+            meta.listing_date.date()
+            if hasattr(meta.listing_date, "date")
+            else meta.listing_date
+        )
+        if as_of_date is None:
+            ref = datetime.now().date()
+        else:
+            ref = as_of_date.date() if isinstance(as_of_date, datetime) else as_of_date
+        return (ref - ld).days
 
     def refresh_universe(self) -> None:
         """Re-download if needed and reload from EQUITY_L_latest.csv."""
@@ -151,7 +190,7 @@ class EquityUniverseService:
         self._load()
 
     @property
-    def filter_engine(self) -> StockFilterEngine:
+    def filter_engine(self) -> StockFilterEngine:  # uses stock filter engine
         return self._filter_engine
 
     def get_meta_for_symbols(self, symbols: List[str]) -> Dict[str, EquityMeta]:
@@ -170,7 +209,9 @@ class EquityUniverseService:
         Build { 'NSE_EQ': [security_id, ...] } for v2 API using broker instrument store.
         Only used for LTP/quote retrieval; universe itself is from NSE. Returns {} if no instrument_store.
         """
-        if not self._instrument_store or not hasattr(self._instrument_store, "get_feed_instruments"):
+        if not self._instrument_store or not hasattr(
+            self._instrument_store, "get_feed_instruments"
+        ):
             return {}
         try:
             instruments = self._instrument_store.get_feed_instruments(symbols)
@@ -189,7 +230,9 @@ class EquityUniverseService:
 
     def get_security_id_to_symbol(self, symbols: List[str]) -> Dict[str, str]:
         """Build { security_id_str: symbol } for given symbols using broker instrument store (for filter/quote)."""
-        if not self._instrument_store or not hasattr(self._instrument_store, "get_feed_instruments"):
+        if not self._instrument_store or not hasattr(
+            self._instrument_store, "get_feed_instruments"
+        ):
             return {}
         try:
             instruments = self._instrument_store.get_feed_instruments(symbols)

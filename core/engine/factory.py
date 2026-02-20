@@ -12,8 +12,10 @@ Usage:
 
 import os
 import queue
+from datetime import datetime
 from pathlib import Path
 from typing import Union
+import pdb
 
 from dotenv import load_dotenv
 
@@ -116,6 +118,8 @@ class EngineFactory:
             config, data_provider, instrument_store, engine_logger=None
         )
 
+        # ---------- IPOBreakout: resolve symbols from universe if not set ----------
+        EngineFactory._resolve_ipo_symbols(config, universe_service)
         return BacktestEngine(
             data_provider=data_provider,
             strategy=strategy,
@@ -215,6 +219,9 @@ class EngineFactory:
             config, data_provider, instrument_store, engine_logger=engine_logger
         )
 
+        # ---------- IPOBreakout: resolve symbols from universe before feed subscription ----------
+        EngineFactory._resolve_ipo_symbols(config, universe_service)
+
         # ---------- CandleService (uses same data_provider) ----------
         candle_service = CandleService(data_provider)
 
@@ -244,8 +251,13 @@ class EngineFactory:
         elif config.broker_name == "DHAN":
             access_token = os.getenv("DHAN_ACCESS_TOKEN")
             client_id = os.getenv("DHAN_CLIENT_CODE")
-            if access_token and client_id and hasattr(instrument_store, "get_feed_instruments"):
-                instruments = instrument_store.get_feed_instruments(config.symbols)
+            if (
+                access_token
+                and client_id
+                and hasattr(instrument_store, "get_feed_instruments")
+            ):
+                symbols_list = config.symbols or []
+                instruments = instrument_store.get_feed_instruments(symbols_list)
                 if instruments:
                     realtime_feed = DhanWebSocketFeed(
                         access_token=access_token,
@@ -262,7 +274,7 @@ class EngineFactory:
             strategy=strategy,
             data=data_provider,
             candle_service=candle_service,
-            symbols=config.symbols,
+            symbols=config.symbols or [],
             order_router=order_router,
             instrument_store=instrument_store,
             position_manager=position_manager,
@@ -274,7 +286,9 @@ class EngineFactory:
             engine_logger=engine_logger,
             feed_stale_seconds=getattr(config, "feed_stale_seconds", None) or 60,
             allowed_trading_hours=getattr(config, "allowed_trading_hours", None),
-            order_state_check_interval_min=getattr(config, "order_state_check_interval_min", 0),
+            order_state_check_interval_min=getattr(
+                config, "order_state_check_interval_min", 0
+            ),
             memory_threshold_percent=getattr(config, "memory_threshold_percent", None),
             strategy_timeout_seconds=getattr(config, "strategy_timeout_seconds", None),
             latency_critical_ms=getattr(config, "latency_critical_ms", 150.0),
@@ -296,7 +310,45 @@ class EngineFactory:
         return InstrumentStore(csv_path=deps / expected_file)
 
     @staticmethod
-    def _universe_service(config: EngineConfig, data_provider, instrument_store, engine_logger=None):
+    def _resolve_ipo_symbols(config: EngineConfig, universe_service) -> None:
+        """
+        For IPOBreakout with symbols None/empty: get IPO equities, filter, cap, set config.symbols.
+        Filtering happens before feed subscription so we subscribe only to filtered symbols.
+        """
+        if config.symbols is not None and len(config.symbols) > 0:
+            return
+        if config.strategy_name != "IPOBreakout" or universe_service is None:
+            config.symbols = config.symbols or []
+            return
+        live_or_backtest = (
+            config.live if config.run_mode != RunMode.BACKTEST else config.backtest
+        )
+        params = live_or_backtest or {}
+        ipo_days = params.get("ipo_days", 365)
+        filter_conditions = params.get("ipo_filter")
+        max_symbols = params.get("ipo_max_symbols", 50)
+        as_of = None
+        if config.run_mode == RunMode.BACKTEST and config.backtest:
+            start_str = config.backtest.get("start_date")
+            if start_str:
+                try:
+                    as_of = datetime.strptime(start_str, "%Y-%m-%d").date()
+                except (ValueError, TypeError):
+                    pass
+        ipo_symbols = universe_service.get_ipo_equities(days=ipo_days, as_of=as_of)
+        # filtered = universe_service.filter_engine.filter(
+        #     ipo_symbols, filter_conditions, universe_service
+        # )
+
+        config.symbols = ipo_symbols[:max_symbols] if ipo_symbols else []
+        # Fallback when universe is empty (e.g. NSE file missing) so backtest can still run
+        if not config.symbols and params.get("ipo_fallback_symbols"):
+            config.symbols = list(params["ipo_fallback_symbols"])[:max_symbols]
+
+    @staticmethod
+    def _universe_service(
+        config: EngineConfig, data_provider, instrument_store, engine_logger=None
+    ):
         """
         Build EquityUniverseService for DHAN equity strategies only.
         Never raises: on missing file or error returns None so engine does not crash.

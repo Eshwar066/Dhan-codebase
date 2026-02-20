@@ -31,19 +31,19 @@ STRATEGY_MAP = {
             RunMode.LIVE,
         ],
     },
-    "SignalFloodTest": {
-        "strategy": SignalFloodTestStrategy,
-        "instrument": "FUTURE",
-        "allowed_modes": [
-            RunMode.PAPER,
-            RunMode.LIVE,
-        ],
-    },
     "IPOBreakout": {
         "strategy": IPOBreakout,
         "instrument": "EQUITY",
         "allowed_modes": [
             RunMode.BACKTEST,
+            RunMode.PAPER,
+            RunMode.LIVE,
+        ],
+    },
+    "SignalFloodTest": {
+        "strategy": SignalFloodTestStrategy,
+        "instrument": "FUTURE",
+        "allowed_modes": [
             RunMode.PAPER,
             RunMode.LIVE,
         ],

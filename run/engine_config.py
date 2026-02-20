@@ -29,7 +29,7 @@ class EngineConfig:
     broker_name: BrokerName
     run_mode: RunMode
     strategy_name: str
-    symbols: List[str]
+    symbols: Optional[List[str]] = None  # None = derive from universe (e.g. IPOBreakout)
     enabled: bool = True
 
     # Engine identity (for logging and reports)
