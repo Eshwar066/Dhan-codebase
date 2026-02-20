@@ -516,3 +516,32 @@ class IndiaMktMixins:
     def on_structure_exit(self, structure_id, **kwargs):
         """Called when a structure is fully exited. Clears rollover state for that structure."""
         self.rolled_hedges = {k for k in self.rolled_hedges if k[0] != structure_id}
+
+    # Anchor VWAP
+    def _update_anchor_vwap(self, candle: Any):
+        symbol = candle["symbol"]
+        high = candle.get("high")
+        low = candle.get("low")
+        close = candle.get("close")
+        volume = candle.get("volume")
+
+        if None in (high, low, close, volume):
+            return None
+
+        typical_price = (high + low + close) / 3.0
+
+        state = self._anchor_state.get(symbol)
+
+        if state is None:
+            # First listing candle initialization
+            self._anchor_state[symbol] = {
+                "cum_pv": typical_price * volume,
+                "cum_vol": volume,
+                "anchor_vwap": typical_price,
+            }
+        else:
+            state["cum_pv"] += typical_price * volume
+            state["cum_vol"] += volume
+            state["anchor_vwap"] = state["cum_pv"] / state["cum_vol"]
+
+        return self._anchor_state[symbol]["anchor_vwap"]

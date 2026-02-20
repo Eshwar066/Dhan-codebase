@@ -84,8 +84,8 @@ STRATEGY_JOBS = [
         "symbols": None,
         "backtest": {
             "start_date": "2023-01-01",
-            "end_date": "2024-12-31",
-            "timeframe": "5",
+            "end_date": "2026-02-20",
+            "timeframe": "DAY",
             "exchange": "NSE",
             "sector": "NO",
             "ipo_days": 365,
