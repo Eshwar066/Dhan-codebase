@@ -9,11 +9,19 @@ from run.config import RUN_MODE, RunMode
 
 class BaseEngine:
 
-    def __init__(self, strategy, data, instrument_store, position_manager):
+    def __init__(
+        self,
+        strategy,
+        data,
+        instrument_store,
+        position_manager,
+        universe_service=None,
+    ):
         self.strategy = strategy
         self.data = data
         self.instrument_store = instrument_store
         self.position_manager = position_manager
+        self.universe_service = universe_service
         self.data_router = DataRouter(data)
         self.option_chain_service = OptionChainService(self.data_router)
 
@@ -33,6 +41,7 @@ class BaseEngine:
             instrument_store=self.instrument_store,
             position_store=self.position_manager,
             option_chain_service=self.option_chain_service,
+            universe_service=getattr(self, "universe_service", None),
         )
 
         intent = self.strategy.on_candle(candle, ctx)

@@ -42,6 +42,9 @@ class StrategyContext:
     qty: Optional[int] = None
     intent_builder: Optional[Any] = None
 
+    # ---- Optional; set by engine for DHAN equity strategies ----
+    universe_service: Optional[Any] = None
+
     def get_expiry_list(self) -> Optional[List[Any]]:
         """Safe access for expiry_list (may not be set yet)."""
         return self.expiry_list

@@ -83,8 +83,11 @@ class LiveEngine(BaseEngine):
         symbol_error_threshold: int = 5,
         tick_queue: Optional[Any] = None,
         candle_aggregator: Optional[Any] = None,
+        universe_service: Optional[Any] = None,
     ):
-        super().__init__(strategy, data, instrument_store, position_manager)
+        super().__init__(
+            strategy, data, instrument_store, position_manager, universe_service=universe_service
+        )
         self.symbols = symbols
         self.candle_service = candle_service
         self.order_router = order_router

@@ -72,6 +72,33 @@ Level 3 market depth (20 or 200 levels) for demand/supply zones and strategies b
 
 **Usage:** Build instruments with `instrument_store.get_feed_instruments(symbols)`, then `DhanDepthFeed(access_token=..., client_id=..., instruments=instruments, level=20).start()`. Read depth via `feed.get_market_depth(symbol)`. Server pings every 10s; no response for 40s closes the connection. Max 5 WebSocket connections per user across all Dhan feeds.
 
+### Equity Universe Service (Dhan)
+
+Equity universe is **exchange-driven**: built from the official **NSE EQUITY_L** security master (`EQUITY_L.csv`), not from the Dhan instrument CSV. Listing date comes from NSE; IPO = any stock where `(today - listing_date).days <= days`. Broker (Dhan) is used only for order execution, LTP retrieval, and position reconciliation.
+
+| Component | Location | What it does |
+| --------- | -------- | ------------ |
+| **NseMasterDownloader** | `core/universe/nse_master_downloader.py` | Downloads EQUITY_L.csv once per day from NSE; saves to `data_cache/EQUITY_L_{YYYYMMDD}.csv` and `data_cache/EQUITY_L_latest.csv`. User-Agent and Referer headers. Logs `nse_master_downloaded` / `nse_master_download_failed`. Runs at engine startup if file missing or outdated, or via `schedule_daily_refresh(hour=20)`. |
+| **EquityUniverseService** | `core/universe/equity_universe_service.py` | Loads from `data_cache/EQUITY_L_latest.csv`. Parses SERIES == "EQ"; extracts SYMBOL, DATE OF LISTING (DD-Mon-YY), ISIN NUMBER, MARKET LOT. `get_ipo_equities(days=365)` = symbols where `(today - listing_date).days <= days`. No Dhan CSV for universe. If file missing, attempts download; on failure logs `universe_load_error` and continues with empty universe. |
+| **StockFilterEngine** | `core/universe/stock_filter_engine.py` | `filter(symbols, conditions, universe_service)`. Uses DhanDataProvider v2 for LTP/quote (security IDs from broker instrument store). No network inside strategy loop; no file I/O in `on_candle`. |
+| **EquityMeta** | `core/universe/models.py` | Dataclass: `symbol`, `listing_date` (from NSE), `isin`, `market_lot`, `security_id` (optional, from broker for API). |
+
+**Integration:** For **DHAN** engines with strategy `instrument == "EQUITY"`, EngineFactory instantiates EquityUniverseService (cache_dir, data_provider, instrument_store, engine_logger) and passes it as `ctx.universe_service`. Universe loads at startup; no file I/O inside `on_candle`.
+
+**Strategy usage example:**
+
+```python
+all_stocks = ctx.universe_service.get_all_equities()
+ipo_stocks = ctx.universe_service.get_ipo_equities(days=365)
+filtered = ctx.universe_service.filter_engine.filter(
+    ipo_stocks,
+    {"price_above": 200, "volume_above": 500000},
+    ctx.universe_service,
+)
+```
+
+Refresh once per day via `schedule_daily_refresh(hour=20)` (no blocking in strategy loop).
+
 ---
 
 ## Architecture at a glance
@@ -216,6 +243,13 @@ Algo/
 │   │   ├── candle_service.py
 │   │   ├── candle_aggregator.py   # Tick→1m; higher TFs from closed 1m; broker-agnostic
 │   │   └── data_router.py
+│   │
+│   ├── universe/                  # Equity universe from NSE EQUITY_L (DHAN only)
+│   │   ├── nse_master_downloader.py
+│   │   ├── equity_universe_service.py
+│   │   ├── ipo_tracker.py
+│   │   ├── stock_filter_engine.py
+│   │   └── models.py
 │   │
 │   ├── broker/
 │   │   ├── base.py          # BaseBroker, IBrokerApi

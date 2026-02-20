@@ -44,6 +44,11 @@ from core.utils.instruments.instrument_store import InstrumentStore
 from logs.logger.trade_logger import TradeLogger
 from logs.engine_logger import EngineLogger
 
+try:
+    from core.universe.equity_universe_service import EquityUniverseService
+except ImportError:
+    EquityUniverseService = None
+
 
 class EngineFactory:
     """
@@ -106,12 +111,18 @@ class EngineFactory:
         # ---------- Instruments (venue-specific path) ----------
         instrument_store = EngineFactory._instrument_store(config)
 
+        # ---------- Universe (DHAN equity strategies only) ----------
+        universe_service = EngineFactory._universe_service(
+            config, data_provider, instrument_store, engine_logger=None
+        )
+
         return BacktestEngine(
             data_provider=data_provider,
             strategy=strategy,
             instrument_store=instrument_store,
             order_router=order_router,
             position_manager=position_manager,
+            universe_service=universe_service,
         )
 
     @staticmethod
@@ -199,6 +210,11 @@ class EngineFactory:
         # ---------- Instruments ----------
         instrument_store = EngineFactory._instrument_store(config)
 
+        # ---------- Universe (DHAN equity strategies only) ----------
+        universe_service = EngineFactory._universe_service(
+            config, data_provider, instrument_store, engine_logger=engine_logger
+        )
+
         # ---------- CandleService (uses same data_provider) ----------
         candle_service = CandleService(data_provider)
 
@@ -264,6 +280,7 @@ class EngineFactory:
             latency_critical_ms=getattr(config, "latency_critical_ms", 150.0),
             latency_critical_cycles=getattr(config, "latency_critical_cycles", 3),
             symbol_error_threshold=getattr(config, "symbol_error_threshold", 5),
+            universe_service=universe_service,
         )
 
     @staticmethod
@@ -277,3 +294,30 @@ class EngineFactory:
             return InstrumentStore(broker="DELTA", csv_path=csv_path)
         expected_file = "all_instrument" + current_date + ".csv"
         return InstrumentStore(csv_path=deps / expected_file)
+
+    @staticmethod
+    def _universe_service(config: EngineConfig, data_provider, instrument_store, engine_logger=None):
+        """
+        Build EquityUniverseService for DHAN equity strategies only.
+        Never raises: on missing file or error returns None so engine does not crash.
+        """
+        if config.broker_name != "DHAN":
+            return None
+        cfg = STRATEGY_MAP.get(config.strategy_name)
+        if not cfg or cfg.get("instrument") != "EQUITY":
+            return None
+        if EquityUniverseService is None:
+            return None
+        try:
+            base_dir = config.base_dir
+            cache_dir = base_dir / "data_cache"
+            return EquityUniverseService(
+                cache_dir=cache_dir,
+                data_provider=data_provider,
+                instrument_store=instrument_store,
+                engine_logger=engine_logger,
+            )
+        except Exception as e:
+            if engine_logger and hasattr(engine_logger, "log"):
+                engine_logger.log("universe_load_error", error=str(e))
+            return None

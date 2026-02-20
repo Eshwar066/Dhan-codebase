@@ -12,12 +12,14 @@ class BacktestEngine(BaseEngine):
         instrument_store,
         order_router,
         position_manager,
+        universe_service=None,
     ):
         super().__init__(
             strategy=strategy,
             data=data_provider,
             instrument_store=instrument_store,
             position_manager=position_manager,
+            universe_service=universe_service,
         )
         self.order_router = order_router
         self.position_manager = position_manager
