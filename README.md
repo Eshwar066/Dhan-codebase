@@ -85,19 +85,34 @@ Equity universe is **exchange-driven**: built from the official **NSE EQUITY_L**
 
 **Integration:** For **DHAN** engines with strategy `instrument == "EQUITY"`, EngineFactory instantiates EquityUniverseService (cache_dir, data_provider, instrument_store, engine_logger) and passes it as `ctx.universe_service`. Universe loads at startup; no file I/O inside `on_candle`.
 
-**Strategy usage example:**
+**Strategy usage:** Universe = data; strategy = intelligence. Cache the IPO list once (e.g. in strategy init); do **not** call `get_ipo_equities()` inside `on_candle` (avoids O(N) rebuild per candle). Strategy owns selection logic (breakout, volume, NR7, VWAP, etc.).
 
 ```python
-all_stocks = ctx.universe_service.get_all_equities()
-ipo_stocks = ctx.universe_service.get_ipo_equities(days=365)
-filtered = ctx.universe_service.filter_engine.filter(
-    ipo_stocks,
-    {"price_above": 200, "volume_above": 500000},
-    ctx.universe_service,
-)
+# Option A: cache IPO set at init, then fast lookup in on_candle
+def __init__(self):
+    self.ipo_symbols = set()  # filled once when ctx.universe_service is available
+
+def on_candle(self, candle, ctx):
+    if ctx.universe_service and not self.ipo_symbols:
+        self.ipo_symbols = set(ctx.universe_service.get_ipo_equities(days=365))
+    if candle["symbol"] not in self.ipo_symbols:
+        return None
+    # ... your breakout / filter logic
+
+# Option B: lazy per-symbol with get_listing_days (research-flexible)
+# No IO per call; listing dates cached in memory at universe load.
+def on_candle(self, candle, ctx):
+    symbol = candle["symbol"]
+    as_of = candle.get("timestamp")  # pass in backtest for deterministic days
+    days = ctx.universe_service.get_listing_days(symbol, as_of_date=as_of) if ctx.universe_service else None
+    if days is None or not (30 <= days <= 90):  # e.g. 30–90 day window
+        return None
+    # ... test fresh IPO momentum, post-lockup, 6–12m base breakout, etc.
 ```
 
 Refresh once per day via `schedule_daily_refresh(hour=20)` (no blocking in strategy loop).
+
+**Daily universe refresh for IPOBreakout (symbols derived at startup):** For the IPO strategy, set `symbols: None` in the job. At engine startup the factory builds the universe, gets IPO equities (e.g. last 365 days), runs the filter (e.g. `price_above`, `volume_above`), caps the list (e.g. 50 symbols), and injects it into `config.symbols`. The engine loop and DhanWebSocketFeed then run only on these precomputed symbols—no heavy filtering per candle. Filtering happens before feed subscription so you subscribe only to the filtered set (you cannot subscribe to thousands of symbols). In `run/config.py` use `ipo_days`, `ipo_filter`, and `ipo_max_symbols` under `live` / `backtest` to control this. Run with `RUN_MODE = RunMode.LIVE` and `python -m run.main --venue DHAN`.
 
 ---
 
@@ -247,7 +262,6 @@ Algo/
 │   ├── universe/                  # Equity universe from NSE EQUITY_L (DHAN only)
 │   │   ├── nse_master_downloader.py
 │   │   ├── equity_universe_service.py
-│   │   ├── ipo_tracker.py
 │   │   ├── stock_filter_engine.py
 │   │   └── models.py
 │   │
