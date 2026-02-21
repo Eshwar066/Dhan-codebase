@@ -138,26 +138,32 @@ class EquityUniverseService:
         days: int = 365,
         as_of: Optional[Union[date, datetime]] = None,
     ) -> List[str]:
-        """
-        Return symbols where (as_of - listing_date).days <= days.
-        If as_of is None, use today's date. Time-aware for deterministic backtest.
-        """
+
         if as_of is None:
             as_of = datetime.now().date()
         elif isinstance(as_of, datetime):
             as_of = as_of.date()
-        out: List[str] = []
+
+        filtered = []
+
         for sym, meta in self.all_equities.items():
             if meta.listing_date is None:
                 continue
+
             ld = (
                 meta.listing_date.date()
                 if hasattr(meta.listing_date, "date")
                 else meta.listing_date
             )
-            if (as_of - ld).days <= days:
-                out.append(sym)
-        return out
+
+            age = (as_of - ld).days
+
+            if age <= days:
+                filtered.append((sym, ld))
+
+        # 🔥 Sort by listing_date descending (newest first)
+        filtered.sort(key=lambda x: x[1], reverse=True)
+        return [sym for sym, _ in filtered]
 
     def get_listing_days(
         self, symbol: str, as_of_date: Optional[Union[date, datetime]] = None

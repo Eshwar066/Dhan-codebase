@@ -227,6 +227,8 @@ class PositionManager:
 
             # -------- LOG --------
             if self.logger:
+                # PnL only on EXIT; leave blank on ENTRY/SCALE_IN
+                pnl_val = pos.realized_pnl if trade_type == "EXIT" else ""
                 row = {
                     "candle_timestamp": (
                         candle_ts.strftime("%Y-%m-%d %H:%M")
@@ -239,7 +241,7 @@ class PositionManager:
                     "side": side,
                     "qty": qty,
                     "price": price,
-                    "pnl": pos.realized_pnl,
+                    "pnl": pnl_val,
                     "net_qty_after": new_qty,
                     # "order_id": order_id,
                     # "intent_id": intent_id,
@@ -249,7 +251,6 @@ class PositionManager:
                 }
 
                 if trade_type == "EXIT":
-                    row["pnl"] = pos.realized_pnl
                     row["mae"] = pos.mae
                     row["mfe"] = pos.mfe
 
@@ -449,7 +450,14 @@ class PositionManager:
                 continue
 
             if underlying:
-                if underlying and pos.instrument.custom_symbol.split()[0] != underlying:
+                # Match by trading_symbol (position key) so backtest symbol matches; fallback to custom_symbol
+                inst = pos.instrument
+                by_trading = (inst.trading_symbol or "").strip() == (underlying or "").strip()
+                by_custom = False
+                if getattr(inst, "custom_symbol", None):
+                    parts = (inst.custom_symbol or "").strip().split()
+                    by_custom = (parts[0] == underlying.strip()) if parts else False
+                if not (by_trading or by_custom):
                     continue
 
             positions.append(pos)

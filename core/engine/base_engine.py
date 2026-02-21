@@ -28,7 +28,7 @@ class BaseEngine:
     def get_strategy_params(self):
         return STRATEGY_RUNTIME_SPEC[self.strategy.name][RUN_MODE]
 
-    def build_context(self, candle):
+    def build_context(self, candle, recent_candles=None):
         ts = candle["timestamp"]
         if not isinstance(ts, datetime):
             ts = datetime.fromisoformat(str(ts))
@@ -42,6 +42,7 @@ class BaseEngine:
             position_store=self.position_manager,
             option_chain_service=self.option_chain_service,
             universe_service=getattr(self, "universe_service", None),
+            recent_candles=recent_candles,
         )
 
         intent = self.strategy.on_candle(candle, ctx)

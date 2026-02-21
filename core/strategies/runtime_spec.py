@@ -34,6 +34,11 @@ STRATEGY_RUNTIME_SPEC = {
             }
         },
     },
+    "Futures_EMA_Momentum": {
+        RunMode.BACKTEST: {"data": {}},
+        RunMode.PAPER: {"data": {}},
+        RunMode.LIVE: {"data": {}},
+    },
     "SignalFloodTest": {
         RunMode.PAPER: {"data": {}},
         RunMode.LIVE: {"data": {}},

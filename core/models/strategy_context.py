@@ -45,6 +45,9 @@ class StrategyContext:
     # ---- Optional; set by engine for DHAN equity strategies ----
     universe_service: Optional[Any] = None
 
+    # ---- Optional; set by BacktestEngine: rolling buffer of recent candles for current symbol ----
+    recent_candles: Optional[List[Any]] = None
+
     def get_expiry_list(self) -> Optional[List[Any]]:
         """Safe access for expiry_list (may not be set yet)."""
         return self.expiry_list
@@ -52,3 +55,8 @@ class StrategyContext:
     def get_selected_expiry(self) -> Optional[Any]:
         """Safe access for selected_expiry."""
         return self.selected_expiry
+
+    def get_recent_candles(self, n: int) -> List[Any]:
+        """Last n candles for current symbol (including current). Empty if not provided by engine."""
+        buf = self.recent_candles or []
+        return buf[-n:] if n > 0 else []

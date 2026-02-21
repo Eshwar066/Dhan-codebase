@@ -1,7 +1,9 @@
 import pandas as pd
 import datetime as dt
-from core.engine.base_engine import BaseEngine
+from collections import deque
 import pdb
+
+from core.engine.base_engine import BaseEngine
 
 
 class BacktestEngine(BaseEngine):
@@ -56,6 +58,9 @@ class BacktestEngine(BaseEngine):
             warmup = self.strategy.get_warmup_period()
             df = df.iloc[warmup:].reset_index(drop=True)
 
+            # Rolling buffer of recent candles for this symbol (max 50)
+            candle_buffer = deque(maxlen=50)
+
             # -------- Candle loop --------
             for _, row in df.iterrows():
                 candle = row.to_dict()
@@ -64,8 +69,12 @@ class BacktestEngine(BaseEngine):
                 if ts.weekday() >= 5:
                     continue
 
+                candle_buffer.append(candle)
+
                 # -------- Runtime context --------
-                ctx, entry_intent = self.build_context(candle)
+                ctx, entry_intent = self.build_context(
+                    candle, recent_candles=list(candle_buffer)
+                )
                 # pdb.set_trace()
                 # 🔥 ALWAYS run exits + rollover
                 self._run_risk_and_rollover(symbol, candle, ctx)

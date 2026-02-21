@@ -11,7 +11,7 @@ class RunMode(str, Enum):
 RUN_MODE = RunMode.BACKTEST
 
 # Default venue when job does not specify "venue". Used for single-venue runs.
-DEFAULT_VENUE = "DHAN"  # "DHAN" | "DELTA"
+DEFAULT_VENUE = "DELTA"  # "DHAN" | "DELTA"
 
 STRATEGY_JOBS = [
     {
@@ -83,7 +83,7 @@ STRATEGY_JOBS = [
         "capital": 200000,
         "symbols": None,
         "backtest": {
-            "start_date": "2023-01-01",
+            "start_date": "2022-01-01",
             "end_date": "2026-02-20",
             "timeframe": "DAY",
             "exchange": "NSE",
@@ -99,6 +99,23 @@ STRATEGY_JOBS = [
             "ipo_days": 365,
             "ipo_filter": {"price_above": 200, "volume_above": 500000},
             "ipo_max_symbols": 50,
+        },
+    },
+    {
+        "name": "Futures_EMA_Momentum",
+        "venue": "DELTA",
+        "enabled": True,
+        "engine_id": "dhan_ipo_breakout",
+        "capital": 200000,
+        "symbols": ["BTCUSD"],
+        "instrument": "FUTURES",
+        "delta_india": True,
+        "delta_testnet": False,
+        "live": {"exchange": "INDEX", "sector": "YES"},
+        "backtest": {
+            "start_date": "2022-01-01",
+            "end_date": "2026-02-20",
+            "timeframe": "60",
         },
     },
     {

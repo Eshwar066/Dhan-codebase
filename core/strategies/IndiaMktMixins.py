@@ -16,6 +16,7 @@ import uuid
 import pandas as pd
 from datetime import date, timedelta, datetime
 import calendar
+from typing import Any, List, Optional, Tuple
 
 from run.config import RUN_MODE, RunMode
 from core.utils.expiry_resolver import ExpiryResolver
@@ -545,3 +546,99 @@ class IndiaMktMixins:
             state["anchor_vwap"] = state["cum_pv"] / state["cum_vol"]
 
         return self._anchor_state[symbol]["anchor_vwap"]
+
+    # super trend (atr_period / mult come from strategy attributes if not passed)
+    def _supertrend(
+        self,
+        candles: List[Any],
+        atr_period: Optional[int] = None,
+        mult: Optional[float] = None,
+    ) -> Optional[Tuple[float, bool]]:
+        """
+        Returns (supertrend_line_value, is_green) for the last candle.
+        is_green True = bullish → long only; False = bearish → short only.
+        Strategies should set supertrend_atr_period and supertrend_multiplier.
+        """
+        atr_period = atr_period if atr_period is not None else getattr(self, "supertrend_atr_period", 10)
+        mult = mult if mult is not None else getattr(self, "supertrend_multiplier", 3.0)
+        if len(candles) < atr_period + 1:
+            return None
+        atr_list = self._atr(candles, atr_period)
+        if atr_list is None:
+            return None
+        high = [c["high"] for c in candles]
+        low = [c["low"] for c in candles]
+        close = [c["close"] for c in candles]
+        hl2 = [(high[i] + low[i]) / 2.0 for i in range(len(candles))]
+        upper = [
+            hl2[i] + mult * atr_list[i] if atr_list[i] is not None else None
+            for i in range(len(candles))
+        ]
+        lower = [
+            hl2[i] - mult * atr_list[i] if atr_list[i] is not None else None
+            for i in range(len(candles))
+        ]
+        # Final bands (trailing); supertrend direction
+        final_upper = [None] * len(candles)
+        final_lower = [None] * len(candles)
+        supertrend_green = [None] * len(candles)  # True = green (bullish)
+        final_upper[atr_period - 1] = upper[atr_period - 1]
+        final_lower[atr_period - 1] = lower[atr_period - 1]
+        supertrend_green[atr_period - 1] = (
+            close[atr_period - 1] > final_lower[atr_period - 1]
+        )
+        for i in range(atr_period, len(candles)):
+            prev_upper = final_upper[i - 1]
+            prev_lower = final_lower[i - 1]
+            if prev_upper is not None and close[i] > prev_upper:
+                supertrend_green[i] = True
+                final_lower[i] = lower[i]
+                final_upper[i] = None
+            elif prev_lower is not None and close[i] < prev_lower:
+                supertrend_green[i] = False
+                final_upper[i] = upper[i]
+                final_lower[i] = None
+            else:
+                supertrend_green[i] = supertrend_green[i - 1]
+                if supertrend_green[i]:
+                    # Trail lower band (take higher of new vs prev when bullish)
+                    final_lower[i] = (
+                        max(lower[i], final_lower[i - 1])
+                        if final_lower[i - 1] is not None
+                        else lower[i]
+                    )
+                    final_upper[i] = None
+                else:
+                    # Trail upper band (take lower of new vs prev when bearish)
+                    final_upper[i] = (
+                        min(upper[i], final_upper[i - 1])
+                        if final_upper[i - 1] is not None
+                        else upper[i]
+                    )
+                    final_lower[i] = None
+        idx = len(candles) - 1
+        line_value = final_lower[idx] if supertrend_green[idx] else final_upper[idx]
+        if line_value is None:
+            return None
+        return (line_value, supertrend_green[idx])
+
+    def _atr(self, candles: List[Any], period: int) -> Optional[List[float]]:
+        """True Range then EMA-smoothed ATR. Returns ATR value per candle from index period onward."""
+        if len(candles) < period + 1:
+            return None
+        tr_list = []
+        for i, c in enumerate(candles):
+            high, low, close = c["high"], c["low"], c["close"]
+            if i == 0:
+                tr = high - low
+            else:
+                prev_close = candles[i - 1]["close"]
+                tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+            tr_list.append(tr)
+        # EMA of TR for ATR; alpha = 1/period
+        alpha = 1.0 / period
+        atr_list = [None] * len(candles)
+        atr_list[period - 1] = sum(tr_list[:period]) / period
+        for i in range(period, len(candles)):
+            atr_list[i] = alpha * tr_list[i] + (1 - alpha) * atr_list[i - 1]
+        return atr_list
