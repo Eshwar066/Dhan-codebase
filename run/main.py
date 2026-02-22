@@ -65,7 +65,7 @@ def run_engine(config: EngineConfig) -> None:
     if not symbols and config.strategy_name == "IPOBreakout":
         print(
             "⚠️ IPOBreakout: no symbols from universe (NSE EQUITY_L missing/failed or filter returned empty). "
-            "Strategy will not receive any candles. Ensure data_cache/EQUITY_L_latest.csv exists or set symbols in config."
+            "Strategy will not receive any candles. Ensure Dependencies/equity_universe/EQUITY_L_latest.csv exists or set symbols in config."
         )
 
     if RUN_MODE == RunMode.BACKTEST:

@@ -1,6 +1,6 @@
 """
 Equity universe service: loads NSE equity list from EQUITY_L (daily sync).
-Source: data_cache/EQUITY_L_latest.csv. Listing date from NSE; IPO = (today - listing_date) <= days.
+Source: Dependencies/equity_universe/EQUITY_L_latest.csv. Listing date from NSE; IPO = (today - listing_date) <= days.
 No Dhan instrument CSV for universe. Broker used only for order execution, LTP, positions.
 """
 
@@ -22,7 +22,7 @@ LISTING_DATE_FMT = "%d-%b-%Y"
 
 def _parse_nse_equity_l(csv_path: Path) -> List[EquityMeta]:
     """
-    Parse data_cache/EQUITY_L_latest.csv. Include only SERIES == "EQ".
+    Parse EQUITY_L_latest.csv (e.g. from Dependencies/equity_universe). Include only SERIES == "EQ".
     Extract: symbol=SYMBOL, listing_date=DATE OF LISTING (%d-%b-%y), isin=ISIN NUMBER, market_lot=MARKET LOT.
     """
     import csv
@@ -68,7 +68,7 @@ def _parse_nse_equity_l(csv_path: Path) -> List[EquityMeta]:
 
 class EquityUniverseService:
     """
-    Loads equity universe from NSE EQUITY_L (data_cache/EQUITY_L_latest.csv).
+    Loads equity universe from NSE EQUITY_L (Dependencies/equity_universe/EQUITY_L_latest.csv).
     At startup: if file missing, attempt download; if download fails, log and run with empty universe.
     IPO = (today - listing_date).days <= days. No file I/O inside on_candle. DHAN only.
     """
@@ -82,7 +82,7 @@ class EquityUniverseService:
     ):
         """
         Args:
-            cache_dir: Path to data_cache/ (EQUITY_L_latest.csv lives here)
+            cache_dir: Path to equity universe directory (e.g. Dependencies/equity_universe; EQUITY_L_latest.csv lives here)
             data_provider: DhanDataProvider (for filter engine)
             instrument_store: Optional Dhan instrument store for symbol->security_id (LTP/quote API)
             engine_logger: Optional EngineLogger for structured logs
@@ -112,7 +112,7 @@ class EquityUniverseService:
             logger.info(event, extra=kwargs)
 
     def _load(self) -> None:
-        """Load from EQUITY_L_latest.csv; if missing, try download. Do not call from strategy loop."""
+        """Load from EQUITY_L_latest.csv (in cache_dir, e.g. Dependencies/equity_universe); if missing, try download. Do not call from strategy loop."""
         latest_path = self._cache_dir / "EQUITY_L_latest.csv"
         if not latest_path.exists():
             downloaded = self._downloader.ensure_latest()
@@ -191,7 +191,7 @@ class EquityUniverseService:
         return (ref - ld).days
 
     def refresh_universe(self) -> None:
-        """Re-download if needed and reload from EQUITY_L_latest.csv."""
+        """Re-download if needed and reload from EQUITY_L_latest.csv (in cache_dir)."""
         self._downloader.download()
         self._load()
 

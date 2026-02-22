@@ -1,7 +1,6 @@
 """
 Futures_EMA_Momentum: Supertrend + EMA breakout/breakdown, long and short.
 Supertrend green = long only; supertrend red = short only.
-Same structure as IPOBreakout (stages 1-4) but trades both sides by trend.
 For crypto/futures (DELTA/DHAN futures); uses futures_intent_creation_details.
 """
 
@@ -44,9 +43,6 @@ class FuturesEMAMomentum(IndiaMktMixins, BaseStrategy):
                 "short_stage": 0,
                 "short_stage_low": None,
                 "short_entry_high": None,
-                "listing_high": None,
-                "candles_since_listing": 0,
-                "below_listing_count": 0,
             }
         return self._stage_state[symbol]
 
@@ -82,16 +78,6 @@ class FuturesEMAMomentum(IndiaMktMixins, BaseStrategy):
         if ema5_high is None or ema5_low is None:
             return None
 
-        if state["listing_high"] is None:
-            state["listing_high"] = candles[0]["high"]
-        state["candles_since_listing"] += 1
-        if close < state["listing_high"]:
-            state["below_listing_count"] += 1
-
-        base_ok = (
-            state["candles_since_listing"] >= 10 and state["below_listing_count"] >= 5
-        )
-
         exchange = candle.get("exchange") or "DELTA"
         if hasattr(ctx.instrument_store, "equity_intent_creation_details"):
             inst = ctx.instrument_store.equity_intent_creation_details(symbol, exchange)
@@ -116,7 +102,6 @@ class FuturesEMAMomentum(IndiaMktMixins, BaseStrategy):
             # Only add to long when supertrend is green
             if (
                 not is_supertrend_green
-                or not base_ok
                 or close <= supertrend_value
                 or close <= ema5_high
             ):
@@ -129,15 +114,15 @@ class FuturesEMAMomentum(IndiaMktMixins, BaseStrategy):
             elif state["long_stage"] == 1 and close > state["long_stage_high"]:
                 state["long_stage"] = 2
                 state["long_stage_high"] = high
-                qty = 2
+                qty = 1
             elif state["long_stage"] == 2 and close > state["long_stage_high"]:
                 state["long_stage"] = 3
                 state["long_stage_high"] = high
-                qty = 3
+                qty = 1
             elif state["long_stage"] == 3 and close > state["long_stage_high"]:
                 state["long_stage"] = 4
                 state["long_stage_high"] = high
-                qty = 4
+                qty = 1
             else:
                 return None
             action = "SCALE_IN"
@@ -164,7 +149,6 @@ class FuturesEMAMomentum(IndiaMktMixins, BaseStrategy):
             # Only add to short when supertrend is red
             if (
                 is_supertrend_green
-                or not base_ok
                 or close >= supertrend_value
                 or close >= ema5_low
             ):
@@ -177,15 +161,15 @@ class FuturesEMAMomentum(IndiaMktMixins, BaseStrategy):
             elif state["short_stage"] == 1 and close < state["short_stage_low"]:
                 state["short_stage"] = 2
                 state["short_stage_low"] = low
-                qty = 2
+                qty = 1
             elif state["short_stage"] == 2 and close < state["short_stage_low"]:
                 state["short_stage"] = 3
                 state["short_stage_low"] = low
-                qty = 3
+                qty = 1
             elif state["short_stage"] == 3 and close < state["short_stage_low"]:
                 state["short_stage"] = 4
                 state["short_stage_low"] = low
-                qty = 4
+                qty = 1
             else:
                 return None
             return [
@@ -210,7 +194,6 @@ class FuturesEMAMomentum(IndiaMktMixins, BaseStrategy):
         # Flat: long only when supertrend green, short only when supertrend red
         if (
             is_supertrend_green
-            and base_ok
             and close > supertrend_value
             and close > ema5_high
         ):
@@ -237,7 +220,6 @@ class FuturesEMAMomentum(IndiaMktMixins, BaseStrategy):
             ]
         if (
             (not is_supertrend_green)
-            and base_ok
             and close < supertrend_value
             and close < ema5_low
         ):

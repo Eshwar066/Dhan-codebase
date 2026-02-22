@@ -2,14 +2,16 @@ import requests
 import json
 import os
 from datetime import datetime, date, timedelta
+from pathlib import Path
 import pdb
 
 BASE = "https://www.nseindia.com"
 EXPIRY_API = "/api/historicalOR/meta/foCPV/expireDts"
 HISTORICAL_API = "/api/historicalOR/foCPV"
 
-CACHE_DIR = "data_cache"
-os.makedirs(CACHE_DIR, exist_ok=True)
+# NSE cache: expiries, futures history, options history (JSON files)
+CACHE_DIR = Path("data_cache") / "nse_historical"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class NSEClient:
@@ -27,20 +29,22 @@ class NSEClient:
         self.session.get(BASE, timeout=self.timeout)
 
     # =========================
-    # FILE CACHE
+    # FILE CACHE (data_cache/nse_historical/*.json)
     # =========================
     def _cache_path(self, name):
-        return f"{CACHE_DIR}/{name}.json"
+        return CACHE_DIR / f"{name}.json"
 
     def _load_cache(self, name):
         path = self._cache_path(name)
-        if os.path.exists(path):
-            with open(path, "r") as f:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         return None
 
     def _save_cache(self, name, data):
-        with open(self._cache_path(name), "w") as f:
+        path = self._cache_path(name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
 
     # =========================================================

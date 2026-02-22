@@ -115,7 +115,7 @@ STRATEGY_JOBS = [
         "backtest": {
             "start_date": "2022-01-01",
             "end_date": "2026-02-20",
-            "timeframe": "60",
+            "timeframe": "1d",
         },
     },
     {

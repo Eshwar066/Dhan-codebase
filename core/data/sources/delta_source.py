@@ -8,10 +8,14 @@ from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 import requests
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from typing import Optional, Any
 
-
+from core.data.sources.delta_historical_cache import (
+    cache_key_delta_intraday,
+    load_df,
+    save_df,
+)
 from core.library.delta_rest_client import (
     DeltaRestClient,
     OrderType,
@@ -71,6 +75,23 @@ class DeltaSource:
     def client(self) -> DeltaRestClient:
         """Raw Delta REST client for advanced use."""
         return self._client
+
+    @staticmethod
+    def _to_date(value) -> Optional[date]:
+        """Normalize to date for range comparison."""
+        if value is None:
+            return None
+        if hasattr(value, "date") and callable(getattr(value, "date")):
+            return value.date() if isinstance(value, datetime) else value
+        if hasattr(value, "strftime"):
+            return value
+        s = str(value).strip()
+        if not s:
+            return None
+        try:
+            return datetime.fromisoformat(s[:10]).date()
+        except ValueError:
+            return datetime.strptime(s[:10], "%Y-%m-%d").date()
 
     # -------------------------------------------------------------------------
     # Products (symbol <-> product_id)
@@ -143,62 +164,54 @@ class DeltaSource:
                 continue
         return out if out else None
 
-    def get_intraday(
+    _RESOLUTION_MAP = {
+        "1": "1m",
+        "3": "3m",
+        "5": "5m",
+        "15": "15m",
+        "30": "30m",
+        "1h": "1h",
+        "60": "1h",
+        "2h": "2h",
+        "4h": "4h",
+        "6h": "6h",
+        "1d": "1d",
+        "1w": "1w",
+    }
+
+    def _fetch_intraday_range(
         self,
         symbol: str,
-        start_date: str,
-        end_date: str,
+        start_d: date,
+        end_d: date,
         timeframe: str,
-    ) -> Optional[Any]:
-
+    ) -> Optional[pd.DataFrame]:
+        """Fetch intraday candles for a date range from Delta API. Returns normalized DataFrame or None."""
         try:
-            # Convert to UNIX timestamps
-            start_ts = int(datetime.fromisoformat(start_date).timestamp())
-            end_ts = int(datetime.fromisoformat(end_date).timestamp())
-
-            # Map timeframe (if needed)
-            resolution_map = {
-                "1": "1m",
-                "3": "3m",
-                "5": "5m",
-                "15": "15m",
-                "30": "30m",
-                "1h": "1h",
-                "60": "1h",
-                "2h": "2h",
-                "4h": "4h",
-                "6h": "6h",
-                "1d": "1d",
-                "1w": "1w",
-            }
-
-            resolution = resolution_map.get(timeframe, "5m")
-
+            start_ts = int(datetime.combine(start_d, datetime.min.time()).timestamp())
+            end_ts = int(
+                datetime.combine(end_d, datetime.max.time()).replace(
+                    hour=23, minute=59, second=59, microsecond=999999
+                ).timestamp()
+            )
+            resolution = self._RESOLUTION_MAP.get(timeframe, "5m")
             url = "https://api.india.delta.exchange/v2/history/candles"
-
             headers = {"Accept": "application/json"}
-
             params = {
                 "resolution": resolution,
                 "symbol": symbol,
                 "start": start_ts,
                 "end": end_ts,
             }
-
             response = requests.get(url, params=params, headers=headers)
             response.raise_for_status()
-
             data = response.json()
-
             if not data.get("success"):
                 return None
-
             candles = data["result"]
-
-            # Convert to DataFrame
+            if not candles:
+                return None
             df = pd.DataFrame(candles)
-
-            # Rename columns to match your engine standard
             df.rename(
                 columns={
                     "time": "timestamp",
@@ -210,18 +223,123 @@ class DeltaSource:
                 },
                 inplace=True,
             )
-
-            # Convert timestamp to datetime
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
-
-            df.sort_values("timestamp", inplace=True)
-            df.reset_index(drop=True, inplace=True)
-
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+            df["time"] = df["timestamp"].dt.time
+            df = (
+                df.sort_values("timestamp")
+                .drop_duplicates(subset=["timestamp"])
+                .reset_index(drop=True)
+            )
             return df
-
         except Exception as e:
-            print(f"Delta get_intraday error: {e}")
+            print(f"Delta _fetch_intraday_range error: {e}")
             return None
+
+    def get_intraday(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        timeframe: str,
+    ) -> Optional[pd.DataFrame]:
+        """Long-term historical intraday. Cache key = symbol+timeframe. Returns requested range; fetches only missing dates and stitches into same cache file."""
+        cache_name = cache_key_delta_intraday(symbol, str(timeframe))
+        start_d = self._to_date(start_date)
+        end_d = self._to_date(end_date)
+        if start_d is None or end_d is None:
+            return None
+
+        cached = load_df(cache_name)
+        stitched = cached.copy() if cached is not None and not cached.empty else None
+
+        if (
+            stitched is not None
+            and not stitched.empty
+            and "timestamp" in stitched.columns
+        ):
+            stitched["timestamp"] = pd.to_datetime(stitched["timestamp"], utc=True)
+            stitched["time"] = stitched["timestamp"].dt.time
+            earliest = stitched["timestamp"].dt.date.min()
+            latest = stitched["timestamp"].dt.date.max()
+            if (
+                pd.notna(earliest)
+                and pd.notna(latest)
+                and earliest <= start_d
+                and latest >= end_d
+            ):
+                out = stitched[
+                    (stitched["timestamp"].dt.date >= start_d)
+                    & (stitched["timestamp"].dt.date <= end_d)
+                ].copy()
+                return out.reset_index(drop=True)
+
+        # Backward fetch: need data before current earliest
+        cache_earliest = (
+            stitched["timestamp"].dt.date.min()
+            if stitched is not None
+            and not stitched.empty
+            and "timestamp" in stitched.columns
+            else None
+        )
+        if (
+            cache_earliest is None
+            or pd.isna(cache_earliest)
+            or start_d < cache_earliest
+        ):
+            fetch_end = (
+                (cache_earliest - timedelta(days=1))
+                if cache_earliest is not None and pd.notna(cache_earliest)
+                else end_d
+            )
+            before = self._fetch_intraday_range(
+                symbol, start_d, fetch_end, timeframe
+            )
+            if before is not None and not before.empty:
+                stitched = (
+                    pd.concat([before, stitched], ignore_index=True)
+                    if stitched is not None and not stitched.empty
+                    else before
+                )
+            elif stitched is None:
+                stitched = before
+
+        if (
+            stitched is not None
+            and not stitched.empty
+            and "timestamp" in stitched.columns
+        ):
+            stitched["timestamp"] = pd.to_datetime(stitched["timestamp"], utc=True)
+            stitched["time"] = stitched["timestamp"].dt.time
+
+        # Forward fetch: need data after current latest
+        cache_latest = (
+            stitched["timestamp"].dt.date.max()
+            if stitched is not None and not stitched.empty
+            else None
+        )
+        if cache_latest is not None and pd.notna(cache_latest) and end_d > cache_latest:
+            fetch_start = cache_latest + timedelta(days=1)
+            after = self._fetch_intraday_range(
+                symbol, fetch_start, end_d, timeframe
+            )
+            if after is not None and not after.empty:
+                stitched = pd.concat([stitched, after], ignore_index=True)
+
+        if stitched is None or stitched.empty:
+            return None
+        stitched["timestamp"] = pd.to_datetime(stitched["timestamp"], utc=True)
+        stitched["time"] = stitched["timestamp"].dt.time
+        stitched = (
+            stitched.sort_values("timestamp")
+            .drop_duplicates(subset=["timestamp"])
+            .reset_index(drop=True)
+        )
+        save_df(cache_name, stitched)
+        out = stitched[
+            (stitched["timestamp"].dt.date >= start_d)
+            & (stitched["timestamp"].dt.date <= end_d)
+        ].copy()
+        return out.reset_index(drop=True)
 
     def get_live_expiry(self, symbol: str, exchange: str = None) -> List[Any]:
         """Expiry list from products (e.g. futures/options expiries)."""

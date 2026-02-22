@@ -1,6 +1,6 @@
 """
 NSE equity master downloader: fetches EQUITY_L.csv once per day,
-saves to data_cache/EQUITY_L_{YYYYMMDD}.csv and EQUITY_L_latest.csv.
+saves to Dependencies/equity_universe/EQUITY_L_{YYYYMMDD}.csv and EQUITY_L_latest.csv.
 No network calls inside strategy execution.
 """
 
@@ -21,11 +21,12 @@ REFERER = "https://www.nseindia.com/"
 class NseMasterDownloader:
     """
     Download EQUITY_L.csv once per day. Save as EQUITY_L_{YYYYMMDD}.csv and
-    EQUITY_L_latest.csv. Uses User-Agent and Referer headers. Errors are logged;
-    does not crash engine.
+    EQUITY_L_latest.csv under the given directory (e.g. Dependencies/equity_universe).
+    Uses User-Agent and Referer headers. Errors are logged; does not crash engine.
     """
 
     def __init__(self, cache_dir: Path):
+        """cache_dir: directory for equity universe files (e.g. Dependencies/equity_universe)."""
         self._cache_dir = Path(cache_dir)
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -66,6 +67,7 @@ class NseMasterDownloader:
         """
         If EQUITY_L_latest.csv is missing or outdated (no file for today), run download.
         Return path to EQUITY_L_latest.csv or None if download failed.
+        Directory is typically Dependencies/equity_universe.
         """
         latest_path = self._cache_dir / "EQUITY_L_latest.csv"
         today = datetime.now().strftime("%Y%m%d")

@@ -362,9 +362,9 @@ class EngineFactory:
             return None
         try:
             base_dir = config.base_dir
-            cache_dir = base_dir / "data_cache"
+            equity_universe_dir = base_dir / "Dependencies" / "equity_universe"
             return EquityUniverseService(
-                cache_dir=cache_dir,
+                cache_dir=equity_universe_dir,
                 data_provider=data_provider,
                 instrument_store=instrument_store,
                 engine_logger=engine_logger,
