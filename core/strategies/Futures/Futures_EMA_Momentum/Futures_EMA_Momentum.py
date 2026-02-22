@@ -20,10 +20,6 @@ class FuturesEMAMomentum(IndiaMktMixins, BaseStrategy):
     name = "Futures_EMA_Momentum"
     required_context = ["instrument_store"]
 
-    # Supertrend params (used by mixin _supertrend)
-    supertrend_atr_period = 10
-    supertrend_multiplier = 2.5
-
     def __init__(self):
         super().__init__()
         self._stage_state: Dict[str, Dict] = {}
@@ -46,14 +42,14 @@ class FuturesEMAMomentum(IndiaMktMixins, BaseStrategy):
             }
         return self._stage_state[symbol]
 
-    def _ema(self, values, period=5):
-        if len(values) < period:
-            return None
-        k = 2 / (period + 1)
-        ema = values[0]
-        for price in values[1:]:
-            ema = (price - ema) * k + ema
-        return ema
+    # def _ema(self, values, period=5):
+    #     if len(values) < period:
+    #         return None
+    #     k = 2 / (period + 1)
+    #     ema = values[0]
+    #     for price in values[1:]:
+    #         ema = (price - ema) * k + ema
+    #     return ema
 
     def on_candle(self, candle: Any, ctx: "StrategyContext") -> Optional[List[Any]]:
         symbol = candle["symbol"]
@@ -66,11 +62,6 @@ class FuturesEMAMomentum(IndiaMktMixins, BaseStrategy):
         if len(candles) < 15:
             return None
 
-        st_result = self._supertrend(candles)
-        if st_result is None:
-            return None
-        supertrend_value, is_supertrend_green = st_result
-
         highs = [c["high"] for c in candles]
         lows = [c["low"] for c in candles]
         ema5_high = self._ema(highs, 5)
@@ -79,12 +70,9 @@ class FuturesEMAMomentum(IndiaMktMixins, BaseStrategy):
             return None
 
         exchange = candle.get("exchange") or "DELTA"
-        if hasattr(ctx.instrument_store, "equity_intent_creation_details"):
-            inst = ctx.instrument_store.equity_intent_creation_details(symbol, exchange)
-        else:
-            inst = ctx.instrument_store.futures_intent_creation_details(
-                symbol, exchange, expiry=None
-            )
+        inst = ctx.instrument_store.futures_intent_creation_details(
+            symbol, exchange, expiry=None
+        )
         if inst is None:
             return None
 
@@ -99,13 +87,6 @@ class FuturesEMAMomentum(IndiaMktMixins, BaseStrategy):
         )
 
         if has_long:
-            # Only add to long when supertrend is green
-            if (
-                not is_supertrend_green
-                or close <= supertrend_value
-                or close <= ema5_high
-            ):
-                return None
             if state["long_stage"] == 0:
                 state["long_stage"] = 1
                 state["long_stage_high"] = high
@@ -146,13 +127,6 @@ class FuturesEMAMomentum(IndiaMktMixins, BaseStrategy):
             ]
 
         if has_short:
-            # Only add to short when supertrend is red
-            if (
-                is_supertrend_green
-                or close >= supertrend_value
-                or close >= ema5_low
-            ):
-                return None
             if state["short_stage"] == 0:
                 state["short_stage"] = 1
                 state["short_stage_low"] = low
@@ -191,12 +165,7 @@ class FuturesEMAMomentum(IndiaMktMixins, BaseStrategy):
                 )
             ]
 
-        # Flat: long only when supertrend green, short only when supertrend red
-        if (
-            is_supertrend_green
-            and close > supertrend_value
-            and close > ema5_high
-        ):
+        if close > ema5_high:
             state["long_stage"] = 1
             state["long_stage_high"] = high
             state["long_entry_low"] = low
@@ -218,11 +187,7 @@ class FuturesEMAMomentum(IndiaMktMixins, BaseStrategy):
                     action="ENTRY",
                 )
             ]
-        if (
-            (not is_supertrend_green)
-            and close < supertrend_value
-            and close < ema5_low
-        ):
+        if close < ema5_low:
             state["short_stage"] = 1
             state["short_stage_low"] = low
             state["short_entry_high"] = high
