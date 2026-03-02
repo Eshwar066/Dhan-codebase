@@ -24,8 +24,8 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
 
     def __init__(self):
         self.ema_period = 8
-        self.target_pct = 0.006
-        self.sl_pct = 0.004
+        self.target_pct = 0.018
+        self.sl_pct = 0.005
 
         # State
         self.last_exit_reason = None
