@@ -15,11 +15,12 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
     required_context = ["instrument", "qty", "intent_builder"]
     api = "DELTA"
 
-    # Macro trend filter (engine sets candle["htf_trend"] before should_evaluate):
-    # Option 2 (default): EMA slope — BULL only if ema_slope > threshold, BEAR only if < -threshold (tune for volatility).
     macro_ema_slope_period = 50
-    macro_ema_slope_threshold = 0.5  # slope ~ 0 stays None; raise for more filter, lower for more trades
-    # Option 1 (alternative): same-TF 100h EMA — set macro_ema_period = 100, comment out macro_ema_slope_period
+    macro_ema_slope_threshold = 0.5
+
+    atr_period = 14
+    atr_min = 0.003
+    atr_max = 0.015
 
     def __init__(self):
         self.ema_period = 8
@@ -43,7 +44,8 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
     # ----------------- Indicators -----------------
 
     def get_warmup_period(self):
-        return self.ema_period * 3
+        # ATR needs atr_period + a few bars to stabilize; ema needs ema_period * 3
+        return max(self.ema_period * 3, getattr(self, "atr_period", 14) + 5)
 
     def prepare_indicators(self, df):
         df["ema_high"] = df["high"].ewm(span=self.ema_period, adjust=False).mean()
@@ -109,7 +111,10 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
                     signal = None
 
         # Macro filter: LONG only if close > ema_100 (Option 1) or ema_slope > 0 (Option 2); SHORT only if opposite
-        if signal and (getattr(self, "macro_ema_slope_period", None) or getattr(self, "macro_ema_period", None)):
+        if signal and (
+            getattr(self, "macro_ema_slope_period", None)
+            or getattr(self, "macro_ema_period", None)
+        ):
             htf_trend = candle.get("htf_trend")
             if signal == "LONG" and htf_trend != "BULL":
                 signal = None
@@ -135,9 +140,41 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
 
     # ----------------- Entry -----------------
 
+    def _atr_filter_ok(self, candle, ctx: "StrategyContext") -> bool:
+        """True if ATR filter passes (or filter disabled). Uses IndiaMktMixins._atr. ATR as % of price (regime-stable)."""
+        atr_period = getattr(self, "atr_period", 14)
+        atr_min = getattr(self, "atr_min", None)
+        atr_max = getattr(self, "atr_max", None)
+        if atr_min is None and atr_max is None:
+            return True
+        recent = ctx.get_recent_candles(atr_period + 1)
+        if len(recent) < atr_period + 1:
+            return False
+        atr_list = self._atr(recent, atr_period)
+        if atr_list is None or len(atr_list) == 0:
+            return False
+        current_atr = atr_list[-1]
+        if current_atr is None or (
+            isinstance(current_atr, float)
+            and (pd.isna(current_atr) or current_atr <= 0)
+        ):
+            return False
+        price = float(candle.get("close") or 0)
+        if price <= 0:
+            return False
+        atr_pct = current_atr / price
+        if atr_min is not None and atr_pct < atr_min:
+            return False
+        if atr_max is not None and atr_pct > atr_max:
+            return False
+        return True
+
     def on_candle(self, candle, ctx: "StrategyContext"):
 
         if not self.current_signal:
+            return None
+
+        if not self._atr_filter_ok(candle, ctx):
             return None
 
         regime = self.compute_regime(candle)
