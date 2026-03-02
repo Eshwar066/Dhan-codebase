@@ -1,5 +1,6 @@
 import pandas as pd
 import talib
+import pdb
 
 from run.config import RUN_MODE, RunMode
 from core.strategies.base import BaseStrategy
@@ -52,6 +53,7 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         if not self._is_valid_time(ts, VALID_TIMES):
             return None
 
+        # pdb.set_trace()
         rsi = candle["rsi"]
         if rsi < 32:
             option_type = "CALL"

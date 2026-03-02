@@ -175,6 +175,7 @@ class PositionManager:
             raise TypeError(f"on_fill expects Instrument, got {type(instrument)}")
 
         with self._lock:
+            qty = 1
             sym = instrument.trading_symbol
             lot_size = instrument.lot_size
 
@@ -452,7 +453,9 @@ class PositionManager:
             if underlying:
                 # Match by trading_symbol (position key) so backtest symbol matches; fallback to custom_symbol
                 inst = pos.instrument
-                by_trading = (inst.trading_symbol or "").strip() == (underlying or "").strip()
+                by_trading = (inst.trading_symbol or "").strip() == (
+                    underlying or ""
+                ).strip()
                 by_custom = False
                 if getattr(inst, "custom_symbol", None):
                     parts = (inst.custom_symbol or "").strip().split()

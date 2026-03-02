@@ -28,10 +28,19 @@ class OrderRouter:
             self.intent_store.update(intent.intent_id, "REJECTED")
             return
 
-        if intent.price is None:
-            raise ValueError(f"No price available for intent {intent.intent_id}")
+        # Resolve execution price: intent.price first, else price_map (e.g. backtest candle close)
+        exec_price = intent.price
+        if exec_price is None and price_map:
+            sym = getattr(intent.instrument, "trading_symbol", None) if getattr(intent, "instrument", None) else None
+            if sym is not None:
+                exec_price = price_map.get(sym)
+        if exec_price is None:
+            raise ValueError(
+                f"No price available for intent {intent.intent_id} (intent.price=None and price_map has no "
+                f"entry for {getattr(getattr(intent, 'instrument', None), 'trading_symbol', '?')})"
+            )
 
-        exec_price = self.slippage_model(intent.price)
+        exec_price = self.slippage_model(exec_price)
         sym = intent.instrument.trading_symbol if hasattr(intent, "instrument") else ""
         side = getattr(intent, "side", "")
         qty = getattr(intent, "qty", 0)

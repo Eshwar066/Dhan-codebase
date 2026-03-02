@@ -1,7 +1,14 @@
 """
-Futures_EMA_Momentum: Supertrend + EMA breakout/breakdown, long and short.
-Supertrend green = long only; supertrend red = short only.
-For crypto/futures (DELTA/DHAN futures); uses futures_intent_creation_details.
+Futures_EMA_Momentum: Trend Breakout (EMA filter only).
+
+Trend defines direction. Donchian defines entry. No ATR/volatility gating.
+Simplified Turtle-style logic with trend bias. For crypto/futures (DELTA/DHAN).
+
+Entry:
+  Long:  close > EMA(200) and close > donchian_high (previous N bars, excl. current)
+  Short: close < EMA(200) and close < donchian_low (previous N bars, excl. current)
+Stop: 2 × ATR(14)
+Risk per trade: 1% (sizing may require engine/capital context)
 """
 
 import uuid
@@ -15,6 +22,15 @@ if TYPE_CHECKING:
     from core.models.strategy_context import StrategyContext
 
 
+# Clean parameter set (e.g. BTC Daily)
+EMA_TREND_PERIOD = 200
+DONCHIAN_PERIOD = 20   # or test 55
+ATR_PERIOD = 14
+ATR_STOP_MULT = 2.0   # stop = 2 × ATR(14)
+RISK_PER_TRADE_PCT = 0.01   # 1%; sizing needs capital from engine if applied
+MAX_QTY = 1
+
+
 class FuturesEMAMomentum(IndiaMktMixins, BaseStrategy):
 
     name = "Futures_EMA_Momentum"
@@ -24,50 +40,107 @@ class FuturesEMAMomentum(IndiaMktMixins, BaseStrategy):
         super().__init__()
         self._stage_state: Dict[str, Dict] = {}
 
+    def get_warmup_period(self):
+        return max(EMA_TREND_PERIOD + 20, DONCHIAN_PERIOD + ATR_PERIOD + 5)
+
     def should_evaluate(self, candle: Any) -> bool:
-        close = candle.get("close")
-        if close is None:
-            return False
-        return True
+        return candle.get("close") is not None
 
     def _get_symbol_state(self, symbol: str) -> Dict:
         if symbol not in self._stage_state:
             self._stage_state[symbol] = {
-                "long_stage": 0,
-                "long_stage_high": None,
-                "long_entry_low": None,
-                "short_stage": 0,
-                "short_stage_low": None,
-                "short_entry_high": None,
+                "long_entry_price": None,
+                "long_entry_atr": None,
+                "short_entry_price": None,
+                "short_entry_atr": None,
             }
         return self._stage_state[symbol]
 
-    # def _ema(self, values, period=5):
-    #     if len(values) < period:
-    #         return None
-    #     k = 2 / (period + 1)
-    #     ema = values[0]
-    #     for price in values[1:]:
-    #         ema = (price - ema) * k + ema
-    #     return ema
+    @staticmethod
+    def _ema(values: List[float], period: int) -> Optional[float]:
+        if len(values) < period:
+            return None
+        k = 2 / (period + 1)
+        ema = values[0]
+        for price in values[1:]:
+            ema = (price - ema) * k + ema
+        return ema
+
+    @staticmethod
+    def _atr(
+        highs: List[float], lows: List[float], closes: List[float], period: int
+    ) -> Optional[float]:
+        if (
+            len(highs) < period + 1
+            or len(lows) < period + 1
+            or len(closes) < period + 1
+        ):
+            return None
+        tr_list = []
+        for i in range(1, len(closes)):
+            high, low, prev_close = highs[i], lows[i], closes[i - 1]
+            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+            tr_list.append(tr)
+        if len(tr_list) < period:
+            return None
+        k = 2 / (period + 1)
+        atr = sum(tr_list[:period]) / period
+        for tr in tr_list[period:]:
+            atr = (tr - atr) * k + atr
+        return atr
+
+    def _donchian_high(
+        self, highs: List[float], period: int = DONCHIAN_PERIOD
+    ) -> Optional[float]:
+        """Previous N bars only, excluding current bar."""
+        if len(highs) < period + 1:
+            return None
+        return max(highs[-period - 1 : -1])
+
+    def _donchian_low(
+        self, lows: List[float], period: int = DONCHIAN_PERIOD
+    ) -> Optional[float]:
+        """Previous N bars only, excluding current bar."""
+        if len(lows) < period + 1:
+            return None
+        return min(lows[-period - 1 : -1])
 
     def on_candle(self, candle: Any, ctx: "StrategyContext") -> Optional[List[Any]]:
         symbol = candle["symbol"]
-        close = candle["close"]
-        high = candle["high"]
-        low = candle["low"]
+        close = float(candle["close"])
+        high = float(candle["high"])
+        low = float(candle["low"])
 
         state = self._get_symbol_state(symbol)
-        candles = ctx.get_recent_candles(25)
-        if len(candles) < 15:
+        n_need = max(EMA_TREND_PERIOD + 20, DONCHIAN_PERIOD + ATR_PERIOD + 5)
+        candles = ctx.get_recent_candles(n_need)
+        if len(candles) < EMA_TREND_PERIOD:
             return None
 
-        highs = [c["high"] for c in candles]
-        lows = [c["low"] for c in candles]
-        ema5_high = self._ema(highs, 5)
-        ema5_low = self._ema(lows, 5)
-        if ema5_high is None or ema5_low is None:
+        closes = [float(c["close"]) for c in candles]
+        highs = [float(c["high"]) for c in candles]
+        lows = [float(c["low"]) for c in candles]
+
+        ema_200 = self._ema(closes, EMA_TREND_PERIOD)
+        donchian_high = self._donchian_high(highs, DONCHIAN_PERIOD)
+        donchian_low = self._donchian_low(lows, DONCHIAN_PERIOD)
+        atr = self._atr(highs, lows, closes, ATR_PERIOD)
+
+        if (
+            ema_200 is None
+            or donchian_high is None
+            or donchian_low is None
+            or atr is None
+        ):
             return None
+
+        # Trend defines direction
+        long_trend_ok = close > ema_200
+        short_trend_ok = close < ema_200
+
+        # Donchian defines entry (previous N bars, excl. current)
+        long_entry = long_trend_ok and close > donchian_high
+        short_entry = short_trend_ok and close < donchian_low
 
         exchange = candle.get("exchange") or "DELTA"
         inst = ctx.instrument_store.futures_intent_creation_details(
@@ -76,7 +149,6 @@ class FuturesEMAMomentum(IndiaMktMixins, BaseStrategy):
         if inst is None:
             return None
 
-        # Prefer LONG if we already have open long (scale-in only)
         structure_long = self.build_structure_id(candle, "LONG")
         structure_short = self.build_structure_id(candle, "SHORT")
         has_long = ctx.position_store.has_open_structure(
@@ -86,96 +158,21 @@ class FuturesEMAMomentum(IndiaMktMixins, BaseStrategy):
             strategy=self.name, structure_id=structure_short, tag="MAIN"
         )
 
-        if has_long:
-            if state["long_stage"] == 0:
-                state["long_stage"] = 1
-                state["long_stage_high"] = high
-                state["long_entry_low"] = low
-                qty = 1
-            elif state["long_stage"] == 1 and close > state["long_stage_high"]:
-                state["long_stage"] = 2
-                state["long_stage_high"] = high
-                qty = 1
-            elif state["long_stage"] == 2 and close > state["long_stage_high"]:
-                state["long_stage"] = 3
-                state["long_stage_high"] = high
-                qty = 1
-            elif state["long_stage"] == 3 and close > state["long_stage_high"]:
-                state["long_stage"] = 4
-                state["long_stage_high"] = high
-                qty = 1
-            else:
-                return None
-            action = "SCALE_IN"
+        if has_long or has_short:
+            return None
+
+        qty = max(1, MAX_QTY)
+
+        if long_entry:
+            state["long_entry_price"] = close
+            state["long_entry_atr"] = atr
             return [
                 OrderIntent(
                     intent_id=uuid.uuid4().hex,
                     instrument=inst,
                     side="BUY",
                     qty=qty,
-                    price=float(close),
-                    order_type="LIMIT",
-                    strategy=self.name,
-                    structure_id=structure_long,
-                    trade_type="MARGIN",
-                    tag="MAIN",
-                    candle_ts=candle["timestamp"],
-                    parent_intent_id=None,
-                    symbol=symbol,
-                    action="SCALE_IN",
-                )
-            ]
-
-        if has_short:
-            if state["short_stage"] == 0:
-                state["short_stage"] = 1
-                state["short_stage_low"] = low
-                state["short_entry_high"] = high
-                qty = 1
-            elif state["short_stage"] == 1 and close < state["short_stage_low"]:
-                state["short_stage"] = 2
-                state["short_stage_low"] = low
-                qty = 1
-            elif state["short_stage"] == 2 and close < state["short_stage_low"]:
-                state["short_stage"] = 3
-                state["short_stage_low"] = low
-                qty = 1
-            elif state["short_stage"] == 3 and close < state["short_stage_low"]:
-                state["short_stage"] = 4
-                state["short_stage_low"] = low
-                qty = 1
-            else:
-                return None
-            return [
-                OrderIntent(
-                    intent_id=uuid.uuid4().hex,
-                    instrument=inst,
-                    side="SELL",
-                    qty=qty,
-                    price=float(close),
-                    order_type="LIMIT",
-                    strategy=self.name,
-                    structure_id=structure_short,
-                    trade_type="MARGIN",
-                    tag="MAIN",
-                    candle_ts=candle["timestamp"],
-                    parent_intent_id=None,
-                    symbol=symbol,
-                    action="SCALE_IN",
-                )
-            ]
-
-        if close > ema5_high:
-            state["long_stage"] = 1
-            state["long_stage_high"] = high
-            state["long_entry_low"] = low
-            return [
-                OrderIntent(
-                    intent_id=uuid.uuid4().hex,
-                    instrument=inst,
-                    side="BUY",
-                    qty=1,
-                    price=float(close),
+                    price=close,
                     order_type="LIMIT",
                     strategy=self.name,
                     structure_id=structure_long,
@@ -187,17 +184,17 @@ class FuturesEMAMomentum(IndiaMktMixins, BaseStrategy):
                     action="ENTRY",
                 )
             ]
-        if close < ema5_low:
-            state["short_stage"] = 1
-            state["short_stage_low"] = low
-            state["short_entry_high"] = high
+
+        if short_entry:
+            state["short_entry_price"] = close
+            state["short_entry_atr"] = atr
             return [
                 OrderIntent(
                     intent_id=uuid.uuid4().hex,
                     instrument=inst,
                     side="SELL",
-                    qty=1,
-                    price=float(close),
+                    qty=qty,
+                    price=close,
                     order_type="LIMIT",
                     strategy=self.name,
                     structure_id=structure_short,
@@ -218,28 +215,31 @@ class FuturesEMAMomentum(IndiaMktMixins, BaseStrategy):
             return False
         symbol = candle["symbol"]
         state = self._get_symbol_state(symbol)
-        close = candle["close"]
+        close = float(candle["close"])
 
-        candles = ctx.get_recent_candles(5)
-        if len(candles) < 2:
+        candles = ctx.get_recent_candles(ATR_PERIOD + 5)
+        if len(candles) < ATR_PERIOD + 1:
             return False
-        highs = [c["high"] for c in candles]
-        lows = [c["low"] for c in candles]
-        ema5_high = self._ema(highs, 5)
-        ema5_low = self._ema(lows, 5)
-        if ema5_high is None or ema5_low is None:
+        highs = [float(c["high"]) for c in candles]
+        lows = [float(c["low"]) for c in candles]
+        closes = [float(c["close"]) for c in candles]
+        atr = self._atr(highs, lows, closes, ATR_PERIOD)
+        if atr is None:
             return False
+
+        stop_dist = ATR_STOP_MULT * atr
 
         if position.net_qty > 0:
-            # Long exit
-            if state["long_stage"] == 1:
-                return close < state["long_entry_low"]
-            return close < ema5_low or close < state["long_entry_low"]
+            entry = state.get("long_entry_price")
+            if entry is not None and stop_dist > 0 and close <= entry - stop_dist:
+                return True
+            return False
+
         if position.net_qty < 0:
-            # Short exit
-            if state["short_stage"] == 1:
-                return close > state["short_entry_high"]
-            return close > ema5_high or close > state["short_entry_high"]
+            entry = state.get("short_entry_price")
+            if entry is not None and stop_dist > 0 and close >= entry + stop_dist:
+                return True
+            return False
         return False
 
     def on_position_exit(
@@ -285,10 +285,8 @@ class FuturesEMAMomentum(IndiaMktMixins, BaseStrategy):
             return
         s = self._stage_state[symbol]
         if structure_id and "LONG" in str(structure_id):
-            s["long_stage"] = 0
-            s["long_stage_high"] = None
-            s["long_entry_low"] = None
+            s["long_entry_price"] = None
+            s["long_entry_atr"] = None
         elif structure_id and "SHORT" in str(structure_id):
-            s["short_stage"] = 0
-            s["short_stage_low"] = None
-            s["short_entry_high"] = None
+            s["short_entry_price"] = None
+            s["short_entry_atr"] = None

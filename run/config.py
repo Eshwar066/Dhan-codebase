@@ -17,13 +17,13 @@ STRATEGY_JOBS = [
     {
         "name": "LEAPS_RSI",
         "venue": "DHAN",
-        "enabled": False,
+        "enabled": True,
         "capital": 200000,
         "symbols": ["NIFTY"],
         "live": {"exchange": "INDEX", "sector": "YES", "rsi": "YES"},
         "backtest": {
             "start_date": "2023-10-19",
-            "end_date": "2024-02-28",
+            "end_date": "2026-02-20",
             "timeframe": "60",
             "exchange": "INDEX",
             "sector": "YES",
@@ -40,8 +40,8 @@ STRATEGY_JOBS = [
         "delta_testnet": False,
         "live": {"exchange": "INDEX", "sector": "YES"},
         "backtest": {
-            "start_date": "2024-03-20",
-            "end_date": "2025-03-30",
+            "start_date": "2022-01-01",
+            "end_date": "2026-02-20",
             "timeframe": "60",
             "exchange": "INDEX",
             "sector": "YES",
@@ -78,7 +78,7 @@ STRATEGY_JOBS = [
     {
         "name": "IPOBreakout",
         "venue": "DHAN",
-        "enabled": True,
+        "enabled": False,
         "engine_id": "dhan_ipo_breakout",
         "capital": 200000,
         "symbols": None,
@@ -104,9 +104,9 @@ STRATEGY_JOBS = [
     {
         "name": "Futures_EMA_Momentum",
         "venue": "DELTA",
-        "enabled": True,
+        "enabled": False,
         "engine_id": "dhan_ipo_breakout",
-        "capital": 200000,
+        "capital": 200000000,
         "symbols": ["BTCUSD"],
         "instrument": "FUTURES",
         "delta_india": True,
@@ -115,7 +115,7 @@ STRATEGY_JOBS = [
         "backtest": {
             "start_date": "2022-01-01",
             "end_date": "2026-02-20",
-            "timeframe": "1d",
+            "timeframe": "60",
         },
     },
     {

@@ -54,6 +54,11 @@ class BacktestEngine(BaseEngine):
             df["exchange"] = exchange
 
             # -------- Indicators --------
+            if self.broker_name == "DHAN" and "timestamp" in df.columns:
+                ts_col = pd.to_datetime(df["timestamp"], utc=True)
+                df["timestamp"] = ts_col.dt.tz_convert("Asia/Kolkata")
+            if "time" in df.columns:
+                df["time"] = df["timestamp"].dt.time
             df = self.strategy.prepare_indicators(df)
             warmup = self.strategy.get_warmup_period()
             df = df.iloc[warmup:].reset_index(drop=True)

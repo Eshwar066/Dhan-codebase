@@ -78,6 +78,7 @@ def run_engine(config: EngineConfig) -> None:
             exchange=bt.get("exchange", "INDEX"),
             sector=bt.get("sector", "NO"),
         )
+        print("Done.")
     else:
         live_cfg = config.live or {}
         engine.start(
@@ -106,6 +107,7 @@ def main():
             print(f"No enabled jobs for venue {args.venue}")
             sys.exit(0)
 
+    print(f"Run mode: {RUN_MODE.value} | Jobs: {[c.strategy_name for c in configs]}")
     for config in configs:
         run_engine(config)
 
