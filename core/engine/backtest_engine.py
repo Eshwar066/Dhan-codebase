@@ -15,6 +15,7 @@ class BacktestEngine(BaseEngine):
         order_router,
         position_manager,
         universe_service=None,
+        broker_name=None,
     ):
         super().__init__(
             strategy=strategy,
@@ -25,7 +26,8 @@ class BacktestEngine(BaseEngine):
         )
         self.order_router = order_router
         self.position_manager = position_manager
-        # 🔔 Wire structure-exit callback (ONE TIME)
+        self.broker_name = broker_name or ""
+        # Wire structure-exit callback (ONE TIME)
         self.position_manager.on_structure_exit = strategy.on_structure_exit
 
     # ==========================================================
@@ -71,8 +73,9 @@ class BacktestEngine(BaseEngine):
                 candle = row.to_dict()
                 ts = pd.to_datetime(candle["timestamp"])
 
-                if ts.weekday() >= 5:
-                    continue
+                # Skip weekends for equity/index; crypto (DELTA) runs 24/7
+                # if self.broker_name != "DELTA" and ts.weekday() >= 5:
+                #     continue
 
                 candle_buffer.append(candle)
 

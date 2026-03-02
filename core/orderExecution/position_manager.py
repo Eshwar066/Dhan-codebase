@@ -48,6 +48,7 @@ class Position:
         self.net_qty = 0
         self.avg_price = 0.0
         self.realized_pnl = 0.0
+        self.cumulative_pnl = 0.0
 
         self.trade_id = None
         self.entry_price = None
@@ -111,6 +112,7 @@ class Position:
 
             pnl *= self.instrument.lot_size
             self.realized_pnl = pnl
+            self.cumulative_pnl += pnl
 
             self.net_qty += signed_qty
 
@@ -230,6 +232,7 @@ class PositionManager:
             if self.logger:
                 # PnL only on EXIT; leave blank on ENTRY/SCALE_IN
                 pnl_val = pos.realized_pnl if trade_type == "EXIT" else ""
+                cumulative_val = pos.cumulative_pnl if trade_type == "EXIT" else ""
                 row = {
                     "candle_timestamp": (
                         candle_ts.strftime("%Y-%m-%d %H:%M")
@@ -243,6 +246,7 @@ class PositionManager:
                     "qty": qty,
                     "price": price,
                     "pnl": pnl_val,
+                    "cumulative_pnl": cumulative_val,
                     "net_qty_after": new_qty,
                     # "order_id": order_id,
                     # "intent_id": intent_id,

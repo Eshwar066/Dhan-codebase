@@ -127,6 +127,7 @@ class EngineFactory:
             order_router=order_router,
             position_manager=position_manager,
             universe_service=universe_service,
+            broker_name=config.broker_name,
         )
 
     @staticmethod

@@ -14,6 +14,7 @@ RUN_MODE = RunMode.BACKTEST
 DEFAULT_VENUE = "DELTA"  # "DHAN" | "DELTA"
 
 STRATEGY_JOBS = [
+    # leaps rsi 52 32 for dhan
     {
         "name": "LEAPS_RSI",
         "venue": "DHAN",
@@ -29,10 +30,11 @@ STRATEGY_JOBS = [
             "sector": "YES",
         },
     },
+    # ema 5, 0.7 for profit  and 0.3 for loss used both for nifty and btc, etc
     {
         "name": "FuturesEMAHighLow",
         "venue": "DELTA",
-        "enabled": False,
+        "enabled": True,
         "capital": 200000,
         "symbols": ["BTCUSD"],
         "instrument": "FUTURES",
@@ -40,8 +42,8 @@ STRATEGY_JOBS = [
         "delta_testnet": False,
         "live": {"exchange": "INDEX", "sector": "YES"},
         "backtest": {
-            "start_date": "2022-01-01",
-            "end_date": "2026-02-20",
+            "start_date": "2024-01-01",
+            "end_date": "2026-03-02",
             "timeframe": "60",
             "exchange": "INDEX",
             "sector": "YES",
