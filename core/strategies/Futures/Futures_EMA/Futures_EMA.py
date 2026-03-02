@@ -3,7 +3,6 @@ from typing import TYPE_CHECKING, Optional
 from core.strategies.base import BaseStrategy
 from core.strategies.IndiaMktMixins import IndiaMktMixins
 from datetime import datetime, timedelta
-import pdb
 
 if TYPE_CHECKING:
     from core.models.strategy_context import StrategyContext
@@ -15,6 +14,12 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
     timeframe = "60"
     required_context = ["instrument", "qty", "intent_builder"]
     api = "DELTA"
+
+    # Macro trend filter (engine sets candle["htf_trend"] before should_evaluate):
+    # Option 2 (default): EMA slope — BULL only if ema_slope > threshold, BEAR only if < -threshold (tune for volatility).
+    macro_ema_slope_period = 50
+    macro_ema_slope_threshold = 0.5  # slope ~ 0 stays None; raise for more filter, lower for more trades
+    # Option 1 (alternative): same-TF 100h EMA — set macro_ema_period = 100, comment out macro_ema_slope_period
 
     def __init__(self):
         self.ema_period = 8
@@ -103,6 +108,14 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
                 else:
                     signal = None
 
+        # Macro filter: LONG only if close > ema_100 (Option 1) or ema_slope > 0 (Option 2); SHORT only if opposite
+        if signal and (getattr(self, "macro_ema_slope_period", None) or getattr(self, "macro_ema_period", None)):
+            htf_trend = candle.get("htf_trend")
+            if signal == "LONG" and htf_trend != "BULL":
+                signal = None
+            elif signal == "SHORT" and htf_trend != "BEAR":
+                signal = None
+
         self.current_signal = signal
         self._update_previous(candle)
         return signal is not None
@@ -133,7 +146,6 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
         hasOpenPosition = ctx.position_store.has_open_structure(
             strategy=self.name, structure_id=structure_id, tag="MAIN"
         )
-        # pdb.set_trace()
         if hasOpenPosition:
             return None
 

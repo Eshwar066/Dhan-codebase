@@ -55,6 +55,24 @@ class BacktestEngine(BaseEngine):
             df["symbol"] = symbol
             df["exchange"] = exchange
 
+            # -------- ema  slop used in btc: Macro trend filter (same-TF): set candle["htf_trend"] before should_evaluate --------
+            macro_slope = getattr(self.strategy, "macro_ema_slope_period", None)
+            macro_ema = getattr(self.strategy, "macro_ema_period", None)
+            slope_threshold = getattr(self.strategy, "macro_ema_slope_threshold", 0.5)
+            if macro_slope is not None:
+                df["ema_50"] = df["close"].ewm(span=macro_slope, adjust=False).mean()
+                df["ema_slope"] = df["ema_50"].diff()
+                df["htf_trend"] = None
+                df.loc[df["ema_slope"] > slope_threshold, "htf_trend"] = "BULL"
+                df.loc[df["ema_slope"] < -slope_threshold, "htf_trend"] = "BEAR"
+            elif macro_ema is not None:
+                df["ema_100"] = df["close"].ewm(span=macro_ema, adjust=False).mean()
+                df["htf_trend"] = None
+                df.loc[df["close"] > df["ema_100"], "htf_trend"] = "BULL"
+                df.loc[df["close"] < df["ema_100"], "htf_trend"] = "BEAR"
+            else:
+                df["htf_trend"] = None
+
             # -------- Indicators --------
             if self.broker_name == "DHAN" and "timestamp" in df.columns:
                 ts_col = pd.to_datetime(df["timestamp"], utc=True)
@@ -63,15 +81,19 @@ class BacktestEngine(BaseEngine):
                 df["time"] = df["timestamp"].dt.time
             df = self.strategy.prepare_indicators(df)
             warmup = self.strategy.get_warmup_period()
-            df = df.iloc[warmup:].reset_index(drop=True)
+            # Include macro EMA warmup so first ~50 (slope) or ~100 (ema) candles are stable
+            macro_warmup = max(warmup, macro_slope or 0, macro_ema or 0)
+            df = df.iloc[macro_warmup:].reset_index(drop=True)
 
             # Rolling buffer of recent candles for this symbol (max 50)
             candle_buffer = deque(maxlen=50)
 
-            # -------- Candle loop --------
+            # -------- Candle loop (candle["htf_trend"] already set above for macro filter) --------
             for _, row in df.iterrows():
                 candle = row.to_dict()
                 ts = pd.to_datetime(candle["timestamp"])
+                if "htf_trend" not in candle or pd.isna(candle.get("htf_trend")):
+                    candle["htf_trend"] = None
 
                 # Skip weekends for equity/index; crypto (DELTA) runs 24/7
                 # if self.broker_name != "DELTA" and ts.weekday() >= 5:
