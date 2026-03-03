@@ -23,8 +23,8 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
     atr_max = 0.015
 
     def __init__(self):
-        self.ema_period = 8
-        self.target_pct = 0.018
+        self.ema_period = 5
+        self.target_pct = 0.025
         self.sl_pct = 0.005
 
         # State
@@ -48,6 +48,24 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
         return max(self.ema_period * 3, getattr(self, "atr_period", 14) + 5)
 
     def prepare_indicators(self, df):
+        # Macro / HTF trend (same-TF): used by should_evaluate; shared by backtest and live
+        macro_slope = getattr(self, "macro_ema_slope_period", None)
+        macro_ema = getattr(self, "macro_ema_period", None)
+        slope_threshold = getattr(self, "macro_ema_slope_threshold", 0.5)
+        if macro_slope is not None:
+            df["ema_50"] = df["close"].ewm(span=macro_slope, adjust=False).mean()
+            df["ema_slope"] = df["ema_50"].diff()
+            df["htf_trend"] = None
+            df.loc[df["ema_slope"] > slope_threshold, "htf_trend"] = "BULL"
+            df.loc[df["ema_slope"] < -slope_threshold, "htf_trend"] = "BEAR"
+        elif macro_ema is not None:
+            df["ema_100"] = df["close"].ewm(span=macro_ema, adjust=False).mean()
+            df["htf_trend"] = None
+            df.loc[df["close"] > df["ema_100"], "htf_trend"] = "BULL"
+            df.loc[df["close"] < df["ema_100"], "htf_trend"] = "BEAR"
+        else:
+            df["htf_trend"] = None
+
         df["ema_high"] = df["high"].ewm(span=self.ema_period, adjust=False).mean()
         df["ema_low"] = df["low"].ewm(span=self.ema_period, adjust=False).mean()
         return df
@@ -123,6 +141,7 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
 
         self.current_signal = signal
         self._update_previous(candle)
+
         return signal is not None
 
     # ----------------- Regime -----------------

@@ -86,7 +86,11 @@ class LiveEngine(BaseEngine):
         universe_service: Optional[Any] = None,
     ):
         super().__init__(
-            strategy, data, instrument_store, position_manager, universe_service=universe_service
+            strategy,
+            data,
+            instrument_store,
+            position_manager,
+            universe_service=universe_service,
         )
         self.symbols = symbols
         self.candle_service = candle_service
@@ -242,6 +246,7 @@ class LiveEngine(BaseEngine):
         Fetch broker positions, sync PositionManager to broker truth, log any mismatch.
         Must run before live loop starts.
         """
+
         broker = getattr(self.order_router, "broker", None)
         if not broker or not hasattr(broker, "get_positions_for_recon"):
             if self.engine_logger:
@@ -288,6 +293,7 @@ class LiveEngine(BaseEngine):
             self.engine_logger.reconciliation(
                 "Position mismatch; syncing PM to broker", details={"diff": diff}
             )
+
         self.position_manager.reconcile_with_broker(broker_positions)
 
     def _is_closed_candle(
