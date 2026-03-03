@@ -112,6 +112,7 @@ class DeltaWebSocketFeed(RealtimeFeed):
         channels = [
             {"name": "v2/ticker", "symbols": self.symbols},
             {"name": self._channel_candlestick(), "symbols": self.symbols},
+            {"name": "l2_orderbook", "symbols": self.symbols},
         ]
         self._ws.subscribe(channels)
 
@@ -180,6 +181,42 @@ class DeltaWebSocketFeed(RealtimeFeed):
             "volume": raw.get("volume", 0),
             "timestamp": ts or raw.get("timestamp"),
         }
+
+    def get_last_l2_orderbook(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Raw L2 order book for symbol (bids/asks). Used for best bid/ask."""
+        if not self._ws:
+            return None
+        return self._ws.get_last_l2_orderbook(symbol)
+
+    def get_best_bid(self, symbol: str) -> Optional[float]:
+        """Best bid price for symbol from L2 order book. For Delta limit BUY at best bid."""
+        ob = self.get_last_l2_orderbook(symbol)
+        if not ob:
+            return None
+        bids = ob.get("bids") or ob.get("buy") or []
+        if not bids:
+            return None
+        first = bids[0]
+        if isinstance(first, (list, tuple)) and len(first) >= 1:
+            return float(first[0])
+        if isinstance(first, dict):
+            return float(first.get("price", first.get("price_str", 0)))
+        return None
+
+    def get_best_ask(self, symbol: str) -> Optional[float]:
+        """Best ask price for symbol from L2 order book. For Delta limit SELL at best ask."""
+        ob = self.get_last_l2_orderbook(symbol)
+        if not ob:
+            return None
+        asks = ob.get("asks") or ob.get("sell") or []
+        if not asks:
+            return None
+        first = asks[0]
+        if isinstance(first, (list, tuple)) and len(first) >= 1:
+            return float(first[0])
+        if isinstance(first, dict):
+            return float(first.get("price", first.get("price_str", 0)))
+        return None
 
     def get_orders(self, symbol: str) -> List[Dict[str, Any]]:
         if not self._ws:

@@ -320,9 +320,17 @@ class IndiaMktMixins:
         tag=None,
         parent_intent_id=None,
     ):
-
-        # Futures always use candle close
-        ltp = float(strike_row["close"])
+        # Execution price: for Delta use best_bid (BUY) / best_ask (SELL) when available; else close
+        api = getattr(self, "api", "NSE")
+        if api == "DELTA":
+            if side == "BUY" and strike_row.get("best_bid") is not None:
+                ltp = float(strike_row["best_bid"])
+            elif side == "SELL" and strike_row.get("best_ask") is not None:
+                ltp = float(strike_row["best_ask"])
+            else:
+                ltp = float(strike_row["close"])
+        else:
+            ltp = float(strike_row["close"])
 
         return OrderIntent(
             intent_id=uuid.uuid4().hex,

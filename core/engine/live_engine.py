@@ -422,7 +422,7 @@ class LiveEngine(BaseEngine):
             pass
 
         self.reconcile_positions_on_start()
-        pdb.set_trace()
+        # pdb.set_trace()
         # if not self.reconcile_positions_on_start():
         #     self.engine_logger.log("critical", "Startup reconciliation failed")
         #     return
@@ -541,6 +541,7 @@ class LiveEngine(BaseEngine):
                     ):
                         continue
 
+                    self._enrich_candle_depth(symbol, candle)
                     pdb.set_trace()
                     self._run_strategy(
                         symbol,
@@ -597,6 +598,7 @@ class LiveEngine(BaseEngine):
                                 )
                         continue
                     strategy_time_ms = (time.perf_counter() - t0) * 1000
+                    self._enrich_candle_depth(symbol, candle)
                     self._run_strategy(
                         symbol,
                         candle,
@@ -663,6 +665,24 @@ class LiveEngine(BaseEngine):
                 return candles[symbol]["close"]
         return None
 
+    def _enrich_candle_depth(self, symbol: str, candle: Dict[str, Any]) -> None:
+        """For Delta: set candle['best_bid'] and candle['best_ask'] from L2 so strategy can place at best bid/ask."""
+        if (
+            self.venue != "DELTA"
+            or not self.realtime_feed
+            or not hasattr(self.realtime_feed, "get_best_bid")
+        ):
+            return
+        try:
+            bid = self.realtime_feed.get_best_bid(symbol)
+            ask = self.realtime_feed.get_best_ask(symbol)
+            if bid is not None:
+                candle["best_bid"] = bid
+            if ask is not None:
+                candle["best_ask"] = ask
+        except Exception:
+            pass
+
     def _run_strategy(
         self,
         symbol,
@@ -683,8 +703,8 @@ class LiveEngine(BaseEngine):
                 exit_intents = (
                     self.strategy.on_position_exit(position, candle, ctx) or []
                 )
-                price_map = self.get_price_map(symbol)
-                if price_map is not None and exit_intents:
+                exit_price = self.get_price_map(symbol)
+                if exit_price is not None and exit_intents:
                     if self.engine_logger:
                         self.engine_logger.exit_triggered(
                             symbol,
@@ -693,6 +713,11 @@ class LiveEngine(BaseEngine):
                             "Strategy exit",
                         )
                     for exit_intent in exit_intents:
+                        price_map = {
+                            getattr(
+                                exit_intent.instrument, "trading_symbol", symbol
+                            ): exit_price
+                        }
                         self.order_router.process_intent(exit_intent, price_map)
 
         entry_intents = (
@@ -738,10 +763,14 @@ class LiveEngine(BaseEngine):
                         threshold_ms=self.strategy_timeout_seconds * 1000.0,
                     )
                 return
-            price_map = candle.get("close")
-            if price_map is not None:
+            exec_price = getattr(single_intent, "price", None) or candle.get("close")
+            if exec_price is not None:
                 self._last_signal_hash_per_symbol[symbol] = signal_hash
                 t0 = time.perf_counter()
+                trading_sym = getattr(
+                    getattr(single_intent, "instrument", None), "trading_symbol", symbol
+                )
+                price_map = {trading_sym: exec_price}
                 self.order_router.process_intent(single_intent, price_map)
                 broker_latency_ms = (time.perf_counter() - t0) * 1000
                 total_ms = (strategy_time_ms or 0) + broker_latency_ms
