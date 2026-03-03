@@ -26,7 +26,7 @@ from core.engine.base_engine import BaseEngine
 from core.engine.backtest_engine import BacktestEngine
 from core.engine.live_engine import LiveEngine
 from core.data.sources.dhan_source import DhanSource
-from core.data.sources.delta_source import DeltaSource
+from core.data.sources.delta_source import DeltaSource, DELTA_BASE_URL_INDIA_TEST
 from core.data.datalayer import DhanDataProvider, DeltaDataProvider
 from core.data.candle_service import CandleService
 from core.data.candle_aggregator import CandleAggregator
@@ -309,7 +309,10 @@ class EngineFactory:
 
         if config.broker_name == "DELTA":
             csv_path = deps / ("delta_instrument_" + current_date + ".csv")
-            return InstrumentStore(broker="DELTA", csv_path=csv_path)
+            base_url = None
+            if getattr(config, "delta_testnet", False) and getattr(config, "delta_india", True):
+                base_url = DELTA_BASE_URL_INDIA_TEST  # https://cdn-ind.testnet.deltaex.org
+            return InstrumentStore(broker="DELTA", csv_path=csv_path, base_url=base_url)
         expected_file = "all_instrument" + current_date + ".csv"
         return InstrumentStore(csv_path=deps / expected_file)
 

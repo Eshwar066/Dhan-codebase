@@ -10,6 +10,7 @@ import requests
 import pandas as pd
 from datetime import datetime, date, timedelta
 from typing import Optional, Any
+import pdb
 
 from core.utils.delta_env import get_delta_credentials
 from core.data.sources.delta_historical_cache import (
@@ -40,23 +41,23 @@ class DeltaSource:
     def __init__(
         self,
         testnet: bool = True,
-        india: bool = False,
+        india: bool = True,
         symbols: Optional[List[str]] = None,
     ):
         load_dotenv()
-        base_url = os.getenv("DELTA_BASE_URL")
         api_key, api_secret = get_delta_credentials(testnet)
-        if base_url is None:
-            if india:
+        # When testnet=True always use testnet URL (ignore DELTA_BASE_URL) so demo keys hit testnet API.
+        if testnet:
+            base_url = DELTA_BASE_URL_INDIA_TEST
+
+        else:
+            base_url = os.getenv("DELTA_BASE_URL")
+            if base_url is None:
                 base_url = (
-                    DELTA_BASE_URL_INDIA_TEST if testnet else DELTA_BASE_URL_INDIA_PROD
+                    DELTA_BASE_URL_INDIA_PROD if india else DELTA_BASE_URL_GLOBAL_PROD
                 )
-            else:
-                base_url = (
-                    DELTA_BASE_URL_GLOBAL_TEST
-                    if testnet
-                    else DELTA_BASE_URL_GLOBAL_PROD
-                )
+
+        print(base_url, "baseurl")
         self._client = DeltaRestClient(
             base_url=base_url,
             api_key=api_key,
@@ -187,12 +188,13 @@ class DeltaSource:
         try:
             start_ts = int(datetime.combine(start_d, datetime.min.time()).timestamp())
             end_ts = int(
-                datetime.combine(end_d, datetime.max.time()).replace(
-                    hour=23, minute=59, second=59, microsecond=999999
-                ).timestamp()
+                datetime.combine(end_d, datetime.max.time())
+                .replace(hour=23, minute=59, second=59, microsecond=999999)
+                .timestamp()
             )
             resolution = self._RESOLUTION_MAP.get(timeframe, "5m")
-            url = "https://api.india.delta.exchange/v2/history/candles"
+            base = self._client.base_url.rstrip("/")
+            url = f"{base}/v2/history/candles"
             headers = {"Accept": "application/json"}
             params = {
                 "resolution": resolution,
@@ -288,9 +290,7 @@ class DeltaSource:
                 if cache_earliest is not None and pd.notna(cache_earliest)
                 else end_d
             )
-            before = self._fetch_intraday_range(
-                symbol, start_d, fetch_end, timeframe
-            )
+            before = self._fetch_intraday_range(symbol, start_d, fetch_end, timeframe)
             if before is not None and not before.empty:
                 stitched = (
                     pd.concat([before, stitched], ignore_index=True)
@@ -316,9 +316,7 @@ class DeltaSource:
         )
         if cache_latest is not None and pd.notna(cache_latest) and end_d > cache_latest:
             fetch_start = cache_latest + timedelta(days=1)
-            after = self._fetch_intraday_range(
-                symbol, fetch_start, end_d, timeframe
-            )
+            after = self._fetch_intraday_range(symbol, fetch_start, end_d, timeframe)
             if after is not None and not after.empty:
                 stitched = pd.concat([stitched, after], ignore_index=True)
 
@@ -404,9 +402,7 @@ class DeltaSource:
         """
         if self._india:
             underlyings = list(
-                dict.fromkeys(
-                    self._underlying_from_symbol(s) for s in self._symbols
-                )
+                dict.fromkeys(self._underlying_from_symbol(s) for s in self._symbols)
             )
             if not underlyings:
                 underlyings = ["BTC"]

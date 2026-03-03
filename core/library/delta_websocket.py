@@ -81,7 +81,7 @@ class DeltaWebSocket:
         self.on_tick = on_tick
 
         self.ws_url = DELTA_WS_INDIA_TEST if testnet else DELTA_WS_INDIA_PROD
-
+        print("ws url", self.ws_url)
         self.on_message = on_message
         self.on_auth = on_auth
         self.on_subscriptions = on_subscriptions

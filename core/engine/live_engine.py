@@ -542,7 +542,7 @@ class LiveEngine(BaseEngine):
                         continue
 
                     self._enrich_candle_depth(symbol, candle)
-                    pdb.set_trace()
+
                     self._run_strategy(
                         symbol,
                         candle,
@@ -725,6 +725,7 @@ class LiveEngine(BaseEngine):
             if intent is not None and not isinstance(intent, list)
             else (intent or [])
         )
+
         for single_intent in entry_intents:
             if risk_manager and risk_manager.is_engine_blocked():
                 return

@@ -8,7 +8,7 @@ class RunMode(str, Enum):
 
 
 # 🔁 CHANGE ONLY THIS
-RUN_MODE = RunMode.PAPER
+RUN_MODE = RunMode.LIVE
 
 # Default venue when job does not specify "venue". Used for single-venue runs.
 DEFAULT_VENUE = "DELTA"  # "DHAN" | "DELTA"
@@ -34,7 +34,7 @@ STRATEGY_JOBS = [
     {
         "name": "FuturesEMAHighLow",
         "venue": "DELTA",
-        "enabled": True,
+        "enabled": False,
         "capital": 200000,
         "symbols": ["BTCUSD"],
         "instrument": "FUTURES",
@@ -53,13 +53,13 @@ STRATEGY_JOBS = [
     {
         "name": "SignalFloodTest",
         "venue": "DELTA",
-        "enabled": False,
+        "enabled": True,
         "engine_id": "delta_test_pipeline",
         "capital": 10000,
         "symbols": ["BTCUSD"],
         "instrument": "FUTURES",
-        "delta_india": True,
-        "delta_testnet": False,
+        "delta_india": False,
+        "delta_testnet": True,
         "daily_max_loss": 100,
         "max_open_positions": 1,
         "feed_stale_seconds": 30,

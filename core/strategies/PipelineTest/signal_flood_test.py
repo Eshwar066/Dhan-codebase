@@ -102,7 +102,6 @@ class SignalFloodTestStrategy(IndiaMktMixins, BaseStrategy):
         # 10% return same intent twice to trigger duplicate_signal_blocked on second
         if random.random() < 0.10 and intent:
             return [intent, intent]
-        pdb.set_trace()
         return [intent] if intent else None
 
     def should_exit(

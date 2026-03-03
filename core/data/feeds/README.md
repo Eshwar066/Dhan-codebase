@@ -4,8 +4,8 @@ Used by **LiveEngine** for real-time market data (and optional account updates) 
 
 ## Implementations
 
-- **DeltaWebSocketFeed** – Delta Exchange WebSocket (`wss://socket.india.delta.exchange` or testnet).  
-  Subscribes to `v2/ticker`, `candlestick_*`, and optionally private channels: `orders`, `positions`.
+- **DeltaWebSocketFeed** – Delta Exchange WebSocket (production: `wss://socket.india.delta.exchange`; India testnet: `wss://cdn-ind.testnet.deltaex.org`).  
+  Subscribes to `v2/ticker`, `candlestick_*`, `l2_orderbook`, and optionally private channels: `orders`, `positions`.
 
 - **DhanWebSocketFeed** – Dhan Live Market Feed WebSocket (`wss://api-feed.dhan.co`). Subscribes by ExchangeSegment + SecurityId (from `instrument_store.get_feed_instruments(symbols)`). Binary packets: Ticker, Quote, Full, OI, Prev close. Instantiated in `EngineFactory.create_live_engine()` when broker is DHAN and credentials are set.
 
