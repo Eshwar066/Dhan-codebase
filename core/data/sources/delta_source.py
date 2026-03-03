@@ -11,6 +11,7 @@ import pandas as pd
 from datetime import datetime, date, timedelta
 from typing import Optional, Any
 
+from core.utils.delta_env import get_delta_credentials
 from core.data.sources.delta_historical_cache import (
     cache_key_delta_intraday,
     load_df,
@@ -44,11 +45,7 @@ class DeltaSource:
     ):
         load_dotenv()
         base_url = os.getenv("DELTA_BASE_URL")
-        api_key = os.getenv("DELTA_API_KEY")
-        api_secret = os.getenv("DELTA_API_SECRET")
-
-        if not api_key or not api_secret:
-            raise ValueError("Delta API credentials not found in environment variables")
+        api_key, api_secret = get_delta_credentials(testnet)
         if base_url is None:
             if india:
                 base_url = (

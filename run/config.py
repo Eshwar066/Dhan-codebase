@@ -38,8 +38,8 @@ STRATEGY_JOBS = [
         "capital": 200000,
         "symbols": ["BTCUSD"],
         "instrument": "FUTURES",
-        "delta_india": True,
-        "delta_testnet": False,
+        "delta_india": False,
+        "delta_testnet": True,
         "live": {"exchange": "INDEX", "sector": "YES"},
         "backtest": {
             "start_date": "2024-01-01",

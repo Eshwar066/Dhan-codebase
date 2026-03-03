@@ -42,6 +42,7 @@ from core.orderExecution.order_router import OrderRouter
 from core.orderExecution.intent_store import IntentStore
 from core.orderExecution.position_manager import PositionManager
 from core.orderExecution.risk_manager import RiskManager
+from core.utils.delta_env import get_delta_credentials
 from core.utils.instruments.instrument_store import InstrumentStore
 from logs.logger.trade_logger import TradeLogger
 from logs.engine_logger import EngineLogger
@@ -231,8 +232,10 @@ class EngineFactory:
         tick_queue = None
         candle_aggregator = None
         if config.broker_name == "DELTA":
-            api_key = os.getenv("DELTA_API_KEY")
-            api_secret = os.getenv("DELTA_API_SECRET")
+            try:
+                api_key, api_secret = get_delta_credentials(config.delta_testnet)
+            except ValueError:
+                api_key, api_secret = None, None
             if api_key and api_secret:
                 timeframe = config.backtest.get("timeframe", "60")
                 realtime_feed = DeltaWebSocketFeed(

@@ -228,7 +228,7 @@ Latency logging is done **only on the order path** (when an order is placed), no
 Algo/
 ├── README.md                 # This file
 ├── requirements.txt
-├── .env                      # DHAN_*, DELTA_* (create from .env.example if present)
+├── .env                      # DHAN_*, DELTA_*, DEMO_DELTA_* (copy from .env.example)
 │
 ├── run/
 │   ├── main.py               # Entry: python -m run.main [--venue DHAN|DELTA]
@@ -340,7 +340,7 @@ Use **PAPER** or **LIVE** run mode. The strategy (`SignalFloodTest`) generates e
 ### 3. Environment variables
 
 - **Dhan**: `DHAN_CLIENT_CODE`, `DHAN_ACCESS_TOKEN` (and any required by Dhan Tradehull).
-- **Delta**: `DELTA_API_KEY`, `DELTA_API_SECRET`, optional `DELTA_BASE_URL`.
+- **Delta**: `DELTA_API_KEY`, `DELTA_API_SECRET`, optional `DELTA_BASE_URL`. When using **testnet/demo** (`delta_testnet: True` in the job), the app uses **demo account** credentials if set: `DEMO_DELTA_API_KEY`, `DEMO_DELTA_API_SECRET`; otherwise it falls back to `DELTA_API_KEY` / `DELTA_API_SECRET`. Demo WebSocket uses **global testnet** (`wss://socket.testnet.delta.exchange`) because India testnet WebSocket DNS is unreliable. **Important:** use API keys created on **global testnet** (https://testnet.delta.exchange) for `DEMO_*`; keys from India testnet will get "ApiKey not found" on the global testnet WebSocket.
 - Loaded via `dotenv` in live path and in sources; keep `.env` out of version control.
 
 ---
@@ -499,7 +499,7 @@ Use this as a reference for setup and next steps.
 ### Environment variables
 
 - **Dhan**: `DHAN_CLIENT_CODE`, `DHAN_ACCESS_TOKEN`.
-- **Delta**: `DELTA_API_KEY`, `DELTA_API_SECRET`; optional `DELTA_BASE_URL` (defaults depend on testnet/india in config).
+- **Delta**: `DELTA_API_KEY`, `DELTA_API_SECRET`; optional `DELTA_BASE_URL` (defaults depend on testnet/india in config). For **demo/testnet** runs (`delta_testnet: True`), set `DEMO_DELTA_API_KEY` and `DEMO_DELTA_API_SECRET` in `.env`; these must be keys from **global testnet** (https://testnet.delta.exchange), not India testnet, because the demo WebSocket connects to global testnet.
 - Loaded in live path and in data sources; use a `.env` file at project root (do not commit it).
 
 ### Project layout (summary)

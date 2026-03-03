@@ -13,7 +13,7 @@ Supports:
 
 URLs:
 - Production India: wss://socket.india.delta.exchange
-- Testnet India: wss://socket-ind.testnet.deltaex.org
+- Testnet (India & global): wss://socket.testnet.delta.exchange (India testnet DNS often fails; optional DELTA_WS_URL override)
 - Limit: 150 connections per 5 min per IP; 60s inactivity disconnect.
 """
 
@@ -21,13 +21,13 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import socket
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
 import websocket
-
 
 from core.library.delta_rest_client import generate_signature
 
@@ -79,10 +79,8 @@ class DeltaWebSocket:
         self.api_key = api_key
         self.api_secret = api_secret
         self.on_tick = on_tick
-        if india:
-            self.ws_url = DELTA_WS_INDIA_TEST if testnet else DELTA_WS_INDIA_PROD
-        else:
-            self.ws_url = DELTA_WS_GLOBAL_TEST if testnet else DELTA_WS_GLOBAL_PROD
+
+        self.ws_url = DELTA_WS_INDIA_TEST if testnet else DELTA_WS_INDIA_PROD
 
         self.on_message = on_message
         self.on_auth = on_auth
@@ -182,6 +180,13 @@ class DeltaWebSocket:
         if msg_type == "key-auth":
             success = msg.get("success", False)
             self._authenticated = success
+            if not success and msg.get("status") == "api_key_not_found":
+                logger.warning(
+                    "Delta WebSocket key-auth failed: ApiKey not found. "
+                    "Demo/testnet keys from India testnet do not work on global testnet WebSocket "
+                    "(wss://socket.testnet.delta.exchange). Create API keys at https://testnet.delta.exchange "
+                    "for the same environment as the WebSocket URL, or set DELTA_WS_URL if using India testnet."
+                )
             if self.on_auth:
                 self.on_auth(success, msg)
             if self.on_message:
