@@ -29,7 +29,9 @@ class EngineConfig:
     broker_name: BrokerName
     run_mode: RunMode
     strategy_name: str
-    symbols: Optional[List[str]] = None  # None = derive from universe (e.g. IPOBreakout)
+    symbols: Optional[List[str]] = (
+        None  # None = derive from universe (e.g. IPOBreakout)
+    )
     enabled: bool = True
 
     # Engine identity (for logging and reports)
@@ -53,7 +55,7 @@ class EngineConfig:
     live: Optional[Dict[str, Any]] = None
 
     # Venue-specific options (optional overrides)
-    delta_testnet: bool = False
+    delta_testnet: bool = True
     delta_india: bool = True
 
     # Paths (defaults; override for tests)
@@ -155,7 +157,7 @@ def example_delta_live_config() -> EngineConfig:
         capital=200_000.0,
         risk_per_trade_percent=1.0,
         delta_testnet=True,
-        delta_india=False,
+        delta_india=True,
         backtest={
             "start_date": "2024-03-20",
             "end_date": "2025-03-30",
@@ -180,7 +182,7 @@ def example_delta_backtest_config() -> EngineConfig:
         symbols=["BTCUSD"],
         enabled=True,
         delta_testnet=True,
-        delta_india=False,
+        delta_india=True,
         backtest={
             "start_date": "2024-03-20",
             "end_date": "2025-03-30",

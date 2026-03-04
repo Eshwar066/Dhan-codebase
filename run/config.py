@@ -58,7 +58,7 @@ STRATEGY_JOBS = [
         "capital": 10000,
         "symbols": ["BTCUSD"],
         "instrument": "FUTURES",
-        "delta_india": False,
+        "delta_india": True,
         "delta_testnet": True,
         "daily_max_loss": 100,
         "max_open_positions": 1,
