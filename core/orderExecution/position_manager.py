@@ -335,11 +335,14 @@ class PositionManager:
     # ---------------------
     # BROKER RECONCILIATION
     # ---------------------
-    def reconcile_with_broker(self, broker_positions, drift_threshold: int = 0):
+    def reconcile_with_broker(
+        self, broker_positions, drift_threshold: int = 0, strategy: str = None
+    ):
         """
         Sync PositionManager to broker truth.
         broker_positions: { symbol: { "qty": int, "avg_price": float, "segment": str, "lot_size": int } }
         drift_threshold: if |local_qty - broker_qty| > this, set trading_paused.
+        strategy: strategy name to associate with newly discovered positions.
         """
         with self._lock:
             self.last_recon_time = time.time()
@@ -362,6 +365,8 @@ class PositionManager:
                     pos = Position(inst)
                     pos.net_qty = int(bp["qty"])
                     pos.avg_price = float(bp.get("avg_price", 0))
+                    if strategy:
+                        pos.strategy = strategy
                     self.positions[sym] = pos
                     continue
 
@@ -432,7 +437,6 @@ class PositionManager:
     # ---------------------
     def snapshot(self):
         snap = {}
-
         for sym, pos in self.positions.items():
             snap[sym] = {
                 "segment": pos.instrument.segment,
@@ -440,14 +444,12 @@ class PositionManager:
                 "avg_price": pos.avg_price,
                 "realized_pnl": pos.realized_pnl,
             }
-
         return snap
 
     def get_open_positions(self, underlying=None, strategy=None):
         positions = []
-
+        # pdb.set_trace()
         for pos in self.positions.values():
-
             if pos.net_qty == 0:
                 continue
 

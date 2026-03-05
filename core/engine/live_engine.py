@@ -241,10 +241,11 @@ class LiveEngine(BaseEngine):
         if self.engine_logger:
             self.engine_logger.graceful_shutdown(f"Signal {signum} received")
 
-    def reconcile_positions_on_start(self) -> None:
+    def reconcile_positions_on_start(self) -> bool:
         """
         Fetch broker positions, sync PositionManager to broker truth, log any mismatch.
         Must run before live loop starts.
+        Returns True on success, False on error.
         """
 
         broker = getattr(self.order_router, "broker", None)
@@ -253,7 +254,7 @@ class LiveEngine(BaseEngine):
                 self.engine_logger.reconciliation(
                     "No broker or get_positions_for_recon; skip reconcile"
                 )
-            return
+            return True
         try:
             broker_positions = broker.get_positions_for_recon()
         except Exception as e:
@@ -261,11 +262,24 @@ class LiveEngine(BaseEngine):
                 self.engine_logger.reconciliation(
                     f"Failed to fetch broker positions: {e}"
                 )
-            return
+            return False
         local_snapshot = self.position_manager.snapshot()
+        resolved_broker_positions = {}
         diff = []
-        for sym, bp in broker_positions.items():
-            local = local_snapshot.get(sym, {})
+
+        for b_sym, bp in broker_positions.items():
+            # Resolve broker symbol (id or short_name) to engine symbol
+            engine_sym = b_sym
+            if self.instrument_store:
+                inst = self.instrument_store.intent_creation_details(
+                    b_sym, self.venue, None, None, None
+                )
+                if inst:
+                    engine_sym = inst.trading_symbol
+
+            resolved_broker_positions[engine_sym] = bp
+
+            local = local_snapshot.get(engine_sym, {})
             lq = local.get("qty", 0)
             bq = int(bp.get("qty", 0))
             if (
@@ -274,13 +288,14 @@ class LiveEngine(BaseEngine):
             ):
                 diff.append(
                     {
-                        "symbol": sym,
+                        "symbol": engine_sym,
                         "local_qty": lq,
                         "broker_qty": bq,
                         "broker_avg": bp.get("avg_price"),
                     }
                 )
-        for sym in set(local_snapshot.keys()) - set(broker_positions.keys()):
+
+        for sym in set(local_snapshot.keys()) - set(resolved_broker_positions.keys()):
             if local_snapshot[sym].get("qty", 0) != 0:
                 diff.append(
                     {
@@ -294,7 +309,11 @@ class LiveEngine(BaseEngine):
                 "Position mismatch; syncing PM to broker", details={"diff": diff}
             )
 
-        self.position_manager.reconcile_with_broker(broker_positions)
+        strategy_name = getattr(self.strategy, "name", None)
+        self.position_manager.reconcile_with_broker(
+            resolved_broker_positions, strategy=strategy_name
+        )
+        return True
 
     def _is_closed_candle(
         self, candle: Dict, timeframe: str, now: Optional[dt.datetime] = None
@@ -421,11 +440,9 @@ class LiveEngine(BaseEngine):
         except (AttributeError, ValueError):
             pass
 
-        self.reconcile_positions_on_start()
-        # pdb.set_trace()
-        # if not self.reconcile_positions_on_start():
-        #     self.engine_logger.log("critical", "Startup reconciliation failed")
-        #     return
+        if not self.reconcile_positions_on_start():
+            self.engine_logger.log("critical", "Startup reconciliation failed")
+            return
 
         self._do_order_state_check()
         tf = getattr(self.strategy, "timeframe", None)
@@ -643,6 +660,9 @@ class LiveEngine(BaseEngine):
             self.engine_logger.graceful_shutdown(
                 "Graceful shutdown", snapshot_path=snapshot_path
             )
+            self.engine_logger.graceful_shutdown(
+                "================================================"
+            )
         broker = getattr(self.order_router, "broker", None)
         if broker and hasattr(broker, "close"):
             try:
@@ -696,7 +716,6 @@ class LiveEngine(BaseEngine):
         open_positions = self.position_manager.get_open_positions(
             underlying=symbol, strategy=self.strategy.name
         )
-
         for position in open_positions:
             exit_signal = self.strategy.should_exit(position, candle, ctx)
             if exit_signal:

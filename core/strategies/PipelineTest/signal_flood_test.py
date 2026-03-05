@@ -108,6 +108,7 @@ class SignalFloodTestStrategy(IndiaMktMixins, BaseStrategy):
         self, pos: Any, candle: Any, ctx: Optional["StrategyContext"] = None
     ) -> bool:
         """Exit after one candle (always exit when in position for this test)."""
+        # pdb.set_trace()
         return True
 
     def on_position_exit(
@@ -117,7 +118,7 @@ class SignalFloodTestStrategy(IndiaMktMixins, BaseStrategy):
         if pos.instrument is None:
             return None
         exit_side = "SELL" if pos.net_qty > 0 else "BUY"
-        strike_row = self._last_candle or candle
+        strike_row = self._last_candle if self._last_candle is not None else candle
         exit_intent = self.map_futures_instrument_to_intent(
             inst=pos.instrument,
             strike_row=strike_row,
