@@ -11,10 +11,11 @@ class OrderState(str, Enum):
     Local order state cache. Reconciliation only corrects drift; broker calls
     (find_order_by_client_id) are used only when we don't already have terminal state.
     """
-    NEW = "NEW"           # Intent created, not yet sent
-    SENT = "SENT"         # Sent to broker, ack not confirmed
-    OPEN = "OPEN"         # Seen on broker open list (or acked)
-    PARTIAL = "PARTIAL"   # Partially filled
+
+    NEW = "NEW"  # Intent created, not yet sent
+    SENT = "SENT"  # Sent to broker, ack not confirmed
+    OPEN = "OPEN"  # Seen on broker open list (or acked)
+    PARTIAL = "PARTIAL"  # Partially filled
     FILLED = "FILLED"
     CANCELLED = "CANCELLED"
     REJECTED = "REJECTED"
@@ -337,7 +338,11 @@ class OrderRouter:
                     #     b_sym, None, None, None, None
                     # )
                     inst = self.instrument_store.get_by_symbol(b_sym)
-                    if not inst and product_id and hasattr(self.instrument_store, "get_by_product_id"):
+                    if (
+                        not inst
+                        and product_id
+                        and hasattr(self.instrument_store, "get_by_product_id")
+                    ):
                         inst = self.instrument_store.get_by_product_id(product_id)
                     if inst:
                         engine_sym = inst.trading_symbol
@@ -402,7 +407,7 @@ class OrderRouter:
         ]
 
         if missing_needing_poll and hasattr(self.broker, "find_order_by_client_id"):
-            time.sleep(2)  # Let broker open list settle (recent fills may drop off)
+            time.sleep(0.5)  # Let broker open list settle (recent fills may drop off)
 
         for i in missing:
             tag = i.get("intent_id")
@@ -413,12 +418,43 @@ class OrderRouter:
                     order = self.broker.find_order_by_client_id(tag)
                     if order:
                         status = (order.get("status") or "").lower()
-                        # Get original intent object if possible
-                        # The intent_store.get returns a dict, but we need the dataclass for process_fill
-                        # For now, we'll use the data from the dict if the dataclass isn't easily available.
-                        # However, OrderRouter.process_fill expects 'instrument' as an object.
+                        filled = (
+                            float(order["filled_size"])
+                            if order.get("filled_size") is not None
+                            else (
+                                float(order.get("size", 0))
+                                - float(order.get("unfilled_size", 0))
+                            )
+                        )
+                        size = float(order.get("size", 0))
 
-                        if status == "filled":
+                        # Partial fill: filled > 0 and unfilled > 0 (filled < size)
+                        if size > 0 and filled > 0 and filled < size:
+                            self._order_state[tag] = OrderState.PARTIAL
+                            self.intent_store.update(
+                                tag,
+                                IntentStatus.SENT,  # Still in flight
+                                broker_order_id=order.get("order_id"),
+                                order_state=OrderState.PARTIAL,
+                            )
+                            if self.position_manager:
+                                self.process_fill(
+                                    instrument=i.get("instrument"),
+                                    side=i.get("side"),
+                                    qty=filled,
+                                    price=float(
+                                        order.get("average_fill_price")
+                                        or i.get("price", 0)
+                                    ),
+                                    order_id=order.get("order_id"),
+                                    intent_id=tag,
+                                    strategy=i.get("strategy"),
+                                    structure_id=i.get("structure_id"),
+                                    tag=i.get("tag"),
+                                    candle_ts=i.get("candle_ts"),
+                                    action=i.get("action"),
+                                )
+                        elif status == "filled" or (size > 0 and filled >= size):
                             if self.engine_logger:
                                 self.engine_logger.log(
                                     "oms",
@@ -442,22 +478,11 @@ class OrderRouter:
                                 order_state=OrderState.FILLED,
                             )
 
-                            # Trigger fill processing if we can get the data
-                            # This will update PositionManager.
                             if self.position_manager:
-                                # Fallback to dict-based instrument if object not available
-                                # Most brokers handle both
                                 self.process_fill(
                                     instrument=i.get("instrument"),
                                     side=i.get("side"),
-                                    qty=(
-                                        float(order["filled_size"])
-                                        if order.get("filled_size") is not None
-                                        else (
-                                            float(order.get("size", 0))
-                                            - float(order.get("unfilled_size", 0))
-                                        )
-                                    ),
+                                    qty=filled,
                                     price=float(
                                         order.get("average_fill_price")
                                         or i.get("price", 0)
@@ -475,9 +500,11 @@ class OrderRouter:
                             ost = (
                                 OrderState.CANCELLED
                                 if status == "cancelled"
-                                else OrderState.REJECTED
-                                if status == "rejected"
-                                else OrderState.EXPIRED
+                                else (
+                                    OrderState.REJECTED
+                                    if status == "rejected"
+                                    else OrderState.EXPIRED
+                                )
                             )
                             self._order_state[tag] = ost
                             self.intent_store.update(
