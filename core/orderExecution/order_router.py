@@ -1,8 +1,33 @@
 import time
-from typing import Callable, Dict, Optional, Tuple
+from enum import Enum
+from typing import Callable, Dict, Optional, Set, Tuple
 import pdb
 
 from core.orderExecution.intent_store import IntentStatus
+
+
+class OrderState(str, Enum):
+    """
+    Local order state cache. Reconciliation only corrects drift; broker calls
+    (find_order_by_client_id) are used only when we don't already have terminal state.
+    """
+    NEW = "NEW"           # Intent created, not yet sent
+    SENT = "SENT"         # Sent to broker, ack not confirmed
+    OPEN = "OPEN"         # Seen on broker open list (or acked)
+    PARTIAL = "PARTIAL"   # Partially filled
+    FILLED = "FILLED"
+    CANCELLED = "CANCELLED"
+    REJECTED = "REJECTED"
+    EXPIRED = "EXPIRED"
+
+
+# Terminal states: no need to poll broker for these
+_TERMINAL_ORDER_STATES: Set[OrderState] = {
+    OrderState.FILLED,
+    OrderState.CANCELLED,
+    OrderState.REJECTED,
+    OrderState.EXPIRED,
+}
 
 
 class OrderRouter:
@@ -32,12 +57,32 @@ class OrderRouter:
         self.engine_id = engine_id
         self.strategy_id = strategy_id
         self._consecutive_failures = 0
+        # Local order state cache: intent_id -> OrderState. Persisted in IntentStore; rebuilt on init.
+        self._order_state: Dict[str, OrderState] = {}
+        self._rebuild_order_state_cache()
+
+    def _rebuild_order_state_cache(self) -> None:
+        """Rebuild _order_state from IntentStore (e.g. after restart). Makes reconciliation faster."""
+        if not hasattr(self.intent_store, "get_all_order_states"):
+            return
+        for intent_id, order_state_val in self.intent_store.get_all_order_states():
+            try:
+                self._order_state[intent_id] = (
+                    OrderState(order_state_val)
+                    if isinstance(order_state_val, str)
+                    else order_state_val
+                )
+            except (ValueError, TypeError):
+                pass
 
     def process_intent(self, intent, price_map):
         if not self.risk.allow_intent(
             intent, price_map, candle_ts=getattr(intent, "candle_ts", None)
         ):
-            self.intent_store.update(intent.intent_id, IntentStatus.REJECTED)
+            self.intent_store.update(
+                intent.intent_id, IntentStatus.REJECTED, order_state=OrderState.REJECTED
+            )
+            self._order_state[intent.intent_id] = OrderState.REJECTED
             return
 
         # Fix 3: Intent Deduplication (scoped by engine_id + strategy_id to support multi-engine/multi-strategy)
@@ -129,7 +174,10 @@ class OrderRouter:
                     self.engine_logger.broker_circuit_breaker_triggered(
                         "broker_failure"
                     )
-            self.intent_store.update(intent.intent_id, "REJECTED")
+            self.intent_store.update(
+                intent.intent_id, "REJECTED", order_state=OrderState.REJECTED
+            )
+            self._order_state[intent.intent_id] = OrderState.REJECTED
             return
 
         if order_id is None:
@@ -145,10 +193,14 @@ class OrderRouter:
                     self.engine_logger.broker_circuit_breaker_triggered(
                         "broker_failure"
                     )
-            self.intent_store.update(intent.intent_id, "REJECTED")
+            self.intent_store.update(
+                intent.intent_id, "REJECTED", order_state=OrderState.REJECTED
+            )
+            self._order_state[intent.intent_id] = OrderState.REJECTED
             return
 
         self._consecutive_failures = 0
+        self._order_state[intent.intent_id] = OrderState.SENT
         if self.engine_logger:
             self.engine_logger.order_placed(
                 symbol=sym,
@@ -162,6 +214,7 @@ class OrderRouter:
             intent.intent_id,
             "SENT",
             broker_order_id=order_id,
+            order_state=OrderState.SENT,
         )
 
     def refresh_stale_exit_orders(
@@ -243,7 +296,6 @@ class OrderRouter:
         """
         if not hasattr(self.broker, "get_open_orders"):
             return True, {}
-        pdb.set_trace()
         try:
             broker_open = self.broker.get_open_orders()
         except Exception as e:
@@ -285,7 +337,7 @@ class OrderRouter:
                     #     b_sym, None, None, None, None
                     # )
                     inst = self.instrument_store.get_by_symbol(b_sym)
-                    if not inst and product_id:
+                    if not inst and product_id and hasattr(self.instrument_store, "get_by_product_id"):
                         inst = self.instrument_store.get_by_product_id(product_id)
                     if inst:
                         engine_sym = inst.trading_symbol
@@ -293,7 +345,7 @@ class OrderRouter:
 
                 stub_payload = {
                     "symbol": engine_sym,
-                    "side": (o.get("side") or "").lower(),
+                    "side": (o.get("side") or "").upper(),
                     "qty": int(o.get("qty") or 0),
                     "action": "ENTRY",
                     "strategy": "recovery",
@@ -306,13 +358,17 @@ class OrderRouter:
                 # Register in store
                 self.intent_store.create(payload=stub_payload, intent_id=tag)
                 self.intent_store.update(
-                    tag, IntentStatus.SENT, broker_order_id=o.get("order_id")
+                    tag,
+                    IntentStatus.SENT,
+                    broker_order_id=o.get("order_id"),
+                    order_state=OrderState.OPEN,
                 )
+                self._order_state[tag] = OrderState.OPEN  # Seen on broker
 
                 # Augment record for process_fill
                 intent_record = self.intent_store.get(tag)
                 intent_record["instrument"] = instr
-                intent_record["side"] = (o.get("side") or "").lower()
+                intent_record["side"] = (o.get("side") or "").upper()
                 intent_record["qty"] = int(o.get("qty") or 0)
                 intent_record["action"] = stub_payload["action"]
 
@@ -322,28 +378,36 @@ class OrderRouter:
                     )
 
             elif tag in local_intent_ids:
-                # Local thinks it's pending, broker confirms it's open. Sync order ID if missing.
+                # Local thinks it's pending, broker confirms it's open. Sync order ID and persist OPEN.
+                self._order_state[tag] = OrderState.OPEN
                 intent = self.intent_store.get(tag)
-                if not intent.get("broker_order_id"):
-                    self.intent_store.update(
-                        tag, IntentStatus.SENT, broker_order_id=o.get("order_id")
-                    )
+                self.intent_store.update(
+                    tag,
+                    IntentStatus.SENT,
+                    broker_order_id=intent.get("broker_order_id") or o.get("order_id"),
+                    order_state=OrderState.OPEN,
+                )
 
         # 2. Missing: In local pending but not on broker open list
-        # This usually means it FILLED or was REJECTED/CANCELLED.
-        # Broker open list can lag; wait 1–2s before polling so we don't spam find_order_by_client_id.
+        # Usually FILLED/REJECTED/CANCELLED. Only poll broker when cache doesn't have terminal state.
         missing = [
             i
             for i in local_pending
             if i.get("intent_id") and i.get("intent_id") not in broker_tags
         ]
+        missing_needing_poll = [
+            i
+            for i in missing
+            if self._order_state.get(i.get("intent_id")) not in _TERMINAL_ORDER_STATES
+        ]
 
-        if missing and hasattr(self.broker, "find_order_by_client_id"):
-            time.sleep(2)
+        if missing_needing_poll and hasattr(self.broker, "find_order_by_client_id"):
+            time.sleep(2)  # Let broker open list settle (recent fills may drop off)
 
         for i in missing:
             tag = i.get("intent_id")
-            # Query broker for terminal state of this specific intent (tag)
+            if self._order_state.get(tag) in _TERMINAL_ORDER_STATES:
+                continue  # Already resolved locally; no broker call
             if hasattr(self.broker, "find_order_by_client_id"):
                 try:
                     order = self.broker.find_order_by_client_id(tag)
@@ -370,11 +434,12 @@ class OrderRouter:
                                 "instrument"
                             )  # If stored in dict; depends on intent_store implementation
 
-                            # For now, update intent status to avoid re-syncing
+                            self._order_state[tag] = OrderState.FILLED
                             self.intent_store.update(
                                 tag,
                                 IntentStatus.FILLED,
                                 broker_order_id=order.get("order_id"),
+                                order_state=OrderState.FILLED,
                             )
 
                             # Trigger fill processing if we can get the data
@@ -386,8 +451,12 @@ class OrderRouter:
                                     instrument=i.get("instrument"),
                                     side=i.get("side"),
                                     qty=(
-                                        float(order.get("size", 0))
-                                        - float(order.get("unfilled_size", 0))
+                                        float(order["filled_size"])
+                                        if order.get("filled_size") is not None
+                                        else (
+                                            float(order.get("size", 0))
+                                            - float(order.get("unfilled_size", 0))
+                                        )
                                     ),
                                     price=float(
                                         order.get("average_fill_price")
@@ -403,7 +472,17 @@ class OrderRouter:
                                 )
 
                         elif status in ("cancelled", "rejected", "expired"):
-                            self.intent_store.update(tag, IntentStatus.REJECTED)
+                            ost = (
+                                OrderState.CANCELLED
+                                if status == "cancelled"
+                                else OrderState.REJECTED
+                                if status == "rejected"
+                                else OrderState.EXPIRED
+                            )
+                            self._order_state[tag] = ost
+                            self.intent_store.update(
+                                tag, IntentStatus.REJECTED, order_state=ost
+                            )
                 except Exception as e:
                     if self.engine_logger:
                         self.engine_logger.log(
@@ -481,8 +560,12 @@ class OrderRouter:
             intent_id=intent_id,
         )
         if intent_id and self.intent_store:
+            self._order_state[intent_id] = OrderState.FILLED
             self.intent_store.update(
-                intent_id, IntentStatus.FILLED, broker_order_id=order_id
+                intent_id,
+                IntentStatus.FILLED,
+                broker_order_id=order_id,
+                order_state=OrderState.FILLED,
             )
 
     def report_fill(

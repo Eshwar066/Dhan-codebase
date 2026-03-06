@@ -423,7 +423,7 @@ class LiveEngine(BaseEngine):
         ):
             return
         self._last_order_state_check_time = now
-        ok, _ = self.order_router.verify_open_orders_with_broker(self.position_manager)
+        ok, _ = self.order_router.verify_open_orders_with_broker()
         if not ok:
             self._entries_paused_order_mismatch = True
             self.reconcile_positions_on_start()
