@@ -13,6 +13,7 @@ Optional: use Supervisor in code to run both venues in one process (two threads)
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 import pdb
@@ -49,6 +50,12 @@ def job_to_engine_config(job: dict) -> EngineConfig:
         latency_critical_ms=job.get("latency_critical_ms", 150.0),
         latency_critical_cycles=job.get("latency_critical_cycles", 3),
         symbol_error_threshold=job.get("symbol_error_threshold", 5),
+        telegram_bot_token=(
+            (job.get("telegram") or {}).get("bot_token") if isinstance(job.get("telegram"), dict) else None
+        ) or os.getenv("TELEGRAM_BOT_TOKEN"),
+        telegram_chat_id=(
+            (job.get("telegram") or {}).get("chat_id") if isinstance(job.get("telegram"), dict) else None
+        ) or os.getenv("TELEGRAM_CHAT_ID"),
     )
 
 

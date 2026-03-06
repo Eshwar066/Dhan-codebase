@@ -40,6 +40,7 @@ from core.broker import (
 )
 from core.orderExecution.order_router import OrderRouter
 from core.orderExecution.intent_store import IntentStore
+from core.utils.telegram_alert import send_telegram_alert
 from core.orderExecution.position_manager import PositionManager
 from core.orderExecution.risk_manager import RiskManager
 from core.utils.delta_env import get_delta_credentials
@@ -207,6 +208,13 @@ class EngineFactory:
                 intent_store=intent_store,
             )
 
+        # Optional Telegram alerts for Delta (order placed, errors, slippage)
+        telegram_alert = None
+        if getattr(config, "telegram_bot_token", None) and getattr(config, "telegram_chat_id", None):
+            _token = config.telegram_bot_token
+            _chat = config.telegram_chat_id
+            telegram_alert = lambda msg: send_telegram_alert(msg, _chat, _token)
+
         order_router = OrderRouter(
             risk_manager=risk_manager,
             broker=broker,
@@ -218,6 +226,7 @@ class EngineFactory:
             slippage_threshold_pct=getattr(config, "slippage_threshold_pct", None),
             engine_id=getattr(config, "engine_id", None),
             strategy_id=config.strategy_name,
+            telegram_alert=telegram_alert,
         )
         broker.set_order_router(order_router)
 

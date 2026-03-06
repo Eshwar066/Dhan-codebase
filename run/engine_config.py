@@ -80,6 +80,10 @@ class EngineConfig:
     # Symbol-level failure: pause only this symbol after this many consecutive errors.
     symbol_error_threshold: int = 5
 
+    # Telegram alerts (e.g. for Delta): order placed, broker errors, slippage. Optional.
+    telegram_bot_token: Optional[str] = None
+    telegram_chat_id: Optional[str] = None
+
     def __post_init__(self):
         if self.base_dir is None:
             self.base_dir = Path(__file__).resolve().parents[1]

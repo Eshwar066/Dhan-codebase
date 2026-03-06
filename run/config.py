@@ -50,6 +50,7 @@ STRATEGY_JOBS = [
         },
     },
     # Pipeline test configs: Signal every 1m, hit Risk/OMS/Router/Broker/PM. Use PAPER or LIVE.
+    # Optional: "telegram": {"bot_token": "YOUR_BOT_TOKEN", "chat_id": "YOUR_CHAT_ID"} for order/error/slippage alerts.
     {
         "name": "SignalFloodTest",
         "venue": "DELTA",
@@ -69,6 +70,10 @@ STRATEGY_JOBS = [
         "latency_critical_cycles": 1,
         "symbol_error_threshold": 2,
         "live": {"exchange": "DELTA", "sector": "YES"},
+        "telegram": {
+            "bot_token": "8389724629:AAHY_CGcBF8HZCexedsEJFw80Mf6SxH5Bkk",
+            "chat_id": "1021479950",
+        },
         "backtest": {
             "start_date": "2024-03-20",
             "end_date": "2024-03-25",

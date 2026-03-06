@@ -1,6 +1,8 @@
 import time
 from enum import Enum
 from typing import Callable, Dict, Optional, Set, Tuple
+
+OptionalAlert = Optional[Callable[[str], None]]
 import pdb
 import datetime
 
@@ -46,6 +48,7 @@ class OrderRouter:
         slippage_threshold_pct: float = None,
         engine_id: Optional[str] = None,
         strategy_id: Optional[str] = None,
+        telegram_alert: OptionalAlert = None,
     ):
         self.risk = risk_manager
         self.broker = broker
@@ -58,6 +61,7 @@ class OrderRouter:
         self.slippage_threshold_pct = slippage_threshold_pct
         self.engine_id = engine_id
         self.strategy_id = strategy_id
+        self.telegram_alert = telegram_alert
         self._consecutive_failures = 0
         # Local order state cache: intent_id -> OrderState. Persisted in IntentStore; rebuilt on init.
         self._order_state: Dict[str, OrderState] = {}
@@ -167,6 +171,8 @@ class OrderRouter:
             self._consecutive_failures += 1
             if self.engine_logger:
                 self.engine_logger.log("risk_block", f"Broker place_order failed: {e}")
+            if self.telegram_alert:
+                self.telegram_alert(f"Broker error: {sym} {side} qty={qty} — {e}")
             if (
                 self._consecutive_failures >= self.circuit_breaker_threshold
                 and self.risk
@@ -186,6 +192,8 @@ class OrderRouter:
             self._consecutive_failures += 1
             if self.engine_logger:
                 self.engine_logger.log("risk_block", "Broker place_order returned None")
+            if self.telegram_alert:
+                self.telegram_alert(f"Broker returned no order_id: {sym} {side} qty={qty}")
             if (
                 self._consecutive_failures >= self.circuit_breaker_threshold
                 and self.risk
@@ -203,6 +211,8 @@ class OrderRouter:
 
         self._consecutive_failures = 0
         self._order_state[intent.intent_id] = OrderState.SENT
+        if self.telegram_alert:
+            self.telegram_alert(f"Order placed: {sym} {side} qty={qty} order_id={order_id}")
         if self.engine_logger:
             self.engine_logger.order_placed(
                 symbol=sym,
@@ -689,4 +699,8 @@ class OrderRouter:
                         expected_price=expected_price,
                         fill_price=fill_price,
                         slippage_pct=pct * 100,
+                    )
+                if self.telegram_alert:
+                    self.telegram_alert(
+                        f"High slippage: {symbol} expected={expected_price:.2f} fill={fill_price:.2f} ({pct * 100:.2f}%)"
                     )
