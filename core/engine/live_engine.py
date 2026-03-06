@@ -448,6 +448,7 @@ class LiveEngine(BaseEngine):
         self.order_router.refresh_stale_exit_orders(
             get_bid_ask=self._get_bid_ask,
             stale_seconds=float(self._exit_refresh_interval_seconds),
+            get_last_price=self.get_price_map,
         )
 
     def start(self, exchange, sector, rsi):

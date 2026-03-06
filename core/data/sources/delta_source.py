@@ -526,7 +526,7 @@ class DeltaSource:
             return normalized
 
         except Exception as e:
-            self.logger.error(f"get_order_list failed: {e}")
+            self.engine_logger.error(f"get_order_list failed: {e}")
             return []
 
     def cancel_order(self, product_id: int, order_id: Any) -> Any:

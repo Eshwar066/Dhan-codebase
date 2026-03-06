@@ -186,6 +186,7 @@ class DeltaBroker(BaseBroker):
                     "product_id": product_id,
                     "side": (o.get("side") or "").lower(),
                     "qty": int(o.get("qty") or 0),
+                    "reduce_only": o.get("reduce_only"),
                 }
             )
 

@@ -177,7 +177,6 @@ class PositionManager:
             raise TypeError(f"on_fill expects Instrument, got {type(instrument)}")
 
         with self._lock:
-            qty = 1
             sym = instrument.trading_symbol
             lot_size = instrument.lot_size
 

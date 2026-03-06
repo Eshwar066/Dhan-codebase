@@ -6,6 +6,7 @@ Used by LiveEngine when BROKER_NAME == "DELTA" for real-time data.
 """
 
 from typing import Any, Dict, List, Optional
+import pdb
 
 from core.data.feeds.base_feed import RealtimeFeed
 from core.library.delta_websocket import DeltaWebSocket
@@ -60,16 +61,20 @@ class DeltaWebSocketFeed(RealtimeFeed):
         """Push normalized ticks to queue for CandleAggregator. Set before start()."""
         self._tick_queue = queue
 
-    def _push_tick(self, symbol: str, price: float, volume: float, timestamp_sec: float) -> None:
+    def _push_tick(
+        self, symbol: str, price: float, volume: float, timestamp_sec: float
+    ) -> None:
         if self._tick_queue is None:
             return
         try:
-            self._tick_queue.put_nowait({
-                "symbol": symbol,
-                "price": price,
-                "volume": volume,
-                "timestamp": timestamp_sec,
-            })
+            self._tick_queue.put_nowait(
+                {
+                    "symbol": symbol,
+                    "price": price,
+                    "volume": volume,
+                    "timestamp": timestamp_sec,
+                }
+            )
         except Exception:
             pass
 
@@ -93,9 +98,11 @@ class DeltaWebSocketFeed(RealtimeFeed):
         # Subscribe to public channels after socket is ready; private after auth success.
         import threading
         import time
+
         def subscribe_public_after_delay():
             time.sleep(1.5)
             self._do_subscribe_public()
+
         t = threading.Thread(target=subscribe_public_after_delay, daemon=True)
         t.start()
 
@@ -117,14 +124,20 @@ class DeltaWebSocketFeed(RealtimeFeed):
         self._ws.subscribe(channels)
 
     def _do_subscribe_private(self) -> None:
-        if not self._ws or not self._ws.is_connected() or not self._ws.is_authenticated():
+        if (
+            not self._ws
+            or not self._ws.is_connected()
+            or not self._ws.is_authenticated()
+        ):
             return
         if not self.subscribe_private:
             return
-        self._ws.subscribe([
-            {"name": "orders", "symbols": ["all"]},
-            {"name": "positions", "symbols": ["all"]},
-        ])
+        self._ws.subscribe(
+            [
+                {"name": "orders", "symbols": ["all"]},
+                {"name": "positions", "symbols": ["all"]},
+            ]
+        )
 
     def stop(self) -> None:
         if self._ws:
@@ -144,7 +157,11 @@ class DeltaWebSocketFeed(RealtimeFeed):
         # Normalize to common shape for live engine (close/mark_price as price)
         mark = raw.get("mark_price")
         close = raw.get("close")
-        price = float(mark) if mark is not None else (float(close) if close is not None else None)
+        price = (
+            float(mark)
+            if mark is not None
+            else (float(close) if close is not None else None)
+        )
         if price is None:
             return None
         return {
@@ -158,7 +175,9 @@ class DeltaWebSocketFeed(RealtimeFeed):
             "timestamp": raw.get("timestamp"),
         }
 
-    def get_last_candle(self, symbol: str, resolution: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def get_last_candle(
+        self, symbol: str, resolution: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         if not self._ws:
             return None
         raw = self._ws.get_last_candle(symbol)
@@ -168,6 +187,7 @@ class DeltaWebSocketFeed(RealtimeFeed):
         if ts and isinstance(ts, (int, float)):
             # Microseconds to datetime string or keep as-is for engine
             from datetime import datetime
+
             if ts > 1e12:
                 ts = datetime.utcfromtimestamp(ts / 1e6).isoformat() + "Z"
             else:
@@ -200,7 +220,12 @@ class DeltaWebSocketFeed(RealtimeFeed):
         if isinstance(first, (list, tuple)) and len(first) >= 1:
             return float(first[0])
         if isinstance(first, dict):
-            return float(first.get("price", first.get("price_str", 0)))
+            return float(
+                first.get("price")
+                or first.get("limit_price")
+                or first.get("price_str")
+                or 0
+            )
         return None
 
     def get_best_ask(self, symbol: str) -> Optional[float]:
@@ -215,7 +240,12 @@ class DeltaWebSocketFeed(RealtimeFeed):
         if isinstance(first, (list, tuple)) and len(first) >= 1:
             return float(first[0])
         if isinstance(first, dict):
-            return float(first.get("price", first.get("price_str", 0)))
+            return float(
+                first.get("price")
+                or first.get("limit_price")
+                or first.get("price_str")
+                or 0
+            )
         return None
 
     def get_orders(self, symbol: str) -> List[Dict[str, Any]]:

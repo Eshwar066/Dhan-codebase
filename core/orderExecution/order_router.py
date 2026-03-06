@@ -2,6 +2,7 @@ import time
 from enum import Enum
 from typing import Callable, Dict, Optional, Set, Tuple
 import pdb
+import datetime
 
 from core.orderExecution.intent_store import IntentStatus
 
@@ -217,6 +218,10 @@ class OrderRouter:
             broker_order_id=order_id,
             order_state=OrderState.SENT,
         )
+        if getattr(intent, "action", "") == "EXIT":
+            sent_rec = self.intent_store.get(intent.intent_id)
+            if sent_rec:
+                sent_rec["last_price_update_ts"] = time.time()
 
     def refresh_stale_exit_orders(
         self,
@@ -240,29 +245,65 @@ class OrderRouter:
             intent_id = rec.get("intent_id")
             if not intent_id:
                 continue
-            updated_at = rec.get("updated_at") or 0
-            if now - updated_at < stale_seconds:
+
+            # Use last_price_update_ts so only re-quote interval matters. Fallback to updated_at only when missing (not when 0).
+            # Explicit 0 = "always stale" (adopted EXIT orphan from yesterday) so we must not fall back to updated_at.
+            raw_ts = rec.get("last_price_update_ts")
+
+            if raw_ts is None:
+                last_price_ts = rec.get("updated_at") or 0
+            else:
+                last_price_ts = raw_ts
+            try:
+                last_price_ts = float(last_price_ts)
+            except (TypeError, ValueError):
+                last_price_ts = 0
+            if last_price_ts <= 0:
+                pass  # Treat as always stale (e.g. adopted orphan from yesterday)
+            elif now - last_price_ts < stale_seconds:
                 continue
+
             symbol = (rec.get("payload") or {}).get("symbol") or ""
             if not symbol:
                 symbol = getattr(rec.get("instrument"), "trading_symbol", "") or ""
             if not symbol:
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "oms", f"Refresh exit skip {intent_id}: no symbol"
+                    )
                 continue
             order_id = rec.get("broker_order_id")
             if not order_id:
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "oms", f"Refresh exit skip {intent_id}: no broker_order_id"
+                    )
                 continue
-            # Confirm order still open and get product_id (Delta)
             broker_order = None
             if hasattr(self.broker, "find_order_by_client_id"):
                 broker_order = self.broker.find_order_by_client_id(intent_id)
             if not broker_order:
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "oms",
+                        f"Refresh exit skip {intent_id}: order not found at broker",
+                    )
                 continue
             status = (broker_order.get("status") or "").lower()
             open_states = {"open", "pending", "placed", "trigger pending"}
             if status not in open_states:
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "oms",
+                        f"Refresh exit skip {intent_id}: broker status={status} (not open)",
+                    )
                 continue
             product_id = broker_order.get("product_id")
             if product_id is None:
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "oms", f"Refresh exit skip {intent_id}: no product_id"
+                    )
                 continue
             bid, ask = get_bid_ask(symbol)
             side = (rec.get("side") or rec.get("payload", {}).get("side") or "").upper()
@@ -271,6 +312,10 @@ class OrderRouter:
             else:
                 new_price = ask
             if new_price is None or new_price <= 0:
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "oms", f"Refresh exit skip {intent_id}: no bid/ask for {symbol}"
+                    )
                 continue
             try:
                 ok = self.broker.update_order_price(
@@ -285,6 +330,9 @@ class OrderRouter:
                     )
                 if ok:
                     self.intent_store.update(intent_id, IntentStatus.SENT)
+                    rec = self.intent_store.get(intent_id)
+                    if rec:
+                        rec["last_price_update_ts"] = now
             except Exception as e:
                 if self.engine_logger:
                     self.engine_logger.log("oms", f"Refresh exit order failed: {e}")
@@ -334,25 +382,39 @@ class OrderRouter:
                 engine_sym = b_sym
                 instr = None
                 if self.instrument_store and b_sym:
-                    # inst = self.instrument_store.intent_creation_details(
-                    #     b_sym, None, None, None, None
-                    # )
-                    inst = self.instrument_store.get_by_symbol(b_sym)
+                    inst = None
+                    if hasattr(self.instrument_store, "get_by_symbol"):
+                        inst = self.instrument_store.get_by_symbol(b_sym)
                     if (
                         not inst
                         and product_id
                         and hasattr(self.instrument_store, "get_by_product_id")
                     ):
                         inst = self.instrument_store.get_by_product_id(product_id)
+                    if not inst and hasattr(
+                        self.instrument_store, "intent_creation_details"
+                    ):
+                        inst = self.instrument_store.intent_creation_details(
+                            b_sym, None, None, None, None
+                        )
+                    if not inst and hasattr(
+                        self.instrument_store, "futures_intent_creation_details"
+                    ):
+                        inst = self.instrument_store.futures_intent_creation_details(
+                            b_sym, "DELTA", None
+                        )
                     if inst:
                         engine_sym = inst.trading_symbol
                         instr = inst
 
+                # Detect EXIT vs ENTRY from broker (e.g. Delta reduce_only)
+                is_reduce = o.get("reduce_only") in (True, "true", "yes", 1)
+                action = "EXIT" if is_reduce else "ENTRY"
                 stub_payload = {
                     "symbol": engine_sym,
                     "side": (o.get("side") or "").upper(),
                     "qty": int(o.get("qty") or 0),
-                    "action": "ENTRY",
+                    "action": action,
                     "strategy": "recovery",
                     "structure_id": f"recovered:{engine_sym}",
                     "candle_ts": None,
@@ -376,6 +438,9 @@ class OrderRouter:
                 intent_record["side"] = (o.get("side") or "").upper()
                 intent_record["qty"] = int(o.get("qty") or 0)
                 intent_record["action"] = stub_payload["action"]
+                # EXIT orphans (e.g. open from yesterday): set last_price_update_ts=0 so next refresh run re-quotes immediately
+                if action == "EXIT":
+                    intent_record["last_price_update_ts"] = 0
 
                 if self.engine_logger:
                     self.engine_logger.log(
