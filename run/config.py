@@ -66,7 +66,7 @@ STRATEGY_JOBS = [
         "feed_stale_seconds": 30,
         "order_state_check_interval_min": 1,
         "memory_threshold_percent": 5,
-        "latency_critical_ms": 50,
+        "latency_critical_ms": 3000,
         "latency_critical_cycles": 1,
         "symbol_error_threshold": 2,
         "live": {"exchange": "DELTA", "sector": "YES"},

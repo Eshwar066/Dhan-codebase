@@ -577,10 +577,14 @@ class LiveEngine(BaseEngine):
                     strategy_time_ms = (time.perf_counter() - t0) * 1000
                     if intent and self._entries_paused_feed_stale:
                         continue
-                    if intent and (
-                        self._entries_paused_order_mismatch
-                        or self._entries_paused_memory
-                        or self._entries_paused_latency
+                    if (
+                        intent
+                        and intent.action == "ENTRY"
+                        and (
+                            self._entries_paused_order_mismatch
+                            or self._entries_paused_memory
+                            or self._entries_paused_latency
+                        )
                     ):
                         continue
 
@@ -759,7 +763,9 @@ class LiveEngine(BaseEngine):
                         )
                     for exit_intent in exit_intents:
                         # Fix 3: Ensure exit intents have idempotency keys for deduplication (pass in; intent is frozen)
-                        exit_idem_key = getattr(exit_intent, "idempotency_key", None) or self._signal_hash(
+                        exit_idem_key = getattr(
+                            exit_intent, "idempotency_key", None
+                        ) or self._signal_hash(
                             symbol, timeframe or "", candle.get("timestamp"), "exit"
                         )
                         price_map = {
@@ -767,7 +773,9 @@ class LiveEngine(BaseEngine):
                                 exit_intent.instrument, "trading_symbol", symbol
                             ): exit_price
                         }
-                        self.order_router.process_intent(exit_intent, price_map, idempotency_key=exit_idem_key)
+                        self.order_router.process_intent(
+                            exit_intent, price_map, idempotency_key=exit_idem_key
+                        )
 
         entry_intents = (
             [intent]

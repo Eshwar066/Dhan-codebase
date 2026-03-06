@@ -1,5 +1,7 @@
+import json
 import time
 from enum import Enum
+from pathlib import Path
 from typing import Callable, Dict, Optional, Set, Tuple
 
 OptionalAlert = Optional[Callable[[str], None]]
@@ -63,12 +65,50 @@ class OrderRouter:
         self.strategy_id = strategy_id
         self.telegram_alert = telegram_alert
         self._consecutive_failures = 0
-        # Local order state cache: intent_id -> OrderState. Persisted in IntentStore; rebuilt on init.
+        # Order state cache: intent_id -> OrderState. Persisted to logs/order_state_{engine_id}.json.
         self._order_state: Dict[str, OrderState] = {}
+        _logs_dir = Path(__file__).resolve().parents[2] / "logs"
+        _logs_dir.mkdir(parents=True, exist_ok=True)
+        _safe_id = (engine_id or "default").replace(" ", "_").replace("/", "_")
+        self._order_state_file = _logs_dir / f"order_state_{_safe_id}.json"
+        self._load_order_state()
         self._rebuild_order_state_cache()
 
+    def _load_order_state(self) -> None:
+        """Load intent_id -> OrderState from logs/order_state_{engine_id}.json."""
+        if not getattr(self, "_order_state_file", None) or not self._order_state_file.exists():
+            return
+        try:
+            with open(self._order_state_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for intent_id, val in (data if isinstance(data, dict) else {}).items():
+                try:
+                    self._order_state[intent_id] = (
+                        OrderState(val) if isinstance(val, str) else val
+                    )
+                except (ValueError, TypeError):
+                    pass
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    def _persist_order_state(self) -> None:
+        """Write _order_state to logs/order_state_{engine_id}.json."""
+        if not getattr(self, "_order_state_file", None):
+            return
+        try:
+            data = {k: (v.value if isinstance(v, OrderState) else v) for k, v in self._order_state.items()}
+            with open(self._order_state_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except OSError:
+            pass
+
+    def _set_order_state(self, intent_id: str, state: OrderState) -> None:
+        """Update in-memory cache and persist to JSON."""
+        self._order_state[intent_id] = state
+        self._persist_order_state()
+
     def _rebuild_order_state_cache(self) -> None:
-        """Rebuild _order_state from IntentStore (e.g. after restart). Makes reconciliation faster."""
+        """Merge IntentStore order states into _order_state (e.g. after restart). Then persist."""
         if not hasattr(self.intent_store, "get_all_order_states"):
             return
         for intent_id, order_state_val in self.intent_store.get_all_order_states():
@@ -80,6 +120,7 @@ class OrderRouter:
                 )
             except (ValueError, TypeError):
                 pass
+        self._persist_order_state()
 
     def process_intent(self, intent, price_map, idempotency_key=None):
         if not self.risk.allow_intent(
@@ -88,7 +129,7 @@ class OrderRouter:
             self.intent_store.update(
                 intent.intent_id, IntentStatus.REJECTED, order_state=OrderState.REJECTED
             )
-            self._order_state[intent.intent_id] = OrderState.REJECTED
+            self._set_order_state(intent.intent_id, OrderState.REJECTED)
             return
 
         # Fix 3: Intent Deduplication (scoped by engine_id + strategy_id to support multi-engine/multi-strategy)
@@ -185,7 +226,7 @@ class OrderRouter:
             self.intent_store.update(
                 intent.intent_id, "REJECTED", order_state=OrderState.REJECTED
             )
-            self._order_state[intent.intent_id] = OrderState.REJECTED
+            self._set_order_state(intent.intent_id, OrderState.REJECTED)
             return
 
         if order_id is None:
@@ -206,11 +247,11 @@ class OrderRouter:
             self.intent_store.update(
                 intent.intent_id, "REJECTED", order_state=OrderState.REJECTED
             )
-            self._order_state[intent.intent_id] = OrderState.REJECTED
+            self._set_order_state(intent.intent_id, OrderState.REJECTED)
             return
 
         self._consecutive_failures = 0
-        self._order_state[intent.intent_id] = OrderState.SENT
+        self._set_order_state(intent.intent_id, OrderState.SENT)
         if self.telegram_alert:
             self.telegram_alert(f"Order placed: {sym} {side} qty={qty} order_id={order_id}")
         if self.engine_logger:
@@ -440,7 +481,7 @@ class OrderRouter:
                     broker_order_id=o.get("order_id"),
                     order_state=OrderState.OPEN,
                 )
-                self._order_state[tag] = OrderState.OPEN  # Seen on broker
+                self._set_order_state(tag, OrderState.OPEN)  # Seen on broker
 
                 # Augment record for process_fill
                 intent_record = self.intent_store.get(tag)
@@ -459,7 +500,7 @@ class OrderRouter:
 
             elif tag in local_intent_ids:
                 # Local thinks it's pending, broker confirms it's open. Sync order ID and persist OPEN.
-                self._order_state[tag] = OrderState.OPEN
+                self._set_order_state(tag, OrderState.OPEN)
                 intent = self.intent_store.get(tag)
                 self.intent_store.update(
                     tag,
@@ -505,7 +546,7 @@ class OrderRouter:
 
                         # Partial fill: filled > 0 and unfilled > 0 (filled < size)
                         if size > 0 and filled > 0 and filled < size:
-                            self._order_state[tag] = OrderState.PARTIAL
+                            self._set_order_state(tag, OrderState.PARTIAL)
                             self.intent_store.update(
                                 tag,
                                 IntentStatus.SENT,  # Still in flight
@@ -545,7 +586,7 @@ class OrderRouter:
                                 "instrument"
                             )  # If stored in dict; depends on intent_store implementation
 
-                            self._order_state[tag] = OrderState.FILLED
+                            self._set_order_state(tag, OrderState.FILLED)
                             self.intent_store.update(
                                 tag,
                                 IntentStatus.FILLED,
@@ -581,7 +622,7 @@ class OrderRouter:
                                     else OrderState.EXPIRED
                                 )
                             )
-                            self._order_state[tag] = ost
+                            self._set_order_state(tag, ost)
                             self.intent_store.update(
                                 tag, IntentStatus.REJECTED, order_state=ost
                             )
@@ -662,7 +703,7 @@ class OrderRouter:
             intent_id=intent_id,
         )
         if intent_id and self.intent_store:
-            self._order_state[intent_id] = OrderState.FILLED
+            self._set_order_state(intent_id, OrderState.FILLED)
             self.intent_store.update(
                 intent_id,
                 IntentStatus.FILLED,
