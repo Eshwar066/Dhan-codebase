@@ -1,5 +1,5 @@
 import time
-from typing import Callable, Dict, Tuple
+from typing import Callable, Dict, Optional, Tuple
 import pdb
 
 from core.orderExecution.intent_store import IntentStatus
@@ -17,6 +17,8 @@ class OrderRouter:
         instrument_store=None,  # Added for symbol resolution during adoption
         circuit_breaker_threshold: int = 5,
         slippage_threshold_pct: float = None,
+        engine_id: Optional[str] = None,
+        strategy_id: Optional[str] = None,
     ):
         self.risk = risk_manager
         self.broker = broker
@@ -27,6 +29,8 @@ class OrderRouter:
         self.instrument_store = instrument_store
         self.circuit_breaker_threshold = circuit_breaker_threshold
         self.slippage_threshold_pct = slippage_threshold_pct
+        self.engine_id = engine_id
+        self.strategy_id = strategy_id
         self._consecutive_failures = 0
 
     def process_intent(self, intent, price_map):
@@ -36,8 +40,13 @@ class OrderRouter:
             self.intent_store.update(intent.intent_id, IntentStatus.REJECTED)
             return
 
-        # Fix 3: Intent Deduplication
-        # Skip if there's already a pending/sent intent for this specific exit
+        # Fix 3: Intent Deduplication (scoped by engine_id + strategy_id to support multi-engine/multi-strategy)
+        intent_engine_id = getattr(intent, "engine_id", None) or self.engine_id
+        intent_strategy_id = (
+            getattr(intent, "strategy_id", None)
+            or getattr(intent, "strategy_name", None)
+            or self.strategy_id
+        )
         if getattr(intent, "action", "") == "EXIT":
             pending = self.intent_store.list_by_status(
                 IntentStatus.SENT
@@ -52,6 +61,8 @@ class OrderRouter:
                 if (
                     p_payload.get("symbol") == symbol
                     and p_payload.get("action") == "EXIT"
+                    and p_payload.get("engine_id") == intent_engine_id
+                    and p_payload.get("strategy_id") == intent_strategy_id
                 ):
                     if self.engine_logger:
                         self.engine_logger.log(
@@ -88,6 +99,8 @@ class OrderRouter:
                 "side": side,
                 "qty": qty,
                 "action": getattr(intent, "action", "ENTRY"),
+                "engine_id": intent_engine_id,
+                "strategy_id": intent_strategy_id,
             }
             self.intent_store.create(
                 payload=payload,
@@ -286,6 +299,8 @@ class OrderRouter:
                     "strategy": "recovery",
                     "structure_id": f"recovered:{engine_sym}",
                     "candle_ts": None,
+                    "engine_id": self.engine_id,
+                    "strategy_id": self.strategy_id,
                 }
 
                 # Register in store
@@ -316,12 +331,15 @@ class OrderRouter:
 
         # 2. Missing: In local pending but not on broker open list
         # This usually means it FILLED or was REJECTED/CANCELLED.
-        
+        # Broker open list can lag; wait 1–2s before polling so we don't spam find_order_by_client_id.
         missing = [
             i
             for i in local_pending
             if i.get("intent_id") and i.get("intent_id") not in broker_tags
         ]
+
+        if missing and hasattr(self.broker, "find_order_by_client_id"):
+            time.sleep(2)
 
         for i in missing:
             tag = i.get("intent_id")

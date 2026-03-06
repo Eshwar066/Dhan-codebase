@@ -111,6 +111,8 @@ class EngineFactory:
             intent_store=intent_store,
             position_manager=position_manager,
             instrument_store=instrument_store,
+            engine_id=getattr(config, "engine_id", None),
+            strategy_id=config.strategy_name,
         )
         broker.set_order_router(order_router)
 
@@ -214,6 +216,8 @@ class EngineFactory:
             instrument_store=instrument_store,
             circuit_breaker_threshold=getattr(config, "circuit_breaker_threshold", 5),
             slippage_threshold_pct=getattr(config, "slippage_threshold_pct", None),
+            engine_id=getattr(config, "engine_id", None),
+            strategy_id=config.strategy_name,
         )
         broker.set_order_router(order_router)
 
