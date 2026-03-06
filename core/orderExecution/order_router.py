@@ -77,7 +77,7 @@ class OrderRouter:
             except (ValueError, TypeError):
                 pass
 
-    def process_intent(self, intent, price_map):
+    def process_intent(self, intent, price_map, idempotency_key=None):
         if not self.risk.allow_intent(
             intent, price_map, candle_ts=getattr(intent, "candle_ts", None)
         ):
@@ -152,7 +152,7 @@ class OrderRouter:
             self.intent_store.create(
                 payload=payload,
                 intent_id=intent.intent_id,
-                idempotency_key=getattr(intent, "idempotency_key", None),
+                idempotency_key=idempotency_key if idempotency_key is not None else getattr(intent, "idempotency_key", None),
             )
             rec = self.intent_store.get(intent.intent_id)
             if rec and hasattr(intent, "instrument"):

@@ -448,7 +448,6 @@ class LiveEngine(BaseEngine):
         self.order_router.refresh_stale_exit_orders(
             get_bid_ask=self._get_bid_ask,
             stale_seconds=float(self._exit_refresh_interval_seconds),
-            get_last_price=self.get_price_map,
         )
 
     def start(self, exchange, sector, rsi):
@@ -759,18 +758,16 @@ class LiveEngine(BaseEngine):
                             "Strategy exit",
                         )
                     for exit_intent in exit_intents:
-                        # Fix 3: Ensure exit intents have idempotency keys for deduplication
-                        if not getattr(exit_intent, "idempotency_key", None):
-                            exit_intent.idempotency_key = self._signal_hash(
-                                symbol, timeframe or "", candle.get("timestamp"), "exit"
-                            )
-                        
+                        # Fix 3: Ensure exit intents have idempotency keys for deduplication (pass in; intent is frozen)
+                        exit_idem_key = getattr(exit_intent, "idempotency_key", None) or self._signal_hash(
+                            symbol, timeframe or "", candle.get("timestamp"), "exit"
+                        )
                         price_map = {
                             getattr(
                                 exit_intent.instrument, "trading_symbol", symbol
                             ): exit_price
                         }
-                        self.order_router.process_intent(exit_intent, price_map)
+                        self.order_router.process_intent(exit_intent, price_map, idempotency_key=exit_idem_key)
 
         entry_intents = (
             [intent]
