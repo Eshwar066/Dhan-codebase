@@ -111,10 +111,13 @@ class LiveEngine(BaseEngine):
         self._last_signal_hash_per_symbol: Dict[str, int] = {}
         # Time-of-day guard
         self.allowed_trading_hours = allowed_trading_hours or []
-        # Order state check
-        self.order_state_check_interval_min = order_state_check_interval_min
+        # Order state check (Fix 2: Default to 1m if not set)
+        self.order_state_check_interval_min = order_state_check_interval_min or 1
         self._last_order_state_check_time: float = 0
         self._entries_paused_order_mismatch = False
+        # Stale exit order refresh: re-quote at near bid/ask every 1 min until fill
+        self._exit_refresh_interval_seconds = 60
+        self._last_exit_refresh_time: float = 0
         # Memory guard
         self.memory_threshold_percent = memory_threshold_percent
         self._entries_paused_memory = False
@@ -425,6 +428,28 @@ class LiveEngine(BaseEngine):
             self._entries_paused_order_mismatch = True
             self.reconcile_positions_on_start()
 
+    def _get_bid_ask(self, symbol: str) -> Tuple[Optional[float], Optional[float]]:
+        """Return (best_bid, best_ask) for symbol from feed; (None, None) if unavailable."""
+        if self.realtime_feed and hasattr(self.realtime_feed, "get_best_bid"):
+            try:
+                bid = self.realtime_feed.get_best_bid(symbol)
+                ask = self.realtime_feed.get_best_ask(symbol)
+                return (bid, ask)
+            except Exception:
+                pass
+        return (None, None)
+
+    def _do_exit_order_refresh(self) -> None:
+        """Every 1 min, re-quote open exit orders at near bid/ask until they fill."""
+        now = time.time()
+        if now - self._last_exit_refresh_time < self._exit_refresh_interval_seconds:
+            return
+        self._last_exit_refresh_time = now
+        self.order_router.refresh_stale_exit_orders(
+            get_bid_ask=self._get_bid_ask,
+            stale_seconds=float(self._exit_refresh_interval_seconds),
+        )
+
     def start(self, exchange, sector, rsi):
         if self.engine_logger:
             self.engine_logger.engine_start("Live engine started")
@@ -464,6 +489,7 @@ class LiveEngine(BaseEngine):
             self._check_memory()
             self.check_feed_health()
             self._do_order_state_check()
+            self._do_exit_order_refresh()
 
             # move this logic based on date change
             if loop_count % 60 == 0:
@@ -732,6 +758,12 @@ class LiveEngine(BaseEngine):
                             "Strategy exit",
                         )
                     for exit_intent in exit_intents:
+                        # Fix 3: Ensure exit intents have idempotency keys for deduplication
+                        if not getattr(exit_intent, "idempotency_key", None):
+                            exit_intent.idempotency_key = self._signal_hash(
+                                symbol, timeframe or "", candle.get("timestamp"), "exit"
+                            )
+                        
                         price_map = {
                             getattr(
                                 exit_intent.instrument, "trading_symbol", symbol

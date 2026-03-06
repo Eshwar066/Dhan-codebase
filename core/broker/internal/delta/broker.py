@@ -3,6 +3,7 @@
 import time
 import uuid
 from typing import Any, Optional
+import pdb
 
 from core.broker.base import BaseBroker
 
@@ -152,15 +153,53 @@ class DeltaBroker(BaseBroker):
             self.position_manager.reconcile_with_broker(broker_positions)
 
     def get_open_orders(self):
-        """Open/pending orders for order-state consistency. Delta: state in ('open', 'pending', 'placed')."""
+        """
+        Returns normalized list of open/pending orders.
+
+        Used for:
+        - Engine restart reconciliation
+        - PositionManager consistency checks
+        - Preventing duplicate orders
+        """
+
         orders = self.api.get_order_list() or []
+        # pdb.set_trace()
         open_states = {"open", "pending", "placed", "trigger pending"}
-        return [
-            {
-                "order_id": o.get("order_id"),
-                "tag": o.get("tag"),
-                "status": o.get("status"),
-            }
-            for o in orders
-            if (o.get("status") or "").lower() in open_states
-        ]
+
+        normalized_orders = []
+
+        for o in orders:
+
+            status = (o.get("status") or "").lower()
+
+            if status not in open_states:
+                continue
+
+            product_id = o.get("product_id") or o.get("symbol")
+
+            normalized_orders.append(
+                {
+                    "order_id": o.get("order_id"),
+                    "tag": o.get("tag"),
+                    "status": status,
+                    "symbol": o.get("symbol"),
+                    "product_id": product_id,
+                    "side": (o.get("side") or "").lower(),
+                    "qty": int(o.get("qty") or 0),
+                }
+            )
+
+        return normalized_orders
+
+    def update_order_price(
+        self, product_id: int, order_id: str, new_limit_price: float
+    ) -> bool:
+        """Update limit price of an open order (e.g. re-quote exit at near bid/ask). Returns True on success."""
+        if not hasattr(self.api, "batch_edit"):
+            return False
+        try:
+            orders = [{"id": str(order_id), "limit_price": str(new_limit_price)}]
+            self.api.batch_edit(product_id=product_id, orders=orders)
+            return True
+        except Exception:
+            return False

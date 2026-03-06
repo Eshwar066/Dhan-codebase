@@ -99,6 +99,8 @@ class EngineFactory:
         position_manager = PositionManager(logger=logger)
         intent_store = IntentStore()
         risk_manager = RiskManager(position_manager=position_manager)
+        # ---------- Instruments (needed by OrderRouter) ----------
+        instrument_store = EngineFactory._instrument_store(config)
         broker = SimulatedBroker(
             position_manager=position_manager,
             intent_store=intent_store,
@@ -108,11 +110,9 @@ class EngineFactory:
             broker=broker,
             intent_store=intent_store,
             position_manager=position_manager,
+            instrument_store=instrument_store,
         )
         broker.set_order_router(order_router)
-
-        # ---------- Instruments (venue-specific path) ----------
-        instrument_store = EngineFactory._instrument_store(config)
 
         # ---------- Universe (DHAN equity strategies only) ----------
         universe_service = EngineFactory._universe_service(
@@ -180,6 +180,9 @@ class EngineFactory:
             engine_logger=engine_logger,
         )
 
+        # ---------- Instruments (needed by OrderRouter) ----------
+        instrument_store = EngineFactory._instrument_store(config)
+
         # ---------- Broker + OrderRouter (venue-specific) ----------
         # PAPER: use SimulatedBroker (same logs/safeguards as LIVE; no real orders).
         if config.run_mode == RunMode.PAPER:
@@ -208,13 +211,11 @@ class EngineFactory:
             intent_store=intent_store,
             position_manager=position_manager,
             engine_logger=engine_logger,
+            instrument_store=instrument_store,
             circuit_breaker_threshold=getattr(config, "circuit_breaker_threshold", 5),
             slippage_threshold_pct=getattr(config, "slippage_threshold_pct", None),
         )
         broker.set_order_router(order_router)
-
-        # ---------- Instruments ----------
-        instrument_store = EngineFactory._instrument_store(config)
 
         # ---------- Universe (DHAN equity strategies only) ----------
         universe_service = EngineFactory._universe_service(

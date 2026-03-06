@@ -488,21 +488,45 @@ class DeltaSource:
             return {"status": "error", "order_id": None, "message": str(e)}
 
     def get_order_list(self) -> List[Dict[str, Any]]:
-        """Live orders for idempotency / status. Normalized to have order_id, tag."""
+        """
+        Fetch live orders from Delta and normalize fields for the engine.
+
+        Used for:
+        - Order idempotency
+        - Reconciliation on engine restart
+        - PositionManager state sync
+        """
+
         try:
             raw = self._client.get_live_orders(query=None)
             if not isinstance(raw, list):
                 return []
-            return [
-                {
-                    "order_id": str(o.get("id", "")),
-                    "tag": o.get("client_order_id"),
-                    "product_id": o.get("product_id"),
-                    "status": o.get("state"),
-                }
-                for o in raw
-            ]
-        except Exception:
+
+            normalized = []
+
+            for o in raw:
+
+                normalized.append(
+                    {
+                        "order_id": str(o.get("id")),
+                        "tag": o.get("client_order_id"),
+                        "product_id": o.get("product_id"),
+                        "symbol": o.get("product_symbol")
+                        or (o.get("product") or {}).get("symbol"),
+                        "status": (o.get("state") or "").lower(),
+                        "side": (o.get("side") or "").lower(),
+                        "qty": int(o.get("size") or 0),
+                        "remaining_qty": int(o.get("unfilled_size") or 0),
+                        "price": float(o.get("limit_price") or 0),
+                        "reduce_only": bool(o.get("reduce_only")),
+                        "created_at": o.get("created_at"),
+                    }
+                )
+
+            return normalized
+
+        except Exception as e:
+            self.logger.error(f"get_order_list failed: {e}")
             return []
 
     def cancel_order(self, product_id: int, order_id: Any) -> Any:

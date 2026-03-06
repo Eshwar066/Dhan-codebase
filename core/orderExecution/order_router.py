@@ -1,3 +1,7 @@
+import time
+from typing import Callable, Dict, Tuple
+import pdb
+
 from core.orderExecution.intent_store import IntentStatus
 
 
@@ -10,6 +14,7 @@ class OrderRouter:
         position_manager=None,
         slippage_model=None,
         engine_logger=None,
+        instrument_store=None,  # Added for symbol resolution during adoption
         circuit_breaker_threshold: int = 5,
         slippage_threshold_pct: float = None,
     ):
@@ -19,19 +24,50 @@ class OrderRouter:
         self.position_manager = position_manager
         self.slippage_model = slippage_model or (lambda price: price)
         self.engine_logger = engine_logger
+        self.instrument_store = instrument_store
         self.circuit_breaker_threshold = circuit_breaker_threshold
         self.slippage_threshold_pct = slippage_threshold_pct
         self._consecutive_failures = 0
 
     def process_intent(self, intent, price_map):
-        if not self.risk.allow_intent(intent, price_map, candle_ts=getattr(intent, "candle_ts", None)):
-            self.intent_store.update(intent.intent_id, "REJECTED")
+        if not self.risk.allow_intent(
+            intent, price_map, candle_ts=getattr(intent, "candle_ts", None)
+        ):
+            self.intent_store.update(intent.intent_id, IntentStatus.REJECTED)
             return
+
+        # Fix 3: Intent Deduplication
+        # Skip if there's already a pending/sent intent for this specific exit
+        if getattr(intent, "action", "") == "EXIT":
+            pending = self.intent_store.list_by_status(
+                IntentStatus.SENT
+            ) + self.intent_store.list_by_status(IntentStatus.VALIDATED)
+            symbol = (
+                intent.instrument.trading_symbol
+                if hasattr(intent, "instrument")
+                else ""
+            )
+            for p in pending:
+                p_payload = p.get("payload", {})
+                if (
+                    p_payload.get("symbol") == symbol
+                    and p_payload.get("action") == "EXIT"
+                ):
+                    if self.engine_logger:
+                        self.engine_logger.log(
+                            "oms",
+                            f"Exit intent for {symbol} already in flight; skipping",
+                        )
+                    return
 
         # Resolve execution price: intent.price first, else price_map (e.g. backtest candle close)
         exec_price = intent.price
         if exec_price is None and price_map:
-            sym = getattr(intent.instrument, "trading_symbol", None) if getattr(intent, "instrument", None) else None
+            sym = (
+                getattr(intent.instrument, "trading_symbol", None)
+                if getattr(intent, "instrument", None)
+                else None
+            )
             if sym is not None:
                 exec_price = price_map.get(sym)
         if exec_price is None:
@@ -44,16 +80,42 @@ class OrderRouter:
         sym = intent.instrument.trading_symbol if hasattr(intent, "instrument") else ""
         side = getattr(intent, "side", "")
         qty = getattr(intent, "qty", 0)
+
+        # Ensure intent exists in store (for fill sync and stale exit refresh)
+        if not self.intent_store.exists(intent.intent_id):
+            payload = {
+                "symbol": sym,
+                "side": side,
+                "qty": qty,
+                "action": getattr(intent, "action", "ENTRY"),
+            }
+            self.intent_store.create(
+                payload=payload,
+                intent_id=intent.intent_id,
+                idempotency_key=getattr(intent, "idempotency_key", None),
+            )
+            rec = self.intent_store.get(intent.intent_id)
+            if rec and hasattr(intent, "instrument"):
+                rec["instrument"] = intent.instrument
+
+        # Fix 1: Persistence Before Flight
+        self.intent_store.update(intent.intent_id, IntentStatus.VALIDATED)
+
         try:
             order_id = self.broker.place_order(intent, execution_price=exec_price)
         except Exception as e:
             self._consecutive_failures += 1
             if self.engine_logger:
                 self.engine_logger.log("risk_block", f"Broker place_order failed: {e}")
-            if self._consecutive_failures >= self.circuit_breaker_threshold and self.risk:
+            if (
+                self._consecutive_failures >= self.circuit_breaker_threshold
+                and self.risk
+            ):
                 self.risk.trigger_kill_switch("broker_failure")
                 if self.engine_logger:
-                    self.engine_logger.broker_circuit_breaker_triggered("broker_failure")
+                    self.engine_logger.broker_circuit_breaker_triggered(
+                        "broker_failure"
+                    )
             self.intent_store.update(intent.intent_id, "REJECTED")
             return
 
@@ -61,10 +123,15 @@ class OrderRouter:
             self._consecutive_failures += 1
             if self.engine_logger:
                 self.engine_logger.log("risk_block", "Broker place_order returned None")
-            if self._consecutive_failures >= self.circuit_breaker_threshold and self.risk:
+            if (
+                self._consecutive_failures >= self.circuit_breaker_threshold
+                and self.risk
+            ):
                 self.risk.trigger_kill_switch("broker_failure")
                 if self.engine_logger:
-                    self.engine_logger.broker_circuit_breaker_triggered("broker_failure")
+                    self.engine_logger.broker_circuit_breaker_triggered(
+                        "broker_failure"
+                    )
             self.intent_store.update(intent.intent_id, "REJECTED")
             return
 
@@ -84,38 +151,259 @@ class OrderRouter:
             broker_order_id=order_id,
         )
 
-    def verify_open_orders_with_broker(self, position_manager):
+    def refresh_stale_exit_orders(
+        self,
+        get_bid_ask: Callable[[str], Tuple[float, float]],
+        stale_seconds: float = 60,
+    ) -> None:
         """
-        Compare broker.get_open_orders() with local IntentStore (SENT) and PositionManager.
-        Returns (ok: bool, details: dict). If not ok: caller should call reconcile_positions_on_start and optionally pause.
+        If an open EXIT order has been sitting unfilled for >= stale_seconds,
+        update its limit price to near bid (SELL) or near ask (BUY) and repeat until fill.
+        Only runs when broker supports update_order_price (e.g. Delta).
+        """
+        if not hasattr(self.broker, "update_order_price"):
+            return
+        now = time.time()
+        sent_exits = [
+            i
+            for i in self.intent_store.list_by_status(IntentStatus.SENT)
+            if (i.get("payload") or {}).get("action") == "EXIT"
+        ]
+        for rec in sent_exits:
+            intent_id = rec.get("intent_id")
+            if not intent_id:
+                continue
+            updated_at = rec.get("updated_at") or 0
+            if now - updated_at < stale_seconds:
+                continue
+            symbol = (rec.get("payload") or {}).get("symbol") or ""
+            if not symbol:
+                symbol = getattr(rec.get("instrument"), "trading_symbol", "") or ""
+            if not symbol:
+                continue
+            order_id = rec.get("broker_order_id")
+            if not order_id:
+                continue
+            # Confirm order still open and get product_id (Delta)
+            broker_order = None
+            if hasattr(self.broker, "find_order_by_client_id"):
+                broker_order = self.broker.find_order_by_client_id(intent_id)
+            if not broker_order:
+                continue
+            status = (broker_order.get("status") or "").lower()
+            open_states = {"open", "pending", "placed", "trigger pending"}
+            if status not in open_states:
+                continue
+            product_id = broker_order.get("product_id")
+            if product_id is None:
+                continue
+            bid, ask = get_bid_ask(symbol)
+            side = (rec.get("side") or rec.get("payload", {}).get("side") or "").upper()
+            if side == "SELL":
+                new_price = bid
+            else:
+                new_price = ask
+            if new_price is None or new_price <= 0:
+                continue
+            try:
+                ok = self.broker.update_order_price(
+                    product_id=int(product_id),
+                    order_id=str(order_id),
+                    new_limit_price=float(new_price),
+                )
+                if ok and self.engine_logger:
+                    self.engine_logger.log(
+                        "oms",
+                        f"Refreshed exit order {intent_id} at {new_price} (near {'bid' if side == 'SELL' else 'ask'})",
+                    )
+                if ok:
+                    self.intent_store.update(intent_id, IntentStatus.SENT)
+            except Exception as e:
+                if self.engine_logger:
+                    self.engine_logger.log("oms", f"Refresh exit order failed: {e}")
+
+    def verify_open_orders_with_broker(self) -> Tuple[bool, Dict]:
+        """
+        Compare broker open orders with local IntentStore (SENT/VALIDATED).
+        Attempts to resolve mismatches by updating local records.
+        Returns (ok: bool, details: dict).
         """
         if not hasattr(self.broker, "get_open_orders"):
             return True, {}
+        pdb.set_trace()
         try:
             broker_open = self.broker.get_open_orders()
         except Exception as e:
             if self.engine_logger:
-                self.engine_logger.order_state_mismatch(f"Failed to fetch broker open orders: {e}")
+                self.engine_logger.order_state_mismatch(
+                    f"Failed to fetch broker open orders: {e}"
+                )
             return False, {"error": str(e)}
-        local_sent = self.intent_store.list_by_status(IntentStatus.SENT)
-        local_intent_ids = {i.get("intent_id") for i in local_sent if i.get("intent_id")}
+
+        # Consider both VALIDATED (in flight) and SENT
+        local_pending = self.intent_store.list_by_status(
+            IntentStatus.SENT
+        ) + self.intent_store.list_by_status(IntentStatus.VALIDATED)
+
+        local_intent_ids = {
+            i.get("intent_id") for i in local_pending if i.get("intent_id")
+        }
         broker_tags = {o.get("tag") for o in broker_open if o.get("tag")}
-        broker_order_ids = {o.get("order_id") for o in broker_open}
-        orphans = [o for o in broker_open if o.get("tag") and o.get("tag") not in local_intent_ids]
-        missing = [i for i in local_sent if i.get("broker_order_id") and i.get("broker_order_id") not in broker_order_ids]
-        filled_not_reflected = [
-            i for i in local_sent
-            if i.get("broker_order_id") not in broker_order_ids
+        # broker_order_ids = {o.get("order_id") for o in broker_open}
+
+        # 1. Orphans: On broker but not in local pending
+        # We might have recorded them earlier, so check if they exist AT ALL in intent_store
+        orphans = []
+        for o in broker_open:
+            tag = o.get("tag")
+            if not tag:
+                continue
+
+            if not self.intent_store.exists(tag):
+                orphans.append(o)
+                # Orphan Adoption: Create local record for pre-existing broker order
+                b_sym = o.get("symbol") or o.get("product_symbol")
+                product_id = o.get("product_id")
+
+                engine_sym = b_sym
+                instr = None
+                if self.instrument_store and b_sym:
+                    # inst = self.instrument_store.intent_creation_details(
+                    #     b_sym, None, None, None, None
+                    # )
+                    inst = self.instrument_store.get_by_symbol(b_sym)
+                    if not inst and product_id:
+                        inst = self.instrument_store.get_by_product_id(product_id)
+                    if inst:
+                        engine_sym = inst.trading_symbol
+                        instr = inst
+
+                stub_payload = {
+                    "symbol": engine_sym,
+                    "side": (o.get("side") or "").lower(),
+                    "qty": int(o.get("qty") or 0),
+                    "action": "ENTRY",
+                    "strategy": "recovery",
+                    "structure_id": f"recovered:{engine_sym}",
+                    "candle_ts": None,
+                }
+
+                # Register in store
+                self.intent_store.create(payload=stub_payload, intent_id=tag)
+                self.intent_store.update(
+                    tag, IntentStatus.SENT, broker_order_id=o.get("order_id")
+                )
+
+                # Augment record for process_fill
+                intent_record = self.intent_store.get(tag)
+                intent_record["instrument"] = instr
+                intent_record["side"] = (o.get("side") or "").lower()
+                intent_record["qty"] = int(o.get("qty") or 0)
+                intent_record["action"] = stub_payload["action"]
+
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "oms", f"Adopted orphan order {tag} for {engine_sym}"
+                    )
+
+            elif tag in local_intent_ids:
+                # Local thinks it's pending, broker confirms it's open. Sync order ID if missing.
+                intent = self.intent_store.get(tag)
+                if not intent.get("broker_order_id"):
+                    self.intent_store.update(
+                        tag, IntentStatus.SENT, broker_order_id=o.get("order_id")
+                    )
+
+        # 2. Missing: In local pending but not on broker open list
+        # This usually means it FILLED or was REJECTED/CANCELLED.
+        
+        missing = [
+            i
+            for i in local_pending
+            if i.get("intent_id") and i.get("intent_id") not in broker_tags
         ]
+
+        for i in missing:
+            tag = i.get("intent_id")
+            # Query broker for terminal state of this specific intent (tag)
+            if hasattr(self.broker, "find_order_by_client_id"):
+                try:
+                    order = self.broker.find_order_by_client_id(tag)
+                    if order:
+                        status = (order.get("status") or "").lower()
+                        # Get original intent object if possible
+                        # The intent_store.get returns a dict, but we need the dataclass for process_fill
+                        # For now, we'll use the data from the dict if the dataclass isn't easily available.
+                        # However, OrderRouter.process_fill expects 'instrument' as an object.
+
+                        if status == "filled":
+                            if self.engine_logger:
+                                self.engine_logger.log(
+                                    "oms",
+                                    f"Syncing fill for {tag} discovered via polling",
+                                )
+
+                            # Reconstruct fill from broker data and intent record
+                            # Note: In a real system, we'd ideally have the original OrderIntent object.
+                            # Since we don't have it here easily (intent_store stores dicts),
+                            # we'll use the values from the dict.
+                            payload = i.get("payload", {})
+                            instr = i.get(
+                                "instrument"
+                            )  # If stored in dict; depends on intent_store implementation
+
+                            # For now, update intent status to avoid re-syncing
+                            self.intent_store.update(
+                                tag,
+                                IntentStatus.FILLED,
+                                broker_order_id=order.get("order_id"),
+                            )
+
+                            # Trigger fill processing if we can get the data
+                            # This will update PositionManager.
+                            if self.position_manager:
+                                # Fallback to dict-based instrument if object not available
+                                # Most brokers handle both
+                                self.process_fill(
+                                    instrument=i.get("instrument"),
+                                    side=i.get("side"),
+                                    qty=(
+                                        float(order.get("size", 0))
+                                        - float(order.get("unfilled_size", 0))
+                                    ),
+                                    price=float(
+                                        order.get("average_fill_price")
+                                        or i.get("price", 0)
+                                    ),
+                                    order_id=order.get("order_id"),
+                                    intent_id=tag,
+                                    strategy=i.get("strategy"),
+                                    structure_id=i.get("structure_id"),
+                                    tag=i.get("tag"),
+                                    candle_ts=i.get("candle_ts"),
+                                    action=i.get("action"),
+                                )
+
+                        elif status in ("cancelled", "rejected", "expired"):
+                            self.intent_store.update(tag, IntentStatus.REJECTED)
+                except Exception as e:
+                    if self.engine_logger:
+                        self.engine_logger.log(
+                            "oms", f"Failed to sync status for {tag}: {e}"
+                        )
+
         diff = {
             "orphan_broker_orders": len(orphans),
             "missing_local_records": len(missing),
-            "filled_not_reflected": len(filled_not_reflected),
         }
-        if orphans or missing or filled_not_reflected:
+
+        if orphans or missing:
             if self.engine_logger:
-                self.engine_logger.order_state_mismatch("Order state mismatch; reconcile required", details=diff)
+                self.engine_logger.order_state_mismatch(
+                    "Order state mismatch detected", details=diff
+                )
             return False, diff
+
         return True, {}
 
     def process_fill(
@@ -165,15 +453,41 @@ class OrderRouter:
         if position_closed and realized_pnl is not None:
             self.risk.record_realized_pnl(realized_pnl)
         sym = getattr(instrument, "trading_symbol", "")
-        self.report_fill(sym, side, qty, expected_price, price, order_id=order_id, intent_id=intent_id)
+        self.report_fill(
+            sym,
+            side,
+            qty,
+            expected_price,
+            price,
+            order_id=order_id,
+            intent_id=intent_id,
+        )
         if intent_id and self.intent_store:
-            self.intent_store.update(intent_id, IntentStatus.FILLED, broker_order_id=order_id)
+            self.intent_store.update(
+                intent_id, IntentStatus.FILLED, broker_order_id=order_id
+            )
 
-    def report_fill(self, symbol, side, qty, expected_price, fill_price, order_id=None, intent_id=None):
+    def report_fill(
+        self,
+        symbol,
+        side,
+        qty,
+        expected_price,
+        fill_price,
+        order_id=None,
+        intent_id=None,
+    ):
         """Logs order_filled and high_slippage_warning if above threshold. Called by process_fill or legacy paths."""
         if self.engine_logger:
-            self.engine_logger.order_filled(symbol=symbol, side=side, qty=qty, price=fill_price, order_id=order_id)
-        if self.slippage_threshold_pct is not None and expected_price and expected_price > 0 and fill_price is not None:
+            self.engine_logger.order_filled(
+                symbol=symbol, side=side, qty=qty, price=fill_price, order_id=order_id
+            )
+        if (
+            self.slippage_threshold_pct is not None
+            and expected_price
+            and expected_price > 0
+            and fill_price is not None
+        ):
             pct = abs(fill_price - expected_price) / expected_price
             if pct > self.slippage_threshold_pct:
                 if self.engine_logger:
