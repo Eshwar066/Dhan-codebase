@@ -119,9 +119,19 @@ class DeltaRestClient:
         response = self.request("GET", "/v2/products", auth=auth)
         return parseResponse(response)
 
-    def get_all_positions(self):
-        """All open positions (no product_id filter)."""
-        response = self.request("GET", "/v2/positions", auth=True)
+    def get_all_positions(self, underlying_asset_symbol=None, product_id=None):
+        """
+        Open positions. Delta India API requires one of product_id or underlying_asset_symbol.
+        Pass either for India; optional for global Delta.
+        """
+        query = {}
+        if product_id is not None:
+            query["product_id"] = product_id
+        if underlying_asset_symbol is not None:
+            query["underlying_asset_symbol"] = underlying_asset_symbol
+        response = self.request(
+            "GET", "/v2/positions", query=query if query else None, auth=True
+        )
         return parseResponse(response)
 
     def batch_create(self, product_id, orders):

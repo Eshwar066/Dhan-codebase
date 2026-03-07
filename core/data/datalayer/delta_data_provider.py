@@ -26,32 +26,29 @@ class DeltaDataProvider(IDataProvider):
         start_date: str,
         end_date: str,
         timeframe: str,
-        exchange: str,
-        sector: str,
+        exchange: str = None,
+        sector: str = None,
     ) -> Optional[pd.DataFrame]:
         return self._source.get_intraday(
             symbol=symbol,
             start_date=start_date,
             end_date=end_date,
             timeframe=timeframe,
-            exchange=exchange,
-            sector=sector,
         )
+
+    def get_products(self):
+        return self._source.get_products()
+
+    def product_id_for_symbol(self, symbol):
+        return self._source.product_id_for_symbol(symbol)
 
     def get_latest_candles(
         self, symbols: List[str], debug: str = "NO"
     ) -> Optional[dict]:
         return self._source.get_latest_candles(symbols, debug)
 
-    def get_live_expiry(self, symbol: str, exchange: str) -> Any:
+    def get_live_expiry(self, symbol: str, exchange: str = None) -> Any:
         return self._source.get_live_expiry(symbol=symbol, exchange=exchange)
-
-    def get_nse_expiries(
-        self, symbol: str, year: int, instrument: str = "OPTIDX"
-    ) -> List[Any]:
-        return self._source.get_nse_expiries(
-            symbol=symbol, year=year, instrument=instrument
-        )
 
     def get_live_option_chain(
         self,

@@ -1,121 +1,123 @@
-import time
+"""
+Multi-venue entry point. Uses EngineFactory to build isolated engines per venue.
+
+Single process, single venue (filter by --venue):
+    python -m run.main --venue DHAN
+    python -m run.main --venue DELTA
+
+Two processes (parallel Dhan + Delta):
+    Process 1: python -m run.main --venue DHAN
+    Process 2: python -m run.main --venue DELTA
+
+Optional: use Supervisor in code to run both venues in one process (two threads).
+"""
+
+import argparse
+import os
+import sys
 from pathlib import Path
+import pdb
 
-from run.config import RUN_MODE, RunMode, STRATEGY_JOBS
-from core.strategies.registry import STRATEGY_MAP
-from core.engine.backtest_engine import BacktestEngine
-from core.engine.live_engine import LiveEngine
-from core.orderExecution.risk_manager import RiskManager
-from core.data.sources.dhan_source import DhanSource
-from core.data.sources.delta_source import DeltaSource
-from core.data.datalayer import DhanDataProvider, DeltaDataProvider
-from core.broker import (
-    DhanBroker,
-    DhanBrokerApi,
-    DeltaBroker,
-    DeltaBrokerApi,
-    SimulatedBroker,
-)
-from core.data.candle_service import CandleService
-from core.orderExecution.order_router import OrderRouter
-from core.orderExecution.intent_store import IntentStore
-from core.orderExecution.position_manager import PositionManager
-from core.utils.instruments.instrument_store import InstrumentStore
-from logs.logger.trade_logger import TradeLogger
+from run.config import RUN_MODE, RunMode, STRATEGY_JOBS, DEFAULT_VENUE
+from run.engine_config import EngineConfig
+from core.engine.factory import EngineFactory
 
 
-# Select broker: "DHAN" | "DELTA" (Delta uses core/library/delta_rest_client)
-BROKER_NAME = "DHAN"
+def job_to_engine_config(job: dict) -> EngineConfig:
+    """Build EngineConfig from a STRATEGY_JOBS entry."""
+    venue = job.get("venue", DEFAULT_VENUE)
+    backtest = job.get("backtest") or {}
+    live = job.get("live") or {}
+    return EngineConfig(
+        broker_name=venue,
+        run_mode=RUN_MODE,
+        strategy_name=job["name"],
+        symbols=job["symbols"],
+        enabled=job.get("enabled", True),
+        engine_id=job.get("engine_id"),
+        capital=job.get("capital"),
+        risk_per_trade_percent=job.get("risk_per_trade_percent"),
+        daily_max_loss=job.get("daily_max_loss"),
+        max_open_positions=job.get("max_open_positions"),
+        feed_stale_seconds=job.get("feed_stale_seconds"),
+        backtest=backtest,
+        live=live,
+        delta_testnet=job.get("delta_testnet", True),
+        delta_india=job.get("delta_india", False),
+        order_state_check_interval_min=job.get("order_state_check_interval_min", 0),
+        memory_threshold_percent=job.get("memory_threshold_percent"),
+        strategy_timeout_seconds=job.get("strategy_timeout_seconds"),
+        latency_critical_ms=job.get("latency_critical_ms", 150.0),
+        latency_critical_cycles=job.get("latency_critical_cycles", 3),
+        symbol_error_threshold=job.get("symbol_error_threshold", 5),
+        telegram_bot_token=(
+            (job.get("telegram") or {}).get("bot_token") if isinstance(job.get("telegram"), dict) else None
+        ) or os.getenv("TELEGRAM_BOT_TOKEN"),
+        telegram_chat_id=(
+            (job.get("telegram") or {}).get("chat_id") if isinstance(job.get("telegram"), dict) else None
+        ) or os.getenv("TELEGRAM_CHAT_ID"),
+    )
 
 
-def run_job(job):
-    cfg = STRATEGY_MAP[job["name"]]
-
-    if RUN_MODE.value not in cfg["allowed_modes"]:
-        print(f"❌ {job['name']} not allowed in {RUN_MODE}")
+def run_engine(config: EngineConfig) -> None:
+    """Create one engine from config and run it (backtest or live)."""
+    if not config.enabled:
+        print(f"⚠️ {config.strategy_name} ({config.broker_name}) is disabled. Skipping.")
         return
 
-    # ---------- Strategy ----------
-    strategy = cfg["strategy"]()
+    print(f"▶ Running {config.strategy_name} ({config.broker_name})...")
+    engine = EngineFactory.create_engine(config)
 
-    # ---------- Data layer (feeds engines: LTP, option chain, expiry, candles) ----------
-    if BROKER_NAME == "DELTA":
-        delta_source = DeltaSource(testnet=True, india=False)
-        data_provider = DeltaDataProvider(delta_source)
-    else:
-        dhan_source = DhanSource()
-        data_provider = DhanDataProvider(dhan_source)
+    symbols = config.symbols or []
+    if not symbols and config.strategy_name == "IPOBreakout":
+        print(
+            "⚠️ IPOBreakout: no symbols from universe (NSE EQUITY_L missing/failed or filter returned empty). "
+            "Strategy will not receive any candles. Ensure Dependencies/equity_universe/EQUITY_L_latest.csv exists or set symbols in config."
+        )
 
-    # ---------- Order management ----------
-    position_manager = PositionManager(logger=TradeLogger())
-    intent_store = IntentStore()
-    risk_manager = RiskManager(position_manager=position_manager)
-
-    # ---------- Instruments ----------
-    current_date = time.strftime("%Y-%m-%d")
-    expected_file = "all_instrument" + str(current_date) + ".csv"
-    BASE_DIR = Path(__file__).resolve().parents[1]
-    instrument_store = InstrumentStore(BASE_DIR / "Dependencies" / expected_file)
-
-    # ---------- BACKTEST ----------
     if RUN_MODE == RunMode.BACKTEST:
-        bt_cfg = job["backtest"]
-        broker = SimulatedBroker(position_manager=position_manager, intent_store=intent_store)
-        order_router = OrderRouter(
-            risk_manager=risk_manager,
-            broker=broker,
-            intent_store=intent_store,
-        )
-        engine = BacktestEngine(
-            data_provider=data_provider,
-            strategy=strategy,
-            order_router=order_router,
-            instrument_store=instrument_store,
-            position_manager=position_manager,
-        )
+        bt = config.backtest or {}
         engine.run(
-            symbols=job["symbols"],
-            start_date=bt_cfg["start_date"],
-            end_date=bt_cfg["end_date"],
-            timeframe=bt_cfg["timeframe"],
-            exchange=bt_cfg["exchange"],
-            sector=bt_cfg["sector"],
+            symbols=symbols,
+            start_date=bt.get("start_date", ""),
+            end_date=bt.get("end_date", ""),
+            timeframe=bt.get("timeframe", "60"),
+            exchange=bt.get("exchange", "INDEX"),
+            sector=bt.get("sector", "NO"),
+        )
+        print("Done.")
+    else:
+        live_cfg = config.live or {}
+        engine.start(
+            exchange=live_cfg.get("exchange", "INDEX"),
+            sector=live_cfg.get("sector", "NO"),
+            rsi=live_cfg.get("rsi", "NO"),
         )
 
-    # ---------- LIVE / PAPER ----------
-    else:
-        live_cfg = job["live"]
-        candle_service = CandleService(data_provider)
-        if BROKER_NAME == "DELTA":
-            broker_api = DeltaBrokerApi(delta_source)
-            broker = DeltaBroker(api=broker_api, position_manager=position_manager, intent_store=intent_store)
-        else:
-            broker_api = DhanBrokerApi(dhan_source)
-            broker = DhanBroker(api=broker_api, position_manager=position_manager, intent_store=intent_store)
-        order_router = OrderRouter(
-            risk_manager=risk_manager,
-            broker=broker,
-            intent_store=intent_store,
-        )
-        engine = LiveEngine(
-            strategy=strategy,
-            data=data_provider,
-            candle_service=candle_service,
-            symbols=job["symbols"],
-            order_router=order_router,
-            instrument_store=instrument_store,
-            position_manager=position_manager,
-        )
-        engine.start(
-            exchange=live_cfg["exchange"],
-            sector=live_cfg["sector"],
-            rsi=live_cfg["rsi"],
-        )
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Multi-venue trading: Dhan (India) + Delta (Crypto)"
+    )
+    parser.add_argument(
+        "--venue",
+        choices=["DHAN", "DELTA"],
+        default=None,
+        help="Run only jobs for this venue. If omitted, run all jobs (each with its own isolated engine).",
+    )
+    args = parser.parse_args()
+
+    configs = [job_to_engine_config(job) for job in STRATEGY_JOBS]
+    if args.venue:
+        configs = [c for c in configs if c.broker_name == args.venue]
+        if not configs:
+            print(f"No enabled jobs for venue {args.venue}")
+            sys.exit(0)
+
+    print(f"Run mode: {RUN_MODE.value} | Jobs: {[c.strategy_name for c in configs]}")
+    for config in configs:
+        run_engine(config)
 
 
 if __name__ == "__main__":
-    for job in STRATEGY_JOBS:
-        if job.get("enabled", True):
-            run_job(job)
-        else:
-            print(f"⚠️ {job['name']} is disabled. Skipping.")
+    main()

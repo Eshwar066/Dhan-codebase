@@ -2,7 +2,7 @@ import pandas as pd
 from typing import TYPE_CHECKING, Optional
 from core.strategies.base import BaseStrategy
 from core.strategies.IndiaMktMixins import IndiaMktMixins
-import pdb
+from datetime import datetime, timedelta
 
 if TYPE_CHECKING:
     from core.models.strategy_context import StrategyContext
@@ -13,31 +13,59 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
     name = "FuturesEMAHighLow"
     timeframe = "60"
     required_context = ["instrument", "qty", "intent_builder"]
-    api = "NSE"
+    api = "DELTA"
+
+    macro_ema_slope_period = 50
+    macro_ema_slope_threshold = 0.5
+
+    atr_period = 14
+    atr_min = 0.003
+    atr_max = 0.015
 
     def __init__(self):
-        self.ema_period = 20
-        self.target_pct = 0.006
-        self.sl_pct = 0.004
+        self.ema_period = 5
+        self.target_pct = 0.025
+        self.sl_pct = 0.005
 
         # State
         self.last_exit_reason = None
         self.last_exit_time = None
         self.last_direction = None
-
         self.prev_close = None
         self.prev_ema_high = None
         self.prev_ema_low = None
-
         self.current_signal = None
+
+        # Re-entry tracking per structure
+        self.reentry_state = {}
+
         self.on_structure_exit = self.default_structure_exit
 
     # ----------------- Indicators -----------------
 
     def get_warmup_period(self):
-        return self.ema_period * 3
+        # ATR needs atr_period + a few bars to stabilize; ema needs ema_period * 3
+        return max(self.ema_period * 3, getattr(self, "atr_period", 14) + 5)
 
     def prepare_indicators(self, df):
+        # Macro / HTF trend (same-TF): used by should_evaluate; shared by backtest and live
+        macro_slope = getattr(self, "macro_ema_slope_period", None)
+        macro_ema = getattr(self, "macro_ema_period", None)
+        slope_threshold = getattr(self, "macro_ema_slope_threshold", 0.5)
+        if macro_slope is not None:
+            df["ema_50"] = df["close"].ewm(span=macro_slope, adjust=False).mean()
+            df["ema_slope"] = df["ema_50"].diff()
+            df["htf_trend"] = None
+            df.loc[df["ema_slope"] > slope_threshold, "htf_trend"] = "BULL"
+            df.loc[df["ema_slope"] < -slope_threshold, "htf_trend"] = "BEAR"
+        elif macro_ema is not None:
+            df["ema_100"] = df["close"].ewm(span=macro_ema, adjust=False).mean()
+            df["htf_trend"] = None
+            df.loc[df["close"] > df["ema_100"], "htf_trend"] = "BULL"
+            df.loc[df["close"] < df["ema_100"], "htf_trend"] = "BEAR"
+        else:
+            df["htf_trend"] = None
+
         df["ema_high"] = df["high"].ewm(span=self.ema_period, adjust=False).mean()
         df["ema_low"] = df["low"].ewm(span=self.ema_period, adjust=False).mean()
         return df
@@ -58,11 +86,6 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
         ema_low = candle.get("ema_low")
         timestamp = candle.get("timestamp")
 
-        # if self.api in ("NSE", "DHAN"):
-        #     if timestamp.hour == 9 and timestamp.minute == 15:
-        #         self._update_previous(candle)
-        #         return False
-
         if pd.isna(ema_high) or pd.isna(ema_low):
             self._update_previous(candle)
             return False
@@ -75,21 +98,46 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
             self._update_previous(candle)
             return False
 
-        if self.last_exit_reason == "SL" and timestamp == self.last_exit_time:
-            self._update_previous(candle)
-            return False
-
         signal = None
 
         # LONG breakout
-        # if self.prev_close <= self.prev_ema_high and close > ema_high:
         if close > ema_high:
             signal = "LONG"
 
         # SHORT breakdown
-        # elif self.prev_close >= self.prev_ema_low and close < ema_low:
         elif close < ema_low:
             signal = "SHORT"
+
+        # --- Re-entry logic ---
+        if self.last_exit_reason in ["SL", "TARGET"]:
+            last_ts = self.last_exit_time
+            last_dir = self.last_direction
+
+            # Rule 6: wait 1 candle after SL
+            if self.last_exit_reason == "SL" and timestamp <= last_ts + timedelta(
+                minutes=60
+            ):
+                signal = None
+
+            # Rule 7: TARGET re-entry only if same trend touches EMA
+            elif self.last_exit_reason == "TARGET":
+                if last_dir == "LONG" and close <= ema_high:
+                    signal = "LONG"
+                elif last_dir == "SHORT" and close >= ema_low:
+                    signal = "SHORT"
+                else:
+                    signal = None
+
+        # Macro filter: LONG only if close > ema_100 (Option 1) or ema_slope > 0 (Option 2); SHORT only if opposite
+        if signal and (
+            getattr(self, "macro_ema_slope_period", None)
+            or getattr(self, "macro_ema_period", None)
+        ):
+            htf_trend = candle.get("htf_trend")
+            if signal == "LONG" and htf_trend != "BULL":
+                signal = None
+            elif signal == "SHORT" and htf_trend != "BEAR":
+                signal = None
 
         self.current_signal = signal
         self._update_previous(candle)
@@ -111,9 +159,41 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
 
     # ----------------- Entry -----------------
 
+    def _atr_filter_ok(self, candle, ctx: "StrategyContext") -> bool:
+        """True if ATR filter passes (or filter disabled). Uses IndiaMktMixins._atr. ATR as % of price (regime-stable)."""
+        atr_period = getattr(self, "atr_period", 14)
+        atr_min = getattr(self, "atr_min", None)
+        atr_max = getattr(self, "atr_max", None)
+        if atr_min is None and atr_max is None:
+            return True
+        recent = ctx.get_recent_candles(atr_period + 1)
+        if len(recent) < atr_period + 1:
+            return False
+        atr_list = self._atr(recent, atr_period)
+        if atr_list is None or len(atr_list) == 0:
+            return False
+        current_atr = atr_list[-1]
+        if current_atr is None or (
+            isinstance(current_atr, float)
+            and (pd.isna(current_atr) or current_atr <= 0)
+        ):
+            return False
+        price = float(candle.get("close") or 0)
+        if price <= 0:
+            return False
+        atr_pct = current_atr / price
+        if atr_min is not None and atr_pct < atr_min:
+            return False
+        if atr_max is not None and atr_pct > atr_max:
+            return False
+        return True
+
     def on_candle(self, candle, ctx: "StrategyContext"):
 
         if not self.current_signal:
+            return None
+
+        if not self._atr_filter_ok(candle, ctx):
             return None
 
         regime = self.compute_regime(candle)
@@ -122,39 +202,38 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
         hasOpenPosition = ctx.position_store.has_open_structure(
             strategy=self.name, structure_id=structure_id, tag="MAIN"
         )
-        # pdb.set_trace()
         if hasOpenPosition:
             return None
 
         side = "BUY" if self.current_signal == "LONG" else "SELL"
         self.last_direction = self.current_signal
 
-        # ---------------------------------
-        # 1️⃣ Prefer engine provided instrument
-        # ---------------------------------
         inst = ctx.instrument
 
-        # ---------------------------------
-        # 2️⃣ Fallback (Backtest sandbox only)
-        # ---------------------------------
         if inst is None:
-            expiry = self.getExpiry(ctx)
+            expiry = None
+            if self.api == "NSE":
+                expiry = self.getExpiry(ctx)
+
+            elif self.api == "DELTA":
+                product_type = getattr(ctx, "product_type", None)
+                if product_type != "PERPETUALFUTURES":
+                    expiry = self.getExpiry(ctx)
 
             inst = ctx.instrument_store.futures_intent_creation_details(
-                trading_symbol="NIFTY FUT",
-                exchange="NSE",
+                trading_symbol=candle["symbol"],
+                exchange="NSE" if self.api == "NSE" else "DELTA",
                 expiry=expiry,
             )
+            if inst.lot_size <= 0:
+                raise ValueError(f"Invalid lot_size for {self.trading_symbol}")
 
             if inst is None:
                 return None
 
-        # ---------------------------------
-        # 3️⃣ Map to OrderIntent
-        # ---------------------------------
         buy_intent = self.map_futures_instrument_to_intent(
             inst=inst,
-            strike_row=candle,  # ✅ use candle as price source
+            strike_row=candle,
             strategy=self.name,
             side=side,
             structure_id=structure_id,
@@ -171,6 +250,8 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
     def should_exit(self, pos, candle, ctx: Optional["StrategyContext"] = None):
 
         close = candle["close"]
+        high = candle["high"]
+        low = candle["low"]
 
         is_long = pos.net_qty > 0
         is_short = pos.net_qty < 0
@@ -179,12 +260,12 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
             target = pos.entry_price * (1 + self.target_pct)
             stop = pos.entry_price * (1 - self.sl_pct)
 
-            if close >= target:
+            if high >= target:
                 self.last_exit_reason = "TARGET"
                 self.last_exit_time = candle["timestamp"]
                 return True
 
-            if close <= stop:
+            if low <= stop:
                 self.last_exit_reason = "SL"
                 self.last_exit_time = candle["timestamp"]
                 return True
@@ -193,12 +274,12 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
             target = pos.entry_price * (1 - self.target_pct)
             stop = pos.entry_price * (1 + self.sl_pct)
 
-            if close <= target:
+            if low <= target:
                 self.last_exit_reason = "TARGET"
                 self.last_exit_time = candle["timestamp"]
                 return True
 
-            if close >= stop:
+            if high >= stop:
                 self.last_exit_reason = "SL"
                 self.last_exit_time = candle["timestamp"]
                 return True
@@ -210,10 +291,9 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
         if pos.instrument is None:
             return None
 
-        # Reverse side
         exit_side = "SELL" if pos.net_qty > 0 else "BUY"
 
-        structure_id = pos.structure_id  # keep same structure
+        structure_id = pos.structure_id
 
         exit_intent = self.map_futures_instrument_to_intent(
             inst=pos.instrument,

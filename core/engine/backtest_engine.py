@@ -1,7 +1,9 @@
 import pandas as pd
 import datetime as dt
-from core.engine.base_engine import BaseEngine
+from collections import deque
 import pdb
+
+from core.engine.base_engine import BaseEngine
 
 
 class BacktestEngine(BaseEngine):
@@ -12,23 +14,26 @@ class BacktestEngine(BaseEngine):
         instrument_store,
         order_router,
         position_manager,
+        universe_service=None,
+        broker_name=None,
     ):
         super().__init__(
             strategy=strategy,
             data=data_provider,
             instrument_store=instrument_store,
             position_manager=position_manager,
+            universe_service=universe_service,
         )
         self.order_router = order_router
         self.position_manager = position_manager
-        # 🔔 Wire structure-exit callback (ONE TIME)
+        self.broker_name = broker_name or ""
+        # Wire structure-exit callback (ONE TIME)
         self.position_manager.on_structure_exit = strategy.on_structure_exit
 
     # ==========================================================
     # MAIN RUN LOOP
     # ==========================================================
     def run(self, symbols, start_date, end_date, timeframe, exchange, sector):
-
         for symbol in symbols:
             df = self.data.get_intraday(
                 symbol=symbol,
@@ -38,6 +43,11 @@ class BacktestEngine(BaseEngine):
                 exchange=exchange,
                 sector=sector,
             )
+            # df1 = self.data.get_products()
+            # df2 = self.data.product_id_for_symbol("BTCUSD")
+            # df3 = self.data.get_latest_candles({"BTCUSD", "ETHUSD"})
+            # df4 = self.data.get_live_expiry("BTCUSD")
+            # pdb.set_trace()
 
             if df is None or len(df) < 50:
                 continue
@@ -45,21 +55,40 @@ class BacktestEngine(BaseEngine):
             df["symbol"] = symbol
             df["exchange"] = exchange
 
-            # -------- Indicators --------
+            # -------- Indicators (strategy computes htf_trend in prepare_indicators) --------
+            if self.broker_name == "DHAN" and "timestamp" in df.columns:
+                ts_col = pd.to_datetime(df["timestamp"], utc=True)
+                df["timestamp"] = ts_col.dt.tz_convert("Asia/Kolkata")
+            if "time" in df.columns:
+                df["time"] = df["timestamp"].dt.time
             df = self.strategy.prepare_indicators(df)
             warmup = self.strategy.get_warmup_period()
-            df = df.iloc[warmup:].reset_index(drop=True)
+            # Include macro EMA warmup so first ~50 (slope) or ~100 (ema) candles are stable
+            macro_slope = getattr(self.strategy, "macro_ema_slope_period", None)
+            macro_ema = getattr(self.strategy, "macro_ema_period", None)
+            macro_warmup = max(warmup, macro_slope or 0, macro_ema or 0)
+            df = df.iloc[macro_warmup:].reset_index(drop=True)
 
-            # -------- Candle loop --------
+            # Rolling buffer of recent candles for this symbol (max 50)
+            candle_buffer = deque(maxlen=50)
+
+            # -------- Candle loop (candle["htf_trend"] already set above for macro filter) --------
             for _, row in df.iterrows():
                 candle = row.to_dict()
                 ts = pd.to_datetime(candle["timestamp"])
+                if "htf_trend" not in candle or pd.isna(candle.get("htf_trend")):
+                    candle["htf_trend"] = None
 
-                if ts.weekday() >= 5:
-                    continue
+                # Skip weekends for equity/index; crypto (DELTA) runs 24/7
+                # if self.broker_name != "DELTA" and ts.weekday() >= 5:
+                #     continue
+
+                candle_buffer.append(candle)
 
                 # -------- Runtime context --------
-                ctx, entry_intent = self.build_context(candle)
+                ctx, entry_intent = self.build_context(
+                    candle, recent_candles=list(candle_buffer)
+                )
                 # pdb.set_trace()
                 # 🔥 ALWAYS run exits + rollover
                 self._run_risk_and_rollover(symbol, candle, ctx)

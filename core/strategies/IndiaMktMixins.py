@@ -14,7 +14,9 @@ Example:
 
 import uuid
 import pandas as pd
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
+import calendar
+from typing import Any, List, Optional, Tuple
 
 from run.config import RUN_MODE, RunMode
 from core.utils.expiry_resolver import ExpiryResolver
@@ -128,6 +130,16 @@ class IndiaMktMixins:
     # ==================================================
     # OPTION CHAIN & STRIKE SELECTION
     # ==================================================
+
+    def get_last_friday(self, year: int, month: int) -> datetime:
+        # Get last day of month
+        last_day = calendar.monthrange(year, month)[1]
+        last_date = datetime(year, month, last_day)
+
+        # Move backward to Friday
+        offset = (last_date.weekday() - 4) % 7  # Friday = 4
+        return last_date - timedelta(days=offset)
+
     def getExpiry(self, ctx):
         ocs = ctx.option_chain_service
         if self.api == "NSE":
@@ -140,6 +152,26 @@ class IndiaMktMixins:
                 api=self.api,
                 expiry_pref=self.expiryType,
             )
+
+        elif self.api == "DELTA":
+
+            trade_dt = ctx.timestamp
+
+            year = trade_dt.year
+            month = trade_dt.month
+
+            expiry_date = self.get_last_friday(year, month)
+
+            # If trade date already past expiry → move to next month
+            if trade_dt.date() > expiry_date.date():
+
+                if month == 12:
+                    year += 1
+                    month = 1
+                else:
+                    month += 1
+
+                expiry_date = self.get_last_friday(year, month)
 
         return expiry_date
 
@@ -288,9 +320,17 @@ class IndiaMktMixins:
         tag=None,
         parent_intent_id=None,
     ):
-
-        # Futures always use candle close
-        ltp = float(strike_row["close"])
+        # Execution price: for Delta use best_bid (BUY) / best_ask (SELL) when available; else close
+        api = getattr(self, "api", "NSE")
+        if api == "DELTA":
+            if side == "BUY" and strike_row.get("best_bid") is not None:
+                ltp = float(strike_row["best_bid"])
+            elif side == "SELL" and strike_row.get("best_ask") is not None:
+                ltp = float(strike_row["best_ask"])
+            else:
+                ltp = float(strike_row["close"])
+        else:
+            ltp = float(strike_row["close"])
 
         return OrderIntent(
             intent_id=uuid.uuid4().hex,
@@ -485,3 +525,128 @@ class IndiaMktMixins:
     def on_structure_exit(self, structure_id, **kwargs):
         """Called when a structure is fully exited. Clears rollover state for that structure."""
         self.rolled_hedges = {k for k in self.rolled_hedges if k[0] != structure_id}
+
+    # Anchor VWAP
+    def _update_anchor_vwap(self, candle: Any):
+        symbol = candle["symbol"]
+        high = candle.get("high")
+        low = candle.get("low")
+        close = candle.get("close")
+        volume = candle.get("volume")
+
+        if None in (high, low, close, volume):
+            return None
+
+        typical_price = (high + low + close) / 3.0
+
+        state = self._anchor_state.get(symbol)
+
+        if state is None:
+            # First listing candle initialization
+            self._anchor_state[symbol] = {
+                "cum_pv": typical_price * volume,
+                "cum_vol": volume,
+                "anchor_vwap": typical_price,
+            }
+        else:
+            state["cum_pv"] += typical_price * volume
+            state["cum_vol"] += volume
+            state["anchor_vwap"] = state["cum_pv"] / state["cum_vol"]
+
+        return self._anchor_state[symbol]["anchor_vwap"]
+
+    # super trend (atr_period / mult come from strategy attributes if not passed)
+    def _supertrend(
+        self,
+        candles: List[Any],
+        atr_period: Optional[int] = None,
+        mult: Optional[float] = None,
+    ) -> Optional[Tuple[float, bool]]:
+        """
+        Returns (supertrend_line_value, is_green) for the last candle.
+        is_green True = bullish → long only; False = bearish → short only.
+        Strategies should set supertrend_atr_period and supertrend_multiplier.
+        """
+        atr_period = atr_period if atr_period is not None else getattr(self, "supertrend_atr_period", 10)
+        mult = mult if mult is not None else getattr(self, "supertrend_multiplier", 3.0)
+        if len(candles) < atr_period + 1:
+            return None
+        atr_list = self._atr(candles, atr_period)
+        if atr_list is None:
+            return None
+        high = [c["high"] for c in candles]
+        low = [c["low"] for c in candles]
+        close = [c["close"] for c in candles]
+        hl2 = [(high[i] + low[i]) / 2.0 for i in range(len(candles))]
+        upper = [
+            hl2[i] + mult * atr_list[i] if atr_list[i] is not None else None
+            for i in range(len(candles))
+        ]
+        lower = [
+            hl2[i] - mult * atr_list[i] if atr_list[i] is not None else None
+            for i in range(len(candles))
+        ]
+        # Final bands (trailing); supertrend direction
+        final_upper = [None] * len(candles)
+        final_lower = [None] * len(candles)
+        supertrend_green = [None] * len(candles)  # True = green (bullish)
+        final_upper[atr_period - 1] = upper[atr_period - 1]
+        final_lower[atr_period - 1] = lower[atr_period - 1]
+        supertrend_green[atr_period - 1] = (
+            close[atr_period - 1] > final_lower[atr_period - 1]
+        )
+        for i in range(atr_period, len(candles)):
+            prev_upper = final_upper[i - 1]
+            prev_lower = final_lower[i - 1]
+            if prev_upper is not None and close[i] > prev_upper:
+                supertrend_green[i] = True
+                final_lower[i] = lower[i]
+                final_upper[i] = None
+            elif prev_lower is not None and close[i] < prev_lower:
+                supertrend_green[i] = False
+                final_upper[i] = upper[i]
+                final_lower[i] = None
+            else:
+                supertrend_green[i] = supertrend_green[i - 1]
+                if supertrend_green[i]:
+                    # Trail lower band (take higher of new vs prev when bullish)
+                    final_lower[i] = (
+                        max(lower[i], final_lower[i - 1])
+                        if final_lower[i - 1] is not None
+                        else lower[i]
+                    )
+                    final_upper[i] = None
+                else:
+                    # Trail upper band (take lower of new vs prev when bearish)
+                    final_upper[i] = (
+                        min(upper[i], final_upper[i - 1])
+                        if final_upper[i - 1] is not None
+                        else upper[i]
+                    )
+                    final_lower[i] = None
+        idx = len(candles) - 1
+        line_value = final_lower[idx] if supertrend_green[idx] else final_upper[idx]
+        if line_value is None:
+            return None
+        return (line_value, supertrend_green[idx])
+
+    def _atr(self, candles: List[Any], period: int) -> Optional[List[float]]:
+        """True Range then EMA-smoothed ATR. Returns ATR value per candle from index period onward."""
+        if len(candles) < period + 1:
+            return None
+        tr_list = []
+        for i, c in enumerate(candles):
+            high, low, close = c["high"], c["low"], c["close"]
+            if i == 0:
+                tr = high - low
+            else:
+                prev_close = candles[i - 1]["close"]
+                tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+            tr_list.append(tr)
+        # EMA of TR for ATR; alpha = 1/period
+        alpha = 1.0 / period
+        atr_list = [None] * len(candles)
+        atr_list[period - 1] = sum(tr_list[:period]) / period
+        for i in range(period, len(candles)):
+            atr_list[i] = alpha * tr_list[i] + (1 - alpha) * atr_list[i - 1]
+        return atr_list

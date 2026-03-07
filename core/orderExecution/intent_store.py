@@ -96,7 +96,12 @@ class IntentStore:
         intent_id,
         status: IntentStatus,
         broker_order_id=None,
+        order_state=None,
     ):
+        """
+        Update intent status and optionally broker_order_id and order_state.
+        order_state is persisted so OrderRouter can rebuild _order_state cache on restart.
+        """
         with self._lock:
             if intent_id not in self.intents:
                 return None
@@ -109,6 +114,10 @@ class IntentStore:
             if broker_order_id:
                 intent["broker_order_id"] = broker_order_id
 
+            if order_state is not None:
+                # Store string value so OrderRouter can rebuild _order_state cache on restart
+                intent["order_state"] = getattr(order_state, "value", order_state)
+
             return intent
 
     # -------------------------
@@ -116,6 +125,17 @@ class IntentStore:
     # -------------------------
     def list_by_status(self, status: IntentStatus):
         return [i for i in self.intents.values() if i["status"] == status]
+
+    # -------------------------
+    # ORDER STATE (for OrderRouter cache rebuild)
+    # -------------------------
+    def get_all_order_states(self):
+        """Return [(intent_id, order_state_str), ...] for intents that have order_state set."""
+        return [
+            (iid, rec["order_state"])
+            for iid, rec in self.intents.items()
+            if rec.get("order_state")
+        ]
 
     # -------------------------
     # EXPIRE STALE

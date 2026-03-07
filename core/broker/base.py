@@ -54,6 +54,11 @@ class BaseBroker(ABC):
     def __init__(self, position_manager=None, intent_store=None):
         self.position_manager = position_manager
         self.intent_store = intent_store
+        self.order_router = None
+
+    def set_order_router(self, order_router):
+        """Set OrderRouter for fill processing (record_realized_pnl, logging). Call from factory after construction."""
+        self.order_router = order_router
 
     @abstractmethod
     def place_order(
@@ -80,6 +85,18 @@ class BaseBroker(ABC):
     def sync_positions(self):
         """Optional. LIVE brokers may override to reconcile broker truth."""
         return None
+
+    def get_positions_for_recon(self) -> dict:
+        """Return normalized { symbol: { qty, avg_price, segment, lot_size } } for reconciliation."""
+        return {}
+
+    def get_open_orders(self) -> List[Dict[str, Any]]:
+        """
+        Return list of open (pending/active) orders for order-state consistency check.
+        Each item: { order_id, tag (intent_id), symbol/tradingsymbol, status, ... }.
+        Default: filter get_order_list() by non-terminal status; brokers may override.
+        """
+        return []
 
     def find_order_by_client_id(self, client_order_id: str):
         """Optional idempotency hook. LIVE brokers may override."""

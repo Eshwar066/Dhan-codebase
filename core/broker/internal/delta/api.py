@@ -50,3 +50,11 @@ class DeltaBrokerApi:
 
     def get_order_list(self) -> List[Dict[str, Any]]:
         return self._source.get_order_list()
+
+    def product_id_for_symbol(self, symbol: str) -> Optional[int]:
+        """Resolve symbol to Delta product_id (e.g. BTCUSD -> id)."""
+        return self._source.product_id_for_symbol(symbol)
+
+    def batch_edit(self, product_id: int, orders: List[Dict[str, Any]]) -> Any:
+        """Edit orders in batch (e.g. update limit_price). Each order: { 'id': order_id, 'limit_price': str }."""
+        return self._source.batch_edit(product_id=product_id, orders=orders)

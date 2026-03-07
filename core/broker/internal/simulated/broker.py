@@ -23,22 +23,57 @@ class SimulatedBroker(BaseBroker):
         instrument = intent.instrument
         assert isinstance(instrument, Instrument), f"place_order expects Instrument, got {type(instrument)}"
         assert instrument.trading_symbol and instrument.custom_symbol
-        self.position_manager.on_fill(
-            instrument=instrument,
-            side=intent.side,
-            qty=intent.qty,
-            price=float(execution_price),
-            intent_id=intent.intent_id,
-            order_id=order_id,
-            strategy=getattr(intent, "strategy", None),
-            candle_ts=getattr(intent, "candle_ts", None),
-            tag=getattr(intent, "tag", None),
-            structure_id=getattr(intent, "structure_id", None),
-            action=getattr(intent, "action", None),
-        )
-        if self.intent_store:
-            self.intent_store.update(intent.intent_id, "FILLED")
+        if self.order_router:
+            self.order_router.process_fill(
+                instrument=instrument,
+                side=intent.side,
+                qty=intent.qty,
+                price=float(execution_price),
+                expected_price=getattr(intent, "price", None),
+                order_id=order_id,
+                intent_id=intent.intent_id,
+                strategy=getattr(intent, "strategy", None),
+                candle_ts=getattr(intent, "candle_ts", None),
+                tag=getattr(intent, "tag", None),
+                structure_id=getattr(intent, "structure_id", None),
+                action=getattr(intent, "action", None),
+            )
+        else:
+            self.position_manager.on_fill(
+                instrument=instrument,
+                side=intent.side,
+                qty=intent.qty,
+                price=float(execution_price),
+                intent_id=intent.intent_id,
+                order_id=order_id,
+                strategy=getattr(intent, "strategy", None),
+                candle_ts=getattr(intent, "candle_ts", None),
+                tag=getattr(intent, "tag", None),
+                structure_id=getattr(intent, "structure_id", None),
+                action=getattr(intent, "action", None),
+            )
+            if self.intent_store:
+                self.intent_store.update(intent.intent_id, "FILLED")
         return order_id
+
+    def get_positions_for_recon(self):
+        """Return PositionManager state in same format as live brokers so reconcile is a no-op (paper truth = PM)."""
+        if not self.position_manager:
+            return {}
+        out = {}
+        for sym, pos in self.position_manager.positions.items():
+            if pos.net_qty == 0:
+                continue
+            inst = pos.instrument
+            segment = getattr(inst, "segment", "EQ") or "EQ"
+            lot_size = int(getattr(inst, "lot_size", 1) or 1)
+            out[sym] = {
+                "qty": pos.net_qty,
+                "avg_price": float(pos.avg_price),
+                "segment": segment,
+                "lot_size": lot_size,
+            }
+        return out
 
     def exit_position(self, trading_symbol, qty, side, segment="EQ", lot_size=1):
         exit_side = "SELL" if side == "BUY" else "BUY"

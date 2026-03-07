@@ -7,3 +7,4 @@ python-dateutil
 pytz
 dhanhq
 Dhan-Tradehull
+psutil

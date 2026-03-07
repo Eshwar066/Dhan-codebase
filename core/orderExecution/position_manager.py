@@ -48,6 +48,7 @@ class Position:
         self.net_qty = 0
         self.avg_price = 0.0
         self.realized_pnl = 0.0
+        self.cumulative_pnl = 0.0
 
         self.trade_id = None
         self.entry_price = None
@@ -110,7 +111,8 @@ class Position:
                 pnl *= -1
 
             pnl *= self.instrument.lot_size
-            self.realized_pnl += pnl
+            self.realized_pnl = pnl
+            self.cumulative_pnl += pnl
 
             self.net_qty += signed_qty
 
@@ -148,6 +150,7 @@ class PositionManager:
         self.strategy_pos = defaultdict(lambda: defaultdict(int))
 
         self.last_recon_time = 0
+        self.trading_paused = False
 
     # ---------------------
     # LOCAL FILL UPDATE
@@ -226,6 +229,9 @@ class PositionManager:
 
             # -------- LOG --------
             if self.logger:
+                # PnL only on EXIT; leave blank on ENTRY/SCALE_IN
+                pnl_val = pos.realized_pnl if trade_type == "EXIT" else ""
+                cumulative_val = pos.cumulative_pnl if trade_type == "EXIT" else ""
                 row = {
                     "candle_timestamp": (
                         candle_ts.strftime("%Y-%m-%d %H:%M")
@@ -238,6 +244,8 @@ class PositionManager:
                     "side": side,
                     "qty": qty,
                     "price": price,
+                    "pnl": pnl_val,
+                    "cumulative_pnl": cumulative_val,
                     "net_qty_after": new_qty,
                     # "order_id": order_id,
                     # "intent_id": intent_id,
@@ -247,11 +255,43 @@ class PositionManager:
                 }
 
                 if trade_type == "EXIT":
-                    row["pnl"] = pos.realized_pnl
                     row["mae"] = pos.mae
                     row["mfe"] = pos.mfe
 
+                    # Log complete trade for performance analytics (trade log)
+                    entry_time_str = (
+                        datetime.fromtimestamp(pos.entry_time).strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
+                        if pos.entry_time is not None
+                        else ""
+                    )
+                    exit_time_str = (
+                        candle_ts.strftime("%Y-%m-%d %H:%M:%S")
+                        if candle_ts is not None and isinstance(candle_ts, datetime)
+                        else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    )
+                    # Entry side: long position was entered with BUY, short with SELL
+                    entry_side = "BUY" if prev_qty > 0 else "SELL"
+                    trade_row = {
+                        "trade_id": pos.trade_id,
+                        "entry_time": entry_time_str,
+                        "exit_time": exit_time_str,
+                        "side": entry_side,
+                        "entry_price": pos.entry_price,
+                        "exit_price": price,
+                        "qty": qty,
+                        "pnl": pos.realized_pnl,
+                        "symbol": sym,
+                        "strategy": strategy or "GLOBAL",
+                    }
+                    self.logger.log_trade(trade_row)
+
                 self.logger.log(strategy=strategy, row=row)
+
+            position_closed = prev_qty != 0 and new_qty == 0
+            realized_pnl_for_risk = pos.realized_pnl if position_closed else 0.0
+            return (position_closed, realized_pnl_for_risk)
 
     def has_open_structure(self, strategy: str, structure_id: str, tag: str) -> bool:
         for pos in self.positions.values():
@@ -294,69 +334,54 @@ class PositionManager:
     # ---------------------
     # BROKER RECONCILIATION
     # ---------------------
-    def reconcile_with_broker(self, broker_positions):
+    def reconcile_with_broker(
+        self, broker_positions, drift_threshold: int = 0, strategy: str = None
+    ):
         """
-        broker_positions format:
-        {
-            symbol: {
-                "qty": int,
-                "avg_price": float,
-                "segment": str,
-                "lot_size": int
-            }
-        }
+        Sync PositionManager to broker truth.
+        broker_positions: { symbol: { "qty": int, "avg_price": float, "segment": str, "lot_size": int } }
+        drift_threshold: if |local_qty - broker_qty| > this, set trading_paused.
+        strategy: strategy name to associate with newly discovered positions.
         """
-
         with self._lock:
             self.last_recon_time = time.time()
-
             broker_symbols = set(broker_positions.keys())
             local_symbols = set(self.positions.keys())
 
-            # 1) Sync broker → local
             for sym, bp in broker_positions.items():
-
+                segment = bp.get("segment", "EQ")
+                lot_size = int(bp.get("lot_size", 1))
                 inst = Instrument(
-                    symbol=sym,
-                    segment=bp.get("segment", "EQ"),
-                    lot_size=bp.get("lot_size", 1),
+                    trading_symbol=sym,
+                    custom_symbol=sym,
+                    exchange=bp.get("exchange", ""),
+                    segment=segment,
+                    instrument_type=bp.get("instrument_type", "EQ"),
+                    lot_size=lot_size,
                 )
 
                 if sym not in self.positions:
-                    # Ghost broker position
-                    print(f"⚠ Ghost broker position detected: {sym}")
-
                     pos = Position(inst)
-                    pos.net_qty = bp["qty"]
-                    pos.avg_price = bp["avg_price"]
-
+                    pos.net_qty = int(bp["qty"])
+                    pos.avg_price = float(bp.get("avg_price", 0))
+                    if strategy:
+                        pos.strategy = strategy
                     self.positions[sym] = pos
                     continue
 
                 local = self.positions[sym]
-
-                # Drift detection
                 if (
-                    local.net_qty != bp["qty"]
-                    or abs(local.avg_price - bp["avg_price"]) > 0.5
+                    local.net_qty != int(bp["qty"])
+                    or abs(local.avg_price - float(bp.get("avg_price", 0))) > 0.5
                 ):
-                    print(f"⚠ Drift corrected: {sym}")
-
-                    local.net_qty = bp["qty"]
-                    local.avg_price = bp["avg_price"]
+                    local.net_qty = int(bp["qty"])
+                    local.avg_price = float(bp.get("avg_price", 0))
                     local.last_updated = time.time()
-
-                if abs(local.net_qty - bp["qty"]) > threshold:
+                if abs(local.net_qty - int(bp["qty"])) > drift_threshold:
                     self.trading_paused = True
 
-            # 2) Remove ghost locals
             for sym in local_symbols - broker_symbols:
-                local = self.positions[sym]
-
-                if local.net_qty != 0:
-                    print(f"⚠ Ghost local removed: {sym}")
-
-                self.positions.pop(sym)
+                self.positions.pop(sym, None)
 
     # ---------------------
     # POSITION CHECKS
@@ -411,7 +436,6 @@ class PositionManager:
     # ---------------------
     def snapshot(self):
         snap = {}
-
         for sym, pos in self.positions.items():
             snap[sym] = {
                 "segment": pos.instrument.segment,
@@ -419,14 +443,12 @@ class PositionManager:
                 "avg_price": pos.avg_price,
                 "realized_pnl": pos.realized_pnl,
             }
-
         return snap
 
     def get_open_positions(self, underlying=None, strategy=None):
         positions = []
-
+        # pdb.set_trace()
         for pos in self.positions.values():
-
             if pos.net_qty == 0:
                 continue
 
@@ -434,7 +456,16 @@ class PositionManager:
                 continue
 
             if underlying:
-                if underlying and pos.instrument.custom_symbol.split()[0] != underlying:
+                # Match by trading_symbol (position key) so backtest symbol matches; fallback to custom_symbol
+                inst = pos.instrument
+                by_trading = (inst.trading_symbol or "").strip() == (
+                    underlying or ""
+                ).strip()
+                by_custom = False
+                if getattr(inst, "custom_symbol", None):
+                    parts = (inst.custom_symbol or "").strip().split()
+                    by_custom = (parts[0] == underlying.strip()) if parts else False
+                if not (by_trading or by_custom):
                     continue
 
             positions.append(pos)

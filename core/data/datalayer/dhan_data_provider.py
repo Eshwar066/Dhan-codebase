@@ -137,3 +137,16 @@ class DhanDataProvider(IDataProvider):
             option_type=option_type,
             strikes=strikes,
         )
+
+    # ---------- Dhan v2 Market Quote API ----------
+    def get_ltp_v2(self, instruments: dict) -> Any:
+        """LTP via v2 /marketfeed/ltp. instruments: { 'NSE_EQ': [id], 'NSE_FNO': [id], ... }."""
+        return self._source.get_ltp_v2(instruments)
+
+    def get_ohlc_v2(self, instruments: dict) -> Any:
+        """OHLC + LTP via v2 /marketfeed/ohlc."""
+        return self._source.get_ohlc_v2(instruments)
+
+    def get_quote_v2(self, instruments: dict) -> Any:
+        """Full quote via v2 /marketfeed/quote (depth, OI, volume)."""
+        return self._source.get_quote_v2(instruments)

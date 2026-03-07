@@ -8,15 +8,27 @@ go through this source; the data layer (DhanDataProvider) and broker layer
 import os
 import sys
 import pandas as pd
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 import requests
 import json
-import pdb
 
-# Use in-project Dhan Tradehull library
+# Use in-project Dhan Tradehull library and v2 Market Quote API
 from core.library.dhan_tradehull import Tradehull
+from core.library.dhan_marketfeed import (
+    DhanMarketFeedClient,
+    parse_ltp_response,
+    parse_ohlc_response,
+    parse_quote_response,
+)
 from core.data.sources.NSEClient import NSEClient
+from core.data.sources.dhan_historical_cache import (
+    cache_key_futures,
+    cache_key_intraday,
+    load_df,
+    save_df,
+)
 
 load_dotenv()
 
@@ -44,6 +56,11 @@ class DhanSource:
         self._ensure_deps_path()
 
         self.tsl = Tradehull(client_id, access_token)
+        self._marketfeed = DhanMarketFeedClient(
+            client_id=client_id,
+            access_token=access_token,
+            rate_limit_seconds=1.0,
+        )
         self.expiry_cache = {}
         self.nse_client = NSEClient()
 
@@ -54,6 +71,23 @@ class DhanSource:
         if os.getcwd() != str(PROJECT_ROOT):
             os.chdir(PROJECT_ROOT)
 
+    @staticmethod
+    def _to_date(value):
+        """Normalize to date for range comparison."""
+        if value is None:
+            return None
+        if hasattr(value, "date") and callable(getattr(value, "date")):
+            return value.date() if isinstance(value, datetime) else value
+        if hasattr(value, "strftime"):
+            return value
+        s = str(value).strip()
+        if not s:
+            return None
+        try:
+            return datetime.fromisoformat(s[:10]).date()
+        except ValueError:
+            return datetime.strptime(s[:10], "%Y-%m-%d").date()
+
     # -------------------------------------------------------------------------
     # Data: Candles / OHLC
     # -------------------------------------------------------------------------
@@ -63,29 +97,192 @@ class DhanSource:
             symbols = [symbols]
         return self.tsl.get_ohlc_data(symbols, debug)
 
-    def get_intraday(self, symbol, start_date, end_date, timeframe, exchange, sector):
-        """Long-term historical intraday candles for backtest."""
-        df = self.tsl.get_long_term_historical_data(
-            tradingsymbol=symbol,
-            exchange=exchange,
-            timeframe=timeframe,
-            from_date=start_date,
-            to_date=end_date,
-            sector=sector or "NO",
-        )
+    def _normalize_intraday_df(self, df: pd.DataFrame) -> pd.DataFrame | None:
+        """Normalize raw API df: timestamp column, sort, time column. Returns None if invalid."""
         if df is None or df.empty:
             return None
         if "timestamp" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["timestamp"])
+            df = df.copy()
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         elif "date" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["date"])
+            df = df.copy()
+            df["timestamp"] = pd.to_datetime(df["date"], utc=True)
         elif "start_Time" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["start_Time"])
+            df = df.copy()
+            df["timestamp"] = pd.to_datetime(df["start_Time"], utc=True)
         else:
             return None
-        df = df.sort_values("timestamp").reset_index(drop=True)
+        df = (
+            df.sort_values("timestamp")
+            .drop_duplicates(subset=["timestamp"])
+            .reset_index(drop=True)
+        )
         df["time"] = df["timestamp"].dt.time
-        return df.reset_index(drop=True)
+        return df
+
+    def get_intraday(self, symbol, start_date, end_date, timeframe, exchange, sector):
+        """Long-term historical intraday. Cache key = symbol+timeframe+exchange (no dates). Returns requested range; fetches only missing dates and stitches into same cache file."""
+        cache_name = cache_key_intraday(symbol, str(timeframe), exchange or "")
+        start_d = self._to_date(start_date)
+        end_d = self._to_date(end_date)
+        if start_d is None or end_d is None:
+            return None
+
+        cached = load_df(cache_name)
+        stitched = cached.copy() if cached is not None and not cached.empty else None
+
+        if (
+            stitched is not None
+            and not stitched.empty
+            and "timestamp" in stitched.columns
+        ):
+            stitched["timestamp"] = pd.to_datetime(stitched["timestamp"], utc=True)
+            stitched["time"] = stitched["timestamp"].dt.time
+            earliest = stitched["timestamp"].dt.date.min()
+            latest = stitched["timestamp"].dt.date.max()
+            if (
+                pd.notna(earliest)
+                and pd.notna(latest)
+                and earliest <= start_d
+                and latest >= end_d
+            ):
+                out = stitched[
+                    (stitched["timestamp"].dt.date >= start_d)
+                    & (stitched["timestamp"].dt.date <= end_d)
+                ].copy()
+                return out.reset_index(drop=True)
+
+        # Backward fetch: need data before current earliest
+        cache_earliest = (
+            stitched["timestamp"].dt.date.min()
+            if stitched is not None
+            and not stitched.empty
+            and "timestamp" in stitched.columns
+            else None
+        )
+        if (
+            cache_earliest is None
+            or pd.isna(cache_earliest)
+            or start_d < cache_earliest
+        ):
+            fetch_end = (
+                (cache_earliest - timedelta(days=1))
+                if cache_earliest is not None and pd.notna(cache_earliest)
+                else end_d
+            )
+            before = self.tsl.get_long_term_historical_data(
+                tradingsymbol=symbol,
+                exchange=exchange,
+                timeframe=timeframe,
+                from_date=start_d,
+                to_date=fetch_end,
+                sector=sector or "NO",
+            )
+            before = self._normalize_intraday_df(before)
+            if before is not None and not before.empty:
+                stitched = (
+                    pd.concat([before, stitched], ignore_index=True)
+                    if stitched is not None and not stitched.empty
+                    else before
+                )
+            elif stitched is None:
+                stitched = before
+
+        # Ensure timestamp is datetime (concat can yield object dtype); utc=True for tz-aware values
+        if (
+            stitched is not None
+            and not stitched.empty
+            and "timestamp" in stitched.columns
+        ):
+            stitched["timestamp"] = pd.to_datetime(stitched["timestamp"], utc=True)
+            stitched["time"] = stitched["timestamp"].dt.time
+
+        # Forward fetch: need data after current latest
+        cache_latest = (
+            stitched["timestamp"].dt.date.max()
+            if stitched is not None and not stitched.empty
+            else None
+        )
+        if cache_latest is not None and pd.notna(cache_latest) and end_d > cache_latest:
+            fetch_start = stitched["timestamp"].dt.date.max() + timedelta(days=1)
+            after = self.tsl.get_long_term_historical_data(
+                tradingsymbol=symbol,
+                exchange=exchange,
+                timeframe=timeframe,
+                from_date=fetch_start,
+                to_date=end_d,
+                sector=sector or "NO",
+            )
+            after = self._normalize_intraday_df(after)
+            if after is not None and not after.empty:
+                stitched = pd.concat([stitched, after], ignore_index=True)
+
+        if stitched is None or stitched.empty:
+            return None
+        stitched["timestamp"] = pd.to_datetime(stitched["timestamp"], utc=True)
+        stitched["time"] = stitched["timestamp"].dt.time
+        stitched = (
+            stitched.sort_values("timestamp")
+            .drop_duplicates(subset=["timestamp"])
+            .reset_index(drop=True)
+        )
+        save_df(cache_name, stitched)
+        out = stitched[
+            (stitched["timestamp"].dt.date >= start_d)
+            & (stitched["timestamp"].dt.date <= end_d)
+        ].copy()
+        return out.reset_index(drop=True)
+
+    def _fetch_futures_intraday(
+        self,
+        security_id: str,
+        exchange_segment: str,
+        instrument: str,
+        interval: str,
+        from_date: str,
+        to_date: str,
+        oi: bool,
+    ) -> pd.DataFrame:
+        """Call Dhan charts/intraday API and return normalized DataFrame."""
+        payload = {
+            "securityId": str(security_id),
+            "exchangeSegment": exchange_segment,
+            "instrument": instrument,
+            "interval": str(interval),
+            "oi": oi,
+            "fromDate": from_date,
+            "toDate": to_date,
+            "exchange": "NSE",
+            "sector": "NO",
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "access-token": os.getenv("DHAN_ACCESS_TOKEN"),
+            "client-id": os.getenv("DHAN_CLIENT_CODE"),
+        }
+        response = requests.post(
+            "https://api.dhan.co/v2/charts/intraday",
+            headers=headers,
+            data=json.dumps(payload),
+        )
+        if response.status_code != 200:
+            raise Exception(f"API Error {response.status_code}: {response.text}")
+        data = response.json()
+        if not data or "timestamp" not in data:
+            return pd.DataFrame()
+        df = pd.DataFrame(
+            {
+                "timestamp": data["timestamp"],
+                "open": data["open"],
+                "high": data["high"],
+                "low": data["low"],
+                "close": data["close"],
+                "volume": data["volume"],
+            }
+        )
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+        df["timestamp"] = df["timestamp"].dt.tz_convert("Asia/Kolkata")
+        return df
 
     # not providing exact data
     def get_Futures_historical_intraday_data(
@@ -98,53 +295,130 @@ class DhanSource:
         to_date: str,
         oi: bool = False,
     ):
-
-        payload = {
-            "securityId": str(security_id),
-            "exchangeSegment": exchange_segment,
-            "instrument": instrument,
-            "interval": str(interval),
-            "oi": oi,
-            "fromDate": from_date,
-            "toDate": to_date,
-            "exchange": "NSE",
-            "sector": "NO",
-        }
-
-        headers = {
-            "Content-Type": "application/json",
-            "access-token": os.getenv("DHAN_ACCESS_TOKEN"),
-            "client-id": os.getenv("DHAN_CLIENT_CODE"),
-        }
-
-        response = requests.post(
-            "https://api.dhan.co/v2/charts/intraday",
-            headers=headers,
-            data=json.dumps(payload),
+        """Futures intraday. Cache key = security+segment+instrument+interval+oi (no dates). Fetches only missing range and stitches into same cache file."""
+        cache_name = cache_key_futures(
+            str(security_id), exchange_segment, instrument, str(interval), oi
         )
-
-        if response.status_code != 200:
-            raise Exception(f"API Error {response.status_code}: {response.text}")
-        data = response.json()
-
-        if not data or "timestamp" not in data:
+        start_d = self._to_date(from_date)
+        end_d = self._to_date(to_date)
+        if start_d is None or end_d is None:
             return pd.DataFrame()
 
-        df = pd.DataFrame(
-            {
-                "timestamp": data["timestamp"],
-                "open": data["open"],
-                "high": data["high"],
-                "low": data["low"],
-                "close": data["close"],
-                "volume": data["volume"],
-            }
-        )
+        cached = load_df(cache_name)
+        stitched = cached.copy() if cached is not None and not cached.empty else None
 
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
-        df["timestamp"] = df["timestamp"].dt.tz_convert("Asia/Kolkata")
-        pdb.set_trace()
-        return df
+        if (
+            stitched is not None
+            and not stitched.empty
+            and "timestamp" in stitched.columns
+        ):
+            stitched["timestamp"] = pd.to_datetime(stitched["timestamp"], utc=True)
+            earliest = stitched["timestamp"].dt.date.min()
+            latest = stitched["timestamp"].dt.date.max()
+            if (
+                pd.notna(earliest)
+                and pd.notna(latest)
+                and earliest <= start_d
+                and latest >= end_d
+            ):
+                out = stitched[
+                    (stitched["timestamp"].dt.date >= start_d)
+                    & (stitched["timestamp"].dt.date <= end_d)
+                ].copy()
+                return out.reset_index(drop=True)
+
+        cache_earliest = (
+            stitched["timestamp"].dt.date.min()
+            if stitched is not None
+            and not stitched.empty
+            and "timestamp" in stitched.columns
+            else None
+        )
+        if (
+            cache_earliest is None
+            or pd.isna(cache_earliest)
+            or start_d < cache_earliest
+        ):
+            fetch_end_d = (
+                (cache_earliest - timedelta(days=1))
+                if cache_earliest is not None and pd.notna(cache_earliest)
+                else end_d
+            )
+            fetch_end_str = (
+                fetch_end_d.strftime("%Y-%m-%d")
+                if hasattr(fetch_end_d, "strftime")
+                else str(fetch_end_d)
+            )
+            fetch_start_str = (
+                start_d.strftime("%Y-%m-%d")
+                if hasattr(start_d, "strftime")
+                else str(start_d)
+            )
+            before = self._fetch_futures_intraday(
+                security_id,
+                exchange_segment,
+                instrument,
+                interval,
+                fetch_start_str,
+                fetch_end_str,
+                oi,
+            )
+            if not before.empty:
+                stitched = (
+                    pd.concat([before, stitched], ignore_index=True)
+                    if stitched is not None and not stitched.empty
+                    else before
+                )
+            elif stitched is None:
+                stitched = before
+
+        if (
+            stitched is not None
+            and not stitched.empty
+            and "timestamp" in stitched.columns
+        ):
+            stitched["timestamp"] = pd.to_datetime(stitched["timestamp"], utc=True)
+        cache_latest = (
+            stitched["timestamp"].dt.date.max()
+            if stitched is not None and not stitched.empty
+            else None
+        )
+        if cache_latest is not None and pd.notna(cache_latest) and end_d > cache_latest:
+            fetch_start_d = stitched["timestamp"].dt.date.max() + timedelta(days=1)
+            fetch_start_str = (
+                fetch_start_d.strftime("%Y-%m-%d")
+                if hasattr(fetch_start_d, "strftime")
+                else str(fetch_start_d)
+            )
+            fetch_end_str = (
+                end_d.strftime("%Y-%m-%d") if hasattr(end_d, "strftime") else str(end_d)
+            )
+            after = self._fetch_futures_intraday(
+                security_id,
+                exchange_segment,
+                instrument,
+                interval,
+                fetch_start_str,
+                fetch_end_str,
+                oi,
+            )
+            if not after.empty:
+                stitched = pd.concat([stitched, after], ignore_index=True)
+
+        if stitched is None or stitched.empty:
+            return pd.DataFrame()
+        stitched["timestamp"] = pd.to_datetime(stitched["timestamp"], utc=True)
+        stitched = (
+            stitched.sort_values("timestamp")
+            .drop_duplicates(subset=["timestamp"])
+            .reset_index(drop=True)
+        )
+        save_df(cache_name, stitched)
+        out = stitched[
+            (stitched["timestamp"].dt.date >= start_d)
+            & (stitched["timestamp"].dt.date <= end_d)
+        ].copy()
+        return out.reset_index(drop=True)
 
     # -------------------------------------------------------------------------
     # Data: Expiries
@@ -255,6 +529,31 @@ class DhanSource:
     def get_quote_data(self, names, debug="NO"):
         """Quote (bid/ask etc.) for symbols."""
         return self.tsl.get_quote_data(names, debug)
+
+    # -------------------------------------------------------------------------
+    # Dhan v2 Market Quote API – use when you have segment + security IDs
+    # -------------------------------------------------------------------------
+    def get_ltp_v2(self, instruments):
+        """
+        LTP via v2 /marketfeed/ltp. instruments: { "NSE_EQ": [11536], "NSE_FNO": [49081], ... }.
+        Returns raw API response; use parse_ltp_response() for { sec_id: last_price }.
+        """
+        r = self._marketfeed.ltp(instruments)
+        return r
+
+    def get_ohlc_v2(self, instruments):
+        """
+        OHLC + LTP via v2 /marketfeed/ohlc. instruments: { "NSE_EQ": [11536], ... }.
+        Returns raw API response; use parse_ohlc_response() for { sec_id: { last_price, open, high, low, close } }.
+        """
+        return self._marketfeed.ohlc(instruments)
+
+    def get_quote_v2(self, instruments):
+        """
+        Full quote (depth, OHLC, OI, volume) via v2 /marketfeed/quote.
+        Returns raw API response; use parse_quote_response() for flattened dict.
+        """
+        return self._marketfeed.quote(instruments)
 
     # -------------------------------------------------------------------------
     # Data: NSE (historical option chain / expiries)

@@ -135,12 +135,10 @@ class DhanBroker(BaseBroker):
     def get_positions(self):
         return self.api.get_positions()
 
-    def sync_positions(self):
-        if not self.position_manager:
-            return
+    def get_positions_for_recon(self):
         df = self.api.get_positions()
         if df is None or df.empty:
-            return
+            return {}
         broker_positions = {}
         for _, row in df.iterrows():
             sym = row["tradingSymbol"]
@@ -150,7 +148,14 @@ class DhanBroker(BaseBroker):
                 "segment": row.get("segment", "EQ"),
                 "lot_size": int(row.get("lotSize", 1)),
             }
-        self.position_manager.reconcile_with_broker(broker_positions)
+        return broker_positions
+
+    def sync_positions(self):
+        if not self.position_manager:
+            return
+        broker_positions = self.get_positions_for_recon()
+        if broker_positions:
+            self.position_manager.reconcile_with_broker(broker_positions)
 
     def exit_position(self, trading_symbol, qty, side, segment="EQ", lot_size=1):
         exit_side = "SELL" if side == "BUY" else "BUY"
@@ -165,3 +170,22 @@ class DhanBroker(BaseBroker):
             "trade_type": "MARGIN",
         }
         return self.place_order(intent, execution_price=None)
+
+    def get_open_orders(self):
+        """Open/pending orders for order-state consistency. Dhan: filter by orderStatus not in filled/cancelled/rejected."""
+        orders = self.api.get_order_list() or []
+        if not orders:
+            return []
+        # Dhan orderbook: record may have orderStatus, orderId, tag, etc.
+        closed_statuses = {"filled", "cancelled", "rejected", "complete", "completed", "trigger cancelled"}
+        out = []
+        for o in orders if isinstance(orders, list) else []:
+            status = (o.get("orderStatus") or o.get("status") or "").lower()
+            if status in closed_statuses:
+                continue
+            out.append({
+                "order_id": o.get("orderId") or o.get("order_id"),
+                "tag": o.get("tag") or o.get("intent_id"),
+                "status": status or "open",
+            })
+        return out
