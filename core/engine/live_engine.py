@@ -765,6 +765,22 @@ class LiveEngine(BaseEngine):
         self._tick_cache[symbol] = float(tick) if tick is not None else 0.01
         return self._tick_cache[symbol]
 
+    def _validate_lot_size(self, intent: Any, trading_sym: str) -> None:
+        """Raise ValueError if intent.qty is not a multiple of instrument lot size."""
+        lot = 1
+        if self.instrument_store and hasattr(self.instrument_store, "get_lot_size"):
+            try:
+                lot = self.instrument_store.get_lot_size(trading_sym)
+            except Exception:
+                pass
+        if lot is None:
+            lot = getattr(getattr(intent, "instrument", None), "lot_size", 1) or 1
+        qty = getattr(intent, "qty", 0)
+        if lot and qty % lot != 0:
+            raise ValueError(
+                f"Invalid lot size: qty {qty} not multiple of lot {lot} for {trading_sym}"
+            )
+
     def _is_spread_acceptable(
         self,
         bid: Optional[float],
@@ -850,6 +866,7 @@ class LiveEngine(BaseEngine):
                         )
                         if exit_price is None:
                             continue
+                        self._validate_lot_size(exit_intent, trading_sym)
                         price_map = {trading_sym: exit_price}
                         # Fix 3: Ensure exit intents have idempotency keys for deduplication (pass in; intent is frozen)
                         exit_idem_key = getattr(
@@ -914,11 +931,12 @@ class LiveEngine(BaseEngine):
                 or candle.get("close")
             )
             if exec_price is not None:
-                self._last_signal_hash_per_symbol[symbol] = signal_hash
-                t0 = time.perf_counter()
                 trading_sym = getattr(
                     getattr(single_intent, "instrument", None), "trading_symbol", symbol
                 )
+                self._validate_lot_size(single_intent, trading_sym)
+                self._last_signal_hash_per_symbol[symbol] = signal_hash
+                t0 = time.perf_counter()
                 price_map = {trading_sym: exec_price}
                 self.order_router.process_intent(single_intent, price_map)
                 broker_latency_ms = (time.perf_counter() - t0) * 1000

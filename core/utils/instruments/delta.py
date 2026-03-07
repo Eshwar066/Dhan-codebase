@@ -90,6 +90,18 @@ class DeltaInstrumentStore(BaseInstrumentStore):
                 return None if pd.isna(v) else float(v)
         return None
 
+    def get_lot_size(self, symbol: str) -> Optional[int]:
+        """Return lot size for symbol from product data; None if not found. Delta often uses 1."""
+        key = str(symbol).upper()
+        row = self._symbol_to_row.get(key)
+        if row is not None:
+            lot = row.get("lot_size")
+            if lot is not None:
+                v = pd.to_numeric(lot, errors="coerce")
+                if pd.notna(v) and v >= 1:
+                    return int(v)
+        return 1
+
     def _row_to_instrument(self, row: pd.Series) -> Instrument:
         symbol = row.get("symbol") or row.get("short_name", "")
         contract_multiplier = float(

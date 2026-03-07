@@ -69,6 +69,25 @@ class DhanInstrumentStore(BaseInstrumentStore):
         v = pd.to_numeric(val, errors="coerce")
         return None if pd.isna(v) else float(v)
 
+    def get_lot_size(self, symbol: str) -> Optional[int]:
+        """Return lot size for symbol from instrument data (LOT_SIZE / SEM_LOT_UNITS); None if not found."""
+        sym_upper = str(symbol).strip().upper()
+        for col in ("LOT_SIZE", "SEM_LOT_UNITS"):
+            if col not in self.df.columns:
+                continue
+            match = self.df[
+                (self.df["SEM_CUSTOM_SYMBOL"].astype(str).str.upper() == sym_upper)
+                | (self.df["SEM_TRADING_SYMBOL"].astype(str).str.upper() == sym_upper)
+            ]
+            if match.empty:
+                continue
+            val = match.iloc[0].get(col)
+            if val is not None:
+                v = pd.to_numeric(val, errors="coerce")
+                if pd.notna(v) and v >= 1:
+                    return int(v)
+        return None
+
     def map_row_to_instrument(self, row) -> Instrument:
         lot = row.get("LOT_SIZE", row.get("SEM_LOT_UNITS", 1))
         return Instrument(

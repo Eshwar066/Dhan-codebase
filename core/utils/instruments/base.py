@@ -88,3 +88,7 @@ class BaseInstrumentStore(ABC):
     def get_tick_size(self, symbol: str) -> Optional[float]:
         """Return tick size for symbol when known; None otherwise. Override in broker implementations."""
         return None
+
+    def get_lot_size(self, symbol: str) -> Optional[int]:
+        """Return lot size for symbol when known; None otherwise. Override in broker implementations."""
+        return None
