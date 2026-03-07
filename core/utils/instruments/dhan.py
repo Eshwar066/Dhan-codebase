@@ -51,6 +51,24 @@ class DhanInstrumentStore(BaseInstrumentStore):
             self.df["SEM_STRIKE_PRICE"], errors="coerce"
         )
 
+    def get_tick_size(self, symbol: str) -> Optional[float]:
+        """Return tick size for symbol from instrument data (SEM_TICK_SIZE); None if not found."""
+        sym_upper = str(symbol).strip().upper()
+        col = "SEM_TICK_SIZE" if "SEM_TICK_SIZE" in self.df.columns else None
+        if col is None:
+            return None
+        match = self.df[
+            (self.df["SEM_CUSTOM_SYMBOL"].astype(str).str.upper() == sym_upper)
+            | (self.df["SEM_TRADING_SYMBOL"].astype(str).str.upper() == sym_upper)
+        ]
+        if match.empty:
+            return None
+        val = match.iloc[0].get(col)
+        if val is None:
+            return None
+        v = pd.to_numeric(val, errors="coerce")
+        return None if pd.isna(v) else float(v)
+
     def map_row_to_instrument(self, row) -> Instrument:
         lot = row.get("LOT_SIZE", row.get("SEM_LOT_UNITS", 1))
         return Instrument(

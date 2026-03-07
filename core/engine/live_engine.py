@@ -142,6 +142,12 @@ class LiveEngine(BaseEngine):
         # Candle aggregator: last evaluated closed-candle timestamp per symbol (avoid re-eval same bar)
         self._last_evaluated_candle_ts: Dict[str, Any] = {}
         self._max_ticks_per_cycle = 10000
+        # Tick size cache (populated at startup to avoid lookup latency in hot path)
+        self._tick_cache: Dict[str, float] = {}
+        if self.instrument_store and hasattr(self.instrument_store, "get_tick_size"):
+            for sym in self.symbols:
+                tick = self.instrument_store.get_tick_size(sym)
+                self._tick_cache[sym] = float(tick) if tick is not None else 0.01
 
     def _graceful_shutdown_handler(self, signum: int, frame: Any) -> None:
         """Per-engine: set flag so main loop exits; snapshot and flush in loop or on exit."""
@@ -746,19 +752,17 @@ class LiveEngine(BaseEngine):
                 pass
 
     def _get_tick_size(self, symbol: str) -> float:
-        """Return tick size for symbol from instrument store when available; else default."""
-        try:
-            if self.instrument_store and hasattr(
-                self.instrument_store, "_symbol_to_row"
-            ):
-                row = self.instrument_store._symbol_to_row.get(str(symbol).upper())
-                if row is not None:
-                    tick = row.get("tick_size")
-                    if tick is not None:
-                        return float(tick)
-        except Exception:
-            pass
-        return 0.01
+        """Return tick size for symbol from cache (populated at startup); fill cache on first miss."""
+        if symbol in self._tick_cache:
+            return self._tick_cache[symbol]
+        tick = None
+        if self.instrument_store and hasattr(self.instrument_store, "get_tick_size"):
+            try:
+                tick = self.instrument_store.get_tick_size(symbol)
+            except Exception:
+                pass
+        self._tick_cache[symbol] = float(tick) if tick is not None else 0.01
+        return self._tick_cache[symbol]
 
     def _entry_price_from_depth(self, symbol: str, is_buy: bool):
         bid, ask = self._get_bid_ask(symbol)

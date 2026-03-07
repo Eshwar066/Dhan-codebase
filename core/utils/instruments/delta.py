@@ -79,6 +79,17 @@ class DeltaInstrumentStore(BaseInstrumentStore):
                 if pid is not None:
                     self._symbol_to_row[str(pid)] = row
 
+    def get_tick_size(self, symbol: str) -> Optional[float]:
+        """Return tick size for symbol from product data; None if not found."""
+        key = str(symbol).upper()
+        row = self._symbol_to_row.get(key)
+        if row is not None:
+            tick = row.get("tick_size")
+            if tick is not None:
+                v = pd.to_numeric(tick, errors="coerce")
+                return None if pd.isna(v) else float(v)
+        return None
+
     def _row_to_instrument(self, row: pd.Series) -> Instrument:
         symbol = row.get("symbol") or row.get("short_name", "")
         contract_multiplier = float(

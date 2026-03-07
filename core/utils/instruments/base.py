@@ -84,3 +84,7 @@ class BaseInstrumentStore(ABC):
     ) -> Optional[Instrument]:
         """Resolve futures contract to Instrument. Returns None if not found."""
         raise NotImplementedError
+
+    def get_tick_size(self, symbol: str) -> Optional[float]:
+        """Return tick size for symbol when known; None otherwise. Override in broker implementations."""
+        return None
