@@ -439,6 +439,14 @@ class LiveEngine(BaseEngine):
                 pass
         return (None, None)
 
+    def _intent_has_entry(self, intent) -> bool:
+        """True if intent is an ENTRY or (when intent is a list) any item has action ENTRY."""
+        if intent is None:
+            return False
+        if isinstance(intent, list):
+            return any(getattr(i, "action", None) == "ENTRY" for i in intent)
+        return getattr(intent, "action", None) == "ENTRY"
+
     def _do_exit_order_refresh(self) -> None:
         """Every 1 min, re-quote open exit orders at near bid/ask until they fill."""
         now = time.time()
@@ -577,9 +585,10 @@ class LiveEngine(BaseEngine):
                     strategy_time_ms = (time.perf_counter() - t0) * 1000
                     if intent and self._entries_paused_feed_stale:
                         continue
+                    intent_has_entry = self._intent_has_entry(intent)
                     if (
                         intent
-                        and intent.action == "ENTRY"
+                        and intent_has_entry
                         and (
                             self._entries_paused_order_mismatch
                             or self._entries_paused_memory
