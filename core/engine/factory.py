@@ -42,7 +42,7 @@ from core.orderExecution.order_router import OrderRouter
 from core.orderExecution.intent_store import IntentStore
 from core.utils.telegram_alert import send_telegram_alert
 from core.orderExecution.position_manager import PositionManager
-from core.orderExecution.risk_manager import RiskManager
+from core.orderExecution.risk_manager import RiskManager, make_short_option_margin_check
 from core.utils.delta_env import get_delta_credentials
 from core.utils.instruments.instrument_store import InstrumentStore
 from logs.logger.trade_logger import TradeLogger
@@ -228,6 +228,10 @@ class EngineFactory:
             strategy_id=config.strategy_name,
             telegram_alert=telegram_alert,
         )
+        # Option shorting: validate SPAN + exposure margin when broker supports it
+        _margin_check = make_short_option_margin_check(broker)
+        if _margin_check is not None:
+            order_router.risk.check_short_option_margin = _margin_check
         broker.set_order_router(order_router)
 
         # ---------- Universe (DHAN equity strategies only) ----------
