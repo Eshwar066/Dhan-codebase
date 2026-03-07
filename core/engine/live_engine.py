@@ -781,6 +781,7 @@ class LiveEngine(BaseEngine):
                 f"Invalid lot size: qty {qty} not multiple of lot {lot} for {trading_sym}"
             )
 
+    # use this from config level if strategy is required this
     def _is_spread_acceptable(
         self,
         bid: Optional[float],
@@ -806,6 +807,7 @@ class LiveEngine(BaseEngine):
 
         return None
 
+    # Smart Price Laddering Concept: use this on adding multiple lots
     def _exit_price_from_depth(self, symbol: str, is_sell: bool):
         bid, ask = self._get_bid_ask(symbol)
         if not self._is_spread_acceptable(bid, ask):
@@ -910,6 +912,7 @@ class LiveEngine(BaseEngine):
                         symbol=symbol, signal_hash=str(signal_hash)
                     )
                 continue
+            
             if (
                 self.strategy_timeout_seconds
                 and strategy_time_ms is not None
@@ -922,14 +925,27 @@ class LiveEngine(BaseEngine):
                         threshold_ms=self.strategy_timeout_seconds * 1000.0,
                     )
                 return
+
             side = getattr(single_intent, "side", "").upper()
             is_buy = side == "BUY"
 
-            exec_price = (
-                self._entry_price_from_depth(symbol, is_buy)
-                or getattr(single_intent, "price", None)
-                or candle.get("close")
+            trading_sym = getattr(
+                getattr(single_intent, "instrument", None),
+                "trading_symbol",
+                symbol
             )
+            if trading_sym:
+                exec_price = (
+                    self._entry_price_from_depth(trading_sym, is_buy)
+                    or getattr(single_intent, "price", None)
+                    or candle.get("close")
+                )
+            else:
+                exec_price = (
+                    self._entry_price_from_depth(symbol, is_buy)
+                    or getattr(single_intent, "price", None)
+                    or candle.get("close")
+                )
             if exec_price is not None:
                 trading_sym = getattr(
                     getattr(single_intent, "instrument", None), "trading_symbol", symbol
