@@ -9,6 +9,7 @@ import csv
 import os
 import signal
 import time
+import psutil
 import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple
 import pdb
@@ -78,7 +79,7 @@ class LiveEngine(BaseEngine):
         order_state_check_interval_min: int = 0,
         memory_threshold_percent: Optional[float] = None,
         strategy_timeout_seconds: Optional[float] = None,
-        latency_critical_ms: float = 150.0,
+        latency_critical_ms: float = 2000,
         latency_critical_cycles: int = 3,
         symbol_error_threshold: int = 5,
         tick_queue: Optional[Any] = None,
@@ -142,101 +143,6 @@ class LiveEngine(BaseEngine):
         # Candle aggregator: last evaluated closed-candle timestamp per symbol (avoid re-eval same bar)
         self._last_evaluated_candle_ts: Dict[str, Any] = {}
         self._max_ticks_per_cycle = 10000
-
-    def _drain_tick_queue(self) -> None:
-        """Drain tick queue into candle_aggregator (single state owner). Non-blocking; cap per cycle."""
-        if not self.tick_queue or not self.candle_aggregator:
-            return
-        if not hasattr(self, "_tick_debug_count"):
-            self._tick_debug_count = 0
-            self._tick_debug_last_log = time.time()
-        for _ in range(self._max_ticks_per_cycle):
-            try:
-                tick = self.tick_queue.get_nowait()
-            except Exception:
-                break
-            try:
-                s = tick.get("symbol")
-                p = tick.get("price")
-                v = tick.get("volume", 0)
-                ts = tick.get("timestamp")
-                if s is not None and p is not None and ts is not None:
-                    self.candle_aggregator.on_tick(s, p, v, ts)
-                    self._last_tick_timestamp[s] = time.time()
-                    self._tick_debug_count += 1
-                    now = time.time()
-                    if now - self._tick_debug_last_log >= 5:
-                        print(
-                            f"[TICK HEALTH] {self._tick_debug_count} ticks in last 5s"
-                        )
-                        self._tick_debug_count = 0
-                        self._tick_debug_last_log = now
-            except Exception:
-                pass
-
-    def _signal_hash(
-        self, symbol: str, timeframe: str, candle_ts: Any, signal_type: str
-    ) -> int:
-        """Hash for duplicate signal detection. Override candle_ts for bar identity."""
-        ts = getattr(candle_ts, "timestamp", None) or (
-            candle_ts if isinstance(candle_ts, (int, float)) else str(candle_ts)
-        )
-        return hash((symbol, str(timeframe), str(ts), str(signal_type)))
-
-    def _within_trading_hours(self) -> bool:
-        if not self.allowed_trading_hours:
-            return True
-        now = dt.datetime.utcnow()
-        return _within_trading_hours_utc(now, self.allowed_trading_hours)
-
-    def _check_memory(self) -> None:
-        if self.memory_threshold_percent is None or self.memory_threshold_percent <= 0:
-            return
-        try:
-            import psutil
-
-            proc = psutil.Process()
-            usage = proc.memory_percent()
-            if usage >= self.memory_threshold_percent:
-                self._entries_paused_memory = True
-                if self.engine_logger:
-                    self.engine_logger.memory_pressure_warning(
-                        f"Memory usage {usage:.1f}% >= {self.memory_threshold_percent}%",
-                        usage_percent=usage,
-                    )
-            else:
-                self._entries_paused_memory = False
-        except Exception:
-            pass
-
-    def _validate_candle_integrity(
-        self, candle: Dict, symbol: Optional[str] = None
-    ) -> bool:
-        """
-        Validate OHLC consistency: high >= max(open,close), low <= min(open,close).
-        If aggregating tick volumes: volume would equal sum(ticks); we only check OHLC here.
-        Returns True if valid; on failure logs candle_integrity_error and returns False.
-        """
-        o = candle.get("open")
-        h = candle.get("high")
-        l = candle.get("low")
-        c = candle.get("close")
-        print(candle)
-        if o is None or h is None or l is None or c is None:
-            return True
-        try:
-            o, h, l, c = float(o), float(h), float(l), float(c)
-        except (TypeError, ValueError):
-            return True
-        if h < max(o, c) or l > min(o, c):
-            if self.engine_logger:
-                self.engine_logger.candle_integrity_error(
-                    "OHLC inconsistent: high < max(o,c) or low > min(o,c)",
-                    symbol=symbol,
-                    details={"open": o, "high": h, "low": l, "close": c},
-                )
-            return False
-        return True
 
     def _graceful_shutdown_handler(self, signum: int, frame: Any) -> None:
         """Per-engine: set flag so main loop exits; snapshot and flush in loop or on exit."""
@@ -318,47 +224,39 @@ class LiveEngine(BaseEngine):
         )
         return True
 
-    def _is_closed_candle(
-        self, candle: Dict, timeframe: str, now: Optional[dt.datetime] = None
-    ) -> bool:
-        """
-        True if candle timestamp is on timeframe boundary and not in the future.
-        Reject forming candles (timestamp > expected close time).
-        """
-        ts = candle.get("timestamp")
-        if ts is None:
-            return False
-        if isinstance(ts, (int, float)):
-            if ts > 1e12:
-                ts_dt = dt.datetime.utcfromtimestamp(ts / 1e6)
-            else:
-                ts_dt = dt.datetime.utcfromtimestamp(ts)
-        else:
-            ts_dt = (
-                ts
-                if isinstance(ts, dt.datetime)
-                else dt.datetime.fromisoformat(str(ts))
-            )
-        now = now or dt.datetime.utcnow()
-        if ts_dt.tzinfo:
-            now = now.replace(tzinfo=ts_dt.tzinfo) if not now.tzinfo else now
-        if ts_dt > now:
-            return False
-        tf_min = self._tf_to_minutes(timeframe)
-        if tf_min <= 0:
-            return True
-        epoch = dt.datetime(1970, 1, 1, tzinfo=ts_dt.tzinfo if ts_dt.tzinfo else None)
-        mins = int((ts_dt - epoch).total_seconds() / 60)
-        return (mins % tf_min) == 0
+    def _do_order_state_check(self) -> None:
+        if self.order_state_check_interval_min <= 0:
+            return
+        now = time.time()
+        if (
+            now - self._last_order_state_check_time
+            < self.order_state_check_interval_min * 60
+        ):
+            return
+        self._last_order_state_check_time = now
+        ok, _ = self.order_router.verify_open_orders_with_broker()
+        if not ok:
+            self._entries_paused_order_mismatch = True
+            self.reconcile_positions_on_start()
 
-    def _tf_to_minutes(self, tf: str) -> int:
-        tf = str(tf).lower()
-        if tf.endswith("h"):
-            return int(tf[:-1]) * 60
+    def _check_memory(self) -> None:
+        if self.memory_threshold_percent is None or self.memory_threshold_percent <= 0:
+            return
         try:
-            return int(tf)
-        except ValueError:
-            return 60
+            proc = psutil.Process()
+            usage = proc.memory_percent()
+            print(">>usage", usage)
+            if usage >= self.memory_threshold_percent:
+                self._entries_paused_memory = True
+                if self.engine_logger:
+                    self.engine_logger.memory_pressure_warning(
+                        f"Memory usage {usage:.1f}% >= {self.memory_threshold_percent}%",
+                        usage_percent=usage,
+                    )
+            else:
+                self._entries_paused_memory = False
+        except Exception:
+            pass
 
     def check_feed_health(self) -> None:
         """Warn if no tick/candle received for feed_stale_seconds; optionally pause entries."""
@@ -379,6 +277,18 @@ class LiveEngine(BaseEngine):
                     )
         self._entries_paused_feed_stale = any_stale
 
+    def _do_exit_order_refresh(self) -> None:
+        """Every 1 min, re-quote open exit orders at near bid/ask until they fill."""
+        now = time.time()
+        if now - self._last_exit_refresh_time < self._exit_refresh_interval_seconds:
+            return
+        self._last_exit_refresh_time = now
+        self.order_router.refresh_stale_exit_orders(
+            get_bid_ask=self._get_bid_ask,
+            stale_seconds=float(self._exit_refresh_interval_seconds),
+        )
+
+    # this not getting logged properly
     def _export_eod(self, date_str: str) -> None:
         """Export open positions, realized pnl to reports/{engine_id}_{date}.csv."""
         reports_dir = REPORTS_DIR
@@ -413,20 +323,122 @@ class LiveEngine(BaseEngine):
         if self.engine_logger:
             self.engine_logger.eod_export(path)
 
-    def _do_order_state_check(self) -> None:
-        if self.order_state_check_interval_min <= 0:
+    def _drain_tick_queue(self) -> None:
+        """Drain tick queue into candle_aggregator (single state owner). Non-blocking; cap per cycle."""
+        if not self.tick_queue or not self.candle_aggregator:
             return
-        now = time.time()
-        if (
-            now - self._last_order_state_check_time
-            < self.order_state_check_interval_min * 60
-        ):
-            return
-        self._last_order_state_check_time = now
-        ok, _ = self.order_router.verify_open_orders_with_broker()
-        if not ok:
-            self._entries_paused_order_mismatch = True
-            self.reconcile_positions_on_start()
+        if not hasattr(self, "_tick_debug_count"):
+            self._tick_debug_count = 0
+            self._tick_debug_last_log = time.time()
+        for _ in range(self._max_ticks_per_cycle):
+            try:
+                tick = self.tick_queue.get_nowait()
+            except Exception:
+                break
+            try:
+                s = tick.get("symbol")
+                p = tick.get("price")
+                v = tick.get("volume", 0)
+                ts = tick.get("timestamp")
+                if s is not None and p is not None and ts is not None:
+                    self.candle_aggregator.on_tick(s, p, v, ts)
+                    self._last_tick_timestamp[s] = time.time()
+                    self._tick_debug_count += 1
+                    now = time.time()
+                    if now - self._tick_debug_last_log >= 5:
+                        print(
+                            f"[TICK HEALTH] {self._tick_debug_count} ticks in last 5s"
+                        )
+                        self._tick_debug_count = 0
+                        self._tick_debug_last_log = now
+            except Exception:
+                pass
+
+    def _validate_candle_integrity(
+        self, candle: Dict, symbol: Optional[str] = None
+    ) -> bool:
+        """
+        Validate OHLC consistency: high >= max(open,close), low <= min(open,close).
+        If aggregating tick volumes: volume would equal sum(ticks); we only check OHLC here.
+        Returns True if valid; on failure logs candle_integrity_error and returns False.
+        """
+        o = candle.get("open")
+        h = candle.get("high")
+        l = candle.get("low")
+        c = candle.get("close")
+        print(candle)
+        if o is None or h is None or l is None or c is None:
+            return True
+        try:
+            o, h, l, c = float(o), float(h), float(l), float(c)
+        except (TypeError, ValueError):
+            return True
+        if h < max(o, c) or l > min(o, c):
+            if self.engine_logger:
+                self.engine_logger.candle_integrity_error(
+                    "OHLC inconsistent: high < max(o,c) or low > min(o,c)",
+                    symbol=symbol,
+                    details={"open": o, "high": h, "low": l, "close": c},
+                )
+            return False
+        return True
+
+    def _tf_to_minutes(self, tf: str) -> int:
+        tf = str(tf).lower()
+        if tf.endswith("h"):
+            return int(tf[:-1]) * 60
+        try:
+            return int(tf)
+        except ValueError:
+            return 60
+
+    def _is_closed_candle(
+        self, candle: Dict, timeframe: str, now: Optional[dt.datetime] = None
+    ) -> bool:
+        """
+        True if candle timestamp is on timeframe boundary and not in the future.
+        Reject forming candles (timestamp > expected close time).
+        """
+        ts = candle.get("timestamp")
+        if ts is None:
+            return False
+        if isinstance(ts, (int, float)):
+            if ts > 1e12:
+                ts_dt = dt.datetime.utcfromtimestamp(ts / 1e6)
+            else:
+                ts_dt = dt.datetime.utcfromtimestamp(ts)
+        else:
+            ts_dt = (
+                ts
+                if isinstance(ts, dt.datetime)
+                else dt.datetime.fromisoformat(str(ts))
+            )
+        now = now or dt.datetime.utcnow()
+        if ts_dt.tzinfo:
+            now = now.replace(tzinfo=ts_dt.tzinfo) if not now.tzinfo else now
+        if ts_dt > now:
+            return False
+        tf_min = self._tf_to_minutes(timeframe)
+        if tf_min <= 0:
+            return True
+        epoch = dt.datetime(1970, 1, 1, tzinfo=ts_dt.tzinfo if ts_dt.tzinfo else None)
+        mins = int((ts_dt - epoch).total_seconds() / 60)
+        return (mins % tf_min) == 0
+
+    def _signal_hash(
+        self, symbol: str, timeframe: str, candle_ts: Any, signal_type: str
+    ) -> int:
+        """Hash for duplicate signal detection. Override candle_ts for bar identity."""
+        ts = getattr(candle_ts, "timestamp", None) or (
+            candle_ts if isinstance(candle_ts, (int, float)) else str(candle_ts)
+        )
+        return hash((symbol, str(timeframe), str(ts), str(signal_type)))
+
+    def _within_trading_hours(self) -> bool:
+        if not self.allowed_trading_hours:
+            return True
+        now = dt.datetime.utcnow()
+        return _within_trading_hours_utc(now, self.allowed_trading_hours)
 
     def _get_bid_ask(self, symbol: str) -> Tuple[Optional[float], Optional[float]]:
         """Return (best_bid, best_ask) for symbol from feed; (None, None) if unavailable."""
@@ -447,16 +459,38 @@ class LiveEngine(BaseEngine):
             return any(getattr(i, "action", None) == "ENTRY" for i in intent)
         return getattr(intent, "action", None) == "ENTRY"
 
-    def _do_exit_order_refresh(self) -> None:
-        """Every 1 min, re-quote open exit orders at near bid/ask until they fill."""
-        now = time.time()
-        if now - self._last_exit_refresh_time < self._exit_refresh_interval_seconds:
+    def get_price_map(self, symbol):
+        if self.realtime_feed and self.realtime_feed.is_connected():
+            ticker = self.realtime_feed.get_last_ticker(symbol)
+            if ticker and ticker.get("close") is not None:
+                return ticker["close"]
+        if self.data:
+            candles = self.data.get_latest_candles([symbol])
+            if (
+                candles
+                and symbol in candles
+                and candles[symbol].get("close") is not None
+            ):
+                return candles[symbol]["close"]
+        return None
+
+    def _enrich_candle_depth(self, symbol: str, candle: Dict[str, Any]) -> None:
+        """For Delta: set candle['best_bid'] and candle['best_ask'] from L2 so strategy can place at best bid/ask."""
+        if (
+            self.venue != "DELTA"
+            or not self.realtime_feed
+            or not hasattr(self.realtime_feed, "get_best_bid")
+        ):
             return
-        self._last_exit_refresh_time = now
-        self.order_router.refresh_stale_exit_orders(
-            get_bid_ask=self._get_bid_ask,
-            stale_seconds=float(self._exit_refresh_interval_seconds),
-        )
+        try:
+            bid = self.realtime_feed.get_best_bid(symbol)
+            ask = self.realtime_feed.get_best_ask(symbol)
+            if bid is not None:
+                candle["best_bid"] = bid
+            if ask is not None:
+                candle["best_ask"] = ask
+        except Exception:
+            pass
 
     def start(self, exchange, sector, rsi):
         if self.engine_logger:
@@ -499,7 +533,7 @@ class LiveEngine(BaseEngine):
             self._do_order_state_check()
             self._do_exit_order_refresh()
 
-            # move this logic based on date change
+            # Export eod report funtion
             if loop_count % 60 == 0:
                 today = dt.datetime.utcnow().strftime("%Y%m%d")
                 if self._last_eod_date and self._last_eod_date != today:
@@ -552,6 +586,8 @@ class LiveEngine(BaseEngine):
 
                     if not self._validate_candle_integrity(candle, symbol):
                         continue
+
+                    # This code checks if the candle is fully closed; if not, it logs a warning and skips strategy evaluation to avoid trading on incomplete market data.
                     if not self._is_closed_candle(candle, tf, now=_now):
                         if self.engine_logger:
                             self.engine_logger.closed_candle_skip(
@@ -607,6 +643,7 @@ class LiveEngine(BaseEngine):
                         strategy_time_ms=strategy_time_ms,
                         timeframe=tf,
                     )
+            # To be checked properly else condition--> Pending
             else:
                 candles = None
                 if use_feed:
@@ -709,39 +746,6 @@ class LiveEngine(BaseEngine):
             except Exception:
                 pass
 
-    def get_price_map(self, symbol):
-        if self.realtime_feed and self.realtime_feed.is_connected():
-            ticker = self.realtime_feed.get_last_ticker(symbol)
-            if ticker and ticker.get("close") is not None:
-                return ticker["close"]
-        if self.data:
-            candles = self.data.get_latest_candles([symbol])
-            if (
-                candles
-                and symbol in candles
-                and candles[symbol].get("close") is not None
-            ):
-                return candles[symbol]["close"]
-        return None
-
-    def _enrich_candle_depth(self, symbol: str, candle: Dict[str, Any]) -> None:
-        """For Delta: set candle['best_bid'] and candle['best_ask'] from L2 so strategy can place at best bid/ask."""
-        if (
-            self.venue != "DELTA"
-            or not self.realtime_feed
-            or not hasattr(self.realtime_feed, "get_best_bid")
-        ):
-            return
-        try:
-            bid = self.realtime_feed.get_best_bid(symbol)
-            ask = self.realtime_feed.get_best_ask(symbol)
-            if bid is not None:
-                candle["best_bid"] = bid
-            if ask is not None:
-                candle["best_ask"] = ask
-        except Exception:
-            pass
-
     def _run_strategy(
         self,
         symbol,
@@ -755,6 +759,7 @@ class LiveEngine(BaseEngine):
         open_positions = self.position_manager.get_open_positions(
             underlying=symbol, strategy=self.strategy.name
         )
+        pdb.set_trace()
         for position in open_positions:
             exit_signal = self.strategy.should_exit(position, candle, ctx)
             if exit_signal:

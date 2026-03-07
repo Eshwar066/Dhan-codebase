@@ -49,39 +49,6 @@ STRATEGY_JOBS = [
             "sector": "YES",
         },
     },
-    # Pipeline test configs: Signal every 1m, hit Risk/OMS/Router/Broker/PM. Use PAPER or LIVE.
-    # Optional: "telegram": {"bot_token": "YOUR_BOT_TOKEN", "chat_id": "YOUR_CHAT_ID"} for order/error/slippage alerts.
-    {
-        "name": "SignalFloodTest",
-        "venue": "DELTA",
-        "enabled": True,
-        "engine_id": "delta_test_pipeline",
-        "capital": 10000,
-        "symbols": ["BTCUSD"],
-        "instrument": "FUTURES",
-        "delta_india": True,
-        "delta_testnet": True,
-        "daily_max_loss": 100,
-        "max_open_positions": 1,
-        "feed_stale_seconds": 30,
-        "order_state_check_interval_min": 1,
-        "memory_threshold_percent": 5,
-        "latency_critical_ms": 3000,
-        "latency_critical_cycles": 1,
-        "symbol_error_threshold": 2,
-        "live": {"exchange": "DELTA", "sector": "YES"},
-        "telegram": {
-            "bot_token": "8389724629:AAHY_CGcBF8HZCexedsEJFw80Mf6SxH5Bkk",
-            "chat_id": "1021479950",
-        },
-        "backtest": {
-            "start_date": "2024-03-20",
-            "end_date": "2024-03-25",
-            "timeframe": "1",
-            "exchange": "DELTA",
-            "sector": "YES",
-        },
-    },
     {
         "name": "IPOBreakout",
         "venue": "DHAN",
@@ -147,6 +114,38 @@ STRATEGY_JOBS = [
             "end_date": "2023-10-25",
             "timeframe": "1",
             "exchange": "INDEX",
+            "sector": "YES",
+        },
+    },
+    {
+        "name": "SignalFloodTest",
+        "venue": "DELTA",
+        "enabled": True,
+        "engine_id": "delta_test_pipeline",
+        "capital": 10000,
+        "symbols": ["BTCUSD"],
+        "instrument": "FUTURES",
+        "delta_india": True,
+        "delta_testnet": True,
+        "daily_max_loss": 100,  # not in engine
+        "max_open_positions": 1,  # not in engine
+        "feed_stale_seconds": 30,  # In Engine
+        "order_state_check_interval_min": 1,  # In engine
+        "memory_threshold_percent": 5,  # In engine
+        "latency_critical_ms": 3000,  # In engine
+        "latency_critical_cycles": 1,  # In engine
+        "symbol_error_threshold": 2,  # In engine
+        # "strategy_timeout_seconds": 1000000000, # do we need this
+        "live": {"exchange": "DELTA", "sector": "YES"},
+        "telegram": {
+            "bot_token": "8389724629:AAHY_CGcBF8HZCexedsEJFw80Mf6SxH5Bkk",
+            "chat_id": "1021479950",
+        },
+        "backtest": {
+            "start_date": "2024-03-20",
+            "end_date": "2024-03-25",
+            "timeframe": "1",
+            "exchange": "DELTA",
             "sector": "YES",
         },
     },
