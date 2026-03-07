@@ -12,7 +12,6 @@ import time
 import psutil
 import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple
-import pdb
 
 from core.engine.base_engine import BaseEngine
 
@@ -746,6 +745,44 @@ class LiveEngine(BaseEngine):
             except Exception:
                 pass
 
+    def _get_tick_size(self, symbol: str) -> float:
+        """Return tick size for symbol from instrument store when available; else default."""
+        try:
+            if self.instrument_store and hasattr(
+                self.instrument_store, "_symbol_to_row"
+            ):
+                row = self.instrument_store._symbol_to_row.get(str(symbol).upper())
+                if row is not None:
+                    tick = row.get("tick_size")
+                    if tick is not None:
+                        return float(tick)
+        except Exception:
+            pass
+        return 0.01
+
+    def _entry_price_from_depth(self, symbol: str, is_buy: bool):
+        bid, ask = self._get_bid_ask(symbol)
+        tick = self._get_tick_size(symbol)
+
+        if is_buy and ask is not None:
+            return ask + tick
+        if not is_buy and bid is not None:
+            return bid - tick
+
+        return None
+
+    def _exit_price_from_depth(self, symbol: str, is_sell: bool):
+        bid, ask = self._get_bid_ask(symbol)
+        tick = self._get_tick_size(symbol)
+
+        if is_sell and bid is not None:
+            return bid - tick
+
+        if not is_sell and ask is not None:
+            return ask + tick
+
+        return None
+
     def _run_strategy(
         self,
         symbol,
@@ -759,14 +796,15 @@ class LiveEngine(BaseEngine):
         open_positions = self.position_manager.get_open_positions(
             underlying=symbol, strategy=self.strategy.name
         )
-        pdb.set_trace()
         for position in open_positions:
             exit_signal = self.strategy.should_exit(position, candle, ctx)
             if exit_signal:
                 exit_intents = (
                     self.strategy.on_position_exit(position, candle, ctx) or []
                 )
-                exit_price = self.get_price_map(symbol)
+                exit_price = self._exit_price_from_depth(
+                    symbol, is_sell=(position.net_qty > 0)
+                ) or self.get_price_map(symbol)
                 if exit_price is not None and exit_intents:
                     if self.engine_logger:
                         self.engine_logger.exit_triggered(
@@ -835,7 +873,14 @@ class LiveEngine(BaseEngine):
                         threshold_ms=self.strategy_timeout_seconds * 1000.0,
                     )
                 return
-            exec_price = getattr(single_intent, "price", None) or candle.get("close")
+            side = getattr(single_intent, "side", "").upper()
+            is_buy = side == "BUY"
+
+            exec_price = (
+                self._entry_price_from_depth(symbol, is_buy)
+                or getattr(single_intent, "price", None)
+                or candle.get("close")
+            )
             if exec_price is not None:
                 self._last_signal_hash_per_symbol[symbol] = signal_hash
                 t0 = time.perf_counter()
