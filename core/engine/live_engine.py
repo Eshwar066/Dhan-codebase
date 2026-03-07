@@ -764,8 +764,22 @@ class LiveEngine(BaseEngine):
         self._tick_cache[symbol] = float(tick) if tick is not None else 0.01
         return self._tick_cache[symbol]
 
+    def _is_spread_acceptable(
+        self,
+        bid: Optional[float],
+        ask: Optional[float],
+        max_spread_pct: float = 0.1,
+    ) -> bool:
+        """True if both bid/ask exist and spread <= max_spread_pct * bid. Blocks wide spreads (e.g. options)."""
+        if bid is None or ask is None or bid <= 0:
+            return False
+        spread = ask - bid
+        return spread <= bid * max_spread_pct
+
     def _entry_price_from_depth(self, symbol: str, is_buy: bool):
         bid, ask = self._get_bid_ask(symbol)
+        if not self._is_spread_acceptable(bid, ask):
+            return None
         tick = self._get_tick_size(symbol)
 
         if is_buy and ask is not None:
@@ -777,6 +791,8 @@ class LiveEngine(BaseEngine):
 
     def _exit_price_from_depth(self, symbol: str, is_sell: bool):
         bid, ask = self._get_bid_ask(symbol)
+        if not self._is_spread_acceptable(bid, ask):
+            return None
         tick = self._get_tick_size(symbol)
 
         if is_sell and bid is not None:
