@@ -6,6 +6,7 @@ symbol-level failure isolation, strategy timeout, latency alert levels, candle i
 """
 
 import csv
+import dataclasses
 import os
 import signal
 import time
@@ -822,29 +823,40 @@ class LiveEngine(BaseEngine):
                 exit_intents = (
                     self.strategy.on_position_exit(position, candle, ctx) or []
                 )
-                exit_price = self._exit_price_from_depth(
-                    symbol, is_sell=(position.net_qty > 0)
-                ) or self.get_price_map(symbol)
-                if exit_price is not None and exit_intents:
+                is_sell = position.net_qty > 0
+                required_exit_side = "SELL" if is_sell else "BUY"
+                if exit_intents:
                     if self.engine_logger:
                         self.engine_logger.exit_triggered(
                             symbol,
-                            "SELL" if position.net_qty > 0 else "BUY",
+                            required_exit_side,
                             abs(position.net_qty),
                             "Strategy exit",
                         )
                     for exit_intent in exit_intents:
+                        # Position direction validation: exit side must match position (prevents accidental reversal)
+                        if getattr(exit_intent, "side", None) != required_exit_side:
+                            exit_intent = dataclasses.replace(
+                                exit_intent, side=required_exit_side
+                            )
+                        # Exit price from depth by intent's instrument and position direction (correct bid/ask for this contract)
+                        trading_sym = getattr(
+                            exit_intent.instrument, "trading_symbol", symbol
+                        )
+                        exit_price = (
+                            self._exit_price_from_depth(trading_sym, is_sell)
+                            or self.get_price_map(trading_sym)
+                            or self.get_price_map(symbol)
+                        )
+                        if exit_price is None:
+                            continue
+                        price_map = {trading_sym: exit_price}
                         # Fix 3: Ensure exit intents have idempotency keys for deduplication (pass in; intent is frozen)
                         exit_idem_key = getattr(
                             exit_intent, "idempotency_key", None
                         ) or self._signal_hash(
                             symbol, timeframe or "", candle.get("timestamp"), "exit"
                         )
-                        price_map = {
-                            getattr(
-                                exit_intent.instrument, "trading_symbol", symbol
-                            ): exit_price
-                        }
                         self.order_router.process_intent(
                             exit_intent, price_map, idempotency_key=exit_idem_key
                         )
