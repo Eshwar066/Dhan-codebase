@@ -163,6 +163,30 @@ class DhanBroker(BaseBroker):
                     }
         return None
 
+    def get_fill_by_order_id(
+        self, broker_order_id: str, page_size: int = 50
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Resolve fill by broker order_id when fill/order list does not return tag.
+        Returns dict with price, size, side, order_id.
+        """
+        if not broker_order_id:
+            return None
+        fills = self.get_recent_fills(page_size=page_size)
+        bid_str = str(broker_order_id)
+        for f in fills:
+            if str(f.get("order_id") or f.get("id") or "") == bid_str:
+                price = float(f.get("price") or 0)
+                size = float(f.get("size") or 0)
+                if price > 0 and size > 0:
+                    return {
+                        "order_id": bid_str,
+                        "price": price,
+                        "size": size,
+                        "side": (f.get("side") or "").upper(),
+                    }
+        return None
+
     def get_positions(self):
         return self.api.get_positions()
 

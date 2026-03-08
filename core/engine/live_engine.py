@@ -228,7 +228,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         try:
             proc = psutil.Process()
             usage = proc.memory_percent()
-            print(">>usage", usage)
+            # print(">>usage", usage)
             if usage >= self.memory_threshold_percent:
                 self._entries_paused_memory = True
                 if self.engine_logger:

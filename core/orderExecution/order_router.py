@@ -755,12 +755,17 @@ class OrderRouter:
                                 tag, IntentStatus.REJECTED, order_state=ost
                             )
                     else:
-                        # Trade-led: order missing from open list. Only update position from a real trade (fill).
-                        # Do not fabricate a fill; if we have a fill in the API, apply it via process_trade.
+                        # Trade-led: order missing from open list. Resolve fill by client_order_id first,
+                        # then by broker order_id (fills API often returns only order_id, not client_order_id).
                         fill_info = None
                         if hasattr(self.broker, "get_fill_for_client_order_id"):
                             try:
                                 fill_info = self.broker.get_fill_for_client_order_id(tag)
+                            except Exception:
+                                pass
+                        if not fill_info and i.get("broker_order_id") and hasattr(self.broker, "get_fill_by_order_id"):
+                            try:
+                                fill_info = self.broker.get_fill_by_order_id(str(i["broker_order_id"]))
                             except Exception:
                                 pass
                         if fill_info and float(fill_info.get("price") or 0) > 0:
@@ -967,8 +972,23 @@ class OrderRouter:
             fills = self.broker.get_recent_fills(page_size=50)
         except Exception:
             return
+        # Match by broker order_id when fill has no client_order_id (e.g. Delta often returns only order_id)
+        broker_order_id_to_intent: Dict[str, str] = {}
+        try:
+            pending = self.intent_store.list_by_status(IntentStatus.SENT) + self.intent_store.list_by_status(IntentStatus.VALIDATED)
+            for rec in pending:
+                bid = rec.get("broker_order_id")
+                iid = rec.get("intent_id")
+                if bid is not None and iid:
+                    broker_order_id_to_intent[str(bid)] = iid
+        except Exception:
+            pass
         for f in fills or []:
-            intent_id = f.get("client_order_id") or f.get("tag")
+            intent_id = (
+                f.get("client_order_id")
+                or f.get("tag")
+                or broker_order_id_to_intent.get(str(f.get("order_id") or f.get("id") or ""))
+            )
             if not intent_id:
                 continue
             trade = {

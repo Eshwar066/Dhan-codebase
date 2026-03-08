@@ -225,6 +225,42 @@ class DeltaBroker(BaseBroker):
             "reduce_only": matching[0].get("reduce_only"),
         }
 
+    def get_fill_by_order_id(
+        self, broker_order_id: str, page_size: int = 50
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Resolve fill by broker order_id when fill API does not return client_order_id.
+        Returns same shape as get_fill_for_client_order_id (price, size, side, order_id).
+        """
+        if not broker_order_id or not hasattr(self.api, "get_fills"):
+            return None
+        try:
+            fills = self.api.get_fills(page_size=page_size)
+        except Exception:
+            return None
+        bid_str = str(broker_order_id)
+        matching = [
+            f for f in (fills or [])
+            if str(f.get("order_id") or f.get("id") or "") == bid_str
+        ]
+        if not matching:
+            return None
+        total_size = sum(float(f.get("size", 0) or 0) for f in matching)
+        if total_size <= 0:
+            return None
+        total_value = sum(
+            float(f.get("size", 0) or 0) * float(f.get("price", 0) or 0)
+            for f in matching
+        )
+        avg_price = total_value / total_size if total_size else 0
+        return {
+            "order_id": bid_str,
+            "price": avg_price,
+            "size": total_size,
+            "side": (matching[0].get("side") or "").lower(),
+            "reduce_only": matching[0].get("reduce_only"),
+        }
+
     def get_positions(self):
         return self.api.get_positions()
 
