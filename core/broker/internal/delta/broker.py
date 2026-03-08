@@ -2,7 +2,7 @@
 
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 import pdb
 
 from core.broker.base import BaseBroker
@@ -160,15 +160,43 @@ class DeltaBroker(BaseBroker):
                 "reduce_only": o.get("reduce_only"),
             }
         # 2) Try fills (uses fills(); page_size=50) to get fill price/size
+        fill_info = self.get_fill_for_client_order_id(client_order_id)
+        if fill_info:
+            return {
+                "order_id": str(fill_info.get("order_id", "")),
+                "tag": client_order_id,
+                "product_id": fill_info.get("product_id"),
+                "symbol": fill_info.get("product_symbol"),
+                "status": "filled",
+                "side": (fill_info.get("side") or "").lower(),
+                "qty": int(fill_info.get("size", 0)),
+                "remaining_qty": 0,
+                "filled_size": fill_info.get("size", 0),
+                "size": fill_info.get("size", 0),
+                "unfilled_size": 0,
+                "average_fill_price": fill_info.get("price", 0),
+                "price": fill_info.get("price", 0),
+                "reduce_only": fill_info.get("reduce_only"),
+            }
+        return None
+
+    def get_fill_for_client_order_id(
+        self, client_order_id: str, page_size: int = 50
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Resolve fill price and size from /v2/fills for a given client_order_id (intent_id).
+        Used when order is missing from open list so we do not assume filled with price=0.
+        Returns dict with price, size, order_id, side, etc., or None if no matching fill.
+        """
         if not hasattr(self.api, "get_fills"):
             return None
         try:
-            fills = self.api.get_fills(page_size=50)
+            fills = self.api.get_fills(page_size=page_size)
         except Exception:
-            fills = []
+            return None
         matching = [
             f for f in (fills or [])
-            if (f.get("client_order_id") or f.get("order_id")) == client_order_id
+            if (f.get("client_order_id") or f.get("order_id") or f.get("tag")) == client_order_id
             or str(f.get("client_order_id") or "") == client_order_id
         ]
         if not matching:
@@ -181,19 +209,18 @@ class DeltaBroker(BaseBroker):
             for f in matching
         )
         avg_price = total_value / total_size if total_size else 0
+        product_symbol = (
+            matching[0].get("product_symbol")
+            or (matching[0].get("product") or {}).get("symbol")
+        )
         return {
             "order_id": str(matching[0].get("order_id", matching[0].get("id", ""))),
             "tag": client_order_id,
             "product_id": matching[0].get("product_id"),
-            "symbol": matching[0].get("product_symbol") or (matching[0].get("product") or {}).get("symbol"),
-            "status": "filled",
+            "symbol": product_symbol,
+            "product_symbol": product_symbol,
             "side": (matching[0].get("side") or "").lower(),
-            "qty": int(total_size),
-            "remaining_qty": 0,
-            "filled_size": total_size,
-            "size": int(total_size),
-            "unfilled_size": 0,
-            "average_fill_price": avg_price,
+            "size": total_size,
             "price": avg_price,
             "reduce_only": matching[0].get("reduce_only"),
         }

@@ -137,6 +137,7 @@ class IntentStore:
             if rec.get("order_state")
         ]
 
+    # below two are not used
     # -------------------------
     # EXPIRE STALE
     # -------------------------

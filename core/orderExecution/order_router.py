@@ -78,7 +78,10 @@ class OrderRouter:
 
     def _load_order_state(self) -> None:
         """Load intent_id -> OrderState and optional action log from logs/order_state_{engine_id}.json."""
-        if not getattr(self, "_order_state_file", None) or not self._order_state_file.exists():
+        if (
+            not getattr(self, "_order_state_file", None)
+            or not self._order_state_file.exists()
+        ):
             return
         try:
             with open(self._order_state_file, "r", encoding="utf-8") as f:
@@ -135,7 +138,10 @@ class OrderRouter:
         self._order_state[intent_id] = state
         state_val = state.value if isinstance(state, OrderState) else state
         entry = {
-            "timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+            "timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[
+                :-3
+            ]
+            + "Z",
             "intent_id": intent_id,
             "state": state_val,
             "action": action or "set",
@@ -164,13 +170,18 @@ class OrderRouter:
                 pass
         # Append one log entry for this rebuild (no single intent_id)
         log = getattr(self, "_order_state_log", [])
-        log.append({
-            "timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
-            "intent_id": "",
-            "state": "",
-            "action": "cache_rebuild",
-            "message": "Merged order states from intent_store at startup",
-        })
+        log.append(
+            {
+                "timestamp": datetime.datetime.utcnow().strftime(
+                    "%Y-%m-%dT%H:%M:%S.%f"
+                )[:-3]
+                + "Z",
+                "intent_id": "",
+                "state": "",
+                "action": "cache_rebuild",
+                "message": "Merged order states from intent_store at startup",
+            }
+        )
         if len(log) > getattr(self, "_order_state_log_max", 500):
             self._order_state_log = log[-self._order_state_log_max :]
         else:
@@ -258,7 +269,11 @@ class OrderRouter:
             self.intent_store.create(
                 payload=payload,
                 intent_id=intent.intent_id,
-                idempotency_key=idempotency_key if idempotency_key is not None else getattr(intent, "idempotency_key", None),
+                idempotency_key=(
+                    idempotency_key
+                    if idempotency_key is not None
+                    else getattr(intent, "idempotency_key", None)
+                ),
             )
             rec = self.intent_store.get(intent.intent_id)
             if rec and hasattr(intent, "instrument"):
@@ -300,7 +315,9 @@ class OrderRouter:
             if self.engine_logger:
                 self.engine_logger.log("risk_block", "Broker place_order returned None")
             if self.telegram_alert:
-                self.telegram_alert(f"Broker returned no order_id: {sym} {side} qty={qty}")
+                self.telegram_alert(
+                    f"Broker returned no order_id: {sym} {side} qty={qty}"
+                )
             if (
                 self._consecutive_failures >= self.circuit_breaker_threshold
                 and self.risk
@@ -329,7 +346,9 @@ class OrderRouter:
             message=f"order_id={order_id}",
         )
         if self.telegram_alert:
-            self.telegram_alert(f"Order placed: {sym} {side} qty={qty} order_id={order_id}")
+            self.telegram_alert(
+                f"Order placed: {sym} {side} qty={qty} order_id={order_id},price={exec_price},"
+            )
         if self.engine_logger:
             self.engine_logger.order_placed(
                 symbol=sym,
@@ -728,42 +747,61 @@ class OrderRouter:
                                 tag, IntentStatus.REJECTED, order_state=ost
                             )
                     else:
-                        # Order not in broker open list and find_order_by_client_id returned None
-                        # (e.g. get_order_list returns only live orders). Assume filled so local
-                        # state can catch up and next verify passes; allows re-entry.
+                        # Order not in broker open list and find_order_by_client_id returned None.
+                        # Resolve fill price/size from broker fills API before assuming filled;
+                        # do not use price=0 (fabricated fill).
+                        fill_price = None
+                        fill_qty = None
+                        if hasattr(self.broker, "get_fill_for_client_order_id"):
+                            try:
+                                fill_info = self.broker.get_fill_for_client_order_id(tag)
+                                if fill_info and float(fill_info.get("price") or 0) > 0:
+                                    fill_price = float(fill_info["price"])
+                                    fill_qty = int(fill_info.get("size") or 0)
+                            except Exception:
+                                pass
+                        if fill_price is None or fill_qty is None or fill_qty <= 0:
+                            payload = i.get("payload", {})
+                            fill_qty = int(payload.get("qty") or i.get("qty", 0))
+                            fill_price = float(
+                                payload.get("price") or i.get("price", 0) or 0
+                            )
                         if self.engine_logger:
                             self.engine_logger.log(
                                 "oms",
-                                f"Missing order {tag} not on broker open list; assuming filled to unblock re-entry",
+                                f"Missing order {tag} not on broker open list; resolving from fills (price={fill_price}, qty={fill_qty})",
                             )
                         self._set_order_state(
                             tag,
                             OrderState.FILLED,
                             action="assume_filled",
-                            message="Missing on broker open list; assumed filled to unblock re-entry",
+                            message="Missing on broker open list; filled price from /v2/fills",
                         )
                         self.intent_store.update(
                             tag,
                             IntentStatus.FILLED,
                             order_state=OrderState.FILLED,
                         )
-                        if self.position_manager:
-                            payload = i.get("payload", {})
-                            qty = payload.get("qty") or i.get("qty", 0)
-                            price = payload.get("price") or i.get("price", 0)
+                        if self.position_manager and fill_qty and float(fill_price or 0) > 0:
                             instr = i.get("instrument")
-                            if instr and qty:
+                            if instr:
                                 self.process_fill(
                                     instrument=instr,
-                                    side=i.get("side", payload.get("side", "")),
-                                    qty=int(qty),
-                                    price=float(price),
+                                    side=i.get("side", i.get("payload", {}).get("side", "")),
+                                    qty=int(fill_qty),
+                                    price=float(fill_price),
                                     intent_id=tag,
                                     strategy=i.get("strategy"),
                                     structure_id=i.get("structure_id"),
                                     tag=i.get("tag"),
                                     candle_ts=i.get("candle_ts"),
                                     action=i.get("action"),
+                                )
+                        elif self.position_manager and fill_qty and float(fill_price or 0) == 0:
+                            if self.engine_logger:
+                                self.engine_logger.log(
+                                    "oms",
+                                    f"Missing order {tag}: no fill price from fills API and intent has price=0; skipping process_fill to avoid incorrect PnL",
                                 )
                 except Exception as e:
                     if self.engine_logger:
