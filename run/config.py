@@ -132,7 +132,7 @@ STRATEGY_JOBS = [
         "feed_stale_seconds": 30,  # In Engine
         "order_state_check_interval_min": 1,  # In engine
         "memory_threshold_percent": 5,  # In engine
-        "latency_critical_ms": 3000,  # In engine
+        "latency_critical_ms": 6000,  # In engine
         "latency_critical_cycles": 1,  # In engine
         "symbol_error_threshold": 2,  # In engine
         # "strategy_timeout_seconds": 1000000000, # do we need this

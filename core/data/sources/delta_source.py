@@ -589,3 +589,30 @@ class DeltaSource:
         self, query: Optional[Dict] = None, page_size: int = 100, after: Any = None
     ) -> Any:
         return self._client.fills(query=query or {}, page_size=page_size, after=after)
+
+    def get_orders_history(
+        self, page_num: int = 1, page_size: int = 15
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch order history (filled/cancelled etc.) via /v2/orders/history.
+        Used to resolve order status when order is no longer in live list.
+        Returns list of raw order dicts (client_order_id, state, size, etc.).
+        """
+        raw = self._client.get_orders_history(
+            page_num=page_num, page_size=page_size
+        )
+        if not raw:
+            return []
+        return raw
+
+    def get_fills(
+        self, page_num: int = 1, page_size: int = 15
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch fills via /v2/fills for order fill status.
+        Returns list of fill dicts (order_id, client_order_id, size, price, etc.).
+        """
+        raw = self._client.get_fills(page_num=page_num, page_size=page_size)
+        if not raw:
+            return []
+        return raw

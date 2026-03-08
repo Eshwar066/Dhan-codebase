@@ -51,6 +51,18 @@ class DeltaBrokerApi:
     def get_order_list(self) -> List[Dict[str, Any]]:
         return self._source.get_order_list()
 
+    def get_orders_history(
+        self, page_num: int = 1, page_size: int = 15
+    ) -> List[Dict[str, Any]]:
+        """Order history via /v2/orders/history for resolving fill status when not in live list."""
+        return self._source.get_orders_history(page_num=page_num, page_size=page_size)
+
+    def get_fills(
+        self, page_num: int = 1, page_size: int = 15
+    ) -> List[Dict[str, Any]]:
+        """Fills via /v2/fills for order fill status."""
+        return self._source.get_fills(page_num=page_num, page_size=page_size)
+
     def product_id_for_symbol(self, symbol: str) -> Optional[int]:
         """Resolve symbol to Delta product_id (e.g. BTCUSD -> id)."""
         return self._source.product_id_for_symbol(symbol)

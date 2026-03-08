@@ -293,19 +293,74 @@ class DeltaRestClient:
 
         return self.create_order(order)
 
-    def order_history(self, query={}, page_size=100, after=None):
+    def order_history(self, query=None, page_size=100, after=None):
+        query = dict(query) if query else {}
         if after is not None:
             query["after"] = after
         query["page_size"] = page_size
         response = self.request("GET", "/v2/orders/history", query=query, auth=True)
         return response.json()
 
-    def fills(self, query={}, page_size=100, after=None):
+    def fills(self, query=None, page_size=100, after=None):
+        query = dict(query) if query else {}
         if after is not None:
             query["after"] = after
         query["page_size"] = page_size
         response = self.request("GET", "/v2/fills", query=query, auth=True)
         return response.json()
+
+    def get_orders_history(self, page_num=1, page_size=15, query=None, after=None):
+        """
+        Fetch order history (filled/cancelled etc.) for sync.
+        Uses /v2/orders/history. Delta uses cursor-based pagination (after, page_size);
+        page_num is supported by some environments; otherwise pass after for next page.
+        Returns list of orders.
+        """
+        q = dict(query) if query else {}
+        if after is not None:
+            q["after"] = after
+        q["page_size"] = min(int(page_size), 50)
+        if page_num is not None and page_num > 1 and "after" not in q:
+            q["page_num"] = page_num
+        try:
+            data = self.request(
+                "GET", "/v2/orders/history", query=q, auth=True
+            ).json()
+            if not data.get("success"):
+                return []
+            result = data.get("result")
+            if isinstance(result, list):
+                return result
+            if isinstance(result, dict):
+                return result.get("orders", result.get("order", []))
+            return []
+        except Exception:
+            return []
+
+    def get_fills(self, page_num=1, page_size=15, query=None, after=None):
+        """
+        Fetch fills for order fill status. Uses /v2/fills.
+        Cursor-based: use after for next page; page_num for first-page request where supported.
+        Returns list of fills.
+        """
+        q = dict(query) if query else {}
+        if after is not None:
+            q["after"] = after
+        q["page_size"] = min(int(page_size), 50)
+        if page_num is not None and page_num > 1 and "after" not in q:
+            q["page_num"] = page_num
+        try:
+            data = self.request("GET", "/v2/fills", query=q, auth=True).json()
+            if not data.get("success"):
+                return []
+            result = data.get("result")
+            if isinstance(result, list):
+                return result
+            if isinstance(result, dict):
+                return result.get("fills", result.get("fill", []))
+            return []
+        except Exception:
+            return []
 
 
 def parseResponse(response):

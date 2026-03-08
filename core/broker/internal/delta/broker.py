@@ -117,10 +117,87 @@ class DeltaBroker(BaseBroker):
         return self.place_order(intent, execution_price=None)
 
     def find_order_by_client_id(self, client_order_id: str):
+        """Find order in live list; if not there, look up in /v2/orders/history and /v2/fills."""
         for o in self.api.get_order_list() or []:
             if o.get("tag") == client_order_id:
                 return o
-        return None
+        return self._find_order_in_history_or_fills(client_order_id)
+
+    def _find_order_in_history_or_fills(self, client_order_id: str):
+        """Resolve order status from order history or fills when not in live list."""
+        if not hasattr(self.api, "get_orders_history"):
+            return None
+        # 1) Try order history (page_num=1, page_size=15)
+        for page in (1, 2):
+            try:
+                history = self.api.get_orders_history(page_num=page, page_size=15)
+            except Exception:
+                history = []
+            for o in history or []:
+                tag = o.get("client_order_id") or o.get("tag")
+                if tag != client_order_id:
+                    continue
+                # Normalize to same shape as get_order_list for router
+                state = (o.get("state") or o.get("status") or "").lower()
+                size = int(o.get("size", 0) or 0)
+                unfilled = int(o.get("unfilled_size", 0) or 0)
+                filled = size - unfilled
+                if filled < 0:
+                    filled = size
+                return {
+                    "order_id": str(o.get("id", o.get("order_id", ""))),
+                    "tag": tag,
+                    "product_id": o.get("product_id"),
+                    "symbol": o.get("product_symbol") or (o.get("product") or {}).get("symbol"),
+                    "status": state,
+                    "side": (o.get("side") or "").lower(),
+                    "qty": size,
+                    "remaining_qty": unfilled,
+                    "filled_size": filled,
+                    "size": size,
+                    "unfilled_size": unfilled,
+                    "average_fill_price": float(o.get("average_fill_price") or o.get("limit_price") or 0),
+                    "price": float(o.get("limit_price") or o.get("average_fill_price") or 0),
+                    "reduce_only": o.get("reduce_only"),
+                }
+        # 2) Try fills (page_num=1, page_size=15) to get fill price/size
+        if not hasattr(self.api, "get_fills"):
+            return None
+        try:
+            fills = self.api.get_fills(page_num=1, page_size=15)
+        except Exception:
+            fills = []
+        matching = [
+            f for f in (fills or [])
+            if (f.get("client_order_id") or f.get("order_id")) == client_order_id
+            or str(f.get("client_order_id") or "") == client_order_id
+        ]
+        if not matching:
+            return None
+        total_size = sum(float(f.get("size", 0) or 0) for f in matching)
+        if total_size <= 0:
+            return None
+        total_value = sum(
+            float(f.get("size", 0) or 0) * float(f.get("price", 0) or 0)
+            for f in matching
+        )
+        avg_price = total_value / total_size if total_size else 0
+        return {
+            "order_id": str(matching[0].get("order_id", matching[0].get("id", ""))),
+            "tag": client_order_id,
+            "product_id": matching[0].get("product_id"),
+            "symbol": matching[0].get("product_symbol") or (matching[0].get("product") or {}).get("symbol"),
+            "status": "filled",
+            "side": (matching[0].get("side") or "").lower(),
+            "qty": int(total_size),
+            "remaining_qty": 0,
+            "filled_size": total_size,
+            "size": int(total_size),
+            "unfilled_size": 0,
+            "average_fill_price": avg_price,
+            "price": avg_price,
+            "reduce_only": matching[0].get("reduce_only"),
+        }
 
     def get_positions(self):
         return self.api.get_positions()

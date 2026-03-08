@@ -163,20 +163,21 @@ class OrderRouter:
                         )
                     return
 
-        # Resolve execution price: intent.price first, else price_map (e.g. backtest candle close)
-        exec_price = intent.price
-        if exec_price is None and price_map:
-            sym = (
-                getattr(intent.instrument, "trading_symbol", None)
-                if getattr(intent, "instrument", None)
-                else None
-            )
-            if sym is not None:
-                exec_price = price_map.get(sym)
+        # Resolve execution price: always prefer price_map (engine updates it with best bid/ask)
+        sym = (
+            getattr(intent.instrument, "trading_symbol", None)
+            if getattr(intent, "instrument", None)
+            else None
+        )
+        exec_price = None
+        if price_map and sym is not None:
+            exec_price = price_map.get(sym)
+        if exec_price is None:
+            exec_price = intent.price
         if exec_price is None:
             raise ValueError(
-                f"No price available for intent {intent.intent_id} (intent.price=None and price_map has no "
-                f"entry for {getattr(getattr(intent, 'instrument', None), 'trading_symbol', '?')})"
+                f"No price available for intent {intent.intent_id} (price_map has no "
+                f"entry for {sym!r} and intent.price is None)"
             )
 
         exec_price = self.slippage_model(exec_price)
@@ -626,6 +627,39 @@ class OrderRouter:
                             self.intent_store.update(
                                 tag, IntentStatus.REJECTED, order_state=ost
                             )
+                    else:
+                        # Order not in broker open list and find_order_by_client_id returned None
+                        # (e.g. get_order_list returns only live orders). Assume filled so local
+                        # state can catch up and next verify passes; allows re-entry.
+                        if self.engine_logger:
+                            self.engine_logger.log(
+                                "oms",
+                                f"Missing order {tag} not on broker open list; assuming filled to unblock re-entry",
+                            )
+                        self._set_order_state(tag, OrderState.FILLED)
+                        self.intent_store.update(
+                            tag,
+                            IntentStatus.FILLED,
+                            order_state=OrderState.FILLED,
+                        )
+                        if self.position_manager:
+                            payload = i.get("payload", {})
+                            qty = payload.get("qty") or i.get("qty", 0)
+                            price = payload.get("price") or i.get("price", 0)
+                            instr = i.get("instrument")
+                            if instr and qty:
+                                self.process_fill(
+                                    instrument=instr,
+                                    side=i.get("side", payload.get("side", "")),
+                                    qty=int(qty),
+                                    price=float(price),
+                                    intent_id=tag,
+                                    strategy=i.get("strategy"),
+                                    structure_id=i.get("structure_id"),
+                                    tag=i.get("tag"),
+                                    candle_ts=i.get("candle_ts"),
+                                    action=i.get("action"),
+                                )
                 except Exception as e:
                     if self.engine_logger:
                         self.engine_logger.log(

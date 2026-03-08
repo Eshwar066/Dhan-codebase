@@ -13,6 +13,7 @@ import time
 import psutil
 import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple
+import pdb
 
 from core.engine.base_engine import BaseEngine
 from core.engine.live_engine_common import (
@@ -218,6 +219,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         if not ok:
             self._entries_paused_order_mismatch = True
             self.reconcile_positions_on_start()
+        else:
+            self._entries_paused_order_mismatch = False
 
     def _check_memory(self) -> None:
         if self.memory_threshold_percent is None or self.memory_threshold_percent <= 0:
@@ -678,7 +681,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         symbol=symbol, signal_hash=str(signal_hash)
                     )
                 continue
-            
+
             if (
                 self.strategy_timeout_seconds
                 and strategy_time_ms is not None
@@ -696,10 +699,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             is_buy = side == "BUY"
 
             trading_sym = getattr(
-                getattr(single_intent, "instrument", None),
-                "trading_symbol",
-                symbol
+                getattr(single_intent, "instrument", None), "trading_symbol", symbol
             )
+            # pdb.set_trace()
             if trading_sym:
                 exec_price = (
                     self._entry_price_from_depth(trading_sym, is_buy)
@@ -720,6 +722,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 self._last_signal_hash_per_symbol[symbol] = signal_hash
                 t0 = time.perf_counter()
                 price_map = {trading_sym: exec_price}
+                # pdb.set_trace()
                 self.order_router.process_intent(single_intent, price_map)
                 broker_latency_ms = (time.perf_counter() - t0) * 1000
                 total_ms = (strategy_time_ms or 0) + broker_latency_ms
