@@ -32,9 +32,17 @@ class DeltaBrokerApi:
     ) -> Dict[str, Any]:
         product_id = self._source.product_id_for_symbol(tradingsymbol)
         if product_id is None:
-            return {"status": "error", "order_id": None, "message": f"Unknown symbol: {tradingsymbol}"}
+            return {
+                "status": "error",
+                "order_id": None,
+                "message": f"Unknown symbol: {tradingsymbol}",
+            }
         side = (transaction_type or "BUY").lower()
-        limit_price = float(price) if price and (order_type or "MARKET").upper() == "LIMIT" else None
+        limit_price = (
+            float(price)
+            if price and (order_type or "MARKET").upper() == "LIMIT"
+            else None
+        )
         return self._source.place_order(
             product_id=int(product_id),
             size=int(quantity),
@@ -52,16 +60,14 @@ class DeltaBrokerApi:
         return self._source.get_order_list()
 
     def get_orders_history(
-        self, page_num: int = 1, page_size: int = 15
+        self, page_size: int = 50
     ) -> List[Dict[str, Any]]:
-        """Order history via /v2/orders/history for resolving fill status when not in live list."""
-        return self._source.get_orders_history(page_num=page_num, page_size=page_size)
+        """Order history via order_history (v2/orders/history) for resolving fill status when not in live list."""
+        return self._source.get_orders_history(page_size=page_size)
 
-    def get_fills(
-        self, page_num: int = 1, page_size: int = 15
-    ) -> List[Dict[str, Any]]:
-        """Fills via /v2/fills for order fill status."""
-        return self._source.get_fills(page_num=page_num, page_size=page_size)
+    def get_fills(self, page_size: int = 50) -> List[Dict[str, Any]]:
+        """Fills via fills() (v2/fills) for order fill status."""
+        return self._source.get_fills(page_size=page_size)
 
     def product_id_for_symbol(self, symbol: str) -> Optional[int]:
         """Resolve symbol to Delta product_id (e.g. BTCUSD -> id)."""

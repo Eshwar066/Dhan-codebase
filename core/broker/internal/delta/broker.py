@@ -127,44 +127,43 @@ class DeltaBroker(BaseBroker):
         """Resolve order status from order history or fills when not in live list."""
         if not hasattr(self.api, "get_orders_history"):
             return None
-        # 1) Try order history (page_num=1, page_size=15)
-        for page in (1, 2):
-            try:
-                history = self.api.get_orders_history(page_num=page, page_size=15)
-            except Exception:
-                history = []
-            for o in history or []:
-                tag = o.get("client_order_id") or o.get("tag")
-                if tag != client_order_id:
-                    continue
-                # Normalize to same shape as get_order_list for router
-                state = (o.get("state") or o.get("status") or "").lower()
-                size = int(o.get("size", 0) or 0)
-                unfilled = int(o.get("unfilled_size", 0) or 0)
-                filled = size - unfilled
-                if filled < 0:
-                    filled = size
-                return {
-                    "order_id": str(o.get("id", o.get("order_id", ""))),
-                    "tag": tag,
-                    "product_id": o.get("product_id"),
-                    "symbol": o.get("product_symbol") or (o.get("product") or {}).get("symbol"),
-                    "status": state,
-                    "side": (o.get("side") or "").lower(),
-                    "qty": size,
-                    "remaining_qty": unfilled,
-                    "filled_size": filled,
-                    "size": size,
-                    "unfilled_size": unfilled,
-                    "average_fill_price": float(o.get("average_fill_price") or o.get("limit_price") or 0),
-                    "price": float(o.get("limit_price") or o.get("average_fill_price") or 0),
-                    "reduce_only": o.get("reduce_only"),
-                }
-        # 2) Try fills (page_num=1, page_size=15) to get fill price/size
+        # 1) Try order history (uses order_history; page_size=50)
+        try:
+            history = self.api.get_orders_history(page_size=50)
+        except Exception:
+            history = []
+        for o in history or []:
+            tag = o.get("client_order_id") or o.get("tag")
+            if tag != client_order_id:
+                continue
+            # Normalize to same shape as get_order_list for router
+            state = (o.get("state") or o.get("status") or "").lower()
+            size = int(o.get("size", 0) or 0)
+            unfilled = int(o.get("unfilled_size", 0) or 0)
+            filled = size - unfilled
+            if filled < 0:
+                filled = size
+            return {
+                "order_id": str(o.get("id", o.get("order_id", ""))),
+                "tag": tag,
+                "product_id": o.get("product_id"),
+                "symbol": o.get("product_symbol") or (o.get("product") or {}).get("symbol"),
+                "status": state,
+                "side": (o.get("side") or "").lower(),
+                "qty": size,
+                "remaining_qty": unfilled,
+                "filled_size": filled,
+                "size": size,
+                "unfilled_size": unfilled,
+                "average_fill_price": float(o.get("average_fill_price") or o.get("limit_price") or 0),
+                "price": float(o.get("limit_price") or o.get("average_fill_price") or 0),
+                "reduce_only": o.get("reduce_only"),
+            }
+        # 2) Try fills (uses fills(); page_size=50) to get fill price/size
         if not hasattr(self.api, "get_fills"):
             return None
         try:
-            fills = self.api.get_fills(page_num=1, page_size=15)
+            fills = self.api.get_fills(page_size=50)
         except Exception:
             fills = []
         matching = [

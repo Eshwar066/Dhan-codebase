@@ -591,28 +591,45 @@ class DeltaSource:
         return self._client.fills(query=query or {}, page_size=page_size, after=after)
 
     def get_orders_history(
-        self, page_num: int = 1, page_size: int = 15
+        self, page_size: int = 15, after: Any = None
     ) -> List[Dict[str, Any]]:
         """
-        Fetch order history (filled/cancelled etc.) via /v2/orders/history.
-        Used to resolve order status when order is no longer in live list.
-        Returns list of raw order dicts (client_order_id, state, size, etc.).
+        Fetch order history via order_history (v2/orders/history).
+        Returns list of orders for resolving fill status when not in live list.
         """
-        raw = self._client.get_orders_history(
-            page_num=page_num, page_size=page_size
-        )
-        if not raw:
+        try:
+            data = self._client.order_history(
+                query={}, page_size=min(page_size, 50), after=after
+            )
+            if not isinstance(data, dict) or not data.get("success"):
+                return []
+            result = data.get("result")
+            if isinstance(result, list):
+                return result
+            if isinstance(result, dict):
+                return result.get("orders", result.get("order", []))
             return []
-        return raw
+        except Exception:
+            return []
 
     def get_fills(
-        self, page_num: int = 1, page_size: int = 15
+        self, page_size: int = 15, after: Any = None
     ) -> List[Dict[str, Any]]:
         """
-        Fetch fills via /v2/fills for order fill status.
-        Returns list of fill dicts (order_id, client_order_id, size, price, etc.).
+        Fetch fills via fills() (v2/fills) for order fill status.
+        Returns list of fill dicts.
         """
-        raw = self._client.get_fills(page_num=page_num, page_size=page_size)
-        if not raw:
+        try:
+            data = self._client.fills(
+                query={}, page_size=min(page_size, 50), after=after
+            )
+            if not isinstance(data, dict) or not data.get("success"):
+                return []
+            result = data.get("result")
+            if isinstance(result, list):
+                return result
+            if isinstance(result, dict):
+                return result.get("fills", result.get("fill", []))
             return []
-        return raw
+        except Exception:
+            return []

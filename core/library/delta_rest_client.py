@@ -309,152 +309,92 @@ class DeltaRestClient:
         response = self.request("GET", "/v2/fills", query=query, auth=True)
         return response.json()
 
-    def get_orders_history(self, page_num=1, page_size=15, query=None, after=None):
-        """
-        Fetch order history (filled/cancelled etc.) for sync.
-        Uses /v2/orders/history. Delta uses cursor-based pagination (after, page_size);
-        page_num is supported by some environments; otherwise pass after for next page.
-        Returns list of orders.
-        """
-        q = dict(query) if query else {}
-        if after is not None:
-            q["after"] = after
-        q["page_size"] = min(int(page_size), 50)
-        if page_num is not None and page_num > 1 and "after" not in q:
-            q["page_num"] = page_num
-        try:
-            data = self.request(
-                "GET", "/v2/orders/history", query=q, auth=True
-            ).json()
-            if not data.get("success"):
-                return []
-            result = data.get("result")
-            if isinstance(result, list):
-                return result
-            if isinstance(result, dict):
-                return result.get("orders", result.get("order", []))
-            return []
-        except Exception:
-            return []
+    def parseResponse(response):
+        response = response.json()
+        if response["success"]:
+            return response["result"]
+        elif "error" in response:
+            raise requests.exceptions.HTTPError(response["error"])
+        else:
+            raise requests.exceptions.HTTPError()
 
-    def get_fills(self, page_num=1, page_size=15, query=None, after=None):
-        """
-        Fetch fills for order fill status. Uses /v2/fills.
-        Cursor-based: use after for next page; page_num for first-page request where supported.
-        Returns list of fills.
-        """
-        q = dict(query) if query else {}
-        if after is not None:
-            q["after"] = after
-        q["page_size"] = min(int(page_size), 50)
-        if page_num is not None and page_num > 1 and "after" not in q:
-            q["page_num"] = page_num
-        try:
-            data = self.request("GET", "/v2/fills", query=q, auth=True).json()
-            if not data.get("success"):
-                return []
-            result = data.get("result")
-            if isinstance(result, list):
-                return result
-            if isinstance(result, dict):
-                return result.get("fills", result.get("fill", []))
-            return []
-        except Exception:
-            return []
+    def create_order_format(price, size, side, product_id, post_only="false"):
+        order = {
+            "product_id": product_id,
+            "limit_price": str(price),
+            "size": int(size),
+            "side": side,
+            "order_type": "limit_order",
+            "post_only": post_only,
+        }
+        return order
 
+    def cancel_order_format(order):
+        order = {"id": order["id"], "product_id": order["product_id"]}
+        return order
 
-def parseResponse(response):
-    response = response.json()
-    if response["success"]:
-        return response["result"]
-    elif "error" in response:
-        raise requests.exceptions.HTTPError(response["error"])
-    else:
-        raise requests.exceptions.HTTPError()
-
-
-def create_order_format(price, size, side, product_id, post_only="false"):
-    order = {
-        "product_id": product_id,
-        "limit_price": str(price),
-        "size": int(size),
-        "side": side,
-        "order_type": "limit_order",
-        "post_only": post_only,
-    }
-    return order
-
-
-def cancel_order_format(order):
-    order = {"id": order["id"], "product_id": order["product_id"]}
-    return order
-
-
-def round_by_tick_size(price, tick_size, floor_or_ceil=None):
-    remainder = price % tick_size
-    if remainder == 0:
-        price = price
-    if floor_or_ceil == None:
-        floor_or_ceil = "ceil" if (remainder >= tick_size / 2) else "floor"
-    if floor_or_ceil == "ceil":
-        price = price - remainder + tick_size
-    else:
-        price = price - remainder
-    number_of_decimals = len(format(Decimal(repr(float(tick_size))), "f").split(".")[1])
-    price = round(Decimal(price), number_of_decimals)
-    return price
-
-
-def generate_signature(secret, message):
-    message = bytes(message, "utf-8")
-    secret = bytes(secret, "utf-8")
-    hash = hmac.new(secret, message, hashlib.sha256)
-    return hash.hexdigest()
-
-
-def get_time_stamp():
-    d = datetime.datetime.utcnow()
-    epoch = datetime.datetime(1970, 1, 1)
-    return str(int((d - epoch).total_seconds()))
-
-
-def query_string(query):
-    if query == None:
-        return ""
-    else:
-        query_strings = []
-        for key, value in query.items():
-            query_strings.append(key + "=" + urllib.parse.quote_plus(str(value)))
-        return "?" + "&".join(query_strings)
-
-
-def body_string(body):
-    if body == None:
-        return ""
-    else:
-        return json.dumps(body, separators=(",", ":"))
-
-
-def raise_for_status(response):
-    """Raises :class:`HTTPError`, if one occurred."""
-
-    http_error_msg = ""
-    if isinstance(response.reason, bytes):
-        # We attempt to decode utf-8 first because some servers
-        # choose to localize their reason strings. If the string
-        # isn't utf-8, we fall back to iso-8859-1 for all other
-        # encodings. (See PR #3538)
-        try:
-            reason = response.reason.decode("utf-8")
-        except UnicodeDecodeError:
-            reason = response.reason.decode("iso-8859-1")
-    else:
-        reason = response.reason
-    if 400 <= response.status_code < 600:
-        reason = response.reason + " " + str(response.text)
-        http_error_msg = (
-            f"{response.status_code} HTTP Error: {reason} for url: {response.url}"
+    def round_by_tick_size(price, tick_size, floor_or_ceil=None):
+        remainder = price % tick_size
+        if remainder == 0:
+            price = price
+        if floor_or_ceil == None:
+            floor_or_ceil = "ceil" if (remainder >= tick_size / 2) else "floor"
+        if floor_or_ceil == "ceil":
+            price = price - remainder + tick_size
+        else:
+            price = price - remainder
+        number_of_decimals = len(
+            format(Decimal(repr(float(tick_size))), "f").split(".")[1]
         )
+        price = round(Decimal(price), number_of_decimals)
+        return price
 
-    if http_error_msg:
-        raise requests.HTTPError(http_error_msg, response=response)
+    def generate_signature(secret, message):
+        message = bytes(message, "utf-8")
+        secret = bytes(secret, "utf-8")
+        hash = hmac.new(secret, message, hashlib.sha256)
+        return hash.hexdigest()
+
+    def get_time_stamp():
+        d = datetime.datetime.utcnow()
+        epoch = datetime.datetime(1970, 1, 1)
+        return str(int((d - epoch).total_seconds()))
+
+    def query_string(query):
+        if query == None:
+            return ""
+        else:
+            query_strings = []
+            for key, value in query.items():
+                query_strings.append(key + "=" + urllib.parse.quote_plus(str(value)))
+            return "?" + "&".join(query_strings)
+
+    def body_string(body):
+        if body == None:
+            return ""
+        else:
+            return json.dumps(body, separators=(",", ":"))
+
+    def raise_for_status(response):
+        """Raises :class:`HTTPError`, if one occurred."""
+
+        http_error_msg = ""
+        if isinstance(response.reason, bytes):
+            # We attempt to decode utf-8 first because some servers
+            # choose to localize their reason strings. If the string
+            # isn't utf-8, we fall back to iso-8859-1 for all other
+            # encodings. (See PR #3538)
+            try:
+                reason = response.reason.decode("utf-8")
+            except UnicodeDecodeError:
+                reason = response.reason.decode("iso-8859-1")
+        else:
+            reason = response.reason
+        if 400 <= response.status_code < 600:
+            reason = response.reason + " " + str(response.text)
+            http_error_msg = (
+                f"{response.status_code} HTTP Error: {reason} for url: {response.url}"
+            )
+
+        if http_error_msg:
+            raise requests.HTTPError(http_error_msg, response=response)
