@@ -2,7 +2,7 @@ import json
 import time
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Dict, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 OptionalAlert = Optional[Callable[[str], None]]
 import pdb
@@ -67,6 +67,8 @@ class OrderRouter:
         self._consecutive_failures = 0
         # Order state cache: intent_id -> OrderState. Persisted to logs/order_state_{engine_id}.json.
         self._order_state: Dict[str, OrderState] = {}
+        self._order_state_log: List[Dict[str, Any]] = []
+        self._order_state_log_max = 5000
         _logs_dir = Path(__file__).resolve().parents[2] / "logs"
         _logs_dir.mkdir(parents=True, exist_ok=True)
         _safe_id = (engine_id or "default").replace(" ", "_").replace("/", "_")
@@ -75,36 +77,76 @@ class OrderRouter:
         self._rebuild_order_state_cache()
 
     def _load_order_state(self) -> None:
-        """Load intent_id -> OrderState from logs/order_state_{engine_id}.json."""
+        """Load intent_id -> OrderState and optional action log from logs/order_state_{engine_id}.json."""
         if not getattr(self, "_order_state_file", None) or not self._order_state_file.exists():
             return
         try:
             with open(self._order_state_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            for intent_id, val in (data if isinstance(data, dict) else {}).items():
-                try:
-                    self._order_state[intent_id] = (
-                        OrderState(val) if isinstance(val, str) else val
-                    )
-                except (ValueError, TypeError):
-                    pass
+            if not isinstance(data, dict):
+                return
+            # New format: { "states": {...}, "log": [...] }
+            if "states" in data:
+                for intent_id, val in data["states"].items():
+                    try:
+                        self._order_state[intent_id] = (
+                            OrderState(val) if isinstance(val, str) else val
+                        )
+                    except (ValueError, TypeError):
+                        pass
+                self._order_state_log = data.get("log") or []
+            else:
+                # Legacy: flat intent_id -> state
+                for intent_id, val in data.items():
+                    try:
+                        self._order_state[intent_id] = (
+                            OrderState(val) if isinstance(val, str) else val
+                        )
+                    except (ValueError, TypeError):
+                        pass
+                self._order_state_log = []
         except (json.JSONDecodeError, OSError):
             pass
 
     def _persist_order_state(self) -> None:
-        """Write _order_state to logs/order_state_{engine_id}.json."""
+        """Write _order_state and action log to logs/order_state_{engine_id}.json."""
         if not getattr(self, "_order_state_file", None):
             return
         try:
-            data = {k: (v.value if isinstance(v, OrderState) else v) for k, v in self._order_state.items()}
+            states = {
+                k: (v.value if isinstance(v, OrderState) else v)
+                for k, v in self._order_state.items()
+            }
+            log = getattr(self, "_order_state_log", [])
+            data = {"states": states, "log": log}
             with open(self._order_state_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except OSError:
             pass
 
-    def _set_order_state(self, intent_id: str, state: OrderState) -> None:
-        """Update in-memory cache and persist to JSON."""
+    def _set_order_state(
+        self,
+        intent_id: str,
+        state: OrderState,
+        action: Optional[str] = None,
+        message: Optional[str] = None,
+    ) -> None:
+        """Update in-memory cache, append detailed log entry, and persist to JSON."""
         self._order_state[intent_id] = state
+        state_val = state.value if isinstance(state, OrderState) else state
+        entry = {
+            "timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+            "intent_id": intent_id,
+            "state": state_val,
+            "action": action or "set",
+            "message": message or "",
+        }
+        log = getattr(self, "_order_state_log", [])
+        log.append(entry)
+        if len(log) > getattr(self, "_order_state_log_max", 500):
+            self._order_state_log = log[-self._order_state_log_max :]
+        else:
+            self._order_state_log = log
         self._persist_order_state()
 
     def _rebuild_order_state_cache(self) -> None:
@@ -120,6 +162,19 @@ class OrderRouter:
                 )
             except (ValueError, TypeError):
                 pass
+        # Append one log entry for this rebuild (no single intent_id)
+        log = getattr(self, "_order_state_log", [])
+        log.append({
+            "timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+            "intent_id": "",
+            "state": "",
+            "action": "cache_rebuild",
+            "message": "Merged order states from intent_store at startup",
+        })
+        if len(log) > getattr(self, "_order_state_log_max", 500):
+            self._order_state_log = log[-self._order_state_log_max :]
+        else:
+            self._order_state_log = log
         self._persist_order_state()
 
     def process_intent(self, intent, price_map, idempotency_key=None):
@@ -129,7 +184,12 @@ class OrderRouter:
             self.intent_store.update(
                 intent.intent_id, IntentStatus.REJECTED, order_state=OrderState.REJECTED
             )
-            self._set_order_state(intent.intent_id, OrderState.REJECTED)
+            self._set_order_state(
+                intent.intent_id,
+                OrderState.REJECTED,
+                action="risk_rejected",
+                message="Risk manager did not allow intent",
+            )
             return
 
         # Fix 3: Intent Deduplication (scoped by engine_id + strategy_id to support multi-engine/multi-strategy)
@@ -227,7 +287,12 @@ class OrderRouter:
             self.intent_store.update(
                 intent.intent_id, "REJECTED", order_state=OrderState.REJECTED
             )
-            self._set_order_state(intent.intent_id, OrderState.REJECTED)
+            self._set_order_state(
+                intent.intent_id,
+                OrderState.REJECTED,
+                action="broker_error",
+                message=f"place_order failed: {e}",
+            )
             return
 
         if order_id is None:
@@ -248,11 +313,21 @@ class OrderRouter:
             self.intent_store.update(
                 intent.intent_id, "REJECTED", order_state=OrderState.REJECTED
             )
-            self._set_order_state(intent.intent_id, OrderState.REJECTED)
+            self._set_order_state(
+                intent.intent_id,
+                OrderState.REJECTED,
+                action="broker_no_order_id",
+                message="Broker place_order returned None",
+            )
             return
 
         self._consecutive_failures = 0
-        self._set_order_state(intent.intent_id, OrderState.SENT)
+        self._set_order_state(
+            intent.intent_id,
+            OrderState.SENT,
+            action="order_placed",
+            message=f"order_id={order_id}",
+        )
         if self.telegram_alert:
             self.telegram_alert(f"Order placed: {sym} {side} qty={qty} order_id={order_id}")
         if self.engine_logger:
@@ -482,7 +557,12 @@ class OrderRouter:
                     broker_order_id=o.get("order_id"),
                     order_state=OrderState.OPEN,
                 )
-                self._set_order_state(tag, OrderState.OPEN)  # Seen on broker
+                self._set_order_state(
+                    tag,
+                    OrderState.OPEN,
+                    action="adopt_orphan",
+                    message="Order seen on broker open list; adopted as local intent",
+                )
 
                 # Augment record for process_fill
                 intent_record = self.intent_store.get(tag)
@@ -501,7 +581,12 @@ class OrderRouter:
 
             elif tag in local_intent_ids:
                 # Local thinks it's pending, broker confirms it's open. Sync order ID and persist OPEN.
-                self._set_order_state(tag, OrderState.OPEN)
+                self._set_order_state(
+                    tag,
+                    OrderState.OPEN,
+                    action="sync_open",
+                    message="Broker confirms order is open",
+                )
                 intent = self.intent_store.get(tag)
                 self.intent_store.update(
                     tag,
@@ -547,7 +632,12 @@ class OrderRouter:
 
                         # Partial fill: filled > 0 and unfilled > 0 (filled < size)
                         if size > 0 and filled > 0 and filled < size:
-                            self._set_order_state(tag, OrderState.PARTIAL)
+                            self._set_order_state(
+                                tag,
+                                OrderState.PARTIAL,
+                                action="sync_partial",
+                                message=f"Polling: filled={filled} size={size}",
+                            )
                             self.intent_store.update(
                                 tag,
                                 IntentStatus.SENT,  # Still in flight
@@ -587,7 +677,12 @@ class OrderRouter:
                                 "instrument"
                             )  # If stored in dict; depends on intent_store implementation
 
-                            self._set_order_state(tag, OrderState.FILLED)
+                            self._set_order_state(
+                                tag,
+                                OrderState.FILLED,
+                                action="sync_filled",
+                                message="Syncing fill discovered via polling",
+                            )
                             self.intent_store.update(
                                 tag,
                                 IntentStatus.FILLED,
@@ -623,7 +718,12 @@ class OrderRouter:
                                     else OrderState.EXPIRED
                                 )
                             )
-                            self._set_order_state(tag, ost)
+                            self._set_order_state(
+                                tag,
+                                ost,
+                                action="sync_terminal",
+                                message=f"Broker status={status!r}",
+                            )
                             self.intent_store.update(
                                 tag, IntentStatus.REJECTED, order_state=ost
                             )
@@ -636,7 +736,12 @@ class OrderRouter:
                                 "oms",
                                 f"Missing order {tag} not on broker open list; assuming filled to unblock re-entry",
                             )
-                        self._set_order_state(tag, OrderState.FILLED)
+                        self._set_order_state(
+                            tag,
+                            OrderState.FILLED,
+                            action="assume_filled",
+                            message="Missing on broker open list; assumed filled to unblock re-entry",
+                        )
                         self.intent_store.update(
                             tag,
                             IntentStatus.FILLED,
@@ -737,7 +842,12 @@ class OrderRouter:
             intent_id=intent_id,
         )
         if intent_id and self.intent_store:
-            self._set_order_state(intent_id, OrderState.FILLED)
+            self._set_order_state(
+                intent_id,
+                OrderState.FILLED,
+                action="process_fill",
+                message="Fill processed from callback or engine",
+            )
             self.intent_store.update(
                 intent_id,
                 IntentStatus.FILLED,

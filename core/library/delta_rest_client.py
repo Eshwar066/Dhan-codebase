@@ -309,7 +309,7 @@ class DeltaRestClient:
         response = self.request("GET", "/v2/fills", query=query, auth=True)
         return response.json()
 
-    def parseResponse(response):
+def parseResponse(response):
         response = response.json()
         if response["success"]:
             return response["result"]
@@ -318,7 +318,7 @@ class DeltaRestClient:
         else:
             raise requests.exceptions.HTTPError()
 
-    def create_order_format(price, size, side, product_id, post_only="false"):
+def create_order_format(price, size, side, product_id, post_only="false"):
         order = {
             "product_id": product_id,
             "limit_price": str(price),
@@ -329,11 +329,11 @@ class DeltaRestClient:
         }
         return order
 
-    def cancel_order_format(order):
+def cancel_order_format(order):
         order = {"id": order["id"], "product_id": order["product_id"]}
         return order
 
-    def round_by_tick_size(price, tick_size, floor_or_ceil=None):
+def round_by_tick_size(price, tick_size, floor_or_ceil=None):
         remainder = price % tick_size
         if remainder == 0:
             price = price
@@ -349,18 +349,18 @@ class DeltaRestClient:
         price = round(Decimal(price), number_of_decimals)
         return price
 
-    def generate_signature(secret, message):
+def generate_signature(secret, message):
         message = bytes(message, "utf-8")
         secret = bytes(secret, "utf-8")
         hash = hmac.new(secret, message, hashlib.sha256)
         return hash.hexdigest()
 
-    def get_time_stamp():
+def get_time_stamp():
         d = datetime.datetime.utcnow()
         epoch = datetime.datetime(1970, 1, 1)
         return str(int((d - epoch).total_seconds()))
 
-    def query_string(query):
+def query_string(query):
         if query == None:
             return ""
         else:
@@ -369,13 +369,13 @@ class DeltaRestClient:
                 query_strings.append(key + "=" + urllib.parse.quote_plus(str(value)))
             return "?" + "&".join(query_strings)
 
-    def body_string(body):
+def body_string(body):
         if body == None:
             return ""
         else:
             return json.dumps(body, separators=(",", ":"))
 
-    def raise_for_status(response):
+def raise_for_status(response):
         """Raises :class:`HTTPError`, if one occurred."""
 
         http_error_msg = ""

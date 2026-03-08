@@ -701,13 +701,17 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             trading_sym = getattr(
                 getattr(single_intent, "instrument", None), "trading_symbol", symbol
             )
-            # pdb.set_trace()
+
             if trading_sym:
-                exec_price = (
-                    self._entry_price_from_depth(trading_sym, is_buy)
-                    or getattr(single_intent, "price", None)
-                    or candle.get("close")
-                )
+                exec_price = self._entry_price_from_depth(trading_sym, is_buy)
+
+                if exec_price is None:
+                    exec_price = getattr(single_intent, "price", None)
+
+                if exec_price is None:
+                    exec_price = candle.get("close")
+
+                # pdb.set_trace()
             else:
                 exec_price = (
                     self._entry_price_from_depth(symbol, is_buy)
