@@ -1,7 +1,8 @@
-"""Dhan broker: order placement via DhanBrokerApi."""
+"""Dhan broker: order placement via DhanBrokerApi. Trade-led OMS via get_recent_fills / get_fill_for_client_order_id."""
 
 import time
 import uuid
+from typing import Any, Dict, List, Optional
 
 from core.broker.base import BaseBroker
 
@@ -130,6 +131,36 @@ class DhanBroker(BaseBroker):
         for o in orders:
             if o.get("tag") == client_order_id:
                 return o
+        return None
+
+    def get_recent_fills(self, page_size: int = 50) -> List[Dict[str, Any]]:
+        """Recent fills from order list (TRADED/filled) for trade-led OMS sync."""
+        if not getattr(self.api, "get_fills", None):
+            return []
+        try:
+            return self.api.get_fills(page_size=page_size) or []
+        except Exception:
+            return []
+
+    def get_fill_for_client_order_id(
+        self, client_order_id: str, page_size: int = 50
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Resolve fill price/size for a given intent_id (tag) from filled orders.
+        For trade-led OMS: do not assume filled with price=0 when order is missing.
+        """
+        fills = self.get_recent_fills(page_size=page_size)
+        for f in fills:
+            if (f.get("client_order_id") or f.get("tag")) == client_order_id:
+                price = float(f.get("price") or 0)
+                size = float(f.get("size") or 0)
+                if price > 0 and size > 0:
+                    return {
+                        "order_id": str(f.get("order_id", "")),
+                        "price": price,
+                        "size": size,
+                        "side": (f.get("side") or "").upper(),
+                    }
         return None
 
     def get_positions(self):

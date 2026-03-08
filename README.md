@@ -222,6 +222,35 @@ Latency logging is done **only on the order path** (when an order is placed), no
 
 ---
 
+## Trade-led OMS (Delta and Dhan)
+
+For **Delta** and **Dhan**, the engine uses a **trade-led** OMS so that positions are driven by **trades** (fills), not by order state. This avoids fabricated fills and zero-price updates when orders disappear from the open list.
+
+| Concept | Meaning |
+| ------- | ------- |
+| **Order** | Metadata only: order_id, intent_id, symbol, qty, side, state. Placing an order does **not** update position. |
+| **Trade** | Source of truth. A trade is a fill from the exchange. Position changes **only** when a trade is applied. |
+| **Flow** | Strategy → OrderRouter → Broker → place order. Separately: `sync_trades_from_broker()` pulls recent fills → for each new fill, `process_trade(trade)` → PositionManager updated, then order marked FILLED. |
+
+**Behaviour:**
+
+- **sync_trades_from_broker()**: Called at the start of order-state verification. Fetches recent fills from the broker (`get_recent_fills()`), then applies each new fill once via `process_trade()` (idempotent by trade id). Positions are updated only from these trades.
+- **process_trade(trade)**: Updates PositionManager from the trade (price, size, side, intent_id); records realized PnL if position closed; marks the corresponding order/intent as FILLED. No position update is ever made from “order disappeared” or “assume filled.”
+- **Missing order**: If an order is not on the broker open list (and not in history for Delta), the router tries to resolve a fill for that intent. If a fill is found, it is applied via `process_trade()` and the order is marked FILLED. If **no** fill is found, the order state is left unchanged and **no** position update is made (no fabricated fill, no zero price).
+
+**Components:**
+
+| Component | Location | Role |
+| --------- | -------- | ---- |
+| **OrderRouter** | `core/orderExecution/order_router.py` | `process_trade()`, `sync_trades_from_broker()`, `_processed_trade_ids` for idempotency. |
+| **Delta broker** | `core/broker/internal/delta/broker.py` | `get_recent_fills()` (from `/v2/fills`), `get_fill_for_client_order_id()` for missing-order resolution. |
+| **Dhan broker** | `core/broker/internal/dhan/broker.py` | `get_recent_fills()` (from order list: TRADED/filled orders), `get_fill_for_client_order_id()` for missing-order resolution. |
+| **Dhan source** | `core/data/sources/dhan_source.py` | `get_fills()` derives fills from order list (status TRADED/filled/complete) for trade-led sync. |
+
+Reconciliation remains position-based: broker positions are compared with local positions that were built from applied trades.
+
+---
+
 ## Directory structure
 
 ```

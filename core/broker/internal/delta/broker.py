@@ -2,7 +2,7 @@
 
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 import pdb
 
 from core.broker.base import BaseBroker
@@ -227,6 +227,15 @@ class DeltaBroker(BaseBroker):
 
     def get_positions(self):
         return self.api.get_positions()
+
+    def get_recent_fills(self, page_size: int = 50) -> List[Dict[str, Any]]:
+        """Return recent fills from /v2/fills for trade-led OMS sync. Positions are updated from these trades."""
+        if not hasattr(self.api, "get_fills"):
+            return []
+        try:
+            return self.api.get_fills(page_size=page_size) or []
+        except Exception:
+            return []
 
     # used in live engine
     def get_positions_for_recon(self):

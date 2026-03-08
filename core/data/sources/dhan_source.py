@@ -649,6 +649,43 @@ class DhanSource:
         except Exception:
             return []
 
+    def get_fills(self, page_size=50):
+        """
+        Filled orders as trade-led OMS fills. Derived from order list (status TRADED/filled/complete).
+        Returns list of dicts: id, order_id, client_order_id, tag, price, size, side.
+        """
+        try:
+            orders = self.get_order_list()
+            if not orders:
+                return []
+            filled_statuses = {"traded", "filled", "complete", "completed"}
+            out = []
+            for o in orders[: page_size * 2]:
+                status = (o.get("orderStatus") or o.get("status") or "").strip().lower()
+                if status not in filled_statuses:
+                    continue
+                order_id = str(o.get("orderId") or o.get("order_id") or "")
+                tag = o.get("tag") or o.get("intent_id") or ""
+                price = float(o.get("averageTradedPrice") or o.get("AvgTradedPrice") or o.get("average_traded_price") or 0)
+                size = int(o.get("TradedQty") or o.get("tradedQty") or o.get("quantity") or o.get("Quantity") or 0)
+                side = (o.get("transactionType") or o.get("transaction_type") or o.get("side") or "BUY").upper()
+                if not order_id or size <= 0:
+                    continue
+                out.append({
+                    "id": order_id,
+                    "order_id": order_id,
+                    "client_order_id": tag,
+                    "tag": tag,
+                    "price": price,
+                    "size": size,
+                    "side": side,
+                })
+                if len(out) >= page_size:
+                    break
+            return out
+        except Exception:
+            return []
+
     def place_order(
         self,
         tradingsymbol,

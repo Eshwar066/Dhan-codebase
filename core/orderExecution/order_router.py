@@ -4,6 +4,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+# Trade-led OMS: positions are updated only from trade events (fills), not from order state.
+
 OptionalAlert = Optional[Callable[[str], None]]
 import pdb
 import datetime
@@ -69,6 +71,9 @@ class OrderRouter:
         self._order_state: Dict[str, OrderState] = {}
         self._order_state_log: List[Dict[str, Any]] = []
         self._order_state_log_max = 5000
+        # Trade-led: only apply each trade once; positions = f(trades), not f(order state)
+        self._processed_trade_ids: Set[str] = set()
+        self._processed_trade_ids_max = 10000
         _logs_dir = Path(__file__).resolve().parents[2] / "logs"
         _logs_dir.mkdir(parents=True, exist_ok=True)
         _safe_id = (engine_id or "default").replace(" ", "_").replace("/", "_")
@@ -500,6 +505,9 @@ class OrderRouter:
                 )
             return False, {"error": str(e)}
 
+        # Trade-led: sync trades (fills) first so positions are up to date before we compare order state
+        self.sync_trades_from_broker()
+
         # Consider both VALIDATED (in flight) and SENT
         local_pending = self.intent_store.list_by_status(
             IntentStatus.SENT
@@ -747,61 +755,49 @@ class OrderRouter:
                                 tag, IntentStatus.REJECTED, order_state=ost
                             )
                     else:
-                        # Order not in broker open list and find_order_by_client_id returned None.
-                        # Resolve fill price/size from broker fills API before assuming filled;
-                        # do not use price=0 (fabricated fill).
-                        fill_price = None
-                        fill_qty = None
+                        # Trade-led: order missing from open list. Only update position from a real trade (fill).
+                        # Do not fabricate a fill; if we have a fill in the API, apply it via process_trade.
+                        fill_info = None
                         if hasattr(self.broker, "get_fill_for_client_order_id"):
                             try:
                                 fill_info = self.broker.get_fill_for_client_order_id(tag)
-                                if fill_info and float(fill_info.get("price") or 0) > 0:
-                                    fill_price = float(fill_info["price"])
-                                    fill_qty = int(fill_info.get("size") or 0)
                             except Exception:
                                 pass
-                        if fill_price is None or fill_qty is None or fill_qty <= 0:
-                            payload = i.get("payload", {})
-                            fill_qty = int(payload.get("qty") or i.get("qty", 0))
-                            fill_price = float(
-                                payload.get("price") or i.get("price", 0) or 0
-                            )
-                        if self.engine_logger:
-                            self.engine_logger.log(
-                                "oms",
-                                f"Missing order {tag} not on broker open list; resolving from fills (price={fill_price}, qty={fill_qty})",
-                            )
-                        self._set_order_state(
-                            tag,
-                            OrderState.FILLED,
-                            action="assume_filled",
-                            message="Missing on broker open list; filled price from /v2/fills",
-                        )
-                        self.intent_store.update(
-                            tag,
-                            IntentStatus.FILLED,
-                            order_state=OrderState.FILLED,
-                        )
-                        if self.position_manager and fill_qty and float(fill_price or 0) > 0:
-                            instr = i.get("instrument")
-                            if instr:
-                                self.process_fill(
-                                    instrument=instr,
-                                    side=i.get("side", i.get("payload", {}).get("side", "")),
-                                    qty=int(fill_qty),
-                                    price=float(fill_price),
-                                    intent_id=tag,
-                                    strategy=i.get("strategy"),
-                                    structure_id=i.get("structure_id"),
-                                    tag=i.get("tag"),
-                                    candle_ts=i.get("candle_ts"),
-                                    action=i.get("action"),
+                        if fill_info and float(fill_info.get("price") or 0) > 0:
+                            # Only apply trade if not already FILLED (e.g. by sync_trades)
+                            if self._order_state.get(tag) not in _TERMINAL_ORDER_STATES:
+                                trade = {
+                                    "trade_id": f"fill_{tag}_{fill_info.get('order_id', '')}",
+                                    "order_id": fill_info.get("order_id"),
+                                    "intent_id": tag,
+                                    "client_order_id": tag,
+                                    "tag": tag,
+                                    "price": float(fill_info["price"]),
+                                    "size": float(fill_info.get("size") or 0),
+                                    "side": (fill_info.get("side") or i.get("side") or "").upper(),
+                                }
+                                if self.process_trade(trade):
+                                    if self.engine_logger:
+                                        self.engine_logger.log(
+                                            "oms",
+                                            f"Missing order {tag}: applied trade from /v2/fills (trade-led)",
+                                        )
+                            else:
+                                self._set_order_state(
+                                    tag,
+                                    OrderState.FILLED,
+                                    action="assume_filled",
+                                    message="Fill from API; trade already applied by sync_trades",
                                 )
-                        elif self.position_manager and fill_qty and float(fill_price or 0) == 0:
+                                self.intent_store.update(
+                                    tag, IntentStatus.FILLED, order_state=OrderState.FILLED
+                                )
+                        else:
+                            # No trade found: do not update position or mark FILLED (trade-led: no trade → no position change)
                             if self.engine_logger:
                                 self.engine_logger.log(
                                     "oms",
-                                    f"Missing order {tag}: no fill price from fills API and intent has price=0; skipping process_fill to avoid incorrect PnL",
+                                    f"Missing order {tag}: no fill in API; leaving state unchanged (trade-led OMS)",
                                 )
                 except Exception as e:
                     if self.engine_logger:
@@ -892,6 +888,103 @@ class OrderRouter:
                 broker_order_id=order_id,
                 order_state=OrderState.FILLED,
             )
+
+    def process_trade(self, trade: Dict[str, Any]) -> bool:
+        """
+        Trade-led OMS: update position from a trade event (fill). Orders are metadata;
+        positions are driven only by trades. Idempotent by trade_id.
+        Returns True if trade was applied, False if skipped (e.g. already processed).
+        """
+        trade_id = str(
+            trade.get("trade_id")
+            or trade.get("id")
+            or f"{trade.get('order_id', '')}_{trade.get('created_at', '')}"
+        )
+        if not trade_id or trade_id in getattr(self, "_processed_trade_ids", set()):
+            return False
+        intent_id = trade.get("intent_id") or trade.get("client_order_id") or trade.get("tag")
+        if not intent_id:
+            return False
+        price = float(trade.get("price") or 0)
+        size = float(trade.get("size") or 0)
+        if price <= 0 or size <= 0:
+            return False
+        side = (trade.get("side") or "").upper()
+        order_id = trade.get("order_id")
+        # Resolve instrument and metadata from intent_store
+        intent = self.intent_store.get(intent_id) if self.intent_store else None
+        if not intent:
+            return False
+        instrument = trade.get("instrument") or intent.get("instrument")
+        if not instrument:
+            return False
+        if self.position_manager:
+            position_closed, realized_pnl = self.position_manager.on_fill(
+                instrument=instrument,
+                side=side,
+                qty=int(size),
+                price=price,
+                intent_id=intent_id,
+                order_id=order_id,
+                strategy=intent.get("strategy") or trade.get("strategy"),
+                structure_id=intent.get("structure_id") or trade.get("structure_id"),
+                tag=intent.get("tag") or trade.get("tag"),
+                candle_ts=intent.get("candle_ts") or trade.get("candle_ts"),
+                action=intent.get("action") or trade.get("action"),
+            )
+            if position_closed and realized_pnl is not None:
+                self.risk.record_realized_pnl(realized_pnl)
+        sym = getattr(instrument, "trading_symbol", "")
+        self.report_fill(
+            sym, side, int(size), trade.get("expected_price"), price,
+            order_id=order_id, intent_id=intent_id,
+        )
+        self._set_order_state(
+            intent_id,
+            OrderState.FILLED,
+            action="process_trade",
+            message="Position updated from trade (fills API)",
+        )
+        self.intent_store.update(
+            intent_id,
+            IntentStatus.FILLED,
+            broker_order_id=order_id,
+            order_state=OrderState.FILLED,
+        )
+        self._processed_trade_ids.add(trade_id)
+        if len(self._processed_trade_ids) > getattr(self, "_processed_trade_ids_max", 10000):
+            self._processed_trade_ids = set(list(self._processed_trade_ids)[-self._processed_trade_ids_max // 2 :])
+        return True
+
+    def sync_trades_from_broker(self) -> None:
+        """
+        Trade-led OMS: pull recent fills from broker and apply any new trades.
+        Call before order-state verification so positions are up to date from trades.
+        """
+        if not getattr(self.broker, "get_recent_fills", None):
+            return
+        try:
+            fills = self.broker.get_recent_fills(page_size=50)
+        except Exception:
+            return
+        for f in fills or []:
+            intent_id = f.get("client_order_id") or f.get("tag")
+            if not intent_id:
+                continue
+            trade = {
+                "trade_id": f.get("id"),
+                "id": f.get("id"),
+                "order_id": str(f.get("order_id") or f.get("id", "")),
+                "intent_id": intent_id,
+                "client_order_id": intent_id,
+                "tag": intent_id,
+                "price": float(f.get("price") or 0),
+                "size": float(f.get("size") or 0),
+                "side": (f.get("side") or "").upper(),
+                "created_at": f.get("created_at"),
+            }
+            self.process_trade(trade)
+        return
 
     def report_fill(
         self,
