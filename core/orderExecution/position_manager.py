@@ -151,6 +151,8 @@ class PositionManager:
 
         self.last_recon_time = 0
         self.trading_paused = False
+        # Set by engine: strategy.on_structure_exit (BacktestEngine/LiveEngine)
+        self.on_structure_exit = None
 
     # ---------------------
     # LOCAL FILL UPDATE
@@ -205,10 +207,14 @@ class PositionManager:
                 self.strategy_pos[strategy][sym] += signed
 
             if prev_qty == 0 and new_qty != 0:
-                pos.strategy = strategy
-                pos.structure_id = structure_id
-                pos.tag = tag
                 pos.intent_id = intent_id
+            # Always update strategy/structure_id/tag when provided (so positions get strategy name from fills)
+            if strategy is not None:
+                pos.strategy = strategy
+            if structure_id is not None:
+                pos.structure_id = structure_id
+            if tag is not None:
+                pos.tag = tag
 
             if action == "ENTRY" and prev_qty != 0:
                 raise RuntimeError(
@@ -447,7 +453,6 @@ class PositionManager:
 
     def get_open_positions(self, underlying=None, strategy=None):
         positions = []
-        # pdb.set_trace()
         for pos in self.positions.values():
             if pos.net_qty == 0:
                 continue

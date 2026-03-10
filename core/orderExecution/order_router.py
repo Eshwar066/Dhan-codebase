@@ -281,7 +281,22 @@ class OrderRouter:
                 ),
             )
             rec = self.intent_store.get(intent.intent_id)
-            if rec and hasattr(intent, "instrument"):
+            if rec:
+                if hasattr(intent, "instrument"):
+                    rec["instrument"] = intent.instrument
+                rec["strategy"] = intent_strategy_id
+                rec["structure_id"] = getattr(intent, "structure_id", None)
+                rec["tag"] = getattr(intent, "tag", None)
+                rec["action"] = getattr(intent, "action", "ENTRY")
+
+        # Keep intent record metadata in sync when intent already existed (e.g. idempotency retry)
+        rec = self.intent_store.get(intent.intent_id)
+        if rec:
+            rec["strategy"] = intent_strategy_id
+            rec["structure_id"] = getattr(intent, "structure_id", None)
+            rec["tag"] = getattr(intent, "tag", None)
+            rec["action"] = getattr(intent, "action", "ENTRY")
+            if hasattr(intent, "instrument"):
                 rec["instrument"] = intent.instrument
 
         # Fix 1: Persistence Before Flight
@@ -924,6 +939,7 @@ class OrderRouter:
         if not instrument:
             return False
         if self.position_manager:
+            payload = intent.get("payload") or {}
             position_closed, realized_pnl = self.position_manager.on_fill(
                 instrument=instrument,
                 side=side,
@@ -931,11 +947,19 @@ class OrderRouter:
                 price=price,
                 intent_id=intent_id,
                 order_id=order_id,
-                strategy=intent.get("strategy") or trade.get("strategy"),
-                structure_id=intent.get("structure_id") or trade.get("structure_id"),
+                strategy=(
+                    intent.get("strategy")
+                    or payload.get("strategy_id")
+                    or trade.get("strategy")
+                ),
+                structure_id=(
+                    intent.get("structure_id")
+                    or payload.get("structure_id")
+                    or trade.get("structure_id")
+                ),
                 tag=intent.get("tag") or trade.get("tag"),
                 candle_ts=intent.get("candle_ts") or trade.get("candle_ts"),
-                action=intent.get("action") or trade.get("action"),
+                action=intent.get("action") or payload.get("action") or trade.get("action"),
             )
             if position_closed and realized_pnl is not None:
                 self.risk.record_realized_pnl(realized_pnl)

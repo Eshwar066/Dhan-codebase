@@ -48,6 +48,9 @@ class StrategyContext:
     # ---- Optional; set by BacktestEngine: rolling buffer of recent candles for current symbol ----
     recent_candles: Optional[List[Any]] = None
 
+    # ---- Optional; set by LiveEngine/BacktestEngine when order_router is available ----
+    intent_store: Optional[Any] = None
+
     def get_expiry_list(self) -> Optional[List[Any]]:
         """Safe access for expiry_list (may not be set yet)."""
         return self.expiry_list

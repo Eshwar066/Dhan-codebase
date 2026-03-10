@@ -30,6 +30,10 @@ class BacktestEngine(BaseEngine):
         # Wire structure-exit callback (ONE TIME)
         self.position_manager.on_structure_exit = strategy.on_structure_exit
 
+    def build_context(self, candle, recent_candles=None):
+        intent_store = getattr(self.order_router, "intent_store", None)
+        return super().build_context(candle, recent_candles=recent_candles, intent_store=intent_store)
+
     # ==========================================================
     # MAIN RUN LOOP
     # ==========================================================

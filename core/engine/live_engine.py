@@ -72,6 +72,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self.candle_service = candle_service
         self.order_router = order_router
         self.position_manager = position_manager
+        self.position_manager.on_structure_exit = getattr(strategy, "on_structure_exit", None)
         self.realtime_feed = realtime_feed
         self.tick_queue = tick_queue
         self.candle_aggregator = candle_aggregator
@@ -124,6 +125,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             for sym in self.symbols:
                 tick = self.instrument_store.get_tick_size(sym)
                 self._tick_cache[sym] = float(tick) if tick is not None else 0.01
+
+    def build_context(self, candle, recent_candles=None):
+        intent_store = getattr(self.order_router, "intent_store", None)
+        return super().build_context(candle, recent_candles=recent_candles, intent_store=intent_store)
 
     def _graceful_shutdown_handler(self, signum: int, frame: Any) -> None:
         """Per-engine: set flag so main loop exits; snapshot and flush in loop or on exit."""
@@ -604,7 +609,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         open_positions = self.position_manager.get_open_positions(
             underlying=symbol, strategy=self.strategy.name
         )
-        # pdb.set_trace()
         for position in open_positions:
             exit_signal = self.strategy.should_exit(position, candle, ctx)
             if exit_signal:

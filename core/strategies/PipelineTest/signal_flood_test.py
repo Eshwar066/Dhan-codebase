@@ -54,12 +54,25 @@ class SignalFloodTestStrategy(IndiaMktMixins, BaseStrategy):
         if not symbol:
             return None
 
-        # Check if we already have an open position for this symbol
+        structure_id = f"{self.name}:{symbol}:FLAT"
+
         has_open = ctx.position_store.has_open_structure(
-            strategy=self.name, structure_id=f"{self.name}:{symbol}:FLAT", tag="MAIN"
+            strategy=self.name,
+            structure_id=structure_id,
+            tag="MAIN",
         )
-        if has_open:
-            return None  # Exit is handled by should_exit
+        has_pending = (
+            ctx.intent_store.has_pending_intent(
+                strategy=self.name,
+                structure_id=structure_id,
+            )
+            if getattr(ctx, "intent_store", None)
+            else False
+        )
+
+        if has_open or has_pending:
+            return None
+     
 
         # Resolve instrument
         exchange = self.api
