@@ -297,7 +297,7 @@ Algo/
 │   │
 │   ├── broker/
 │   │   ├── base.py          # BaseBroker, IBrokerApi
-│   │   └── internal/        # dhan/, delta/, simulated/
+│   │   └── internal/        # dhan/, delta/, simulated/ (SimulatedBroker used for both BACKTEST and PAPER)
 │   │
 │   ├── orderExecution/
 │   │   ├── order_router.py
@@ -332,7 +332,7 @@ Algo/
 | **OMS**          | Order management: PositionManager, RiskManager, IntentStore, OrderRouter, Broker. One OMS per engine.                       |
 | **Strategy**     | Class registered in `STRATEGY_MAP`; implements `on_candle`, `should_evaluate`, `should_exit`, etc.                          |
 | **EngineConfig** | Dataclass: broker_name, run_mode, strategy_name, symbols, capital, risk_per_trade_percent, backtest/live params, engine_id. |
-| **Run mode**     | `BACKTEST` \| `PAPER` \| `LIVE`. Set in `run/config.py` as `RUN_MODE`.                                                      |
+| **Run mode**     | `BACKTEST` \| `PAPER` \| `LIVE`. Set in `run/config.py` as `RUN_MODE`. **SimulatedBroker** is used for both BACKTEST and PAPER (no real orders); LIVE uses the real broker (Delta/Dhan). |
 
 ---
 
@@ -393,7 +393,7 @@ Use **PAPER** or **LIVE** run mode. The strategy (`SignalFloodTest`) generates e
    # or only Delta jobs
    python -m run.main --venue DELTA
    ```
-4. Each job gets its own BacktestEngine and SimulatedBroker; results and trade log go to `logs/` (e.g. strategy trade CSV).
+4. Each job gets its own BacktestEngine and **SimulatedBroker** (same broker as PAPER; used for both backtest and paper). Results and trade log go to `logs/` (e.g. strategy trade CSV).
 
 ### Live / paper (single venue)
 
@@ -405,7 +405,7 @@ Use **PAPER** or **LIVE** run mode. The strategy (`SignalFloodTest`) generates e
    # or
    python -m run.main --venue DHAN
    ```
-4. **PAPER** (`RUN_MODE = RunMode.PAPER`): Uses **SimulatedBroker**—same LiveEngine stack and logs as LIVE (engine logger, order_placed, fills, reconciliation, EOD), but no real orders. Feed and candle aggregator still use live data when credentials are set.
+4. **PAPER** (`RUN_MODE = RunMode.PAPER`): Runs **the same validations as LIVE**. Uses **SimulatedBroker** (same as BACKTEST; instant fill, no real exchange), but the engine executes the full live stack: reconciliation on start, order-state verification, trade-led sync, kill switch, feed health, duplicate-signal protection, time-of-day guard, latency/memory guards, EOD export, and structured logs. Use PAPER to validate strategy and OMS behaviour before going LIVE. Feed and candle aggregator use live data when credentials are set.
 5. **LIVE**: Live engine will:
    - Reconcile broker positions with PositionManager on startup.
    - Use Delta WebSocket feed for Delta if credentials are set; otherwise candle_service / REST.

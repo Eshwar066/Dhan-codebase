@@ -1,8 +1,9 @@
-"""Simulated broker for backtest."""
+"""Simulated broker for both PAPER and BACKTEST. No real exchange; instant fill. PAPER runs the same validations as LIVE (reconciliation, order-state check, trade-led sync)."""
 
 import uuid
 import time
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 from core.broker.base import BaseBroker
 from core.models.order_intent import OrderIntent
@@ -10,6 +11,8 @@ from core.utils.instruments.instrument_store import Instrument
 
 
 class SimulatedBroker(BaseBroker):
+    """Used for both PAPER and BACKTEST: instant fill, no real exchange. Same contract as live brokers so LiveEngine (PAPER) runs all validations."""
+
     def __init__(self, position_manager=None, intent_store=None, latency_ms=20):
         super().__init__(position_manager=position_manager, intent_store=intent_store)
         self.latency_ms = latency_ms
@@ -74,6 +77,30 @@ class SimulatedBroker(BaseBroker):
                 "lot_size": lot_size,
             }
         return out
+
+    def get_open_orders(self) -> List[Dict[str, Any]]:
+        """Paper: no open orders (instant fill). Same interface as live so order-state verification runs."""
+        return []
+
+    def get_recent_fills(self, page_size: int = 50) -> List[Dict[str, Any]]:
+        """Paper: fills already applied in place_order via process_fill. Same interface as live so sync_trades runs."""
+        return []
+
+    def find_order_by_client_id(self, client_order_id: str) -> Optional[Dict[str, Any]]:
+        """Paper: orders are filled immediately, so never in open list. Same interface as live."""
+        return None
+
+    def get_fill_for_client_order_id(
+        self, client_order_id: str, page_size: int = 50
+    ) -> Optional[Dict[str, Any]]:
+        """Paper: fill already applied in place_order. Same interface as live for missing-order path."""
+        return None
+
+    def get_fill_by_order_id(
+        self, broker_order_id: str, page_size: int = 50
+    ) -> Optional[Dict[str, Any]]:
+        """Paper: same as get_fill_for_client_order_id. Same interface as live."""
+        return None
 
     def exit_position(self, trading_symbol, qty, side, segment="EQ", lot_size=1):
         exit_side = "SELL" if side == "BUY" else "BUY"
