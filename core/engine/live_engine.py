@@ -604,6 +604,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         open_positions = self.position_manager.get_open_positions(
             underlying=symbol, strategy=self.strategy.name
         )
+        # pdb.set_trace()
         for position in open_positions:
             exit_signal = self.strategy.should_exit(position, candle, ctx)
             if exit_signal:
@@ -626,6 +627,12 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             exit_intent = dataclasses.replace(
                                 exit_intent, side=required_exit_side
                             )
+                        self._log_and_telegram_signal(
+                            exit_intent,
+                            symbol,
+                            action="EXIT",
+                            qty_fallback=abs(position.net_qty),
+                        )
                         # Exit price from depth by intent's instrument and position direction (correct bid/ask for this contract)
                         trading_sym = getattr(
                             exit_intent.instrument, "trading_symbol", symbol
@@ -656,6 +663,12 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         )
 
         for single_intent in entry_intents:
+            self._log_and_telegram_signal(
+                single_intent,
+                symbol,
+                action=getattr(single_intent, "action", "ENTRY"),
+            )
+
             if risk_manager and risk_manager.is_engine_blocked():
                 return
             if symbol not in self._symbol_state:

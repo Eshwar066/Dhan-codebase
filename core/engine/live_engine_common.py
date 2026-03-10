@@ -148,6 +148,52 @@ class LiveEngineHelpersMixin:
                 f"Invalid lot size: qty {qty} not multiple of lot {lot} for {trading_sym}"
             )
 
+    # ---------- Signal logging (entry and exit) ----------
+
+    def _log_and_telegram_signal(
+        self,
+        intent: Any,
+        symbol: str,
+        action: str = "ENTRY",
+        qty_fallback: Optional[int] = None,
+    ) -> None:
+        """
+        Log and send Telegram for a strategy-generated signal (entry or exit).
+        Requires self.engine_logger and self.order_router (for telegram_alert).
+        """
+        _sym = (
+            getattr(getattr(intent, "instrument", None), "trading_symbol", None)
+            or symbol
+        )
+        _side = getattr(intent, "side", "").upper()
+        _qty = getattr(intent, "qty", 0) or qty_fallback or 0
+        _intent_id = getattr(intent, "intent_id", "")
+        _price = getattr(intent, "price", None)
+        _id_short = (
+            f"{_intent_id[:16]}..."
+            if _intent_id and len(_intent_id) > 16
+            else _intent_id
+        )
+        _msg = (
+            f"Signal: {action} {_sym} {_side} qty={_qty}"
+            + (f" price={_price}" if _price is not None else "")
+            + f" intent_id={_id_short}"
+        )
+        if getattr(self, "engine_logger", None):
+            self.engine_logger.log(
+                "signal",
+                _msg,
+                symbol=_sym,
+                side=_side,
+                qty=_qty,
+                intent_id=_intent_id,
+                action=action,
+                price=_price,
+            )
+        telegram = getattr(getattr(self, "order_router", None), "telegram_alert", None)
+        if callable(telegram):
+            telegram(_msg)
+
     # ---------- Strategy helpers ----------
 
     def _signal_hash(
