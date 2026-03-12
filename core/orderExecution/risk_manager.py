@@ -157,7 +157,7 @@ class RiskManager:
             self._log_block("Max open positions reached")
             return False
 
-        # 4️⃣ Per-symbol qty limit
+        # 4️⃣ Per-symbol qty limit ==> tested ✅          
         future_qty = abs(self.pm.get_qty(symbol)) + qty
         if future_qty > self.max_qty_per_symbol:
             self._log_block("Qty limit breach", symbol=symbol)

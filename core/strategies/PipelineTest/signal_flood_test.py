@@ -6,6 +6,8 @@ SignalFloodTestStrategy: pipeline test strategy for both Delta and Dhan.
 - 10% of entries use oversized qty (to trigger risk rejection).
 - 10% of entries return duplicate intents (to trigger duplicate_signal_blocked).
 - Uses futures instrument and IndiaMktMixins for intent creation.
+- Risk limits (daily_max_loss, max_open_positions, max_portfolio_exposure) are set
+  in run/config.py per job; RiskManager blocks entries when limits are breached.
 """
 
 import random
@@ -72,8 +74,6 @@ class SignalFloodTestStrategy(IndiaMktMixins, BaseStrategy):
 
         if has_open or has_pending:
             return None
-     
-
         # Resolve instrument
         exchange = self.api
         expiry = None
@@ -94,9 +94,9 @@ class SignalFloodTestStrategy(IndiaMktMixins, BaseStrategy):
         self._next_side = "SELL" if side == "BUY" else "BUY"
         structure_id = f"{self.name}:{symbol}:FLAT"
 
-        # 10% oversized qty (to trigger risk rejection)
         qty = int(inst.lot_size)
-        # if random.random() < 0.10:
+        # 10% oversized qty (to trigger risk rejection) ==> max_qty_per_symbol in risk manager
+        # if random.random() < 0.50:
         #     qty = max(qty, 99999)
 
         intent = self.map_futures_instrument_to_intent(
@@ -112,7 +112,7 @@ class SignalFloodTestStrategy(IndiaMktMixins, BaseStrategy):
         )
         if intent and qty != int(inst.lot_size):
             intent = replace(intent, qty=qty)
-        # 10% return same intent twice to trigger duplicate_signal_blocked on second
+        # 10% return same intent twice to trigger duplicate_signal_blocked on second ==> tested ✅
         # if random.random() < 0.10 and intent:
         #     return [intent, intent]
         return [intent] if intent else None

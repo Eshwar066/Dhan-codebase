@@ -102,6 +102,7 @@ STRATEGY_JOBS = [
         "instrument": "FUTURES",
         "daily_max_loss": 100,
         "max_open_positions": 1,
+        "max_portfolio_exposure": 5000,
         "feed_stale_seconds": 30,
         "order_state_check_interval_min": 1,
         "memory_threshold_percent": 5,
@@ -127,14 +128,15 @@ STRATEGY_JOBS = [
         "instrument": "FUTURES",
         "delta_india": True,
         "delta_testnet": True,
-        "daily_max_loss": 100,  # not in engine
-        "max_open_positions": 1,  # not in engine
+        "daily_max_loss": 10000,  # not in engine
+        "max_open_positions": 6,  # not in engine
+        "max_portfolio_exposure": 50000,  # In Engine (RiskManager)
         "feed_stale_seconds": 30,  # In Engine
         "order_state_check_interval_min": 1,  # In engine
         "memory_threshold_percent": 5,  # In engine
         "latency_critical_ms": 6000,  # In engine
-        "latency_critical_cycles": 1,  # In engine
-        "symbol_error_threshold": 2,  # In engine
+        "latency_critical_cycles": 6,  # In engine
+        "symbol_error_threshold": 6,  # In engine
         # "strategy_timeout_seconds": 1000000000, # do we need this
         "live": {"exchange": "DELTA", "sector": "YES"},
         "telegram": {

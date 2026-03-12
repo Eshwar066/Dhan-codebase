@@ -44,6 +44,7 @@ class EngineConfig:
     # Risk limits (optional)
     daily_max_loss: Optional[float] = None
     max_open_positions: Optional[int] = None
+    max_portfolio_exposure: Optional[float] = None
 
     # Feed health: warn/pause when no data for this many seconds (live only).
     feed_stale_seconds: Optional[float] = None

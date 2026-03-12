@@ -39,6 +39,7 @@ def job_to_engine_config(job: dict) -> EngineConfig:
         risk_per_trade_percent=job.get("risk_per_trade_percent"),
         daily_max_loss=job.get("daily_max_loss"),
         max_open_positions=job.get("max_open_positions"),
+        max_portfolio_exposure=job.get("max_portfolio_exposure"),
         feed_stale_seconds=job.get("feed_stale_seconds"),
         backtest=backtest,
         live=live,

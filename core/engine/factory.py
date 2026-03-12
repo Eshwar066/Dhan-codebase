@@ -180,6 +180,8 @@ class EngineFactory:
             risk_per_trade_percent=config.risk_per_trade_percent,
             daily_max_loss=config.daily_max_loss,
             max_open_positions=getattr(config, "max_open_positions", None) or 20,
+            max_portfolio_exposure=getattr(config, "max_portfolio_exposure", None)
+            or 10000000,
             engine_logger=engine_logger,
         )
 

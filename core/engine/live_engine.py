@@ -692,6 +692,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             signal_hash = self._signal_hash(
                 symbol, timeframe or "", candle.get("timestamp"), "entry"
             )
+
+            # Dublicate signal blocker ==> tested ✅
             if self._last_signal_hash_per_symbol.get(symbol) == signal_hash:
                 if self.engine_logger:
                     self.engine_logger.duplicate_signal_blocked(
