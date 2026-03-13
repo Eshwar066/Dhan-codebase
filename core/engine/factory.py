@@ -238,9 +238,10 @@ class EngineFactory:
                 order_router.risk.check_short_option_margin = _margin_check
         broker.set_order_router(order_router)
 
-        # ---------- Delta: set leverage from config (live only) ----------
+        # ---------- Delta: set leverage from config (live only; skip for SimulatedBroker e.g. PAPER) ----------
         if (
             config.broker_name == "DELTA"
+            and hasattr(broker, "api")
             and getattr(config, "delta_leverage", None) is not None
             and (getattr(config, "symbols", None) or [])
         ):
