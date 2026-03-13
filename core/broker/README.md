@@ -34,8 +34,10 @@ Do not import from `core.broker.internal.*` in application code; use the package
 ## Brokers
 
 - **DhanBroker** – uses `DhanBrokerApi` (wraps Dhan for orders only).
-- **DeltaBroker** – uses `DeltaBrokerApi` (stub for Delta Exchange; wire real API when ready).
-- **SimulatedBroker** – backtest; no exchange.
+- **DeltaBroker** – uses `DeltaBrokerApi` (Delta Exchange). Leverage is set from config: per-job `delta_leverage` (e.g. 10) is applied at engine start for the job's symbols via Delta API (`set_leverage_for_symbols`).
+- **SimulatedBroker** – used for PAPER and BACKTEST; no exchange.
+
+**Funds/margin check:** The broker's `check_funds_before_order` is invoked by OrderRouter only for **ENTRY** intents. **EXIT** and **FORCE_EXIT** never undergo funds check so positions can always be closed.
 
 ## Flow
 

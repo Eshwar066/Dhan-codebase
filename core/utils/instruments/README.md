@@ -6,7 +6,7 @@
 
 - **`base.py`** – **Instrument** (shared), **BaseInstrumentStore** (abstract: `intent_creation_details`, `futures_intent_creation_details`).
 - **`dhan.py`** – **DhanInstrumentProvider** (CSV), **DhanInstrumentStore** (SEM_*, NSE/NFO/BSE, backtest dummies).
-- **`delta.py`** – **DeltaInstrumentProvider** (Delta `/v2/products`), **DeltaInstrumentStore** (product id/symbol, Delta dummies).
+- **`delta.py`** – **DeltaInstrumentProvider** (Delta `/v2/products`), **DeltaInstrumentStore** (product id/symbol, Delta dummies). When creating a new cache from the API, any existing `delta_instrument_*.csv` in the cache directory (e.g. Dependencies) is deleted so only the new file remains.
 - **`instrument_store.py`** – Facade: **Instrument**, **InstrumentStore(broker=..., csv_path=..., base_url=...)** → Dhan or Delta store.
 - **`providers.py`** – **fetch_delta_products**, **get_provider_for_path** (Dhan CSV vs Delta fallback).
 

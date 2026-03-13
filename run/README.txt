@@ -8,15 +8,14 @@ main.py
   - Builds data_provider = DhanDataProvider(DhanSource())  [data layer]
   - Builds broker = DhanBroker(DhanBrokerApi(dhan_source)) or DeltaBroker/SimulatedBroker
   - Builds order_router, position_manager, intent_store, risk_manager, instrument_store
-  - BACKTEST: BacktestEngine(data_provider, strategy, order_router, ...).run(...)
-  - LIVE/PAPER: LiveEngine(..., candle_service=CandleService(data_provider), ...).start(...)
-
-Broker choice: set BROKER_NAME = "DHAN" or "DELTA" in main.py (Delta is stub).
+  - BACKTEST: BacktestEngine(...).run(...)
+- LIVE/PAPER: LiveEngine(...).start(...); broker is SimulatedBroker for PAPER, real broker for LIVE (per config.run_mode from job run_mode or RUN_MODE)
 
 config.py
 ---------
-- RUN_MODE: RunMode.BACKTEST | RunMode.PAPER | RunMode.LIVE
-- STRATEGY_JOBS: list of { name, enabled, capital, symbols, backtest: {...}, live: {...} }
+- RUN_MODE: default RunMode.BACKTEST | RunMode.PAPER | RunMode.LIVE when a job does not set run_mode
+- Per-job run_mode: set "run_mode": "PAPER" or "run_mode": "LIVE" on a job to override; mix paper and live in one process
+- STRATEGY_JOBS: list of { name, venue, enabled, run_mode (optional), capital, symbols, backtest: {...}, live: {...}, delta_leverage (Delta only, optional), ... }
 
 Strategy config is wired via core/strategies/registry.STRATEGY_MAP and runtime_spec.
 

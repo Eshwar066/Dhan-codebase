@@ -332,7 +332,7 @@ Algo/
 | **OMS**          | Order management: PositionManager, RiskManager, IntentStore, OrderRouter, Broker. One OMS per engine.                       |
 | **Strategy**     | Class registered in `STRATEGY_MAP`; implements `on_candle`, `should_evaluate`, `should_exit`, etc.                          |
 | **EngineConfig** | Dataclass: broker_name, run_mode, strategy_name, symbols, capital, risk_per_trade_percent, backtest/live params, engine_id. |
-| **Run mode**     | `BACKTEST` \| `PAPER` \| `LIVE`. Set in `run/config.py` as `RUN_MODE`. **SimulatedBroker** is used for both BACKTEST and PAPER (no real orders); LIVE uses the real broker (Delta/Dhan). |
+| **Run mode**     | `BACKTEST` \| `PAPER` \| `LIVE`. Default in `run/config.py` is `RUN_MODE`; each job can override with `"run_mode": "PAPER"` or `"run_mode": "LIVE"` so you can run some strategies in paper and others in live in the same process. **SimulatedBroker** for PAPER; real broker for LIVE. |
 
 ---
 
@@ -340,20 +340,23 @@ Algo/
 
 ### 1. Run mode and default venue (`run/config.py`)
 
-- **RUN_MODE**: `RunMode.BACKTEST` \| `RunMode.PAPER` \| `RunMode.LIVE` — applies to all jobs when using `main.py`.
+- **RUN_MODE**: default `RunMode.BACKTEST` \| `RunMode.PAPER` \| `RunMode.LIVE` when a job does not set `run_mode`.
+- **Per-job run_mode**: set `"run_mode": "PAPER"` or `"run_mode": "LIVE"` (or `"BACKTEST"`) on a job to override; you can run some strategies in paper and others in live in the same process.
 - **DEFAULT_VENUE**: used when a job does not set `"venue"` (e.g. `"DELTA"` or `"DHAN"`).
 - **STRATEGY_JOBS**: list of job dicts. Each job has:
   - **name**: strategy key in `STRATEGY_MAP` (e.g. `"FuturesEMAHighLow"`, `"LEAPS_RSI"`).
   - **venue**: `"DHAN"` or `"DELTA"`.
   - **enabled**: if `False`, job is skipped.
+  - **run_mode** (optional): `"PAPER"` \| `"LIVE"` \| `"BACKTEST"`; if omitted, `RUN_MODE` is used.
   - **symbols**: list of symbols (e.g. `["BTCUSD"]`, `["NIFTY"]`).
   - **capital**, **risk_per_trade_percent** (optional; for live risk limits).
   - **backtest**: `start_date`, `end_date`, `timeframe`, `exchange`, `sector`.
   - **live**: `exchange`, `sector`, `rsi` (and any strategy-specific params).
+  - **delta_leverage** (Delta only): optional integer (e.g. `10`); set at engine start for `symbols` via Delta API.
 
 ### 2. Engine config (`run/engine_config.py`)
 
-- **EngineConfig**: full config for one engine (used by EngineFactory).
+- **EngineConfig**: full config for one engine (used by EngineFactory). Includes `run_mode`, `delta_leverage` (Delta only; set at engine start for symbols).
 - Helpers: `example_dhan_live_config()`, `example_delta_live_config()`, etc., with `engine_id`, `capital`, `risk_per_trade_percent` where relevant.
 - **engine_id** defaults to `{broker_name}_{strategy_name}` if not set; used for log file and EOD report filename.
 - **Production safeguards** (live only): `order_state_check_interval_min`, `circuit_breaker_threshold`, `allowed_trading_hours`, `slippage_threshold_pct`, `memory_threshold_percent`, `strategy_timeout_seconds`, `latency_critical_ms`, `latency_critical_cycles`, `symbol_error_threshold`, `feed_stale_seconds`, `max_open_positions`. All optional.
@@ -381,7 +384,7 @@ Use **PAPER** or **LIVE** run mode. The strategy (`SignalFloodTest`) generates e
 
 - Python 3.x; install deps: `pip install -r requirements.txt`.
 - `.env` with credentials for the venue(s) you run.
-- **Dependencies/** with instrument file for the venue/date (e.g. `all_instrument{YYYY-MM-DD}.csv` for Dhan, `delta_instrument_{YYYY-MM-DD}.csv` for Delta). Some flows create or fetch these automatically.
+- **Dependencies/** with instrument file for the venue/date (e.g. `all_instrument{YYYY-MM-DD}.csv` for Dhan, `delta_instrument_{YYYY-MM-DD}.csv` for Delta). Dhan: created/fetched by Tradehull. Delta: fetched from API on first use; when a new Delta instrument file is created, previous `delta_instrument_*.csv` files in Dependencies are removed so only the current one remains.
 
 ### Backtest (single venue)
 
@@ -397,7 +400,7 @@ Use **PAPER** or **LIVE** run mode. The strategy (`SignalFloodTest`) generates e
 
 ### Live / paper (single venue)
 
-1. Set `RUN_MODE = RunMode.LIVE` (or `PAPER`) in `run/config.py`.
+1. 1. Set default `RUN_MODE = RunMode.LIVE` (or `PAPER`) in `run/config.py`, or set per-job `"run_mode": "LIVE"` / `"run_mode": "PAPER"` to mix paper and live in one process.
 2. Set the job’s `venue` to the broker you use; add `live` (e.g. `exchange`, `sector`, `rsi`).
 3. Run that venue only (recommended: one process per venue):
    ```bash
@@ -433,10 +436,11 @@ See `docs/MULTI_VENUE.md`: create a Supervisor, `register_from_config()` for eac
 | ---------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Broker reconciliation**    | LiveEngine   | On start, fetches broker positions, syncs PositionManager, logs mismatches to engine log.                                                       |
 | **Kill switch**              | RiskManager  | `trigger_kill_switch(reason)` blocks all new entries; exits still allowed; logged.                                                              |
+| **Funds/margin check**       | OrderRouter  | Applied only to **ENTRY** intents. **EXIT** and **FORCE_EXIT** never check funds so positions can always be closed.                             |
 | **Risk limits**              | RiskManager  | daily_max_loss, max_open_positions, max_symbol_exposure, max_portfolio_exposure; capital × risk_per_trade_percent → max_risk_amount per trade.  |
 | **Closed-candle validation** | LiveEngine   | Only evaluates candles that are closed and aligned to timeframe; skips forming candles.                                                         |
 | **Structured logging**       | EngineLogger | One JSON line per event in `logs/{engine_id}.log` (order_placed, risk_block, reconciliation, kill_switch, latency, etc.).                       |
-| **Feed health**              | LiveEngine   | Tracks last tick/candle per symbol; warns and can pause entries if no data for `feed_stale_seconds`.                                            |
+| **Feed health**              | LiveEngine   | Tracks last tick/candle per symbol; warns and can pause entries if no data for `feed_stale_seconds`. Delta WebSocket feed stall (no ticks for N seconds) is logged to engine log (`feed_health_warning`) and optional Telegram when configured. |
 | **EOD export**               | LiveEngine   | Writes `reports/{engine_id}_{YYYYMMDD}.csv` (open positions, realized pnl).                                                                     |
 | **Latency**                  | LiveEngine   | Logs strategy_time_ms, broker_latency_ms, total_latency_ms for orders (order path only; not in tick ingestion, so no impact at high tick rate). |
 
@@ -494,7 +498,7 @@ Use this as a reference for setup and next steps.
 
 ### Live / paper
 
-7. Set `RUN_MODE = RunMode.LIVE` (or PAPER) in `run/config.py`.
+7. Set `RUN_MODE = RunMode.LIVE` (or PAPER) in `run/config.py`, or use per-job `run_mode` to mix paper and live.
 8. Ensure the job has `live` with `exchange`, `sector`, and optionally `rsi`.
 9. Run one venue per process: `python -m run.main --venue DELTA` or `--venue DHAN`.
 10. Monitor `logs/{engine_id}.log` (JSON lines) and `reports/{engine_id}_{date}.csv` for EOD.

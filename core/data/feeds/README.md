@@ -5,7 +5,8 @@ Used by **LiveEngine** for real-time market data (and optional account updates) 
 ## Implementations
 
 - **DeltaWebSocketFeed** – Delta Exchange WebSocket (production: `wss://socket.india.delta.exchange`; India testnet: `wss://cdn-ind.testnet.deltaex.org`).  
-  Subscribes to `v2/ticker`, `candlestick_*`, `l2_orderbook`, and optionally private channels: `orders`, `positions`.
+  Subscribes to `v2/ticker`, `candlestick_*`, `l2_orderbook`, and optionally private channels: `orders`, `positions`.  
+  **Feed stall:** If no ticks are received for the configured period (e.g. 10s), the client calls an optional `on_feed_stall` callback. When the feed is built with `engine_logger` and/or `telegram_alert` (EngineFactory), stall is logged via `engine_logger.feed_health_warning()` and an optional Telegram alert is sent.
 
 - **DhanWebSocketFeed** – Dhan Live Market Feed WebSocket (`wss://api-feed.dhan.co`). Subscribes by ExchangeSegment + SecurityId (from `instrument_store.get_feed_instruments(symbols)`). Binary packets: Ticker, Quote, Full, OI, Prev close. Instantiated in `EngineFactory.create_live_engine()` when broker is DHAN and credentials are set.
 

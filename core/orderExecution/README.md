@@ -46,6 +46,8 @@ Can include: portfolio exposure, per-symbol limits, max position size, no double
 
 **Option shorting:** For option-selling strategies, the risk manager can validate **SPAN margin** and **exposure margin** before sending the order. Set `check_short_option_margin(intent, price_map) -> bool` (e.g. via `make_short_option_margin_check(broker)` when the broker implements `check_short_option_margin`). If the callable returns `False`, the intent is blocked so short options avoid broker rejections due to insufficient margin.
 
+**Funds/margin check:** The broker's `check_funds_before_order` is invoked by OrderRouter only for **ENTRY** intents. **EXIT** and **FORCE_EXIT** never undergo funds check, so positions can always be closed.
+
 =============================================================
 ## order router--> order slicing
 
