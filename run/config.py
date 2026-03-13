@@ -7,18 +7,21 @@ class RunMode(str, Enum):
     LIVE = "LIVE"
 
 
-# 🔁 CHANGE ONLY THIS
+# 🔁 Default run mode when a job does not specify "run_mode".
 RUN_MODE = RunMode.LIVE
 
 # Default venue when job does not specify "venue". Used for single-venue runs.
 DEFAULT_VENUE = "DELTA"  # "DHAN" | "DELTA"
 
+# Per-job run_mode: set "run_mode": "PAPER" or "run_mode": "LIVE" (or "BACKTEST") on each job.
+# If omitted, RUN_MODE above is used. You can run some strategies in paper and others in live in the same process.
 STRATEGY_JOBS = [
     # leaps rsi 52 32 for dhan
     {
         "name": "LEAPS_RSI",
         "venue": "DHAN",
         "enabled": True,
+        "run_mode": "PAPER",  # or "LIVE"; omit to use RUN_MODE default
         "capital": 200000,
         "symbols": ["NIFTY"],
         "live": {"exchange": "INDEX", "sector": "YES", "rsi": "YES"},
@@ -127,6 +130,7 @@ STRATEGY_JOBS = [
         "name": "SignalFloodTest",
         "venue": "DELTA",
         "enabled": True,
+        "run_mode": "LIVE",
         "engine_id": "delta_test_pipeline",
         "symbols": ["BTCUSD"],
         "instrument": "FUTURES",

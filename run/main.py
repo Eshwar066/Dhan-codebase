@@ -24,13 +24,19 @@ from core.engine.factory import EngineFactory
 
 
 def job_to_engine_config(job: dict) -> EngineConfig:
-    """Build EngineConfig from a STRATEGY_JOBS entry."""
+    """Build EngineConfig from a STRATEGY_JOBS entry. Per-job run_mode overrides global RUN_MODE."""
     venue = job.get("venue", DEFAULT_VENUE)
     backtest = job.get("backtest") or {}
     live = job.get("live") or {}
+    # Per-job run_mode: "PAPER" | "LIVE" | "BACKTEST"; if omitted or invalid, use global RUN_MODE
+    run_mode_raw = job.get("run_mode")
+    try:
+        run_mode = RunMode(str(run_mode_raw).upper()) if run_mode_raw else RUN_MODE
+    except (ValueError, AttributeError):
+        run_mode = RUN_MODE
     return EngineConfig(
         broker_name=venue,
-        run_mode=RUN_MODE,
+        run_mode=run_mode,
         strategy_name=job["name"],
         symbols=job["symbols"],
         enabled=job.get("enabled", True),
@@ -79,7 +85,7 @@ def run_engine(config: EngineConfig) -> None:
             "Strategy will not receive any candles. Ensure Dependencies/equity_universe/EQUITY_L_latest.csv exists or set symbols in config."
         )
 
-    if RUN_MODE == RunMode.BACKTEST:
+    if config.run_mode == RunMode.BACKTEST:
         bt = config.backtest or {}
         engine.run(
             symbols=symbols,
@@ -118,7 +124,8 @@ def main():
             print(f"No enabled jobs for venue {args.venue}")
             sys.exit(0)
 
-    print(f"Run mode: {RUN_MODE.value} | Jobs: {[c.strategy_name for c in configs]}")
+    mode_summary = ", ".join(f"{c.strategy_name}({c.run_mode.value})" for c in configs)
+    print(f"Default run mode: {RUN_MODE.value} | Jobs: {mode_summary}")
     for config in configs:
         run_engine(config)
 
