@@ -260,33 +260,35 @@ class OrderRouter:
         sym = intent.instrument.trading_symbol if hasattr(intent, "instrument") else ""
         side = getattr(intent, "side", "")
         qty = getattr(intent, "qty", 0)
+        action = getattr(intent, "action", "ENTRY")
 
-        # Check available / required / SPAN margin before placing (broker may implement check_funds_before_order)
-        funds_check = getattr(
-            self.broker, "check_funds_before_order", lambda _i, _p: None
-        )(intent, exec_price)
-        if funds_check is not None and funds_check.get("ok") is False:
-            shortfall = funds_check.get("shortfall", 0)
-            msg = funds_check.get("message") or "Insufficient funds"
-            if self.engine_logger:
-                self.engine_logger.log(
-                    "risk_block",
-                    f"Funds check failed: {msg} (shortfall={shortfall})",
+        # ENTRY → check margin. EXIT / FORCE_EXIT → NEVER check margin (otherwise you cannot close positions).
+        if action not in ("EXIT", "FORCE_EXIT"):
+            funds_check = getattr(
+                self.broker, "check_funds_before_order", lambda _i, _p: None
+            )(intent, exec_price)
+            if funds_check is not None and funds_check.get("ok") is False:
+                shortfall = funds_check.get("shortfall", 0)
+                msg = funds_check.get("message") or "Insufficient funds"
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "risk_block",
+                        f"Funds check failed: {msg} (shortfall={shortfall})",
+                    )
+                if self.telegram_alert:
+                    self.telegram_alert(
+                        f"⚠️ Order blocked – insufficient funds: {sym} {side} qty={qty}. {msg} Shortfall: {shortfall}"
+                    )
+                self.intent_store.update(
+                    intent.intent_id, IntentStatus.REJECTED, order_state=OrderState.REJECTED
                 )
-            if self.telegram_alert:
-                self.telegram_alert(
-                    f"⚠️ Order blocked – insufficient funds: {sym} {side} qty={qty}. {msg} Shortfall: {shortfall}"
+                self._set_order_state(
+                    intent.intent_id,
+                    OrderState.REJECTED,
+                    action="insufficient_funds",
+                    message=msg,
                 )
-            self.intent_store.update(
-                intent.intent_id, IntentStatus.REJECTED, order_state=OrderState.REJECTED
-            )
-            self._set_order_state(
-                intent.intent_id,
-                OrderState.REJECTED,
-                action="insufficient_funds",
-                message=msg,
-            )
-            return
+                return
 
         # Ensure intent exists in store (for fill sync and stale exit refresh)
         if not self.intent_store.exists(intent.intent_id):

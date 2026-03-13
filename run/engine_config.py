@@ -62,6 +62,8 @@ class EngineConfig:
     # Venue-specific options (optional overrides)
     delta_testnet: bool = True
     delta_india: bool = True
+    # Delta Exchange: leverage to set per product (e.g. 10 for 10x). Applied at engine start for config.symbols.
+    delta_leverage: Optional[int] = None
 
     # Paths (defaults; override for tests)
     base_dir: Optional[Path] = None

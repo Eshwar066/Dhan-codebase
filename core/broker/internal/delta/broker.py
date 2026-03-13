@@ -87,7 +87,7 @@ class DeltaBroker(BaseBroker):
         Check available wallet balance vs required notional before placing order.
         Delta does not expose SPAN; uses wallet balance as proxy.
         """
-        pdb.set_trace()
+        # pdb.set_trace()
         try:
             required = _delta_required_notional(intent, execution_price)
         except Exception:

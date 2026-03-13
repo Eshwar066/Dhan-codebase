@@ -238,6 +238,26 @@ class EngineFactory:
                 order_router.risk.check_short_option_margin = _margin_check
         broker.set_order_router(order_router)
 
+        # ---------- Delta: set leverage from config (live only) ----------
+        if (
+            config.broker_name == "DELTA"
+            and getattr(config, "delta_leverage", None) is not None
+            and (getattr(config, "symbols", None) or [])
+        ):
+            lev = int(config.delta_leverage)
+            results = broker.api.set_leverage_for_symbols(config.symbols, lev)
+            for sym, res in results.items():
+                if res.get("ok"):
+                    engine_logger.log(
+                        "delta_leverage",
+                        f"Delta leverage set: {sym} -> {lev}x (product_id={res.get('product_id')})",
+                    )
+                else:
+                    engine_logger.log(
+                        "delta_leverage_warning",
+                        f"Delta leverage failed for {sym}: {res.get('message', res)}",
+                    )
+
         # ---------- Universe (DHAN equity strategies only) ----------
         universe_service = EngineFactory._universe_service(
             config, data_provider, instrument_store, engine_logger=engine_logger

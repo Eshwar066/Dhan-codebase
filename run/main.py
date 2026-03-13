@@ -47,6 +47,7 @@ def job_to_engine_config(job: dict) -> EngineConfig:
         live=live,
         delta_testnet=job.get("delta_testnet", True),
         delta_india=job.get("delta_india", False),
+        delta_leverage=job.get("delta_leverage"),
         order_state_check_interval_min=job.get("order_state_check_interval_min", 0),
         memory_threshold_percent=job.get("memory_threshold_percent"),
         strategy_timeout_seconds=job.get("strategy_timeout_seconds"),

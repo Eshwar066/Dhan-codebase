@@ -40,6 +40,7 @@ STRATEGY_JOBS = [
         "instrument": "FUTURES",
         "delta_india": False,
         "delta_testnet": True,
+        "delta_leverage": 10,
         "live": {"exchange": "INDEX", "sector": "YES"},
         "backtest": {
             "start_date": "2024-01-01",
@@ -85,6 +86,7 @@ STRATEGY_JOBS = [
         "instrument": "FUTURES",
         "delta_india": True,
         "delta_testnet": False,
+        "delta_leverage": 10,
         "live": {"exchange": "INDEX", "sector": "YES"},
         "backtest": {
             "start_date": "2022-01-01",
@@ -130,6 +132,7 @@ STRATEGY_JOBS = [
         "instrument": "FUTURES",
         "delta_india": True,
         "delta_testnet": True,
+        "delta_leverage": 10,
         "capital": 10000,
         "daily_max_loss": 10000,  # not in engine
         "max_open_positions": 6,  # not in engine

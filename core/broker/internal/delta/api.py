@@ -5,6 +5,14 @@ from typing import Any, Dict, List, Optional
 from core.data.sources.delta_source import DeltaSource
 
 
+def _ensure_list_str(symbols: Any) -> List[str]:
+    if symbols is None:
+        return []
+    if isinstance(symbols, str):
+        return [symbols]
+    return list(symbols)
+
+
 class DeltaBrokerApi:
     """IBrokerApi implementation for Delta Exchange. Uses DeltaSource (wraps DeltaRestClient)."""
 
@@ -76,3 +84,26 @@ class DeltaBrokerApi:
     def batch_edit(self, product_id: int, orders: List[Dict[str, Any]]) -> Any:
         """Edit orders in batch (e.g. update limit_price). Each order: { 'id': order_id, 'limit_price': str }."""
         return self._source.batch_edit(product_id=product_id, orders=orders)
+
+    def set_leverage(self, product_id: int, leverage: int) -> Any:
+        """Set leverage for a Delta product (by product_id)."""
+        return self._source.set_leverage(product_id=product_id, leverage=leverage)
+
+    def set_leverage_for_symbols(self, symbols: List[str], leverage: int) -> Dict[str, Any]:
+        """
+        Set leverage for each symbol in the list. Resolves symbol -> product_id and calls set_leverage.
+        Returns a dict of symbol -> result (or error message) for each.
+        """
+        symbols = _ensure_list_str(symbols)
+        results: Dict[str, Any] = {}
+        for symbol in symbols:
+            pid = self._source.product_id_for_symbol(symbol)
+            if pid is None:
+                results[symbol] = {"ok": False, "message": f"Unknown symbol: {symbol}"}
+                continue
+            try:
+                out = self._source.set_leverage(product_id=int(pid), leverage=leverage)
+                results[symbol] = {"ok": True, "product_id": pid, "response": out}
+            except Exception as e:
+                results[symbol] = {"ok": False, "message": str(e)}
+        return results
