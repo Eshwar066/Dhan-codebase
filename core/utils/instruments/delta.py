@@ -69,6 +69,12 @@ class DeltaInstrumentStore(BaseInstrumentStore):
             self.df = provider.load()
             if cache and not self.df.empty:
                 cache.parent.mkdir(parents=True, exist_ok=True)
+                # Remove previous Delta instrument files so only the new one remains
+                for old in cache.parent.glob("delta_instrument_*.csv"):
+                    try:
+                        old.unlink()
+                    except OSError:
+                        pass
                 self.df.to_csv(cache, index=False)
         self._symbol_to_row = {}
         if not self.df.empty and "symbol" in self.df.columns:
