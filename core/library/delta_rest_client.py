@@ -229,6 +229,11 @@ class DeltaRestClient:
         response = self.request("DELETE", "/v2/orders", order, auth=True)
         return parseResponse(response)
 
+    def cancel_order_with_payload(self, payload):
+        """Cancel order using a pre-built payload (e.g. from cancel_order_format)."""
+        response = self.request("DELETE", "/v2/orders", payload, auth=True)
+        return parseResponse(response)
+
     def place_stop_order(
         self,
         product_id,
@@ -342,18 +347,22 @@ def cancel_order_format(order):
 
 
 def round_by_tick_size(price, tick_size, floor_or_ceil=None):
-    remainder = price % tick_size
+    """Round price to exchange tick size. Uses Decimal to avoid float precision errors."""
+    if tick_size is None or tick_size <= 0:
+        return float(price) if price is not None else None
+    p = Decimal(str(float(price)))
+    ts = Decimal(str(float(tick_size)))
+    remainder = p % ts
     if remainder == 0:
-        price = price
-    if floor_or_ceil == None:
-        floor_or_ceil = "ceil" if (remainder >= tick_size / 2) else "floor"
+        return float(p)
+    if floor_or_ceil is None:
+        floor_or_ceil = "ceil" if (remainder >= ts / 2) else "floor"
     if floor_or_ceil == "ceil":
-        price = price - remainder + tick_size
+        p = p - remainder + ts
     else:
-        price = price - remainder
-    number_of_decimals = len(format(Decimal(repr(float(tick_size))), "f").split(".")[1])
-    price = round(Decimal(price), number_of_decimals)
-    return price
+        p = p - remainder
+    n = len(format(ts, "f").rstrip("0").split(".")[-1]) if "." in format(ts, "f") else 0
+    return float(round(p, n))
 
 
 def generate_signature(secret, message):

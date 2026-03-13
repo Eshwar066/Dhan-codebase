@@ -22,7 +22,9 @@ from core.library.delta_rest_client import (
     DeltaRestClient,
     OrderType,
     TimeInForce,
-    parseResponse,
+    create_order_format,
+    cancel_order_format,
+    round_by_tick_size,
 )
 
 # Delta Exchange base URLs
@@ -117,6 +119,20 @@ class DeltaSource:
         for prod in self._products_cache or []:
             if (prod.get("symbol") or "").upper() == str(symbol).upper():
                 return prod.get("id")
+        return None
+
+    def _get_tick_size_for_product(self, product_id: int) -> Optional[float]:
+        """Return tick_size for product_id from products cache; None if not found."""
+        self.get_products(use_cache=True)
+        for p in (self._products_cache or []):
+            if p.get("id") == product_id:
+                tick = p.get("tick_size")
+                if tick is not None:
+                    try:
+                        return float(tick)
+                    except (TypeError, ValueError):
+                        pass
+                return None
         return None
 
     # -------------------------------------------------------------------------
@@ -467,18 +483,35 @@ class DeltaSource:
         tif = None
         if time_in_force:
             tif = getattr(TimeInForce, time_in_force.upper(), None)
+        # Round limit price to exchange tick size to avoid invalid price precision
+        tick_size = self._get_tick_size_for_product(product_id)
+        effective_limit_price = limit_price
+        if limit_price is not None and tick_size is not None:
+            effective_limit_price = round_by_tick_size(limit_price, tick_size)
         try:
-            result = self._client.place_order(
-                product_id=product_id,
-                size=size,
-                side=side,
-                limit_price=limit_price,
-                time_in_force=tif,
-                order_type=ot,
-                post_only=post_only,
-                client_order_id=client_order_id,
-                reduce_only=reduce_only,
-            )
+            if ot == OrderType.LIMIT and effective_limit_price is not None:
+                # Build exchange order payload via create_order_format, then add extra fields
+                order = create_order_format(
+                    effective_limit_price, size, side, product_id, post_only=post_only
+                )
+                order["reduce_only"] = reduce_only
+                if client_order_id:
+                    order["client_order_id"] = client_order_id
+                if tif is not None:
+                    order["time_in_force"] = tif.value
+                result = self._client.create_order(order)
+            else:
+                result = self._client.place_order(
+                    product_id=product_id,
+                    size=size,
+                    side=side,
+                    limit_price=effective_limit_price,
+                    time_in_force=tif,
+                    order_type=ot,
+                    post_only=post_only,
+                    client_order_id=client_order_id,
+                    reduce_only=reduce_only,
+                )
             oid = result.get("id") or result.get("order_id")
             return {
                 "status": "success",
@@ -530,7 +563,8 @@ class DeltaSource:
             return []
 
     def cancel_order(self, product_id: int, order_id: Any) -> Any:
-        return self._client.cancel_order(product_id=product_id, order_id=order_id)
+        payload = cancel_order_format({"id": order_id, "product_id": product_id})
+        return self._client.cancel_order_with_payload(payload)
 
     def get_live_orders(self, query: Optional[Dict] = None) -> Any:
         return self._client.get_live_orders(query=query)

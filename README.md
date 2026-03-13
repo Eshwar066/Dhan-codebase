@@ -354,6 +354,8 @@ Algo/
   - **live**: `exchange`, `sector`, `rsi` (and any strategy-specific params).
   - **delta_leverage** (Delta only): optional integer (e.g. `10`); set at engine start for `symbols` via Delta API.
 
+**Delta broker – order format and tick size:** The Delta source converts OMS orders to the exchange payload with a standard order formatter and ensures prices respect the exchange tick size. Limit orders use the formatted payload (product_id, limit_price, size, side, order_type, post_only) plus reduce_only/client_order_id/time_in_force; cancel requests use a standard cancel payload (id, product_id). Prices are rounded to the product’s tick size before sending so the exchange does not reject orders for invalid precision.
+
 ### 2. Engine config (`run/engine_config.py`)
 
 - **EngineConfig**: full config for one engine (used by EngineFactory). Includes `run_mode`, `delta_leverage` (Delta only; set at engine start for symbols).
