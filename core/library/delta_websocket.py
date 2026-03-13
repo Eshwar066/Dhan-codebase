@@ -75,6 +75,7 @@ class DeltaWebSocket:
         on_error: Optional[Callable[[Exception], None]] = None,
         on_close: Optional[Callable[[int, str], None]] = None,
         on_tick: Optional[Callable[[str, float, float, float], None]] = None,
+        on_feed_stall: Optional[Callable[[float], None]] = None,
     ):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -87,6 +88,7 @@ class DeltaWebSocket:
         self.on_subscriptions = on_subscriptions
         self.on_error_cb = on_error
         self.on_close_cb = on_close
+        self.on_feed_stall = on_feed_stall
 
         self._ws: Optional[websocket.WebSocketApp] = None
         self._thread: Optional[threading.Thread] = None
@@ -142,10 +144,16 @@ class DeltaWebSocket:
                 ):
                     if not self._feed_stall_warned:
                         self._feed_stall_warned = True
+                        stall_sec = time.time() - self._last_tick_time
                         logger.warning(
                             "[WARNING] No ticks received for %.0f seconds!",
-                            time.time() - self._last_tick_time,
+                            stall_sec,
                         )
+                        if self.on_feed_stall:
+                            try:
+                                self.on_feed_stall(stall_sec)
+                            except Exception:
+                                pass
             self._heartbeat_timer = threading.Timer(15, check)
             self._heartbeat_timer.daemon = True
             self._heartbeat_timer.start()

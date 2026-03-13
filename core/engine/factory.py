@@ -288,6 +288,8 @@ class EngineFactory:
                     testnet=config.delta_testnet,
                     india=config.delta_india,
                     subscribe_private=True,
+                    engine_logger=engine_logger,
+                    telegram_alert=telegram_alert,
                 )
                 if getattr(strategy, "timeframe", None):
                     tick_queue = queue.Queue(maxsize=50000)

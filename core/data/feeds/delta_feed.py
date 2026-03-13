@@ -44,6 +44,8 @@ class DeltaWebSocketFeed(RealtimeFeed):
         testnet: bool = True,
         india: bool = True,
         subscribe_private: bool = True,
+        engine_logger: Optional[Any] = None,
+        telegram_alert: Optional[Any] = None,
     ):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -52,6 +54,8 @@ class DeltaWebSocketFeed(RealtimeFeed):
         self.testnet = testnet
         self.india = india
         self.subscribe_private = subscribe_private
+        self._engine_logger = engine_logger
+        self._telegram_alert = telegram_alert
 
         self._ws: Optional[DeltaWebSocket] = None
         self._auth_done = False
@@ -86,6 +90,17 @@ class DeltaWebSocketFeed(RealtimeFeed):
         if self._ws:
             return
         on_tick = self._push_tick if self._tick_queue else None
+
+        def _on_feed_stall(stall_sec: float) -> None:
+            msg = f"Delta feed stall: no ticks received for {stall_sec:.0f}s"
+            if self._engine_logger:
+                self._engine_logger.feed_health_warning(message=msg)
+            if self._telegram_alert:
+                try:
+                    self._telegram_alert(f"⚠️ {msg}")
+                except Exception:
+                    pass
+
         self._ws = DeltaWebSocket(
             api_key=self.api_key,
             api_secret=self.api_secret,
@@ -93,6 +108,7 @@ class DeltaWebSocketFeed(RealtimeFeed):
             india=self.india,
             on_auth=self._on_auth,
             on_tick=on_tick,
+            on_feed_stall=_on_feed_stall if (self._engine_logger or self._telegram_alert) else None,
         )
         self._ws.connect()
         # Subscribe to public channels after socket is ready; private after auth success.
