@@ -182,6 +182,7 @@ class DeltaRestClient:
         response = self.request(
             "GET", "/v2/wallet/balances", auth=True
         )  # query={'asset_id': asset_id}, auth=True)
+        # pdb.set_trace()
         wallets = parseResponse(response)
         wallets = list(filter(lambda w: w["asset_id"] == asset_id, wallets))
         return wallets[0] if len(wallets) > 0 else None

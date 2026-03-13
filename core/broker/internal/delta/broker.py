@@ -55,12 +55,91 @@ def _intent_to_delta_payload(intent, execution_price=None):
     }
 
 
+def _delta_required_notional(intent, execution_price=None):
+    """Estimate required margin as notional (qty * price) for funds check."""
+    if hasattr(intent, "instrument"):
+        inst = intent.instrument
+        qty = int(getattr(intent, "qty", getattr(inst, "lot_size", 1)))
+        lot = int(getattr(inst, "lot_size", 1))
+        price = execution_price if execution_price is not None else (intent.price or 0)
+        mult = getattr(inst, "contract_multiplier", 1)
+        return abs(qty) * lot * price * mult
+    return (
+        int(intent.get("qty", 1))
+        * int(intent.get("lot_size", 1))
+        * float(execution_price or intent.get("price") or 0)
+    )
+
+
 class DeltaBroker(BaseBroker):
     """Order placement via Delta Exchange. Uses DeltaBrokerApi (DeltaSource / delta_rest_client)."""
 
     def __init__(self, api, position_manager=None, intent_store=None):
         super().__init__(position_manager=position_manager, intent_store=intent_store)
         self.api = api
+
+    def check_funds_before_order(
+        self,
+        intent: Any,
+        execution_price: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Check available wallet balance vs required notional before placing order.
+        Delta does not expose SPAN; uses wallet balance as proxy.
+        """
+        pdb.set_trace()
+        try:
+            required = _delta_required_notional(intent, execution_price)
+        except Exception:
+            return None
+
+        source = getattr(self.api, "_source", None)
+        if source is None or not getattr(source, "get_balances", None):
+            return None
+
+        try:
+            # Prefer USD wallet (asset_id = 3)
+            wallet = source.get_balances(3)
+
+            # If USD wallet unavailable, fallback to INR wallet (asset_id = 17)
+            if not wallet:
+                wallet = source.get_balances(17)
+
+            if not isinstance(wallet, dict):
+                return None
+
+            available = float(
+                wallet.get("available_balance")
+                or wallet.get("availableBalance")
+                or wallet.get("balance")
+                or wallet.get("withdrawable_balance")
+                or 0
+            )
+
+            if available < required:
+                shortfall = required - available
+                return {
+                    "ok": False,
+                    "available": available,
+                    "required_margin": required,
+                    "span_margin": None,
+                    "shortfall": shortfall,
+                    "message": (
+                        f"Available={available:.2f}, required={required:.2f}; shortfall={shortfall:.2f}"
+                    ),
+                }
+
+            return {
+                "ok": True,
+                "available": available,
+                "required_margin": required,
+                "span_margin": None,
+                "shortfall": 0,
+                "message": "",
+            }
+
+        except Exception:
+            return None
 
     def place_order(
         self,
@@ -147,7 +226,8 @@ class DeltaBroker(BaseBroker):
                 "order_id": str(o.get("id", o.get("order_id", ""))),
                 "tag": tag,
                 "product_id": o.get("product_id"),
-                "symbol": o.get("product_symbol") or (o.get("product") or {}).get("symbol"),
+                "symbol": o.get("product_symbol")
+                or (o.get("product") or {}).get("symbol"),
                 "status": state,
                 "side": (o.get("side") or "").lower(),
                 "qty": size,
@@ -155,8 +235,12 @@ class DeltaBroker(BaseBroker):
                 "filled_size": filled,
                 "size": size,
                 "unfilled_size": unfilled,
-                "average_fill_price": float(o.get("average_fill_price") or o.get("limit_price") or 0),
-                "price": float(o.get("limit_price") or o.get("average_fill_price") or 0),
+                "average_fill_price": float(
+                    o.get("average_fill_price") or o.get("limit_price") or 0
+                ),
+                "price": float(
+                    o.get("limit_price") or o.get("average_fill_price") or 0
+                ),
                 "reduce_only": o.get("reduce_only"),
             }
         # 2) Try fills (uses fills(); page_size=50) to get fill price/size
@@ -195,8 +279,10 @@ class DeltaBroker(BaseBroker):
         except Exception:
             return None
         matching = [
-            f for f in (fills or [])
-            if (f.get("client_order_id") or f.get("order_id") or f.get("tag")) == client_order_id
+            f
+            for f in (fills or [])
+            if (f.get("client_order_id") or f.get("order_id") or f.get("tag"))
+            == client_order_id
             or str(f.get("client_order_id") or "") == client_order_id
         ]
         if not matching:
@@ -209,10 +295,9 @@ class DeltaBroker(BaseBroker):
             for f in matching
         )
         avg_price = total_value / total_size if total_size else 0
-        product_symbol = (
-            matching[0].get("product_symbol")
-            or (matching[0].get("product") or {}).get("symbol")
-        )
+        product_symbol = matching[0].get("product_symbol") or (
+            matching[0].get("product") or {}
+        ).get("symbol")
         return {
             "order_id": str(matching[0].get("order_id", matching[0].get("id", ""))),
             "tag": client_order_id,
@@ -240,7 +325,8 @@ class DeltaBroker(BaseBroker):
             return None
         bid_str = str(broker_order_id)
         matching = [
-            f for f in (fills or [])
+            f
+            for f in (fills or [])
             if str(f.get("order_id") or f.get("id") or "") == bid_str
         ]
         if not matching:

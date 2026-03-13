@@ -83,6 +83,93 @@ class DhanBroker(BaseBroker):
             "intent_id": intent.get("intent_id"),
         }
 
+    def check_funds_before_order(
+        self,
+        intent: Any,
+        execution_price: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Check available balance and required/SPAN margin before placing order.
+        Uses Dhan get_balance() and margin_calculator(); on shortage returns ok=False
+        with shortfall and message for logging and Telegram.
+        """
+        try:
+            payload = self._build_payload(intent, execution_price)
+        except Exception:
+            return None
+        source = getattr(self.api, "_source", None)
+        if source is None:
+            return None
+        try:
+            available = float(getattr(source, "get_balance", lambda: 0)())
+        except Exception:
+            return None
+        tsl = getattr(source, "tsl", None)
+        required_margin = None
+        span_margin = None
+        if tsl and getattr(tsl, "margin_calculator", None):
+            try:
+                oc = tsl.margin_calculator(
+                    tradingsymbol=payload["tradingsymbol"],
+                    exchange=payload["exchange"],
+                    transaction_type=payload["transaction_type"],
+                    quantity=payload["quantity"],
+                    trade_type=payload["trade_type"],
+                    price=payload["price"],
+                    trigger_price=payload["trigger_price"],
+                )
+                if isinstance(oc, dict):
+                    required_margin = float(oc.get("totalMargin") or oc.get("total_margin") or 0)
+                    span_margin = float(oc.get("spanMargin") or oc.get("span_margin") or 0)
+                    # API can return availableBalance from margin response
+                    if "availableBalance" in oc or "available_balance" in oc:
+                        available = float(oc.get("availableBalance") or oc.get("available_balance") or available)
+                    insufficient = float(oc.get("insufficientBalance") or oc.get("insufficient_balance") or 0)
+                    if insufficient > 0:
+                        return {
+                            "ok": False,
+                            "available": available,
+                            "required_margin": required_margin,
+                            "span_margin": span_margin if span_margin else None,
+                            "shortfall": insufficient,
+                            "message": (
+                                f"Available={available:.2f}, required_margin={required_margin:.2f}, "
+                                f"SPAN={span_margin:.2f}; shortfall={insufficient:.2f}"
+                            ),
+                        }
+                    return {
+                        "ok": True,
+                        "available": available,
+                        "required_margin": required_margin,
+                        "span_margin": span_margin if span_margin else None,
+                        "shortfall": 0,
+                        "message": "",
+                    }
+            except Exception:
+                pass
+        if required_margin is None:
+            required_margin = payload["price"] * payload["quantity"]
+        if available < required_margin:
+            shortfall = required_margin - available
+            return {
+                "ok": False,
+                "available": available,
+                "required_margin": required_margin,
+                "span_margin": span_margin,
+                "shortfall": shortfall,
+                "message": (
+                    f"Available={available:.2f}, required={required_margin:.2f}; shortfall={shortfall:.2f}"
+                ),
+            }
+        return {
+            "ok": True,
+            "available": available,
+            "required_margin": required_margin,
+            "span_margin": span_margin,
+            "shortfall": 0,
+            "message": "",
+        }
+
     def place_order(self, intent, execution_price=None, retries=2):
         order_payload = self._build_payload(intent, execution_price)
         intent_id = order_payload["intent_id"]
