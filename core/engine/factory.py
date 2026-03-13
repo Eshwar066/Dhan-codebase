@@ -182,6 +182,7 @@ class EngineFactory:
             max_open_positions=getattr(config, "max_open_positions", None) or 20,
             max_portfolio_exposure=getattr(config, "max_portfolio_exposure", None)
             or 10000000,
+            cooldown_seconds=getattr(config, "cooldown_seconds", None) or 5,
             engine_logger=engine_logger,
         )
 
@@ -230,10 +231,11 @@ class EngineFactory:
             strategy_id=config.strategy_name,
             telegram_alert=telegram_alert,
         )
-        # Option shorting: validate SPAN + exposure margin when broker supports it
-        _margin_check = make_short_option_margin_check(broker)
-        if _margin_check is not None:
-            order_router.risk.check_short_option_margin = _margin_check
+        # Option shorting: validate SPAN + exposure margin when broker supports it (unless disabled in config)
+        if getattr(config, "check_short_option_margin_enabled", True) is not False:
+            _margin_check = make_short_option_margin_check(broker)
+            if _margin_check is not None:
+                order_router.risk.check_short_option_margin = _margin_check
         broker.set_order_router(order_router)
 
         # ---------- Universe (DHAN equity strategies only) ----------

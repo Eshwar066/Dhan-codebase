@@ -45,6 +45,10 @@ class EngineConfig:
     daily_max_loss: Optional[float] = None
     max_open_positions: Optional[int] = None
     max_portfolio_exposure: Optional[float] = None
+    cooldown_seconds: Optional[int] = None
+
+    # Option shorting: if False, do not use broker's check_short_option_margin (e.g. futures-only).
+    check_short_option_margin_enabled: Optional[bool] = None
 
     # Feed health: warn/pause when no data for this many seconds (live only).
     feed_stale_seconds: Optional[float] = None

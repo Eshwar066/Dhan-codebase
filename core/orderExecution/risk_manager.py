@@ -10,7 +10,9 @@ import time
 from typing import Any, Callable, Dict, Optional
 
 
-def make_short_option_margin_check(broker: Any) -> Optional[Callable[[Any, Dict], bool]]:
+def make_short_option_margin_check(
+    broker: Any,
+) -> Optional[Callable[[Any, Dict], bool]]:
     """
     Return a callable (intent, price_map) -> bool for SPAN + exposure margin validation,
     or None if broker does not support it. Brokers (e.g. Dhan) can implement
@@ -139,7 +141,10 @@ class RiskManager:
                 return False
 
         # 1️⃣ Daily loss limit
-        if self.daily_max_loss is not None and self.daily_realized_pnl <= -self.daily_max_loss:
+        if (
+            self.daily_max_loss is not None
+            and self.daily_realized_pnl <= -self.daily_max_loss
+        ):
             self._log_block("Daily max loss reached")
             return False
 
@@ -153,11 +158,13 @@ class RiskManager:
         open_count = self._open_positions_count()
         if open_count >= self.max_open_positions:
             if self.engine_logger:
-                self.engine_logger.max_positions_blocked(current_count=open_count, max_allowed=self.max_open_positions)
+                self.engine_logger.max_positions_blocked(
+                    current_count=open_count, max_allowed=self.max_open_positions
+                )
             self._log_block("Max open positions reached")
             return False
 
-        # 4️⃣ Per-symbol qty limit ==> tested ✅          
+        # 4️⃣ Per-symbol qty limit ==> tested ✅
         future_qty = abs(self.pm.get_qty(symbol)) + qty
         if future_qty > self.max_qty_per_symbol:
             self._log_block("Qty limit breach", symbol=symbol)
@@ -201,14 +208,18 @@ class RiskManager:
             self._log_block(f"Symbol exposure breach {sym_exposure}", symbol=symbol)
             return False
 
-        # 8️⃣ Portfolio exposure check
+        # 8️⃣ 🔶🔶 Portfolio exposure check ==> checked when there are open positions in singal or multiple strategies
         portfolio_exposure = self.pm.total_exposure(price_map)
         new_exposure = portfolio_exposure + (qty * price * multiplier)
         if new_exposure > self.max_portfolio_exposure:
             self._log_block("Portfolio exposure breach")
             return False
 
-        key = (getattr(intent, "strategy", None), getattr(intent, "structure_id", None), intent.instrument.contract_key)
+        key = (
+            getattr(intent, "strategy", None),
+            getattr(intent, "structure_id", None),
+            intent.instrument.contract_key,
+        )
         self.last_trade_time[key] = now_ts
         return True
 

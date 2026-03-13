@@ -103,6 +103,9 @@ STRATEGY_JOBS = [
         "daily_max_loss": 100,
         "max_open_positions": 1,
         "max_portfolio_exposure": 5000,
+        "cooldown_seconds": 5,
+        "risk_per_trade_percent": 0.5,
+        "check_short_option_margin_enabled": False,
         "feed_stale_seconds": 30,
         "order_state_check_interval_min": 1,
         "memory_threshold_percent": 5,
@@ -123,14 +126,17 @@ STRATEGY_JOBS = [
         "venue": "DELTA",
         "enabled": True,
         "engine_id": "delta_test_pipeline",
-        "capital": 10000,
         "symbols": ["BTCUSD"],
         "instrument": "FUTURES",
         "delta_india": True,
         "delta_testnet": True,
+        "capital": 10000,
         "daily_max_loss": 10000,  # not in engine
         "max_open_positions": 6,  # not in engine
-        "max_portfolio_exposure": 50000,  # In Engine (RiskManager)
+        "max_portfolio_exposure": 1000,  # In Engine (RiskManager)
+        "cooldown_seconds": 5,
+        "risk_per_trade_percent": 1.0,
+        "check_short_option_margin_enabled": False,  # futures-only; no option margin check
         "feed_stale_seconds": 30,  # In Engine
         "order_state_check_interval_min": 1,  # In engine
         "memory_threshold_percent": 5,  # In engine
