@@ -7,6 +7,7 @@ symbol-level failure isolation, strategy timeout, latency alert levels, candle i
 
 import csv
 import dataclasses
+import logging
 import os
 import signal
 import time
@@ -15,6 +16,9 @@ import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple
 import pdb
 
+logger = logging.getLogger(__name__)
+
+from run.config import RunMode
 from core.engine.base_engine import BaseEngine
 from core.engine.live_engine_common import (
     DEFAULT_FEED_STALE_SECONDS,
@@ -60,6 +64,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         tick_queue: Optional[Any] = None,
         candle_aggregator: Optional[Any] = None,
         universe_service: Optional[Any] = None,
+        run_mode: Optional[RunMode] = None,
     ):
         super().__init__(
             strategy,
@@ -72,7 +77,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self.candle_service = candle_service
         self.order_router = order_router
         self.position_manager = position_manager
-        self.position_manager.on_structure_exit = getattr(strategy, "on_structure_exit", None)
+        self.position_manager.on_structure_exit = getattr(
+            strategy, "on_structure_exit", None
+        )
         self.realtime_feed = realtime_feed
         self.tick_queue = tick_queue
         self.candle_aggregator = candle_aggregator
@@ -95,6 +102,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         # Stale exit order refresh: re-quote at near bid/ask every 1 min until fill
         self._exit_refresh_interval_seconds = 60
         self._last_exit_refresh_time: float = 0
+        self.run_mode = run_mode
         # Memory guard
         self.memory_threshold_percent = memory_threshold_percent
         self._entries_paused_memory = False
@@ -128,7 +136,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
 
     def build_context(self, candle, recent_candles=None):
         intent_store = getattr(self.order_router, "intent_store", None)
-        return super().build_context(candle, recent_candles=recent_candles, intent_store=intent_store)
+        return super().build_context(
+            candle, recent_candles=recent_candles, intent_store=intent_store
+        )
 
     def _graceful_shutdown_handler(self, signum: int, frame: Any) -> None:
         """Per-engine: set flag so main loop exits; snapshot and flush in loop or on exit."""
@@ -211,6 +221,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         return True
 
     def _do_order_state_check(self) -> None:
+        # PAPER: skip broker order comparison (SimulatedBroker has no real orders; avoids false mismatches).
+        # LIVE: fetch broker orders, compare with OMS, resolve mismatches.
+        if self.run_mode == RunMode.PAPER:
+            return
         if self.order_state_check_interval_min <= 0:
             return
         now = time.time()
@@ -243,8 +257,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     )
             else:
                 self._entries_paused_memory = False
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Memory check failed: %s", e)
 
     def check_feed_health(self) -> None:
         """Warn if no tick/candle received for feed_stale_seconds; optionally pause entries."""
@@ -333,20 +347,22 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     self._last_tick_timestamp[s] = time.time()
                     self._tick_debug_count += 1
                     now = time.time()
-                    if now - self._tick_debug_last_log >= 5:
-                        print(
-                            f"[TICK HEALTH] {self._tick_debug_count} ticks in last 5s"
-                        )
+                    if now - self._tick_debug_last_log >= 600:
+                        msg = f"Tick health: {self._tick_debug_count} ticks in last 5s"
+                        if self.engine_logger:
+                            self.engine_logger.log("tick_health", msg)
+                        else:
+                            logger.info(msg)
                         self._tick_debug_count = 0
                         self._tick_debug_last_log = now
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Invalid tick or aggregator error: %s", e)
 
     def start(self, exchange, sector, rsi):
         if self.engine_logger:
             self.engine_logger.engine_start("Live engine started")
         else:
-            print("Live engine started")
+            logger.info("Live engine started")
 
         try:
             signal.signal(signal.SIGINT, self._graceful_shutdown_handler)
@@ -367,6 +383,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         risk_manager = getattr(self.order_router, "risk", None)
         loop_count = 0
         while not self._shutdown_requested:
+            # pdb.set_trace()
             loop_count += 1
             _now = dt.datetime.utcnow()
             if risk_manager and risk_manager.is_engine_blocked():
@@ -410,6 +427,11 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         if candle and candle.get(
                             "bucket_ts"
                         ) == self._last_evaluated_candle_ts.get(symbol):
+                            logger.debug(
+                                "Skip %s: same candle bucket_ts=%s (waiting for new bar)",
+                                symbol,
+                                candle.get("bucket_ts"),
+                            )
                             continue
                     if candle is None and use_feed and not use_aggregator:
                         candle = self.realtime_feed.get_last_candle(symbol, tf)
@@ -665,7 +687,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             if intent is not None and not isinstance(intent, list)
             else (intent or [])
         )
-
+        # pdb.set_trace()
         for single_intent in entry_intents:
             self._log_and_telegram_signal(
                 single_intent,

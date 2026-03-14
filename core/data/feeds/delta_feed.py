@@ -5,10 +5,13 @@ Subscribes to v2/ticker and candlestick_* for symbols, optional private channels
 Used by LiveEngine when BROKER_NAME == "DELTA" for real-time data.
 """
 
+import logging
 from typing import Any, Dict, List, Optional
 import pdb
 
 from core.data.feeds.base_feed import RealtimeFeed
+
+logger = logging.getLogger(__name__)
 from core.library.delta_websocket import DeltaWebSocket
 
 # Map strategy timeframe to Delta candlestick channel name
@@ -79,8 +82,8 @@ class DeltaWebSocketFeed(RealtimeFeed):
                     "timestamp": timestamp_sec,
                 }
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Delta feed: tick queue put failed: %s", e)
 
     def _channel_candlestick(self) -> str:
         res = RESOLUTION_MAP.get(self.timeframe, "1h")
@@ -98,8 +101,8 @@ class DeltaWebSocketFeed(RealtimeFeed):
             if self._telegram_alert:
                 try:
                     self._telegram_alert(f"⚠️ {msg}")
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Delta feed: telegram stall alert failed: %s", e)
 
         self._ws = DeltaWebSocket(
             api_key=self.api_key,

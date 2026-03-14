@@ -3,9 +3,12 @@ Send alerts via Telegram bot. Used by Delta (and optionally Dhan) for order plac
 errors, and slippage notifications. Logic mirrors dhan_tradehull.send_telegram_alert.
 """
 
+import logging
 import urllib.parse
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 def send_telegram_alert(message: str, receiver_chat_id: str, bot_token: str) -> None:
@@ -26,4 +29,4 @@ def send_telegram_alert(message: str, receiver_chat_id: str, bot_token: str) -> 
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
         # Log but do not raise; alert failure must not break trading
-        print(f"Telegram alert failed: {e}")
+        logger.warning("Telegram alert failed: %s", e)

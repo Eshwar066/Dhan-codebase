@@ -1,3 +1,4 @@
+import logging
 import threading
 import time
 from collections import defaultdict
@@ -6,6 +7,8 @@ from datetime import datetime
 import uuid
 import pdb
 from core.utils.instruments.instrument_store import Instrument
+
+logger = logging.getLogger(__name__)
 
 # use
 # How to Run Auto-Reconciliation
@@ -385,6 +388,13 @@ class PositionManager:
                     local.last_updated = time.time()
                 if abs(local.net_qty - int(bp["qty"])) > drift_threshold:
                     self.trading_paused = True
+                    logger.warning(
+                        "Position drift above threshold: %s local_qty=%s broker_qty=%s threshold=%s",
+                        sym,
+                        local.net_qty,
+                        bp.get("qty"),
+                        drift_threshold,
+                    )
 
             for sym in local_symbols - broker_symbols:
                 self.positions.pop(sym, None)

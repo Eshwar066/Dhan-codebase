@@ -3,9 +3,12 @@ Delta Exchange source: market data and order/position APIs via delta_rest_client
 Used by DeltaDataProvider (data layer) and DeltaBrokerApi (broker layer).
 """
 
+import logging
 import os
 from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 import requests
 import pandas as pd
 from datetime import datetime, date, timedelta
@@ -59,7 +62,7 @@ class DeltaSource:
                     DELTA_BASE_URL_INDIA_PROD if india else DELTA_BASE_URL_GLOBAL_PROD
                 )
 
-        print(base_url, "baseurl")
+        logger.info("Delta base_url: %s", base_url)
         self._client = DeltaRestClient(
             base_url=base_url,
             api_key=api_key,
@@ -247,7 +250,7 @@ class DeltaSource:
             )
             return df
         except Exception as e:
-            print(f"Delta _fetch_intraday_range error: {e}")
+            logger.warning("Delta _fetch_intraday_range error: %s", e, exc_info=True)
             return None
 
     def get_intraday(
@@ -518,6 +521,7 @@ class DeltaSource:
                 "order_id": str(oid) if oid is not None else None,
             }
         except Exception as e:
+            logger.warning("Delta place_order failed: %s", e, exc_info=True)
             return {"status": "error", "order_id": None, "message": str(e)}
 
     def get_order_list(self) -> List[Dict[str, Any]]:
@@ -559,7 +563,7 @@ class DeltaSource:
             return normalized
 
         except Exception as e:
-            self.engine_logger.error(f"get_order_list failed: {e}")
+            logger.warning("Delta get_order_list failed: %s", e, exc_info=True)
             return []
 
     def cancel_order(self, product_id: int, order_id: Any) -> Any:

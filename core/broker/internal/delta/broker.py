@@ -1,11 +1,14 @@
 """Delta Exchange broker: order placement via DeltaBrokerApi (delta_rest_client)."""
 
+import logging
 import time
 import uuid
 from typing import Any, Dict, List, Optional
 import pdb
 
 from core.broker.base import BaseBroker
+
+logger = logging.getLogger(__name__)
 
 
 def _intent_to_delta_payload(intent, execution_price=None):
@@ -90,7 +93,8 @@ class DeltaBroker(BaseBroker):
         # pdb.set_trace()
         try:
             required = _delta_required_notional(intent, execution_price)
-        except Exception:
+        except Exception as e:
+            logger.warning("Delta funds check: failed to compute required notional: %s", e)
             return None
 
         source = getattr(self.api, "_source", None)
@@ -138,7 +142,8 @@ class DeltaBroker(BaseBroker):
                 "message": "",
             }
 
-        except Exception:
+        except Exception as e:
+            logger.warning("Delta funds check: balance fetch failed: %s", e)
             return None
 
     def place_order(
@@ -166,9 +171,11 @@ class DeltaBroker(BaseBroker):
                     if self.intent_store and payload.get("tag"):
                         self.intent_store.update(payload["tag"], "SENT")
                     return result.get("order_id")
+                logger.warning("Delta place_order returned error: %s", result)
                 return None
             except Exception as e:
                 if attempt == retries:
+                    logger.warning("Delta place_order exception (final attempt): %s", e, exc_info=True)
                     raise
                 time.sleep(0.3)
         return None
@@ -209,7 +216,8 @@ class DeltaBroker(BaseBroker):
         # 1) Try order history (uses order_history; page_size=50)
         try:
             history = self.api.get_orders_history(page_size=50)
-        except Exception:
+        except Exception as e:
+            logger.debug("Delta get_orders_history failed: %s", e)
             history = []
         for o in history or []:
             tag = o.get("client_order_id") or o.get("tag")
@@ -276,7 +284,8 @@ class DeltaBroker(BaseBroker):
             return None
         try:
             fills = self.api.get_fills(page_size=page_size)
-        except Exception:
+        except Exception as e:
+            logger.debug("Delta get_fills failed for client_order_id=%s: %s", client_order_id, e)
             return None
         matching = [
             f
@@ -321,7 +330,8 @@ class DeltaBroker(BaseBroker):
             return None
         try:
             fills = self.api.get_fills(page_size=page_size)
-        except Exception:
+        except Exception as e:
+            logger.debug("Delta get_fills failed for order_id=%s: %s", broker_order_id, e)
             return None
         bid_str = str(broker_order_id)
         matching = [

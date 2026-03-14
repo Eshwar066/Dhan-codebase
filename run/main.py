@@ -13,12 +13,15 @@ Optional: use Supervisor in code to run both venues in one process (two threads)
 """
 
 import argparse
+import logging
 import os
 import sys
 from pathlib import Path
 import pdb
 
 from run.config import RUN_MODE, RunMode, STRATEGY_JOBS, DEFAULT_VENUE
+
+logger = logging.getLogger(__name__)
 from run.engine_config import EngineConfig
 from core.engine.factory import EngineFactory
 
@@ -121,6 +124,7 @@ def main():
     if args.venue:
         configs = [c for c in configs if c.broker_name == args.venue]
         if not configs:
+            logger.warning("No enabled jobs for venue %s", args.venue)
             print(f"No enabled jobs for venue {args.venue}")
             sys.exit(0)
 

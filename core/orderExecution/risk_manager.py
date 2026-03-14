@@ -6,8 +6,11 @@ SPAN and exposure margin before allowing short option entries. Wire via
 make_short_option_margin_check(broker) when broker implements check_short_option_margin.
 """
 
+import logging
 import time
 from typing import Any, Callable, Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def make_short_option_margin_check(
@@ -85,7 +88,7 @@ class RiskManager:
         if self.engine_logger:
             self.engine_logger.kill_switch(reason)
         else:
-            print(f"CRITICAL Kill switch: {reason}")
+            logger.critical("Kill switch: %s", reason)
 
     def record_realized_pnl(self, amount: float) -> None:
         """Call when a position is closed and PnL is realized (e.g. from PositionManager)."""
@@ -99,7 +102,7 @@ class RiskManager:
         if self.engine_logger:
             self.engine_logger.risk_block(msg, symbol=symbol)
         else:
-            print(msg)
+            logger.warning("Risk block: %s (symbol=%s)", msg, symbol)
 
     # -------------------------
     # MAIN CHECK

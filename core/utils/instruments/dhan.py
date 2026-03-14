@@ -3,10 +3,13 @@ Dhan broker: instrument loading (CSV) and lookup logic.
 SEM_* schema, NSE/NFO/BSE exchange mapping, backtest dummy rows.
 """
 
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 from run.config import RUN_MODE, RunMode
 
 from .base import BaseInstrumentStore, Instrument
@@ -123,7 +126,7 @@ class DhanInstrumentStore(BaseInstrumentStore):
             df = self.df[eq_mask & no_expiry]
         if df.empty:
             if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
-                print(f"❌ No equity instrument found for {trading_symbol} on {exchange}")
+                logger.warning("No equity instrument found for %s on %s", trading_symbol, exchange)
             return None
         row = df.iloc[0]
         return self.map_row_to_instrument(row)
@@ -142,7 +145,7 @@ class DhanInstrumentStore(BaseInstrumentStore):
                 & (self.df["SEM_EXM_EXCH_ID"] == ex)
             ]
             if df.empty:
-                print(f"❌ No instrument found for {trading_symbol} on {exchange}")
+                logger.warning("No instrument found for %s on %s", trading_symbol, exchange)
                 return None
             return self.map_row_to_instrument(df.iloc[0])
 
@@ -262,7 +265,7 @@ class DhanInstrumentStore(BaseInstrumentStore):
                 & (self.df["SEM_EXM_EXCH_ID"] == ex)
             ]
             if df.empty:
-                print(f"❌ No FUT instrument found for {trading_symbol} on {exchange}")
+                logger.warning("No FUT instrument found for %s on %s", trading_symbol, exchange)
                 return None
             return self.map_row_to_instrument(df.iloc[0])
 

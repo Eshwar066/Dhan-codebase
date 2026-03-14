@@ -10,6 +10,7 @@ Usage:
     # then engine.run(...) or engine.start(...)
 """
 
+import logging
 import os
 import queue
 from datetime import datetime
@@ -18,6 +19,8 @@ from typing import Union
 import pdb
 
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 from run.config import RunMode
 from run.engine_config import EngineConfig
@@ -277,7 +280,8 @@ class EngineFactory:
         if config.broker_name == "DELTA":
             try:
                 api_key, api_secret = get_delta_credentials(config.delta_testnet)
-            except ValueError:
+            except ValueError as e:
+                logger.warning("Delta credentials missing or invalid: %s", e)
                 api_key, api_secret = None, None
             if api_key and api_secret:
                 timeframe = config.backtest.get("timeframe", "60")
@@ -297,9 +301,13 @@ class EngineFactory:
                     candle_aggregator = CandleAggregator()
                     realtime_feed.set_tick_queue(tick_queue)
                 realtime_feed.start()
+            elif not api_key or not api_secret:
+                logger.warning("Delta realtime feed skipped: missing API credentials")
         elif config.broker_name == "DHAN":
             access_token = os.getenv("DHAN_ACCESS_TOKEN")
             client_id = os.getenv("DHAN_CLIENT_CODE")
+            if not access_token or not client_id:
+                logger.warning("Dhan realtime feed skipped: DHAN_ACCESS_TOKEN or DHAN_CLIENT_CODE not set")
             if (
                 access_token
                 and client_id
@@ -307,6 +315,8 @@ class EngineFactory:
             ):
                 symbols_list = config.symbols or []
                 instruments = instrument_store.get_feed_instruments(symbols_list)
+                if not instruments:
+                    logger.warning("Dhan realtime feed skipped: get_feed_instruments returned empty for %s", symbols_list)
                 if instruments:
                     realtime_feed = DhanWebSocketFeed(
                         access_token=access_token,
@@ -344,6 +354,7 @@ class EngineFactory:
             latency_critical_cycles=getattr(config, "latency_critical_cycles", 3),
             symbol_error_threshold=getattr(config, "symbol_error_threshold", 5),
             universe_service=universe_service,
+            run_mode=config.run_mode,
         )
 
     @staticmethod

@@ -82,7 +82,7 @@ class DeltaWebSocket:
         self.on_tick = on_tick
 
         self.ws_url = DELTA_WS_INDIA_TEST if testnet else DELTA_WS_INDIA_PROD
-        print("ws url", self.ws_url)
+        logger.info("Delta WebSocket URL: %s", self.ws_url)
         self.on_message = on_message
         self.on_auth = on_auth
         self.on_subscriptions = on_subscriptions
@@ -152,8 +152,8 @@ class DeltaWebSocket:
                         if self.on_feed_stall:
                             try:
                                 self.on_feed_stall(stall_sec)
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.debug("Delta WS feed_stall callback error: %s", e)
             self._heartbeat_timer = threading.Timer(15, check)
             self._heartbeat_timer.daemon = True
             self._heartbeat_timer.start()
@@ -248,8 +248,8 @@ class DeltaWebSocket:
                         elif not isinstance(ts, (int, float)):
                             ts = time.time()
                         self.on_tick(sym, price, vol, float(ts))
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Delta WS on_tick callback error: %s", e)
             if self.on_message:
                 self.on_message(msg)
             return
@@ -455,8 +455,8 @@ class DeltaWebSocket:
         if self._ws:
             try:
                 self._ws.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Delta WS close during reconnect: %s", e)
             self._ws = None
         logger.debug("Delta WebSocket: reconnecting in 2s...")
         time.sleep(2)
@@ -484,8 +484,8 @@ class DeltaWebSocket:
         if self._ws:
             try:
                 self._ws.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Delta WS close during disconnect: %s", e)
             self._ws = None
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)

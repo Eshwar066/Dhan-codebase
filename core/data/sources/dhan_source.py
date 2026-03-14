@@ -5,9 +5,12 @@ go through this source; the data layer (DhanDataProvider) and broker layer
 (DhanBrokerApi) wrap it for engines and order management.
 """
 
+import logging
 import os
 import sys
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
@@ -730,7 +733,7 @@ class DhanSource:
                 return {"status": "success", "order_id": result}
             return {"status": "error", "order_id": None}
         except Exception as e:
-            print(f"place_order exception: {e}")
+            logger.warning("Dhan place_order exception: %s", e, exc_info=True)
             return {"status": "error", "order_id": None}
 
     def cancel_order(self, order_id):

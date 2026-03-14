@@ -3,12 +3,15 @@ Delta Exchange broker: instrument loading (API) and lookup logic.
 Product id / symbol, Delta API schema, backtest dummy rows.
 """
 
+import logging
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
 import pdb
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 import requests
 from run.config import RUN_MODE, RunMode
 
@@ -143,7 +146,7 @@ class DeltaInstrumentStore(BaseInstrumentStore):
             return self._row_to_instrument(row)
 
         if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
-            print(f"❌ No Delta instrument found for {trading_symbol}")
+            logger.warning("No Delta instrument found for %s", trading_symbol)
             return None
 
         DeltaInstrumentStore.dummy_security_counter += 1
@@ -170,7 +173,7 @@ class DeltaInstrumentStore(BaseInstrumentStore):
             return self._row_to_instrument(row)
 
         if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
-            print(f"❌ No Delta FUT instrument found for {trading_symbol}")
+            logger.warning("No Delta FUT instrument found for %s", trading_symbol)
             return None
 
         DeltaInstrumentStore.dummy_security_counter += 1

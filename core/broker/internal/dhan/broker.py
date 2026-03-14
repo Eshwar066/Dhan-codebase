@@ -1,8 +1,11 @@
 """Dhan broker: order placement via DhanBrokerApi. Trade-led OMS via get_recent_fills / get_fill_for_client_order_id."""
 
+import logging
 import time
 import uuid
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from core.broker.base import BaseBroker
 
@@ -195,7 +198,7 @@ class DhanBroker(BaseBroker):
                 if not isinstance(resp, dict):
                     raise Exception(f"Invalid broker response: {resp}")
                 if resp.get("status") != "success":
-                    print("❌ Broker rejection:", resp)
+                    logger.warning("Dhan broker rejection: %s", resp)
                     return None
                 order_id = resp.get("order_id")
                 if self.intent_store:
@@ -209,7 +212,7 @@ class DhanBroker(BaseBroker):
                     raise Exception("Order failed after retries")
                 time.sleep(0.4)
             except Exception as e:
-                print("❌ place_order exception:", e)
+                logger.warning("Dhan place_order exception: %s", e, exc_info=True)
                 return None
         return None
 

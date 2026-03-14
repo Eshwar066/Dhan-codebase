@@ -13,7 +13,6 @@ SignalFloodTestStrategy: pipeline test strategy for both Delta and Dhan.
 import random
 from dataclasses import replace
 from typing import Any, List, Optional, TYPE_CHECKING
-import pdb
 
 from core.strategies.base import BaseStrategy
 from core.strategies.IndiaMktMixins import IndiaMktMixins
@@ -57,7 +56,6 @@ class SignalFloodTestStrategy(IndiaMktMixins, BaseStrategy):
             return None
 
         structure_id = f"{self.name}:{symbol}:FLAT"
-
         has_open = ctx.position_store.has_open_structure(
             strategy=self.name,
             structure_id=structure_id,
@@ -73,6 +71,7 @@ class SignalFloodTestStrategy(IndiaMktMixins, BaseStrategy):
         )
 
         if has_open or has_pending:
+            print(">>has open, pending order exits")
             return None
         # Resolve instrument
         exchange = self.api
@@ -110,6 +109,7 @@ class SignalFloodTestStrategy(IndiaMktMixins, BaseStrategy):
             action="ENTRY",
             tag="MAIN",
         )
+
         if intent and qty != int(inst.lot_size):
             intent = replace(intent, qty=qty)
         # 10% return same intent twice to trigger duplicate_signal_blocked on second ==> tested ✅
