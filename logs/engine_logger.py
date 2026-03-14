@@ -1,6 +1,7 @@
 """
 Structured JSON logging per engine. One file per engine: logs/{engine_id}.log.
 No print(); all events logged as one JSON object per line.
+Timestamps are in India/Bangalore (IST, UTC+5:30).
 """
 
 import json
@@ -8,6 +9,9 @@ import os
 import threading
 from datetime import datetime
 from typing import Any, Dict, Optional
+from zoneinfo import ZoneInfo
+
+IST = ZoneInfo("Asia/Kolkata")
 
 LOGS_DIR = "logs"
 REPORTS_DIR = "reports"
@@ -44,7 +48,7 @@ class EngineLogger:
             "venue": self.venue,
             "strategy": self.strategy,
             "event_type": event_type,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(IST).isoformat(),
         }
         if message:
             base["message"] = message

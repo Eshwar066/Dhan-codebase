@@ -1,4 +1,5 @@
 import json
+import logging
 import time
 from enum import Enum
 from pathlib import Path
@@ -9,6 +10,8 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 OptionalAlert = Optional[Callable[[str], None]]
 import pdb
 import datetime
+
+logger = logging.getLogger(__name__)
 
 from core.orderExecution.intent_store import IntentStatus
 
@@ -363,6 +366,8 @@ class OrderRouter:
             self._consecutive_failures += 1
             if self.engine_logger:
                 self.engine_logger.log("risk_block", "Broker place_order returned None")
+            else:
+                logger.warning("Broker place_order returned None for %s %s qty=%s", sym, side, qty)
             if self.telegram_alert:
                 self.telegram_alert(
                     f"Broker returned no order_id: {sym} {side} qty={qty}"
@@ -388,35 +393,65 @@ class OrderRouter:
             return
 
         self._consecutive_failures = 0
-        self._set_order_state(
-            intent.intent_id,
-            OrderState.SENT,
-            action="order_placed",
-            message=f"order_id={order_id}",
+        # Paper/sim broker may call process_fill inside place_order, so intent can already be FILLED.
+        # Do not overwrite terminal status with SENT so has_pending_intent stays correct.
+        rec = self.intent_store.get(intent.intent_id)
+        already_terminal = rec and rec.get("status") in (
+            IntentStatus.FILLED,
+            IntentStatus.REJECTED,
+            IntentStatus.CANCELLED,
+            IntentStatus.EXPIRED,
         )
-        if self.telegram_alert:
-            self.telegram_alert(
-                f"Order placed: {sym} {side} qty={qty} order_id={order_id},price={exec_price},"
+        if not already_terminal:
+            self._set_order_state(
+                intent.intent_id,
+                OrderState.SENT,
+                action="order_placed",
+                message=f"order_id={order_id}",
             )
-        if self.engine_logger:
-            self.engine_logger.order_placed(
-                symbol=sym,
-                side=side,
-                qty=qty,
-                price=exec_price,
-                order_id=order_id,
-                intent_id=getattr(intent, "intent_id", None),
+            if self.telegram_alert:
+                self.telegram_alert(
+                    f"Order placed: {sym} {side} qty={qty} order_id={order_id},price={exec_price},"
+                )
+            if self.engine_logger:
+                self.engine_logger.order_placed(
+                    symbol=sym,
+                    side=side,
+                    qty=qty,
+                    price=exec_price,
+                    order_id=order_id,
+                    intent_id=getattr(intent, "intent_id", None),
+                )
+            self.intent_store.update(
+                intent.intent_id,
+                "SENT",
+                broker_order_id=order_id,
+                order_state=OrderState.SENT,
             )
-        self.intent_store.update(
-            intent.intent_id,
-            "SENT",
-            broker_order_id=order_id,
-            order_state=OrderState.SENT,
-        )
-        if getattr(intent, "action", "") == "EXIT":
-            sent_rec = self.intent_store.get(intent.intent_id)
-            if sent_rec:
-                sent_rec["last_price_update_ts"] = time.time()
+            if getattr(intent, "action", "") == "EXIT":
+                sent_rec = self.intent_store.get(intent.intent_id)
+                if sent_rec:
+                    sent_rec["last_price_update_ts"] = time.time()
+        else:
+            # Paper/sim filled synchronously: keep status FILLED, still log order_placed for audit.
+            if self.telegram_alert:
+                self.telegram_alert(
+                    f"Order placed: {sym} {side} qty={qty} order_id={order_id},price={exec_price},"
+                )
+            if self.engine_logger:
+                self.engine_logger.order_placed(
+                    symbol=sym,
+                    side=side,
+                    qty=qty,
+                    price=exec_price,
+                    order_id=order_id,
+                    intent_id=getattr(intent, "intent_id", None),
+                )
+            self.intent_store.update(
+                intent.intent_id,
+                rec["status"],
+                broker_order_id=order_id,
+            )
 
     def refresh_stale_exit_orders(
         self,
@@ -547,6 +582,8 @@ class OrderRouter:
                 self.engine_logger.order_state_mismatch(
                     f"Failed to fetch broker open orders: {e}"
                 )
+            else:
+                logger.warning("Failed to fetch broker open orders: %s", e)
             return False, {"error": str(e)}
 
         # Trade-led: sync trades (fills) first so positions are up to date before we compare order state
