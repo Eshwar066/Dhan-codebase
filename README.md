@@ -250,6 +250,17 @@ For **Delta** and **Dhan**, the engine uses a **trade-led** OMS so that position
 
 Reconciliation remains position-based: broker positions are compared with local positions that were built from applied trades.
 
+### Delta Exchange: reduce_only (OMS rule)
+
+The **Delta broker** derives `reduce_only` from the intent’s **action** in the broker layer (not in the strategy):
+
+| Intent action | reduce_only | Effect on Delta Exchange |
+| --------------| ----------- | -------------------------|
+| ENTRY         | `false`     | Opens or increases position. |
+| EXIT          | `true`      | Only reduces existing position; rejected if no position. |
+
+Rule applied in `core/broker/internal/delta/broker.py`: `reduce_only = (intent.action == "EXIT")`. This avoids accidental position flips (e.g. an entry SELL after an exit SELL turning a flat position into a short). Strategies send `OrderIntent(action=ENTRY|EXIT)`; the Delta broker adapter sets the exchange flag accordingly.
+
 ---
 
 ## Directory structure

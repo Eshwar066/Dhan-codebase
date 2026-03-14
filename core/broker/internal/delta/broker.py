@@ -4,11 +4,19 @@ import logging
 import time
 import uuid
 from typing import Any, Dict, List, Optional
-import pdb
 
 from core.broker.base import BaseBroker
 
 logger = logging.getLogger(__name__)
+
+
+def _get_reduce_only(action: str) -> bool:
+    """
+    OMS rule: ENTRY → reduce_only=False (open/increase position);
+    EXIT → reduce_only=True (only reduce existing position).
+    Prevents accidental position flips when exit and entry signals are reordered.
+    """
+    return (action or "").upper() == "EXIT"
 
 
 def _intent_to_delta_payload(intent, execution_price=None):
@@ -23,6 +31,7 @@ def _intent_to_delta_payload(intent, execution_price=None):
         lot_size = int(getattr(inst, "lot_size", 1))
         total_qty = qty * lot_size
         price = execution_price if execution_price is not None else (intent.price or 0)
+        action = getattr(intent, "action", "")
         return {
             "tradingsymbol": trading_symbol,
             "exchange": segment,
@@ -33,9 +42,7 @@ def _intent_to_delta_payload(intent, execution_price=None):
             "transaction_type": intent.side,
             "trade_type": getattr(intent, "trade_type", "MARGIN"),
             "tag": intent.intent_id,
-            "reduce_only": (
-                "true" if getattr(intent, "action", "") == "EXIT" else "false"
-            ),
+            "reduce_only": "true" if _get_reduce_only(action) else "false",
         }
     # Dict intent
     total_qty = int(intent.get("qty", 1)) * int(intent.get("lot_size", 1))
@@ -44,6 +51,8 @@ def _intent_to_delta_payload(intent, execution_price=None):
         if execution_price is not None
         else float(intent.get("price", 0) or 0)
     )
+    action = intent.get("action", "")
+    reduce_only = "true" if _get_reduce_only(action) else intent.get("reduce_only", "false")
     return {
         "tradingsymbol": intent.get("trading_symbol", ""),
         "exchange": intent.get("segment", "EQ"),
@@ -54,7 +63,7 @@ def _intent_to_delta_payload(intent, execution_price=None):
         "transaction_type": intent.get("side", "BUY"),
         "trade_type": intent.get("trade_type", "MARGIN"),
         "tag": intent.get("intent_id"),
-        "reduce_only": intent.get("reduce_only", "false"),
+        "reduce_only": reduce_only if reduce_only in ("true", "false") else "false",
     }
 
 
