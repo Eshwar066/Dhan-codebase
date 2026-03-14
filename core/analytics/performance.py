@@ -3,7 +3,7 @@ Trade log and performance analytics.
 
 - Trade log: trade_id, entry_time, exit_time, side, entry_price, exit_price, qty, pnl
 - Win rate, profit factor, equity curve, drawdown (absolute and %)
-- Bonus: average win/loss, expectancy
+- Bonus: average win/loss, expectancy, Sharpe ratio
 
 Step zero:
 - Equity = initial_capital + cumsum(pnl). initial_capital must be > 0 (from config).
@@ -80,6 +80,39 @@ def load_trade_log(
     return trades.reset_index(drop=True)
 
 
+def sharpe_ratio(
+    trades: pd.DataFrame,
+    initial_capital: float = 100_000,
+    risk_free_rate: float = 0.0,
+    annualization_factor: Optional[float] = None,
+) -> float:
+    """
+    Sharpe ratio from trade PnL: (mean return - risk_free_rate) / std(return).
+
+    Each trade is treated as one period; return = pnl / capital (no compounding).
+    risk_free_rate: per-period (e.g. 0 for simplicity).
+    annualization_factor: if set (e.g. sqrt(252) for daily), multiplies the ratio
+        to approximate annualized Sharpe; if None, returns raw (per-trade) Sharpe.
+
+    Returns 0.0 if fewer than 2 trades or std of returns is 0.
+    """
+    if trades is None or len(trades) < 2:
+        return 0.0
+    cap = float(initial_capital) if initial_capital and initial_capital > 0 else 100_000.0
+    work = trades.copy()
+    if "pnl" not in work.columns or work["pnl"].isna().all():
+        work["pnl"] = work.apply(calculate_pnl, axis=1)
+    returns = work["pnl"] / cap
+    mean_r = returns.mean()
+    std_r = returns.std()
+    if std_r is None or std_r == 0 or (hasattr(std_r, "__float__") and float(std_r) == 0):
+        return 0.0
+    raw = (mean_r - risk_free_rate) / std_r
+    if annualization_factor is not None and annualization_factor > 0:
+        raw = raw * (annualization_factor ** 0.5)
+    return float(raw)
+
+
 def performance_summary(
     trades: pd.DataFrame,
     initial_capital: float = 100_000,
@@ -95,7 +128,7 @@ def performance_summary(
 
     Returns dict with:
         Initial Capital, Total Trades, Win Rate %, Profit Factor, Net Profit,
-        Max Drawdown, Max Drawdown %, Avg Win, Avg Loss, Expectancy.
+        Max Drawdown, Max Drawdown %, Avg Win, Avg Loss, Expectancy, Sharpe Ratio.
     """
     trades = trades.copy()
 
@@ -116,6 +149,7 @@ def performance_summary(
             "Avg Win": 0.0,
             "Avg Loss": 0.0,
             "Expectancy": 0.0,
+            "Sharpe Ratio": 0.0,
         }
 
     if "pnl" not in trades.columns or trades["pnl"].isna().all():
@@ -151,6 +185,8 @@ def performance_summary(
     # Expectancy: (win_rate/100 * avg_win) - ((1 - win_rate/100) * abs(avg_loss))
     expectancy = (win_rate / 100 * avg_win) - ((1 - win_rate / 100) * abs(avg_loss))
 
+    sharpe = sharpe_ratio(trades, initial_capital=cap)
+
     return {
         "Initial Capital": cap,
         "Total Trades": total_trades,
@@ -162,6 +198,7 @@ def performance_summary(
         "Avg Win": round(avg_win, 2),
         "Avg Loss": round(avg_loss, 2),
         "Expectancy": round(expectancy, 2),
+        "Sharpe Ratio": round(sharpe, 4),
     }
 
 

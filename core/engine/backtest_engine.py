@@ -32,7 +32,9 @@ class BacktestEngine(BaseEngine):
 
     def build_context(self, candle, recent_candles=None):
         intent_store = getattr(self.order_router, "intent_store", None)
-        return super().build_context(candle, recent_candles=recent_candles, intent_store=intent_store)
+        return super().build_context(
+            candle, recent_candles=recent_candles, intent_store=intent_store
+        )
 
     # ==========================================================
     # MAIN RUN LOOP
@@ -74,7 +76,7 @@ class BacktestEngine(BaseEngine):
             df = df.iloc[macro_warmup:].reset_index(drop=True)
 
             # Rolling buffer of recent candles for this symbol (max 50)
-            candle_buffer = deque(maxlen=50)
+            candle_buffer = deque(maxlen=220)
 
             # -------- Candle loop (candle["htf_trend"] already set above for macro filter) --------
             for _, row in df.iterrows():
