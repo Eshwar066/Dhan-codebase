@@ -8,7 +8,7 @@ class RunMode(str, Enum):
 
 
 # 🔁 Default run mode when a job does not specify "run_mode".
-RUN_MODE = RunMode.LIVE
+RUN_MODE = RunMode.PAPER
 
 # Default venue when job does not specify "venue". Used for single-venue runs.
 DEFAULT_VENUE = "DELTA"  # "DHAN" | "DELTA"
@@ -28,26 +28,6 @@ STRATEGY_JOBS = [
         "backtest": {
             "start_date": "2023-10-19",
             "end_date": "2026-02-20",
-            "timeframe": "60",
-            "exchange": "INDEX",
-            "sector": "YES",
-        },
-    },
-    # ema 5, 0.7 for profit  and 0.3 for loss used both for nifty and btc, etc
-    {
-        "name": "FuturesEMAHighLow",
-        "venue": "DELTA",
-        "enabled": False,
-        "capital": 200000,
-        "symbols": ["BTCUSD"],
-        "instrument": "FUTURES",
-        "delta_india": False,
-        "delta_testnet": True,
-        "delta_leverage": 10,
-        "live": {"exchange": "INDEX", "sector": "YES"},
-        "backtest": {
-            "start_date": "2024-01-01",
-            "end_date": "2026-03-02",
             "timeframe": "60",
             "exchange": "INDEX",
             "sector": "YES",
@@ -80,24 +60,6 @@ STRATEGY_JOBS = [
         },
     },
     {
-        "name": "Futures_EMA_Momentum",
-        "venue": "DELTA",
-        "enabled": False,
-        "engine_id": "dhan_ipo_breakout",
-        "capital": 200000000,
-        "symbols": ["BTCUSD"],
-        "instrument": "FUTURES",
-        "delta_india": True,
-        "delta_testnet": False,
-        "delta_leverage": 10,
-        "live": {"exchange": "INDEX", "sector": "YES"},
-        "backtest": {
-            "start_date": "2022-01-01",
-            "end_date": "2026-02-20",
-            "timeframe": "60",
-        },
-    },
-    {
         "name": "SignalFloodTest",
         "venue": "DHAN",
         "enabled": False,
@@ -126,10 +88,49 @@ STRATEGY_JOBS = [
             "sector": "YES",
         },
     },
+    # ema 5, 0.7 for profit  and 0.3 for loss used both for nifty and btc, etc
+    {
+        "name": "FuturesEMAHighLow",
+        "venue": "DELTA",
+        "enabled": True,
+        "capital": 200000,
+        "symbols": ["BTCUSD"],
+        "instrument": "FUTURES",
+        "delta_india": True,
+        "delta_testnet": False,
+        "delta_leverage": 1,
+        "live": {"exchange": "INDEX", "sector": "YES"},
+        "backtest": {
+            "start_date": "2024-02-01",
+            "end_date": "2026-03-02",
+            "timeframe": "60",
+            "exchange": "INDEX",
+            "sector": "YES",
+        },
+    },
+    # dont use this
+    {
+        "name": "Futures_EMA_Momentum",
+        "venue": "DELTA",
+        "enabled": False,
+        "engine_id": "delta_futures_ema_momentum",
+        "capital": 200000000,
+        "symbols": ["BTCUSD"],
+        "instrument": "FUTURES",
+        "delta_india": True,
+        "delta_testnet": False,
+        "delta_leverage": 1,
+        "live": {"exchange": "INDEX", "sector": "YES"},
+        "backtest": {
+            "start_date": "2024-09-01",  # dont go below this in delta exchange "2024-02-01"
+            "end_date": "2026-03-13",
+            "timeframe": "60",
+        },
+    },
     {
         "name": "SignalFloodTest",
         "venue": "DELTA",
-        "enabled": True,
+        "enabled": False,
         "run_mode": "LIVE",
         "engine_id": "delta_test_pipeline",
         "symbols": ["BTCUSD"],
