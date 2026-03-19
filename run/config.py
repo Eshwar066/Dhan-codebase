@@ -8,10 +8,10 @@ class RunMode(str, Enum):
 
 
 # 🔁 Default run mode when a job does not specify "run_mode".
-RUN_MODE = RunMode.PAPER
+RUN_MODE = RunMode.BACKTEST
 
 # Default venue when job does not specify "venue". Used for single-venue runs.
-DEFAULT_VENUE = "DELTA"  # "DHAN" | "DELTA"
+DEFAULT_VENUE = "DHAN"  # "DHAN" | "DELTA"
 
 # Per-job run_mode: set "run_mode": "PAPER" or "run_mode": "LIVE" (or "BACKTEST") on each job.
 # If omitted, RUN_MODE above is used. You can run some strategies in paper and others in live in the same process.
@@ -20,7 +20,7 @@ STRATEGY_JOBS = [
     {
         "name": "LEAPS_RSI",
         "venue": "DHAN",
-        "enabled": True,
+        "enabled": False,
         "run_mode": "PAPER",  # or "LIVE"; omit to use RUN_MODE default
         "capital": 200000,
         "symbols": ["NIFTY"],
@@ -29,6 +29,21 @@ STRATEGY_JOBS = [
             "start_date": "2023-10-19",
             "end_date": "2026-02-20",
             "timeframe": "60",
+            "exchange": "INDEX",
+            "sector": "YES",
+        },
+    },
+    {
+        "name": "MagicalLines",
+        "venue": "DHAN",
+        "enabled": True,
+        "capital": 200000,
+        "symbols": ["NIFTY"],
+        "live": {"exchange": "INDEX", "sector": "YES"},
+        "backtest": {
+            "start_date": "2026-01-01",
+            "end_date": "2026-02-19",
+            "timeframe": "DAY",
             "exchange": "INDEX",
             "sector": "YES",
         },

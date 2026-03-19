@@ -355,7 +355,7 @@ Algo/
 - **Per-job run_mode**: set `"run_mode": "PAPER"` or `"run_mode": "LIVE"` (or `"BACKTEST"`) on a job to override; you can run some strategies in paper and others in live in the same process.
 - **DEFAULT_VENUE**: used when a job does not set `"venue"` (e.g. `"DELTA"` or `"DHAN"`).
 - **STRATEGY_JOBS**: list of job dicts. Each job has:
-  - **name**: strategy key in `STRATEGY_MAP` (e.g. `"FuturesEMAHighLow"`, `"LEAPS_RSI"`).
+  - **name**: strategy key in `STRATEGY_MAP` (e.g. `"FuturesEMAHighLow"`, `"LEAPS_RSI"`, `"MagicalLines"`).
   - **venue**: `"DHAN"` or `"DELTA"`.
   - **enabled**: if `False`, job is skipped.
   - **run_mode** (optional): `"PAPER"` \| `"LIVE"` \| `"BACKTEST"`; if omitted, `RUN_MODE` is used.
@@ -382,6 +382,17 @@ Two jobs in `STRATEGY_JOBS` exercise the full pipeline (Signal → Risk → OMS 
 - **Dhan**: same strategy with `venue: "DHAN"`, `engine_id: "dhan_test_pipeline"`, `symbols: ["NIFTY"]`.
 
 Use **PAPER** or **LIVE** run mode. The strategy (`SignalFloodTest`) generates entry/exit every 1m candle and optionally triggers oversize (risk rejection) and duplicate-signal blocks for verification.
+
+### 2.2 Dhan option strategies (NSE index options)
+
+Two option-selling strategies are available for **DHAN** (NSE index options, e.g. NIFTY):
+
+| Strategy       | Key in STRATEGY_MAP | Description |
+| -------------- | ------------------- | ----------- |
+| **LEAPS RSI**  | `LEAPS_RSI`         | Quarterly RSI-based option selling: short CALL when RSI &lt; 32, short PUT when RSI &gt; 52. Evaluates at fixed times (e.g. 10:15–15:15). Strike in premium range; hedge leg. See `core/strategies/Leaps/LeapsQuatery_RSI_52_32.py`. |
+| **Magical Lines** | `MagicalLines`  | Time-anchored at 3:20 PM. Direction from intraday candle (9:15–15:20): green → short PE, red → short CE. Magical line: spot ±0.25% for level; main leg strike in multiples of 100 with premium in 180–320 range; hedge within 500 points, net credit 90–120. Monthly expiry; after 13th of month new trades use next month; rollover one week before expiry (Wednesday). Reversal: if at 3:20 price crosses and closes opposite to magical line, exit and short in reverse. See `core/strategies/Leaps/MagicalLines.py`. |
+
+Add a job with `"name": "MagicalLines"`, `"venue": "DHAN"`, `"symbols": ["NIFTY"]`, and `backtest` / `live` with `timeframe: "60"`, `exchange: "INDEX"`, `sector: "YES"` as needed.
 
 ### 3. Environment variables
 
