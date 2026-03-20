@@ -62,9 +62,9 @@ class BacktestEngine(BaseEngine):
             df["exchange"] = exchange
 
             # -------- Indicators (strategy computes htf_trend in prepare_indicators) --------
-            if self.broker_name == "DHAN" and "timestamp" in df.columns:
-                ts_col = pd.to_datetime(df["timestamp"], utc=True)
-                df["timestamp"] = ts_col.dt.tz_convert("Asia/Kolkata")
+
+            ts_col = pd.to_datetime(df["timestamp"], utc=True)
+            df["timestamp"] = ts_col.dt.tz_convert("Asia/Kolkata")
             if "time" in df.columns:
                 df["time"] = df["timestamp"].dt.time
             df = self.strategy.prepare_indicators(df)

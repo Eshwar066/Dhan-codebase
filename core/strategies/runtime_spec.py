@@ -34,6 +34,28 @@ STRATEGY_RUNTIME_SPEC = {
             }
         },
     },
+    "OneDayMagicalLine": {
+        RunMode.BACKTEST: {
+            "data": {
+                "option_chain": {
+                    "exchange": "NSE",
+                    "interval": "60",  # 1hr candle
+                    "segment": "OPT",
+                    "api": "DHAN",
+                    "expiry_flag": "MONTHLY",
+                }
+            }
+        },
+        RunMode.LIVE: {
+            "data": {
+                "option_chain": {
+                    "exchange": "NSE",
+                    "interval": "1",  # live
+                    "segment": "OPT",
+                }
+            }
+        },
+    },
     "Futures_EMA_Momentum": {
         RunMode.BACKTEST: {"data": {}},
         RunMode.PAPER: {"data": {}},

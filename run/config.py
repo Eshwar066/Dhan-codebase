@@ -103,11 +103,23 @@ STRATEGY_JOBS = [
             "sector": "YES",
         },
     },
+    {
+        "name": "OneDayMagicalLine",
+        "venue": "DELTA",
+        "enabled": True,
+        "capital": 200000,
+        "symbols": ["BTCUSD"],
+        "backtest": {
+            "start_date": "2026-02-01",
+            "end_date": "2026-02-26",
+            "timeframe": "60",
+        },
+    },
     # ema 5, 0.7 for profit  and 0.3 for loss used both for nifty and btc, etc
     {
         "name": "FuturesEMAHighLow",
         "venue": "DELTA",
-        "enabled": True,
+        "enabled": False,
         "capital": 200000,
         "symbols": ["BTCUSD"],
         "instrument": "FUTURES",
