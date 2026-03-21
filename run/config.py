@@ -103,16 +103,32 @@ STRATEGY_JOBS = [
             "sector": "YES",
         },
     },
+    # OneDayMagicalLine: DELTA BTC options (sell CE/PE; buy to close / exits). Same wiring as FuturesEMAHighLow / SignalFloodTest (DELTA).
+    # Backtest: omit run_mode (uses RUN_MODE). Live: add "run_mode": "LIVE".
+    # Testnet: delta_testnet True + DEMO_DELTA_API_KEY / DEMO_DELTA_API_SECRET | Mainnet live: delta_testnet False + DELTA_API_KEY / DELTA_API_SECRET.
     {
         "name": "OneDayMagicalLine",
         "venue": "DELTA",
         "enabled": True,
+        # "run_mode": "LIVE",  # uncomment for Delta paper/live; omit for backtest (uses RUN_MODE)
         "capital": 200000,
         "symbols": ["BTCUSD"],
+        "instrument": "OPTION",
+        "delta_india": True,
+        "delta_testnet": True,
+        "delta_leverage": 10,
+        "check_short_option_margin_enabled": True,
+        "telegram": {
+            "bot_token": "8389724629:AAHY_CGcBF8HZCexedsEJFw80Mf6SxH5Bkk",
+            "chat_id": "1021479950",
+        },
+        "live": {"exchange": "DELTA", "sector": "YES"},
         "backtest": {
             "start_date": "2026-02-01",
             "end_date": "2026-02-26",
             "timeframe": "60",
+            "exchange": "DELTA",
+            "sector": "YES",
         },
     },
     # ema 5, 0.7 for profit  and 0.3 for loss used both for nifty and btc, etc

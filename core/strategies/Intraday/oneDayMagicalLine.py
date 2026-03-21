@@ -37,7 +37,7 @@ VALID_TIME_1730 = {"17:30"}  # 1hr candle close time (IST)
 STRIKE_STEP = 500
 STRIKE_LOOKBACK = 15  # +/- 15 steps around ATM => 31 strikes
 TARGET_PREMIUM_MIN = 700
-TARGET_PREMIUM_MAX = 1200
+TARGET_PREMIUM_MAX = 1500
 
 # Risk
 SL_PCT = 0.15  # 15% rise in short option premium triggers exit
@@ -390,6 +390,9 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             return None
 
         expiry = ctx.selected_expiry
+
+        pdb.set_trace()
+
         trading_symbol = ExpiryResolver.build_option_symbol(
             self, symbol, expiry, strike, option_type
         )

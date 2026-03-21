@@ -101,20 +101,19 @@ class DeltaMktMixins:
             self._delta_cache_df = None
             return None
 
+        ctx.delta_data = df
         self._delta_cache_date = trade_date
         self._delta_cache_file = file_path
         self._delta_cache_df = df
         return df
 
-    def weeklyExpiry():
+    def weeklyExpiry(self, candle: dict, ctx: Any):
         ts = pd.to_datetime(candle["timestamp"]).tz_localize(None)
         trade_date = ts.date()
         weekday = trade_date.weekday()  # Mon=0 ... Thu=3 ... Fri=4
 
-        # Weekly expiry rule:
-        # - default: this week's Friday
-        # - on Thursday: use next week's Friday
-        if weekday == 3:
+        # ---- Weekly expiry logic ----
+        if weekday == 3:  # Thursday → next Friday
             days_to_friday = 8
         else:
             days_to_friday = 4 - weekday
@@ -122,76 +121,132 @@ class DeltaMktMixins:
                 days_to_friday += 7
 
         weekly_expiry = trade_date + pd.Timedelta(days=days_to_friday)
-        ctx.selected_expiry = pd.Timestamp(weekly_expiry).strftime("%Y-%m-%d")
+
+        # 🔥 Convert to DDMMYY format (matches your data)
+        ctx.selected_expiry = pd.Timestamp(weekly_expiry).strftime("%d%m%y")
+        return pd.Timestamp(weekly_expiry).strftime("%d%m%y")
 
     def find_strike_in_premium_range(
         self,
         candle,
         ctx,
-        option_type,  # "C" or "P"
-        expiry,
-        min_prem=200,
-        max_prem=400,
-        lookback_sec=60,
-        # 🔥 important for realistic fills
+        option_type,
+        expiry=None,
+        min_prem=700,
+        max_prem=1400,
+        lookback_sec=600,
     ):
-        # Keep data-loading responsibility inside the mixin so strategies
-        # only call strike selection.
         df = self.load_delta_data_for_candle(candle, ctx)
 
         if df is None or df.empty:
             return None
 
-        if expiry is "Weekly":
-            weeklyExpiry()
-        # ---- columns ----
         df.columns = ["symbol", "price", "qty", "timestamp", "side"]
         df["timestamp"] = pd.to_datetime(df["timestamp"])
 
         candle_time = pd.to_datetime(candle["timestamp"]).tz_localize(None)
 
-        # ---- 🔥 ONLY recent trades (avoid stale LTP) ----
-        start_time = candle_time - pd.Timedelta(seconds=lookback_sec)
-        df = df[(df["timestamp"] >= start_time) & (df["timestamp"] <= candle_time)]
-
-        if df.empty:
-            return None
-
-        # ---- parse symbol ----
+        # ---- 🔥 parse symbol ----
         parts = df["symbol"].str.split("-", expand=True)
-        pdb.set_trace()
+
         df["opt_type"] = parts[0]
         df["strike"] = parts[2].astype(float)
-        df["expiry"] = parts[3]
+        df["expiry"] = parts[3]  # e.g. 010226
+        # ---- 🔥 resolve expiry ----
+        if expiry == "Weekly":
+            selected_expiry = self.weeklyExpiry(candle, ctx)
+        elif expiry == "Monthly":
+            selected_expiry = self.monthlyExpiry(candle, ctx)
+        else:
+            selected_expiry = ctx.selected_expiry  # fallback
 
-        # ---- filter ----
-        df = df[df["opt_type"] == option_type.upper()]
+        if selected_expiry is None:
+            print(">>select expiry")
+            return None
 
-        # 🔥 expiry filter (CRITICAL)
-        if hasattr(ctx, "selected_expiry"):
-            df = df[df["expiry"] == ctx.selected_expiry]
+        # ---- 🔥 1. filter exact expiry ----
+        df = df[df["expiry"] == selected_expiry]
 
         if df.empty:
             return None
 
-        # ---- 🔥 build LTP per strike ----
+        # ---- 🔥 2. filter by candle DATE ----
+        candle_date = candle_time.date()
+        df = df[df["timestamp"].dt.date == candle_date]
+
+        if df.empty:
+            return None
+
+        # ---- 3. filter option type ----
+        opt = option_type.strip().upper()[0]  # takes first letter safely
+        df = df[df["opt_type"] == opt]
+
+        if df.empty:
+            return None
+
+        # ---- 🔥 time filter ----
+        start_time = candle_time - pd.Timedelta(seconds=600)
+        end_time = candle_time + pd.Timedelta(seconds=600)
+
+        df = df[(df["timestamp"] >= start_time) & (df["timestamp"] <= end_time)]
+
+        if df.empty:
+            return None
+
+        # ---- 🔥 LTP per strike at candle time ----
         df = df.sort_values("timestamp")
 
-        latest = df.groupby("strike").last().reset_index()
+        latest = df.groupby("strike", as_index=False).last()
 
-        # ---- 🔥 liquidity filter (avoid fake strikes) ----
+        # ---- liquidity filter ----
         latest = latest[latest["qty"] > 0]
-
-        # ---- premium filter ----
+        pdb.set_trace()
+        # ---- premium range ----
         filtered = latest[(latest["price"] >= min_prem) & (latest["price"] <= max_prem)]
 
         if filtered.empty:
             return None
 
-        # ---- 🔥 choose best strike ----
+        # ---- 🔥 best strike selection ----
         target = (min_prem + max_prem) / 2
+
+        filtered = filtered.copy()  # avoid pandas warning
         filtered["diff"] = (filtered["price"] - target).abs()
 
         selected = filtered.sort_values("diff").iloc[0]
 
         return (selected["strike"], float(selected["price"]), selected)
+
+    def find_strike(self, strike, expiry):
+        df = self.load_delta_data_for_candle(candle, ctx)
+
+        if df is None or df.empty:
+            return None
+
+        df.columns = ["symbol", "price", "qty", "timestamp", "side"]
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+        candle_time = pd.to_datetime(candle["timestamp"]).tz_localize(None)
+
+        # ---- 🔥 parse symbol ----
+        parts = df["symbol"].str.split("-", expand=True)
+
+        df["opt_type"] = parts[0]
+        df["strike"] = parts[2].astype(float)
+        df["expiry"] = parts[3]  # e.g. 010226
+        # ---- 🔥 resolve expiry ----
+        if expiry == "Weekly":
+            selected_expiry = self.weeklyExpiry(candle, ctx)
+        elif expiry == "Monthly":
+            selected_expiry = self.monthlyExpiry(candle, ctx)
+        else:
+            selected_expiry = ctx.selected_expiry  # fallback
+
+        df = df[df["strike"] == strike]
+        df = df[df["expiry"] == selected_expiry]
+        candle_date = candle_time.date()
+        df = df[df["timestamp"].dt.date == candle_date]
+        opt = option_type.strip().upper()[0]  # takes first letter safely
+        df = df[df["opt_type"] == opt]
+        start_time = candle_time - pd.Timedelta(seconds=600)
+        df = df[(df["timestamp"] >= start_time) & (df["timestamp"] <= candle_time)]
