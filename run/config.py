@@ -8,7 +8,7 @@ class RunMode(str, Enum):
 
 
 # 🔁 Default run mode when a job does not specify "run_mode".
-RUN_MODE = RunMode.BACKTEST
+RUN_MODE = RunMode.LIVE
 
 # Default venue when job does not specify "venue". Used for single-venue runs.
 DEFAULT_VENUE = "DHAN"  # "DHAN" | "DELTA"
@@ -110,12 +110,12 @@ STRATEGY_JOBS = [
         "name": "OneDayMagicalLine",
         "venue": "DELTA",
         "enabled": True,
-        # "run_mode": "LIVE",  # uncomment for Delta paper/live; omit for backtest (uses RUN_MODE)
+        "run_mode": "LIVE",  # uncomment for Delta paper/live; omit for backtest (uses RUN_MODE)
         "capital": 200000,
         "symbols": ["BTCUSD"],
         "instrument": "OPTION",
         "delta_india": True,
-        "delta_testnet": True,
+        "delta_testnet": False,
         "delta_leverage": 10,
         "check_short_option_margin_enabled": True,
         "telegram": {

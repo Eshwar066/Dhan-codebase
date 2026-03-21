@@ -145,6 +145,81 @@ class DeltaSource:
         """Single ticker by symbol or product identifier."""
         return self._client.get_ticker(identifier, auth=False)
 
+    @staticmethod
+    def expiry_ddmmyy_to_api_date(ddmmyy: str) -> Optional[str]:
+        """``DDMMYY`` (e.g. ``070326``) -> ``DD-MM-YYYY`` for Delta ``GET /v2/tickers`` query."""
+        s = (ddmmyy or "").strip()
+        if len(s) != 6 or not s.isdigit():
+            return None
+        dd, mm, yy = s[:2], s[2:4], s[4:6]
+        return f"{dd}-{mm}-20{yy}"
+
+    def get_tickers_list(
+        self,
+        contract_types: Optional[str] = None,
+        underlying_asset_symbols: Optional[str] = None,
+        expiry_date: Optional[str] = None,
+    ) -> List[Dict]:
+        """
+        One REST call: ``GET /v2/tickers`` with optional filters (option chain per expiry).
+        """
+        query: Dict[str, str] = {}
+        if contract_types:
+            query["contract_types"] = contract_types
+        if underlying_asset_symbols:
+            query["underlying_asset_symbols"] = underlying_asset_symbols
+        if expiry_date:
+            query["expiry_date"] = expiry_date
+        try:
+            result = self._client.get_tickers(
+                query=query if query else None, auth=False
+            )
+            if isinstance(result, list):
+                return result
+            return []
+        except Exception as e:
+            logger.warning("get_tickers_list failed: %s", e)
+            return []
+
+    def tickers_map_by_symbol(self, rows: List[Dict]) -> Dict[str, Dict]:
+        """Index ticker rows by uppercase ``symbol``."""
+        out: Dict[str, Dict] = {}
+        for row in rows:
+            sym = (row.get("symbol") or "").upper()
+            if sym:
+                out[sym] = row
+        return out
+
+    def get_option_tickers_for_expiry(
+        self,
+        underlying_symbol: str,
+        expiry_ddmmyy: str,
+        option_letter: str,
+    ) -> Dict[str, Dict]:
+        """
+        Single batch call for all call or put option tickers for one underlying + expiry.
+        Replaces N× ``get_ticker`` when selecting strikes in ``find_strike_in_premium_range_live``.
+        """
+        expiry_api = self.expiry_ddmmyy_to_api_date(expiry_ddmmyy)
+        if not expiry_api:
+            return {}
+        ol = (option_letter or "C").upper()
+        ct = "put_options" if ol == "P" else "call_options"
+        rows = self.get_tickers_list(
+            contract_types=ct,
+            underlying_asset_symbols=underlying_symbol,
+            expiry_date=expiry_api,
+        )
+        return self.tickers_map_by_symbol(rows)
+
+    def get_all_tickers_map(self) -> Dict[str, Dict]:
+        """
+        One ``GET /v2/tickers`` call with no filters (all products). Large payload;
+        prefer :meth:`get_option_tickers_for_expiry` for strike selection.
+        """
+        rows = self.get_tickers_list()
+        return self.tickers_map_by_symbol(rows)
+
     def get_l2_orderbook(self, identifier: str) -> Any:
         """L2 orderbook by symbol or product identifier."""
         return self._client.get_l2_orderbook(identifier, auth=False)

@@ -422,6 +422,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         candle = self.candle_aggregator.get_last_closed_candle(
                             symbol, tf
                         )
+
                         if candle:
                             self._last_candle_timestamp[symbol] = time.time()
                         if candle and candle.get(
@@ -446,7 +447,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         )
                     if candle is None:
                         continue
-
+                    print(">>candle", candle)
                     if isinstance(candle.get("timestamp"), (int, float)):
                         ts = candle["timestamp"]
                         if ts > 1e12:

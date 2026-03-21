@@ -174,6 +174,11 @@ class DeltaRestClient:
         response = self.request("GET", "/v2/l2orderbook/%s" % identifier, auth=auth)
         return parseResponse(response)
 
+    def get_tickers(self, query=None, auth=False):
+        """List tickers (all products, or filter via query params). See Delta GET /v2/tickers."""
+        response = self.request("GET", "/v2/tickers", query=query, auth=auth)
+        return parseResponse(response)
+
     def get_ticker(self, identifier, auth=False):
         response = self.request("GET", "/v2/tickers/%s" % (identifier), auth=auth)
         return parseResponse(response)

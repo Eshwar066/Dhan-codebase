@@ -13,14 +13,17 @@ Example:
 """
 
 import uuid
-import pandas as pd
-from datetime import date, timedelta, datetime
 import calendar
+import pandas as pd
+from datetime import date, timedelta, datetime, timezone
 from typing import Any, List, Optional, Tuple
+# India Standard Time (UTC+5:30) for strategy time-of-day filters.
+IST = timezone(timedelta(hours=5, minutes=30))
 
 from run.config import RUN_MODE, RunMode
 from core.utils.expiry_resolver import ExpiryResolver
 from core.models.order_intent import OrderIntent
+from core.strategies.deltaMktMixins import ltp_from_strike_row_live
 
 
 class IndiaMktMixins:
@@ -37,6 +40,9 @@ class IndiaMktMixins:
     api = "NSE"
     expiryType = "QUARTERLY"
     required_context = ["option_chain"]
+    # If set (e.g. 120), ``_is_valid_time`` returns False when candle IST lags system IST
+    # by more than this many seconds (late feed / backlog). None = log only, no skip.
+    max_signal_lag_seconds: Optional[int] = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -45,13 +51,70 @@ class IndiaMktMixins:
     # ==================================================
     # TIME FILTER (override valid_times in strategy)
     # ==================================================
-    def _is_valid_time(self, ts, valid_times=None):
+    def _is_valid_time(self, ts, valid_times=None, candle=None):
+        """
+        Match candle clock time in IST against ``valid_times``.
+
+        ``valid_times`` may be a set of ``"HH:MM"`` strings (legacy) or
+        ``datetime.time`` values (recommended). Naive timestamps are treated as UTC
+        then converted to IST for comparison.
+
+        Pass optional ``candle`` to log raw ``timestamp`` for lag root-cause (late feed vs slow processing).
+
+        Logs ``Now IST``, ``Candle IST``, ``lag_sec``. If ``max_signal_lag_seconds`` is set (>0)
+        and lag exceeds it, returns False (late signal / skip entry).
+        """
         times = (
             valid_times
             if valid_times is not None
             else getattr(self, "valid_times", set())
         )
-        return ts.strftime("%H:%M") in times
+
+        if not times:
+            return False
+
+        ts = pd.Timestamp(ts)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        ts_utc = ts
+        ts_ist = ts.tz_convert(IST)
+
+        print("Now IST:", datetime.now(IST))
+        print("Candle IST:", ts_ist)
+        if candle is not None:
+            print("Raw timestamp:", candle.get("timestamp"))
+
+        delay = (datetime.now(IST) - ts_ist.to_pydatetime()).total_seconds()
+        lag_limit = getattr(self, "max_signal_lag_seconds", None)
+        if lag_limit is not None and lag_limit > 0 and delay > lag_limit:
+            print(
+                f"⚠️ Late signal, skipping (lag {delay:.1f}s > {lag_limit}s)"
+            )
+            return False
+
+        sample = next(iter(times))
+        if isinstance(sample, str):
+            current_time = ts_ist.strftime("%H:%M")
+            match = current_time in times
+        else:
+            current_time = ts_ist.time().replace(second=0, microsecond=0)
+            match = current_time in times
+
+        print(
+            ">>times",
+            times,
+            ">>UTC ts",
+            ts_utc,
+            ">>IST ts",
+            ts_ist,
+            ">>lag_sec",
+            delay,
+            ">>current_time",
+            current_time,
+            ">>match",
+            match,
+        )
+        return match
 
     # ==================================================
     # STRUCTURE ID
@@ -277,7 +340,7 @@ class IndiaMktMixins:
         option_type = inst.option_type
 
         if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
-            ltp = float(strike_row.iloc[0]["close"])
+            ltp = ltp_from_strike_row_live(strike_row)
         else:
             option_type_label = "PUT" if option_type == "PE" else "CALL"
             ltp_value = strike_row.get(f"{option_type_label} LTP", 0)
@@ -567,7 +630,11 @@ class IndiaMktMixins:
         is_green True = bullish → long only; False = bearish → short only.
         Strategies should set supertrend_atr_period and supertrend_multiplier.
         """
-        atr_period = atr_period if atr_period is not None else getattr(self, "supertrend_atr_period", 10)
+        atr_period = (
+            atr_period
+            if atr_period is not None
+            else getattr(self, "supertrend_atr_period", 10)
+        )
         mult = mult if mult is not None else getattr(self, "supertrend_multiplier", 3.0)
         if len(candles) < atr_period + 1:
             return None

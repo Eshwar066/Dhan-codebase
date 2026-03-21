@@ -7,12 +7,12 @@ Rules (per user spec)
 3. If market crosses `ML1`, reverse direction:
    - Currently short `PE` => reverse to short `CE` when spot crosses above ML1
    - Currently short `CE` => reverse to short `PE` when spot crosses below ML1
-4. Monthly expiry, and after 15th of month use next month expiry.
 5. From short premium use 15% as SL:
    - If option premium rises by >= 15% from entry premium => exit (no reversal).
 
 Implementation notes
 - Uses `IndiaMktMixins` for option strike/premium selection and option LTP fetching.
+- Delta product symbols via `DeltaMktMixins.delta_option_trading_symbol` (see `deltaMktMixins.py`).
 - Reversal ENTRY is emitted from `on_candle` (engine expects entry intents from `on_candle`).
 - ML1 is stored per opened position via `structure_id` to enable correct reversal + SL.
 """
@@ -20,24 +20,28 @@ Implementation notes
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, time
 from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
+
 
 from core.strategies.IndiaMktMixins import IndiaMktMixins
 from core.strategies.deltaMktMixins import DeltaMktMixins
 from core.strategies.base import BaseStrategy
 from core.utils.expiry_resolver import ExpiryResolver
+from run.config import RUN_MODE, RunMode
 
 
-VALID_TIME_1730 = {"17:30"}  # 1hr candle close time (IST)
+VALID_TIME_1730 = {time(1, 45)}  # 1hr candle close time (IST)
 
 # Strike/premium selection (kept conservative and similar to `MagicalLines`)
 STRIKE_STEP = 500
 STRIKE_LOOKBACK = 15  # +/- 15 steps around ATM => 31 strikes
 TARGET_PREMIUM_MIN = 700
 TARGET_PREMIUM_MAX = 1500
+TARGET_DELTA = 0.25
+DELTA_RANGE = (0.2, 0.3)
 
 # Risk
 SL_PCT = 0.15  # 15% rise in short option premium triggers exit
@@ -58,11 +62,13 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     """
 
     name = "OneDayMagicalLine"
-    timeframe = "60"
+    timeframe = "5"  # change to 60min later
     required_context = ["option_chain"]
-    api = "NSE"
-    expiryType = "MONTHLY"
+    api = "DELTA"
+    expiryType = "Weekly"
     valid_times = VALID_TIME_1730
+    delta = TARGET_DELTA
+    delta_range = DELTA_RANGE
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -79,8 +85,8 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     def get_warmup_period(self):
         return 0
 
-    # Force strike selection to use DeltaMktMixins implementation even though
-    # IndiaMktMixins appears first in MRO.
+    # Strike selection: backtest = Delta tick CSV; live/paper = products + tickers (``deltaMktMixins``).
+    # Branch uses ``run.config.RUN_MODE`` — for live engines set global ``RUN_MODE`` or ensure it matches the job.
     def find_strike_in_premium_range(
         self,
         candle,
@@ -90,7 +96,18 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         max_prem=400,
         lookback_sec=60,
     ):
-        return DeltaMktMixins.find_strike_in_premium_range(
+        if RUN_MODE == RunMode.BACKTEST:
+            return DeltaMktMixins.find_strike_in_premium_range(
+                self,
+                candle,
+                ctx,
+                option_type,
+                min_prem=min_prem,
+                max_prem=max_prem,
+                lookback_sec=lookback_sec,
+                expiry="Weekly",
+            )
+        return DeltaMktMixins.find_strike_in_premium_range_live(
             self,
             candle,
             ctx,
@@ -99,57 +116,11 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             max_prem=max_prem,
             lookback_sec=lookback_sec,
             expiry="Weekly",
+            side="SELL",
+            target_delta=self.delta,
+            delta_min=self.delta_range[0],
+            delta_max=self.delta_range[1],
         )
-
-    # ==================================================
-    # EXPIRY: monthly; after 15th use next month
-    # ==================================================
-    def _expiry_for_entry(self, entry_trade_date: date):
-        if entry_trade_date.day > 15:
-            return ExpiryResolver.next_month_expiry(entry_trade_date)
-        return ExpiryResolver.current_month_expiry(entry_trade_date)
-
-    # ==================================================
-    # OPTION CHAIN STRIKES
-    # ==================================================
-    def fetch_option_chain(self, candle: dict, ctx: Any, option_type: str):
-        """
-        Prepare:
-        - ctx.expiry_list / ctx.selected_expiry
-        - ctx.otm_strikes (wide band around spot)
-        """
-        ocs = ctx.option_chain_service
-        if self.api == "NSE":
-            ctx.expiry_list = ocs.get_expiries(
-                api=self.api, ctx=ctx, instrument="FUTIDX"
-            )
-
-        expiry_date = self._expiry_for_entry(pd.to_datetime(ctx.timestamp).date())
-        if expiry_date is None or not ctx.expiry_list:
-            return None
-
-        expiry_dates = [pd.to_datetime(e).date() for e in ctx.expiry_list]
-        matches = [e for e in expiry_dates if e == expiry_date]
-        if not matches:
-            # Fallback: pick first expiry >= desired, else last available
-            sorted_dates = sorted(expiry_dates)
-            chosen = next((e for e in sorted_dates if e >= expiry_date), None)
-            expiry_date = chosen if chosen is not None else sorted_dates[-1]
-
-        idx = next((i for i, e in enumerate(expiry_dates) if e == expiry_date), 0)
-        ctx.selected_expiry = (
-            ctx.expiry_list[idx] if idx < len(ctx.expiry_list) else ctx.expiry_list[0]
-        )
-
-        # Wide strike band around ATM to find target premium
-        spot = float(candle["close"])
-        atm = round(spot / STRIKE_STEP) * STRIKE_STEP
-        strikes = [
-            atm + (i * STRIKE_STEP)
-            for i in range(-STRIKE_LOOKBACK, STRIKE_LOOKBACK + 1)
-        ]
-        ctx.otm_strikes = [int(s) for s in strikes]
-        return ctx.otm_strikes
 
     # ==================================================
     # TIME FILTER
@@ -166,6 +137,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     def should_enter(self, candle: dict) -> bool:
         """Only enter at `17:30` IST candle close."""
         ts = pd.to_datetime(candle["timestamp"])
+
         return self._is_valid_time(ts, self.valid_times)
 
     def _direction_at_1730(self, candle: dict) -> str:
@@ -281,6 +253,14 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 ):
                     reversal_entry = None
                     break
+                if getattr(
+                    ctx, "intent_store", None
+                ) and ctx.intent_store.has_pending_intent(
+                    strategy=self.name,
+                    structure_id=new_structure_id,
+                ):
+                    reversal_entry = None
+                    break
 
                 result = self.find_strike_in_premium_range(
                     candle,
@@ -299,8 +279,11 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                     break
 
                 expiry = ctx.selected_expiry
-                trading_symbol = ExpiryResolver.build_option_symbol(
-                    self, meta.symbol, expiry, strike, reverse_option_type
+                trading_symbol = self.delta_option_trading_symbol(
+                    row,
+                    float(strike),
+                    reverse_option_type,
+                    str(expiry),
                 )
                 inst = ctx.instrument_store.intent_creation_details(
                     trading_symbol,
@@ -347,7 +330,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             return None
 
         trade_dt = pd.to_datetime(candle["timestamp"]).date()
-
+        print(">>trade_dt", trade_dt)
         # Enforce: at most one MAIN structure open for this underlying
         open_positions = ctx.position_store.get_open_positions(
             underlying=symbol, strategy=self.name
@@ -373,7 +356,17 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             strategy=self.name, structure_id=structure_id, tag="MAIN"
         ):
             return None
-
+        has_pending = (
+            ctx.intent_store.has_pending_intent(
+                strategy=self.name,
+                structure_id=structure_id,
+            )
+            if getattr(ctx, "intent_store", None)
+            else False
+        )
+        if has_pending:
+            return None
+        # pdb.set_trace()
         # Select strike by target premium range for delta excahnage
         result = self.find_strike_in_premium_range(
             candle,
@@ -391,10 +384,11 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
 
         expiry = ctx.selected_expiry
 
-        pdb.set_trace()
-
-        trading_symbol = ExpiryResolver.build_option_symbol(
-            self, symbol, expiry, strike, option_type
+        trading_symbol = self.delta_option_trading_symbol(
+            row,
+            float(strike),
+            option_type,
+            str(expiry),
         )
         inst = ctx.instrument_store.intent_creation_details(
             trading_symbol, ctx.exchange, expiry, option_type, strike
@@ -454,6 +448,11 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
 
     def on_position_exit(self, position: Any, candle: dict, ctx: Any):
         structure_id = position.structure_id
+        if getattr(ctx, "intent_store", None) and ctx.intent_store.has_pending_intent(
+            strategy=self.name,
+            structure_id=structure_id,
+        ):
+            return []
         # Prevent duplicate exit intents if broker fill is delayed
         self._pending_exit_structure_ids.add(structure_id)
 
