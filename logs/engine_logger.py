@@ -1,5 +1,6 @@
 """
 Structured JSON logging per engine. One file per engine: logs/{engine_id}.log.
+Closed candles: logs/{engine_id}_candles.log (see candle_created).
 No print(); all events logged as one JSON object per line.
 Timestamps are in India/Bangalore (IST, UTC+5:30).
 """
@@ -28,6 +29,7 @@ class EngineLogger:
         self.strategy = strategy
         self._log_dir = (log_dir or LOGS_DIR)
         self._path = os.path.join(self._log_dir, f"{engine_id}.log")
+        self._candles_path = os.path.join(self._log_dir, f"{engine_id}_candles.log")
         self._lock = threading.Lock()
         os.makedirs(self._log_dir, exist_ok=True)
 
@@ -72,6 +74,38 @@ class EngineLogger:
         line = json.dumps(payload, default=str) + "\n"
         with self._lock:
             with open(self._path, "a", encoding="utf-8") as f:
+                f.write(line)
+
+    def candle_created(
+        self,
+        candle: Dict[str, Any],
+        timeframe: Optional[str] = None,
+        source: str = "live",
+    ) -> None:
+        """Append one JSON line per closed candle to logs/{engine_id}_candles.log."""
+        ts = candle.get("timestamp")
+        if isinstance(ts, datetime):
+            ts_out = ts.isoformat()
+        else:
+            ts_out = ts
+        payload = self._payload(
+            "candle_created",
+            message="Closed candle",
+            symbol=candle.get("symbol"),
+            timeframe=timeframe,
+            source=source,
+            open=candle.get("open"),
+            high=candle.get("high"),
+            low=candle.get("low"),
+            close=candle.get("close"),
+            volume=candle.get("volume"),
+            bucket_ts=candle.get("bucket_ts"),
+            bar_timestamp=ts_out,
+            exchange=candle.get("exchange"),
+        )
+        line = json.dumps(payload, default=str) + "\n"
+        with self._lock:
+            with open(self._candles_path, "a", encoding="utf-8") as f:
                 f.write(line)
 
     def order_placed(self, symbol: str, side: str, qty: int, price: Optional[float], order_id: Optional[str], intent_id: Optional[str] = None) -> None:

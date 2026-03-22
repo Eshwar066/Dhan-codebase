@@ -7,12 +7,14 @@ from strike rows. Import module functions or mix in ``DeltaMktMixins``.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
 import pandas as pd
 
 from core.utils.expiry_resolver import ExpiryResolver
+from core.utils.lag_diag import lag_diag_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -434,9 +436,15 @@ class DeltaMktMixins:
         tickers_map: dict[str, Any] = {}
         if hasattr(source, "get_option_tickers_for_expiry"):
             try:
+                api_start = datetime.now() if lag_diag_enabled() else None
                 tickers_map = source.get_option_tickers_for_expiry(
                     und, str(selected_expiry), opt_letter
                 )
+                if lag_diag_enabled() and api_start is not None:
+                    print(
+                        "🌐 API time:",
+                        (datetime.now() - api_start).total_seconds(),
+                    )
             except Exception as e:
                 logger.warning(
                     "find_strike_in_premium_range_live: batch tickers failed (%s); "

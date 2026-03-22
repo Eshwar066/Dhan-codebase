@@ -33,7 +33,7 @@ from core.utils.expiry_resolver import ExpiryResolver
 from run.config import RUN_MODE, RunMode
 
 
-VALID_TIME_1730 = {time(1, 45)}  # 1hr candle close time (IST)
+VALID_TIME_1730 = {time(9, 30)}  # 1hr candle close time (IST)
 
 # Strike/premium selection (kept conservative and similar to `MagicalLines`)
 STRIKE_STEP = 500
@@ -62,7 +62,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     """
 
     name = "OneDayMagicalLine"
-    timeframe = "5"  # change to 60min later
+    timeframe = "15"  # change to 60min later
     required_context = ["option_chain"]
     api = "DELTA"
     expiryType = "Weekly"
@@ -194,6 +194,24 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     # ENTRY
     # ==================================================
     def on_candle(self, candle: dict, ctx: Any):
+        """Lag diagnostics: set ``ALGO_LAG_DIAG=1`` (see ``cursor.md`` / ``core/utils/lag_diag.py``)."""
+        from datetime import datetime
+
+        from core.utils.lag_diag import IST, lag_diag_enabled
+
+        _t0 = datetime.now(IST) if lag_diag_enabled() else None
+        if _t0 is not None:
+            print("🚀 on_candle start:", _t0)
+        try:
+            return self._on_candle_body(candle, ctx)
+        finally:
+            if _t0 is not None and lag_diag_enabled():
+                print(
+                    "⚙️ Strategy execution time (sec):",
+                    (datetime.now(IST) - _t0).total_seconds(),
+                )
+
+    def _on_candle_body(self, candle: dict, ctx: Any):
         symbol = candle["symbol"]
 
         # Commit previous candle close for cross detection.

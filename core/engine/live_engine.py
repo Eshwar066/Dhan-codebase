@@ -447,7 +447,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         )
                     if candle is None:
                         continue
-                    print(">>candle", candle)
                     if isinstance(candle.get("timestamp"), (int, float)):
                         ts = candle["timestamp"]
                         if ts > 1e12:
@@ -456,6 +455,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             candle["timestamp"] = dt.datetime.utcfromtimestamp(ts)
                     candle["symbol"] = symbol
                     candle["exchange"] = exchange
+                    if self.engine_logger:
+                        self.engine_logger.candle_created(candle, timeframe=tf)
 
                     if not self._validate_candle_integrity(candle, symbol):
                         continue
