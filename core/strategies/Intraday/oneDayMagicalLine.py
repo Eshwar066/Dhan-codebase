@@ -24,20 +24,21 @@ from datetime import date, time
 from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
+import pdb
 
 
 from core.strategies.IndiaMktMixins import IndiaMktMixins
 from core.strategies.deltaMktMixins import DeltaMktMixins
 from core.strategies.base import BaseStrategy
 from core.utils.expiry_resolver import ExpiryResolver
-from run.config import RUN_MODE, RunMode
+from run.config import RUN_MODE, RunMode, STRATEGY_JOBS
 
 
-VALID_TIME_1730 = {time(9, 30)}  # 1hr candle close time (IST)
+VALID_TIME_1730 = {time(21, 5)}  # 1hr candle close time (IST)
 
 # Strike/premium selection (kept conservative and similar to `MagicalLines`)
 STRIKE_STEP = 500
-STRIKE_LOOKBACK = 15  # +/- 15 steps around ATM => 31 strikes
+STRIKE_LOOKBACK = 5  # +/- 15 steps around ATM => 31 strikes
 TARGET_PREMIUM_MIN = 700
 TARGET_PREMIUM_MAX = 1500
 TARGET_DELTA = 0.25
@@ -62,7 +63,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     """
 
     name = "OneDayMagicalLine"
-    timeframe = "15"  # change to 60min later
+    timeframe = "1"  # change to 60min later
     required_context = ["option_chain"]
     api = "DELTA"
     expiryType = "Weekly"
@@ -85,6 +86,15 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     def get_warmup_period(self):
         return 0
 
+    def _is_delta_testnet_enabled(self) -> bool:
+        for job in STRATEGY_JOBS:
+            if str(job.get("name")) != self.name:
+                continue
+            if str(job.get("venue", "")).upper() != "DELTA":
+                continue
+            return bool(job.get("delta_testnet", False))
+        return False
+
     # Strike selection: backtest = Delta tick CSV; live/paper = products + tickers (``deltaMktMixins``).
     # Branch uses ``run.config.RUN_MODE`` — for live engines set global ``RUN_MODE`` or ensure it matches the job.
     def find_strike_in_premium_range(
@@ -92,8 +102,8 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         candle,
         ctx,
         option_type,
-        min_prem=200,
-        max_prem=400,
+        min_prem=600,
+        max_prem=1500,
         lookback_sec=60,
     ):
         if RUN_MODE == RunMode.BACKTEST:
@@ -106,6 +116,21 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 max_prem=max_prem,
                 lookback_sec=lookback_sec,
                 expiry="Weekly",
+            )
+        if self._is_delta_testnet_enabled():
+            return self.find_strike_in_premium_range_live(
+                candle,
+                ctx,
+                option_type,
+                min_prem=10,
+                max_prem=30000,
+                expiry="Weekly",
+                side="SELL",
+                lookback_sec=lookback_sec,
+                target_delta=0.1,
+                delta_min=0.01,
+                delta_max=1,
+                max_spread_ratio=20,
             )
         return DeltaMktMixins.find_strike_in_premium_range_live(
             self,
@@ -138,7 +163,8 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         """Only enter at `17:30` IST candle close."""
         ts = pd.to_datetime(candle["timestamp"])
 
-        return self._is_valid_time(ts, self.valid_times)
+        # return self._is_valid_time(ts, self.valid_times)
+        return True
 
     def _direction_at_1730(self, candle: dict) -> str:
         open_ = float(candle.get("open", candle.get("close", 0)) or 0)
@@ -229,8 +255,11 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         open_positions = ctx.position_store.get_open_positions(
             underlying=symbol, strategy=self.name
         )
+        print(">>open>> in strategy", open_positions)
         reversal_entry: Optional[Any] = None
         if open_positions:
+            print(">>open_positions in strategy", open_positions)
+            pdb.set_trace()
             for pos in open_positions:
                 if (
                     getattr(pos, "tag", None) != "MAIN"
@@ -348,7 +377,6 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             return None
 
         trade_dt = pd.to_datetime(candle["timestamp"]).date()
-        print(">>trade_dt", trade_dt)
         # Enforce: at most one MAIN structure open for this underlying
         open_positions = ctx.position_store.get_open_positions(
             underlying=symbol, strategy=self.name
@@ -374,6 +402,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             strategy=self.name, structure_id=structure_id, tag="MAIN"
         ):
             return None
+
         has_pending = (
             ctx.intent_store.has_pending_intent(
                 strategy=self.name,
@@ -384,7 +413,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         )
         if has_pending:
             return None
-        # pdb.set_trace()
+
         # Select strike by target premium range for delta excahnage
         result = self.find_strike_in_premium_range(
             candle,
@@ -393,6 +422,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             min_prem=TARGET_PREMIUM_MIN,
             max_prem=TARGET_PREMIUM_MAX,
         )
+
         if result is None:
             return None
 
