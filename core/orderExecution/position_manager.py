@@ -478,7 +478,7 @@ class PositionManager:
         positions = []
         for pos in self.positions.values():
             print(">>positions Manager", self.positions, underlying, strategy)
-            pdb.set_trace()
+
             if pos.net_qty == 0:
                 continue
 
@@ -493,8 +493,20 @@ class PositionManager:
                 ).strip()
                 by_custom = False
                 if getattr(inst, "custom_symbol", None):
-                    parts = (inst.custom_symbol or "").strip().split()
-                    by_custom = (parts[0] == underlying.strip()) if parts else False
+                    symbol = (inst.custom_symbol or "").strip()
+
+                    # Handle option format: C-BTC-78000-270326 / P-BTC-...
+                    if "-" in symbol:
+                        parts = symbol.split("-")
+                        if len(parts) >= 2:
+                            underlying_from_symbol = parts[1]  # BTC
+
+                            # Compare with passed underlying (BTCUSD → BTC)
+                            base_underlying = (
+                                (underlying or "").replace("USD", "").strip()
+                            )
+
+                            by_custom = underlying_from_symbol == base_underlying
                 if not (by_trading or by_custom):
                     continue
 
