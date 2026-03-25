@@ -127,6 +127,28 @@ class IntentStore:
         return [i for i in self.intents.values() if i["status"] == status]
 
     # -------------------------
+    # PENDING INTENT CHECK (for strategy duplicate-signal guard)
+    # -------------------------
+    def has_pending_intent(self, strategy: str, structure_id: str) -> bool:
+        """True if any intent in SENT or VALIDATED matches strategy and structure_id.
+        structure_id is expected as \"StrategyName:SYMBOL:FLAT\"; symbol is matched from payload."""
+        pending = list(self.list_by_status(IntentStatus.SENT)) + list(
+            self.list_by_status(IntentStatus.VALIDATED)
+        )
+        # Parse symbol from structure_id "StrategyName:SYMBOL:FLAT"
+        parts = (structure_id or "").split(":")
+        sym = parts[1] if len(parts) >= 2 else None
+        for i in pending:
+            p = i.get("payload") or {}
+            if p.get("strategy_id") != strategy:
+                continue
+            if sym is not None and p.get("symbol") == sym:
+                return True
+            if p.get("structure_id") == structure_id:
+                return True
+        return False
+
+    # -------------------------
     # ORDER STATE (for OrderRouter cache rebuild)
     # -------------------------
     def get_all_order_states(self):
@@ -137,6 +159,7 @@ class IntentStore:
             if rec.get("order_state")
         ]
 
+    # below two are not used
     # -------------------------
     # EXPIRE STALE
     # -------------------------

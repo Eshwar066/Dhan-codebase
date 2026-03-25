@@ -13,24 +13,33 @@ Optional: use Supervisor in code to run both venues in one process (two threads)
 """
 
 import argparse
+import logging
 import os
 import sys
 from pathlib import Path
 import pdb
 
 from run.config import RUN_MODE, RunMode, STRATEGY_JOBS, DEFAULT_VENUE
+
+logger = logging.getLogger(__name__)
 from run.engine_config import EngineConfig
 from core.engine.factory import EngineFactory
 
 
 def job_to_engine_config(job: dict) -> EngineConfig:
-    """Build EngineConfig from a STRATEGY_JOBS entry."""
+    """Build EngineConfig from a STRATEGY_JOBS entry. Per-job run_mode overrides global RUN_MODE."""
     venue = job.get("venue", DEFAULT_VENUE)
     backtest = job.get("backtest") or {}
     live = job.get("live") or {}
+    # Per-job run_mode: "PAPER" | "LIVE" | "BACKTEST"; if omitted or invalid, use global RUN_MODE
+    run_mode_raw = job.get("run_mode")
+    try:
+        run_mode = RunMode(str(run_mode_raw).upper()) if run_mode_raw else RUN_MODE
+    except (ValueError, AttributeError):
+        run_mode = RUN_MODE
     return EngineConfig(
         broker_name=venue,
-        run_mode=RUN_MODE,
+        run_mode=run_mode,
         strategy_name=job["name"],
         symbols=job["symbols"],
         enabled=job.get("enabled", True),
@@ -39,11 +48,15 @@ def job_to_engine_config(job: dict) -> EngineConfig:
         risk_per_trade_percent=job.get("risk_per_trade_percent"),
         daily_max_loss=job.get("daily_max_loss"),
         max_open_positions=job.get("max_open_positions"),
+        max_portfolio_exposure=job.get("max_portfolio_exposure"),
+        cooldown_seconds=job.get("cooldown_seconds"),
+        check_short_option_margin_enabled=job.get("check_short_option_margin_enabled"),
         feed_stale_seconds=job.get("feed_stale_seconds"),
         backtest=backtest,
         live=live,
         delta_testnet=job.get("delta_testnet", True),
         delta_india=job.get("delta_india", False),
+        delta_leverage=job.get("delta_leverage"),
         order_state_check_interval_min=job.get("order_state_check_interval_min", 0),
         memory_threshold_percent=job.get("memory_threshold_percent"),
         strategy_timeout_seconds=job.get("strategy_timeout_seconds"),
@@ -75,7 +88,7 @@ def run_engine(config: EngineConfig) -> None:
             "Strategy will not receive any candles. Ensure Dependencies/equity_universe/EQUITY_L_latest.csv exists or set symbols in config."
         )
 
-    if RUN_MODE == RunMode.BACKTEST:
+    if config.run_mode == RunMode.BACKTEST:
         bt = config.backtest or {}
         engine.run(
             symbols=symbols,
@@ -111,10 +124,12 @@ def main():
     if args.venue:
         configs = [c for c in configs if c.broker_name == args.venue]
         if not configs:
+            logger.warning("No enabled jobs for venue %s", args.venue)
             print(f"No enabled jobs for venue {args.venue}")
             sys.exit(0)
 
-    print(f"Run mode: {RUN_MODE.value} | Jobs: {[c.strategy_name for c in configs]}")
+    mode_summary = ", ".join(f"{c.strategy_name}({c.run_mode.value})" for c in configs)
+    print(f"Default run mode: {RUN_MODE.value} | Jobs: {mode_summary}")
     for config in configs:
         run_engine(config)
 

@@ -3,9 +3,12 @@ Delta Exchange source: market data and order/position APIs via delta_rest_client
 Used by DeltaDataProvider (data layer) and DeltaBrokerApi (broker layer).
 """
 
+import logging
 import os
 from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 import requests
 import pandas as pd
 from datetime import datetime, date, timedelta
@@ -22,7 +25,9 @@ from core.library.delta_rest_client import (
     DeltaRestClient,
     OrderType,
     TimeInForce,
-    parseResponse,
+    create_order_format,
+    cancel_order_format,
+    round_by_tick_size,
 )
 
 # Delta Exchange base URLs
@@ -57,7 +62,7 @@ class DeltaSource:
                     DELTA_BASE_URL_INDIA_PROD if india else DELTA_BASE_URL_GLOBAL_PROD
                 )
 
-        print(base_url, "baseurl")
+        logger.info("Delta base_url: %s", base_url)
         self._client = DeltaRestClient(
             base_url=base_url,
             api_key=api_key,
@@ -119,12 +124,101 @@ class DeltaSource:
                 return prod.get("id")
         return None
 
+    def _get_tick_size_for_product(self, product_id: int) -> Optional[float]:
+        """Return tick_size for product_id from products cache; None if not found."""
+        self.get_products(use_cache=True)
+        for p in (self._products_cache or []):
+            if p.get("id") == product_id:
+                tick = p.get("tick_size")
+                if tick is not None:
+                    try:
+                        return float(tick)
+                    except (TypeError, ValueError):
+                        pass
+                return None
+        return None
+
     # -------------------------------------------------------------------------
     # Data: Ticker / LTP / orderbook
     # -------------------------------------------------------------------------
     def get_ticker(self, identifier: str) -> Any:
         """Single ticker by symbol or product identifier."""
         return self._client.get_ticker(identifier, auth=False)
+
+    @staticmethod
+    def expiry_ddmmyy_to_api_date(ddmmyy: str) -> Optional[str]:
+        """``DDMMYY`` (e.g. ``070326``) -> ``DD-MM-YYYY`` for Delta ``GET /v2/tickers`` query."""
+        s = (ddmmyy or "").strip()
+        if len(s) != 6 or not s.isdigit():
+            return None
+        dd, mm, yy = s[:2], s[2:4], s[4:6]
+        return f"{dd}-{mm}-20{yy}"
+
+    def get_tickers_list(
+        self,
+        contract_types: Optional[str] = None,
+        underlying_asset_symbols: Optional[str] = None,
+        expiry_date: Optional[str] = None,
+    ) -> List[Dict]:
+        """
+        One REST call: ``GET /v2/tickers`` with optional filters (option chain per expiry).
+        """
+        query: Dict[str, str] = {}
+        if contract_types:
+            query["contract_types"] = contract_types
+        if underlying_asset_symbols:
+            query["underlying_asset_symbols"] = underlying_asset_symbols
+        if expiry_date:
+            query["expiry_date"] = expiry_date
+        try:
+            result = self._client.get_tickers(
+                query=query if query else None, auth=False
+            )
+            if isinstance(result, list):
+                return result
+            return []
+        except Exception as e:
+            logger.warning("get_tickers_list failed: %s", e)
+            return []
+
+    def tickers_map_by_symbol(self, rows: List[Dict]) -> Dict[str, Dict]:
+        """Index ticker rows by uppercase ``symbol``."""
+        out: Dict[str, Dict] = {}
+        for row in rows:
+            sym = (row.get("symbol") or "").upper()
+            if sym:
+                out[sym] = row
+        return out
+
+    def get_option_tickers_for_expiry(
+        self,
+        underlying_symbol: str,
+        expiry_ddmmyy: str,
+        option_letter: str,
+    ) -> Dict[str, Dict]:
+        """
+        Single batch call for all call or put option tickers for one underlying + expiry.
+        Replaces N× ``get_ticker`` when selecting strikes in ``find_strike_in_premium_range_live``.
+        """
+        expiry_api = self.expiry_ddmmyy_to_api_date(expiry_ddmmyy)
+        if not expiry_api:
+            return {}
+        ol = (option_letter or "C").upper()
+        ct = "put_options" if ol == "P" else "call_options"
+        rows = self.get_tickers_list(
+            contract_types=ct,
+            underlying_asset_symbols=underlying_symbol,
+            expiry_date=expiry_api,
+        )
+        return self.tickers_map_by_symbol(rows)
+
+    def get_all_tickers_map(self) -> Dict[str, Dict]:
+        """
+        One ``GET /v2/tickers`` call with no filters (all products). Large payload;
+        prefer :meth:`get_option_tickers_for_expiry` for strike selection.
+        """
+        rows = self.get_tickers_list()
+        return self.tickers_map_by_symbol(rows)
 
     def get_l2_orderbook(self, identifier: str) -> Any:
         """L2 orderbook by symbol or product identifier."""
@@ -231,7 +325,7 @@ class DeltaSource:
             )
             return df
         except Exception as e:
-            print(f"Delta _fetch_intraday_range error: {e}")
+            logger.warning("Delta _fetch_intraday_range error: %s", e, exc_info=True)
             return None
 
     def get_intraday(
@@ -467,24 +561,42 @@ class DeltaSource:
         tif = None
         if time_in_force:
             tif = getattr(TimeInForce, time_in_force.upper(), None)
+        # Round limit price to exchange tick size to avoid invalid price precision
+        tick_size = self._get_tick_size_for_product(product_id)
+        effective_limit_price = limit_price
+        if limit_price is not None and tick_size is not None:
+            effective_limit_price = round_by_tick_size(limit_price, tick_size)
         try:
-            result = self._client.place_order(
-                product_id=product_id,
-                size=size,
-                side=side,
-                limit_price=limit_price,
-                time_in_force=tif,
-                order_type=ot,
-                post_only=post_only,
-                client_order_id=client_order_id,
-                reduce_only=reduce_only,
-            )
+            if ot == OrderType.LIMIT and effective_limit_price is not None:
+                # Build exchange order payload via create_order_format, then add extra fields
+                order = create_order_format(
+                    effective_limit_price, size, side, product_id, post_only=post_only
+                )
+                order["reduce_only"] = reduce_only
+                if client_order_id:
+                    order["client_order_id"] = client_order_id
+                if tif is not None:
+                    order["time_in_force"] = tif.value
+                result = self._client.create_order(order)
+            else:
+                result = self._client.place_order(
+                    product_id=product_id,
+                    size=size,
+                    side=side,
+                    limit_price=effective_limit_price,
+                    time_in_force=tif,
+                    order_type=ot,
+                    post_only=post_only,
+                    client_order_id=client_order_id,
+                    reduce_only=reduce_only,
+                )
             oid = result.get("id") or result.get("order_id")
             return {
                 "status": "success",
                 "order_id": str(oid) if oid is not None else None,
             }
         except Exception as e:
+            logger.warning("Delta place_order failed: %s", e, exc_info=True)
             return {"status": "error", "order_id": None, "message": str(e)}
 
     def get_order_list(self) -> List[Dict[str, Any]]:
@@ -526,11 +638,12 @@ class DeltaSource:
             return normalized
 
         except Exception as e:
-            self.engine_logger.error(f"get_order_list failed: {e}")
+            logger.warning("Delta get_order_list failed: %s", e, exc_info=True)
             return []
 
     def cancel_order(self, product_id: int, order_id: Any) -> Any:
-        return self._client.cancel_order(product_id=product_id, order_id=order_id)
+        payload = cancel_order_format({"id": order_id, "product_id": product_id})
+        return self._client.cancel_order_with_payload(payload)
 
     def get_live_orders(self, query: Optional[Dict] = None) -> Any:
         return self._client.get_live_orders(query=query)
@@ -589,3 +702,47 @@ class DeltaSource:
         self, query: Optional[Dict] = None, page_size: int = 100, after: Any = None
     ) -> Any:
         return self._client.fills(query=query or {}, page_size=page_size, after=after)
+
+    def get_orders_history(
+        self, page_size: int = 15, after: Any = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch order history via order_history (v2/orders/history).
+        Returns list of orders for resolving fill status when not in live list.
+        """
+        try:
+            data = self._client.order_history(
+                query={}, page_size=min(page_size, 50), after=after
+            )
+            if not isinstance(data, dict) or not data.get("success"):
+                return []
+            result = data.get("result")
+            if isinstance(result, list):
+                return result
+            if isinstance(result, dict):
+                return result.get("orders", result.get("order", []))
+            return []
+        except Exception:
+            return []
+
+    def get_fills(
+        self, page_size: int = 15, after: Any = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch fills via fills() (v2/fills) for order fill status.
+        Returns list of fill dicts.
+        """
+        try:
+            data = self._client.fills(
+                query={}, page_size=min(page_size, 50), after=after
+            )
+            if not isinstance(data, dict) or not data.get("success"):
+                return []
+            result = data.get("result")
+            if isinstance(result, list):
+                return result
+            if isinstance(result, dict):
+                return result.get("fills", result.get("fill", []))
+            return []
+        except Exception:
+            return []

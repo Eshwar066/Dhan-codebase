@@ -1,10 +1,32 @@
 """
 RiskManager: per-engine limits, kill switch, capital-based exposure.
 Exits always allowed; entries blocked when limits or kill switch triggered.
+Option shorting: optional check_short_option_margin(intent, price_map) validates
+SPAN and exposure margin before allowing short option entries. Wire via
+make_short_option_margin_check(broker) when broker implements check_short_option_margin.
 """
 
+import logging
 import time
-from typing import Optional, Any
+from typing import Any, Callable, Dict, Optional
+
+logger = logging.getLogger(__name__)
+
+
+def make_short_option_margin_check(
+    broker: Any,
+) -> Optional[Callable[[Any, Dict], bool]]:
+    """
+    Return a callable (intent, price_map) -> bool for SPAN + exposure margin validation,
+    or None if broker does not support it. Brokers (e.g. Dhan) can implement
+    check_short_option_margin(intent, price_map) using margin_calculator / fund limits.
+    """
+    if broker is None:
+        return None
+    fn = getattr(broker, "check_short_option_margin", None)
+    if callable(fn):
+        return lambda intent, price_map: fn(intent, price_map)
+    return None
 
 
 class RiskManager:
@@ -20,9 +42,14 @@ class RiskManager:
         capital: Optional[float] = None,
         risk_per_trade_percent: Optional[float] = None,
         engine_logger: Optional[Any] = None,
+        check_short_option_margin: Optional[
+            Callable[[Any, Dict[str, float]], bool]
+        ] = None,
     ):
         self.pm = position_manager
         self.engine_logger = engine_logger
+        # Option shorting: callable(intent, price_map) -> True if SPAN + exposure margin OK
+        self.check_short_option_margin = check_short_option_margin
 
         # Limits
         self.max_portfolio_exposure = max_portfolio_exposure
@@ -61,7 +88,7 @@ class RiskManager:
         if self.engine_logger:
             self.engine_logger.kill_switch(reason)
         else:
-            print(f"CRITICAL Kill switch: {reason}")
+            logger.critical("Kill switch: %s", reason)
 
     def record_realized_pnl(self, amount: float) -> None:
         """Call when a position is closed and PnL is realized (e.g. from PositionManager)."""
@@ -75,7 +102,7 @@ class RiskManager:
         if self.engine_logger:
             self.engine_logger.risk_block(msg, symbol=symbol)
         else:
-            print(msg)
+            logger.warning("Risk block: %s (symbol=%s)", msg, symbol)
 
     # -------------------------
     # MAIN CHECK
@@ -117,7 +144,10 @@ class RiskManager:
                 return False
 
         # 1️⃣ Daily loss limit
-        if self.daily_max_loss is not None and self.daily_realized_pnl <= -self.daily_max_loss:
+        if (
+            self.daily_max_loss is not None
+            and self.daily_realized_pnl <= -self.daily_max_loss
+        ):
             self._log_block("Daily max loss reached")
             return False
 
@@ -131,11 +161,13 @@ class RiskManager:
         open_count = self._open_positions_count()
         if open_count >= self.max_open_positions:
             if self.engine_logger:
-                self.engine_logger.max_positions_blocked(current_count=open_count, max_allowed=self.max_open_positions)
+                self.engine_logger.max_positions_blocked(
+                    current_count=open_count, max_allowed=self.max_open_positions
+                )
             self._log_block("Max open positions reached")
             return False
 
-        # 4️⃣ Per-symbol qty limit
+        # 4️⃣ Per-symbol qty limit ==> tested ✅
         future_qty = abs(self.pm.get_qty(symbol)) + qty
         if future_qty > self.max_qty_per_symbol:
             self._log_block("Qty limit breach", symbol=symbol)
@@ -145,6 +177,22 @@ class RiskManager:
         if not self._direction_ok(intent.instrument, side):
             self._log_block("Opposite position exists", symbol=symbol)
             return False
+
+        # 5b️⃣ Option shorting: validate SPAN + exposure margin before sending
+        if self._is_short_option(intent) and self.check_short_option_margin is not None:
+            try:
+                if not self.check_short_option_margin(intent, price_map):
+                    self._log_block(
+                        "Insufficient margin (SPAN/exposure) for short option",
+                        symbol=symbol,
+                    )
+                    return False
+            except Exception as e:
+                self._log_block(
+                    f"Short option margin check failed: {e}",
+                    symbol=symbol,
+                )
+                return False
 
         multiplier = getattr(intent.instrument, "contract_multiplier", 1)
         trade_exposure = abs(qty) * price * multiplier
@@ -163,20 +211,37 @@ class RiskManager:
             self._log_block(f"Symbol exposure breach {sym_exposure}", symbol=symbol)
             return False
 
-        # 8️⃣ Portfolio exposure check
+        # 8️⃣ 🔶🔶 Portfolio exposure check ==> checked when there are open positions in singal or multiple strategies
         portfolio_exposure = self.pm.total_exposure(price_map)
         new_exposure = portfolio_exposure + (qty * price * multiplier)
         if new_exposure > self.max_portfolio_exposure:
             self._log_block("Portfolio exposure breach")
             return False
 
-        key = (getattr(intent, "strategy", None), getattr(intent, "structure_id", None), intent.instrument.contract_key)
+        key = (
+            getattr(intent, "strategy", None),
+            getattr(intent, "structure_id", None),
+            intent.instrument.contract_key,
+        )
         self.last_trade_time[key] = now_ts
         return True
 
     # -------------------------
     # HELPERS
     # -------------------------
+    def _is_short_option(self, intent) -> bool:
+        """True if intent is ENTRY + SELL on an option (short option)."""
+        action = getattr(intent, "action", "ENTRY")
+        side = getattr(intent, "side", "")
+        if action != "ENTRY" or (str(side).upper() != "SELL"):
+            return False
+        inst = getattr(intent, "instrument", None)
+        if inst is None:
+            return False
+        itype = (getattr(inst, "instrument_type", None) or "").upper()
+        otype = getattr(inst, "option_type", None)
+        return itype in ("OP", "OPT", "OPTION") or otype in ("CE", "PE", "CALL", "PUT")
+
     def _direction_ok(self, instrument, side):
         for pos in self.pm.get_open_positions():
             if pos.instrument.contract_key != instrument.contract_key:

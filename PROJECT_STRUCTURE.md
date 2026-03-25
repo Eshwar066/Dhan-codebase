@@ -28,7 +28,7 @@ Dhan codebase/
 │   ├── strategies/            base, IndiaMktMixins, Leaps, Inside_bar_candle, registry
 │   └── utils/                 expiry_resolver, instruments, session
 ├── run/
-│   ├── config.py              RUN_MODE, STRATEGY_JOBS
+│   ├── config.py              RUN_MODE (default), STRATEGY_JOBS (per-job run_mode, venue, delta_leverage)
 │   └── main.py                Wire and run jobs
 ├── logs/
 ├── Dependencies/              Instrument file (all_instrument{date}.csv)

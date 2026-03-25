@@ -25,13 +25,37 @@ import os
 import socket
 import threading
 import time
+import pdb
 from typing import Any, Callable, Dict, List, Optional
 
 import websocket
 
 from core.library.delta_rest_client import generate_signature
+from core.utils.lag_diag import (
+    print_ws_tick_vs_now,
+    ws_tick_diag_enabled,
+    ws_tick_should_drop_stale,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _is_delta_ticker_message(msg: dict) -> bool:
+    """
+    Match Delta ``v2/ticker`` updates. Some builds use different ``type`` casing
+    or omit it; fallback: ``symbol`` + ``quotes`` (order book) present.
+    """
+    mt = msg.get("type")
+    if mt is not None:
+        s = str(mt).lower()
+        if s.startswith("candlestick"):
+            return False
+        if s == "v2/ticker" or "ticker" in s:
+            return True
+    if msg.get("symbol") and isinstance(msg.get("quotes"), dict):
+        return True
+    return False
+
 
 # WebSocket base URLs
 DELTA_WS_INDIA_PROD = "wss://socket.india.delta.exchange"
@@ -75,18 +99,20 @@ class DeltaWebSocket:
         on_error: Optional[Callable[[Exception], None]] = None,
         on_close: Optional[Callable[[int, str], None]] = None,
         on_tick: Optional[Callable[[str, float, float, float], None]] = None,
+        on_feed_stall: Optional[Callable[[float], None]] = None,
     ):
         self.api_key = api_key
         self.api_secret = api_secret
         self.on_tick = on_tick
 
         self.ws_url = DELTA_WS_INDIA_TEST if testnet else DELTA_WS_INDIA_PROD
-        print("ws url", self.ws_url)
+        logger.info("Delta WebSocket URL: %s", self.ws_url)
         self.on_message = on_message
         self.on_auth = on_auth
         self.on_subscriptions = on_subscriptions
         self.on_error_cb = on_error
         self.on_close_cb = on_close
+        self.on_feed_stall = on_feed_stall
 
         self._ws: Optional[websocket.WebSocketApp] = None
         self._thread: Optional[threading.Thread] = None
@@ -111,6 +137,7 @@ class DeltaWebSocket:
         self._last_orderbook_l2: Dict[str, Dict] = {}
         self._orders: Dict[str, List[Dict]] = {}
         self._positions: Dict[str, Dict] = {}
+        self._ws_msg_sample_count = 0
 
     def _send(self, payload: Dict) -> None:
         if self._ws and self._ws.sock and self._ws.sock.connected:
@@ -142,10 +169,18 @@ class DeltaWebSocket:
                 ):
                     if not self._feed_stall_warned:
                         self._feed_stall_warned = True
+                        stall_sec = time.time() - self._last_tick_time
                         logger.warning(
                             "[WARNING] No ticks received for %.0f seconds!",
-                            time.time() - self._last_tick_time,
+                            stall_sec,
                         )
+                        if self.on_feed_stall:
+                            try:
+                                self.on_feed_stall(stall_sec)
+                            except Exception as e:
+                                logger.debug(
+                                    "Delta WS feed_stall callback error: %s", e
+                                )
             self._heartbeat_timer = threading.Timer(15, check)
             self._heartbeat_timer.daemon = True
             self._heartbeat_timer.start()
@@ -162,6 +197,14 @@ class DeltaWebSocket:
             return
 
         msg_type = msg.get("type")
+        if ws_tick_diag_enabled() and self._ws_msg_sample_count < 12:
+            self._ws_msg_sample_count += 1
+            logger.info(
+                "Delta WS msg #%s type=%r symbol=%r",
+                self._ws_msg_sample_count,
+                msg_type,
+                msg.get("symbol"),
+            )
 
         if msg_type == "heartbeat":
             with self._lock:
@@ -203,7 +246,10 @@ class DeltaWebSocket:
             return
 
         # Public market data
-        if msg_type == "v2/ticker" or "ticker" in (msg_type or ""):
+        if _is_delta_ticker_message(msg):
+            if ws_tick_should_drop_stale(msg):
+                return
+            print_ws_tick_vs_now(msg)
             self._last_tick_time = time.time()
             self._feed_stall_warned = False
             if not self._feed_data_logged:
@@ -240,13 +286,16 @@ class DeltaWebSocket:
                         elif not isinstance(ts, (int, float)):
                             ts = time.time()
                         self.on_tick(sym, price, vol, float(ts))
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Delta WS on_tick callback error: %s", e)
             if self.on_message:
                 self.on_message(msg)
             return
 
         if msg_type and msg_type.startswith("candlestick_"):
+            if ws_tick_should_drop_stale(msg):
+                return
+            print_ws_tick_vs_now(msg)
             self._last_tick_time = time.time()
             self._feed_stall_warned = False
             if not self._feed_data_logged:
@@ -447,8 +496,8 @@ class DeltaWebSocket:
         if self._ws:
             try:
                 self._ws.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Delta WS close during reconnect: %s", e)
             self._ws = None
         logger.debug("Delta WebSocket: reconnecting in 2s...")
         time.sleep(2)
@@ -476,8 +525,8 @@ class DeltaWebSocket:
         if self._ws:
             try:
                 self._ws.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Delta WS close during disconnect: %s", e)
             self._ws = None
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)

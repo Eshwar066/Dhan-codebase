@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 if TYPE_CHECKING:
     from core.models.strategy_context import StrategyContext
 
-
+# use for  BTC profit factor 1.2
 class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
 
     name = "FuturesEMAHighLow"

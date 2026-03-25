@@ -101,3 +101,17 @@ class BaseBroker(ABC):
     def find_order_by_client_id(self, client_order_id: str):
         """Optional idempotency hook. LIVE brokers may override."""
         return None
+
+    def check_funds_before_order(
+        self,
+        intent: Any,
+        execution_price: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Optional: before placing an order, check available balance vs required/SPAN margin.
+        Return None to skip check; else return dict with:
+          ok (bool), available (float), required_margin (float), span_margin (float|None),
+          shortfall (float), message (str).
+        On shortage, caller should log and send telegram then reject the intent.
+        """
+        return None

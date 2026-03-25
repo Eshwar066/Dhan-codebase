@@ -3,12 +3,15 @@ Delta Exchange broker: instrument loading (API) and lookup logic.
 Product id / symbol, Delta API schema, backtest dummy rows.
 """
 
+import logging
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
 import pdb
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 import requests
 from run.config import RUN_MODE, RunMode
 
@@ -69,6 +72,12 @@ class DeltaInstrumentStore(BaseInstrumentStore):
             self.df = provider.load()
             if cache and not self.df.empty:
                 cache.parent.mkdir(parents=True, exist_ok=True)
+                # Remove previous Delta instrument files so only the new one remains
+                for old in cache.parent.glob("delta_instrument_*.csv"):
+                    try:
+                        old.unlink()
+                    except OSError:
+                        pass
                 self.df.to_csv(cache, index=False)
         self._symbol_to_row = {}
         if not self.df.empty and "symbol" in self.df.columns:
@@ -78,6 +87,29 @@ class DeltaInstrumentStore(BaseInstrumentStore):
                 pid = row.get("id")
                 if pid is not None:
                     self._symbol_to_row[str(pid)] = row
+
+    def get_tick_size(self, symbol: str) -> Optional[float]:
+        """Return tick size for symbol from product data; None if not found."""
+        key = str(symbol).upper()
+        row = self._symbol_to_row.get(key)
+        if row is not None:
+            tick = row.get("tick_size")
+            if tick is not None:
+                v = pd.to_numeric(tick, errors="coerce")
+                return None if pd.isna(v) else float(v)
+        return None
+
+    def get_lot_size(self, symbol: str) -> Optional[int]:
+        """Return lot size for symbol from product data; None if not found. Delta often uses 1."""
+        key = str(symbol).upper()
+        row = self._symbol_to_row.get(key)
+        if row is not None:
+            lot = row.get("lot_size")
+            if lot is not None:
+                v = pd.to_numeric(lot, errors="coerce")
+                if pd.notna(v) and v >= 1:
+                    return int(v)
+        return 1
 
     def _row_to_instrument(self, row: pd.Series) -> Instrument:
         symbol = row.get("symbol") or row.get("short_name", "")
@@ -114,7 +146,7 @@ class DeltaInstrumentStore(BaseInstrumentStore):
             return self._row_to_instrument(row)
 
         if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
-            print(f"❌ No Delta instrument found for {trading_symbol}")
+            logger.warning("No Delta instrument found for %s", trading_symbol)
             return None
 
         DeltaInstrumentStore.dummy_security_counter += 1
@@ -141,7 +173,7 @@ class DeltaInstrumentStore(BaseInstrumentStore):
             return self._row_to_instrument(row)
 
         if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
-            print(f"❌ No Delta FUT instrument found for {trading_symbol}")
+            logger.warning("No Delta FUT instrument found for %s", trading_symbol)
             return None
 
         DeltaInstrumentStore.dummy_security_counter += 1

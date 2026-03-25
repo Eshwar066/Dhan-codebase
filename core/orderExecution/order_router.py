@@ -1,12 +1,17 @@
 import json
+import logging
 import time
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Dict, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+# Trade-led OMS: positions are updated only from trade events (fills), not from order state.
 
 OptionalAlert = Optional[Callable[[str], None]]
 import pdb
 import datetime
+
+logger = logging.getLogger(__name__)
 
 from core.orderExecution.intent_store import IntentStatus
 
@@ -67,6 +72,11 @@ class OrderRouter:
         self._consecutive_failures = 0
         # Order state cache: intent_id -> OrderState. Persisted to logs/order_state_{engine_id}.json.
         self._order_state: Dict[str, OrderState] = {}
+        self._order_state_log: List[Dict[str, Any]] = []
+        self._order_state_log_max = 5000
+        # Trade-led: only apply each trade once; positions = f(trades), not f(order state)
+        self._processed_trade_ids: Set[str] = set()
+        self._processed_trade_ids_max = 10000
         _logs_dir = Path(__file__).resolve().parents[2] / "logs"
         _logs_dir.mkdir(parents=True, exist_ok=True)
         _safe_id = (engine_id or "default").replace(" ", "_").replace("/", "_")
@@ -75,36 +85,82 @@ class OrderRouter:
         self._rebuild_order_state_cache()
 
     def _load_order_state(self) -> None:
-        """Load intent_id -> OrderState from logs/order_state_{engine_id}.json."""
-        if not getattr(self, "_order_state_file", None) or not self._order_state_file.exists():
+        """Load intent_id -> OrderState and optional action log from logs/order_state_{engine_id}.json."""
+        if (
+            not getattr(self, "_order_state_file", None)
+            or not self._order_state_file.exists()
+        ):
             return
         try:
             with open(self._order_state_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            for intent_id, val in (data if isinstance(data, dict) else {}).items():
-                try:
-                    self._order_state[intent_id] = (
-                        OrderState(val) if isinstance(val, str) else val
-                    )
-                except (ValueError, TypeError):
-                    pass
+            if not isinstance(data, dict):
+                return
+            # New format: { "states": {...}, "log": [...] }
+            if "states" in data:
+                for intent_id, val in data["states"].items():
+                    try:
+                        self._order_state[intent_id] = (
+                            OrderState(val) if isinstance(val, str) else val
+                        )
+                    except (ValueError, TypeError):
+                        pass
+                self._order_state_log = data.get("log") or []
+            else:
+                # Legacy: flat intent_id -> state
+                for intent_id, val in data.items():
+                    try:
+                        self._order_state[intent_id] = (
+                            OrderState(val) if isinstance(val, str) else val
+                        )
+                    except (ValueError, TypeError):
+                        pass
+                self._order_state_log = []
         except (json.JSONDecodeError, OSError):
             pass
 
     def _persist_order_state(self) -> None:
-        """Write _order_state to logs/order_state_{engine_id}.json."""
+        """Write _order_state and action log to logs/order_state_{engine_id}.json."""
         if not getattr(self, "_order_state_file", None):
             return
         try:
-            data = {k: (v.value if isinstance(v, OrderState) else v) for k, v in self._order_state.items()}
+            states = {
+                k: (v.value if isinstance(v, OrderState) else v)
+                for k, v in self._order_state.items()
+            }
+            log = getattr(self, "_order_state_log", [])
+            data = {"states": states, "log": log}
             with open(self._order_state_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except OSError:
             pass
 
-    def _set_order_state(self, intent_id: str, state: OrderState) -> None:
-        """Update in-memory cache and persist to JSON."""
+    def _set_order_state(
+        self,
+        intent_id: str,
+        state: OrderState,
+        action: Optional[str] = None,
+        message: Optional[str] = None,
+    ) -> None:
+        """Update in-memory cache, append detailed log entry, and persist to JSON."""
         self._order_state[intent_id] = state
+        state_val = state.value if isinstance(state, OrderState) else state
+        entry = {
+            "timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[
+                :-3
+            ]
+            + "Z",
+            "intent_id": intent_id,
+            "state": state_val,
+            "action": action or "set",
+            "message": message or "",
+        }
+        log = getattr(self, "_order_state_log", [])
+        log.append(entry)
+        if len(log) > getattr(self, "_order_state_log_max", 500):
+            self._order_state_log = log[-self._order_state_log_max :]
+        else:
+            self._order_state_log = log
         self._persist_order_state()
 
     def _rebuild_order_state_cache(self) -> None:
@@ -120,6 +176,24 @@ class OrderRouter:
                 )
             except (ValueError, TypeError):
                 pass
+        # Append one log entry for this rebuild (no single intent_id)
+        log = getattr(self, "_order_state_log", [])
+        log.append(
+            {
+                "timestamp": datetime.datetime.utcnow().strftime(
+                    "%Y-%m-%dT%H:%M:%S.%f"
+                )[:-3]
+                + "Z",
+                "intent_id": "",
+                "state": "",
+                "action": "cache_rebuild",
+                "message": "Merged order states from intent_store at startup",
+            }
+        )
+        if len(log) > getattr(self, "_order_state_log_max", 500):
+            self._order_state_log = log[-self._order_state_log_max :]
+        else:
+            self._order_state_log = log
         self._persist_order_state()
 
     def process_intent(self, intent, price_map, idempotency_key=None):
@@ -129,7 +203,12 @@ class OrderRouter:
             self.intent_store.update(
                 intent.intent_id, IntentStatus.REJECTED, order_state=OrderState.REJECTED
             )
-            self._set_order_state(intent.intent_id, OrderState.REJECTED)
+            self._set_order_state(
+                intent.intent_id,
+                OrderState.REJECTED,
+                action="risk_rejected",
+                message="Risk manager did not allow intent",
+            )
             return
 
         # Fix 3: Intent Deduplication (scoped by engine_id + strategy_id to support multi-engine/multi-strategy)
@@ -163,26 +242,56 @@ class OrderRouter:
                         )
                     return
 
-        # Resolve execution price: intent.price first, else price_map (e.g. backtest candle close)
-        exec_price = intent.price
-        if exec_price is None and price_map:
-            sym = (
-                getattr(intent.instrument, "trading_symbol", None)
-                if getattr(intent, "instrument", None)
-                else None
-            )
-            if sym is not None:
-                exec_price = price_map.get(sym)
+        # Resolve execution price: always prefer price_map (engine updates it with best bid/ask)
+        sym = (
+            getattr(intent.instrument, "trading_symbol", None)
+            if getattr(intent, "instrument", None)
+            else None
+        )
+        exec_price = None
+        if price_map and sym is not None:
+            exec_price = price_map.get(sym)
+        if exec_price is None:
+            exec_price = intent.price
         if exec_price is None:
             raise ValueError(
-                f"No price available for intent {intent.intent_id} (intent.price=None and price_map has no "
-                f"entry for {getattr(getattr(intent, 'instrument', None), 'trading_symbol', '?')})"
+                f"No price available for intent {intent.intent_id} (price_map has no "
+                f"entry for {sym!r} and intent.price is None)"
             )
 
         exec_price = self.slippage_model(exec_price)
         sym = intent.instrument.trading_symbol if hasattr(intent, "instrument") else ""
         side = getattr(intent, "side", "")
         qty = getattr(intent, "qty", 0)
+        action = getattr(intent, "action", "ENTRY")
+
+        # ENTRY → check margin. EXIT / FORCE_EXIT → NEVER check margin (otherwise you cannot close positions).
+        if action not in ("EXIT", "FORCE_EXIT"):
+            funds_check = getattr(
+                self.broker, "check_funds_before_order", lambda _i, _p: None
+            )(intent, exec_price)
+            if funds_check is not None and funds_check.get("ok") is False:
+                shortfall = funds_check.get("shortfall", 0)
+                msg = funds_check.get("message") or "Insufficient funds"
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "risk_block",
+                        f"Funds check failed: {msg} (shortfall={shortfall})",
+                    )
+                if self.telegram_alert:
+                    self.telegram_alert(
+                        f"⚠️ Order blocked – insufficient funds: {sym} {side} qty={qty}. {msg} Shortfall: {shortfall}"
+                    )
+                self.intent_store.update(
+                    intent.intent_id, IntentStatus.REJECTED, order_state=OrderState.REJECTED
+                )
+                self._set_order_state(
+                    intent.intent_id,
+                    OrderState.REJECTED,
+                    action="insufficient_funds",
+                    message=msg,
+                )
+                return
 
         # Ensure intent exists in store (for fill sync and stale exit refresh)
         if not self.intent_store.exists(intent.intent_id):
@@ -193,15 +302,48 @@ class OrderRouter:
                 "action": getattr(intent, "action", "ENTRY"),
                 "engine_id": intent_engine_id,
                 "strategy_id": intent_strategy_id,
+                "structure_id": getattr(intent, "structure_id", None),
+                "tag": getattr(intent, "tag", None),
             }
+            _extras = getattr(intent, "metadata_extras", None)
+            if _extras is not None:
+                payload["strategy_meta"] = _extras
             self.intent_store.create(
                 payload=payload,
                 intent_id=intent.intent_id,
-                idempotency_key=idempotency_key if idempotency_key is not None else getattr(intent, "idempotency_key", None),
+                idempotency_key=(
+                    idempotency_key
+                    if idempotency_key is not None
+                    else getattr(intent, "idempotency_key", None)
+                ),
             )
             rec = self.intent_store.get(intent.intent_id)
-            if rec and hasattr(intent, "instrument"):
+            if rec:
+                if hasattr(intent, "instrument"):
+                    rec["instrument"] = intent.instrument
+                rec["strategy"] = intent_strategy_id
+                rec["structure_id"] = getattr(intent, "structure_id", None)
+                rec["tag"] = getattr(intent, "tag", None)
+                rec["action"] = getattr(intent, "action", "ENTRY")
+
+        # Keep intent record metadata in sync when intent already existed (e.g. idempotency retry)
+        rec = self.intent_store.get(intent.intent_id)
+        if rec:
+            rec["strategy"] = intent_strategy_id
+            rec["structure_id"] = getattr(intent, "structure_id", None)
+            rec["tag"] = getattr(intent, "tag", None)
+            rec["action"] = getattr(intent, "action", "ENTRY")
+            if hasattr(intent, "instrument"):
                 rec["instrument"] = intent.instrument
+            pay = rec.get("payload") or {}
+            if getattr(intent, "structure_id", None) is not None:
+                pay["structure_id"] = intent.structure_id
+            if getattr(intent, "tag", None) is not None:
+                pay["tag"] = intent.tag
+            _extras = getattr(intent, "metadata_extras", None)
+            if _extras is not None:
+                pay["strategy_meta"] = _extras
+            rec["payload"] = pay
 
         # Fix 1: Persistence Before Flight
         self.intent_store.update(intent.intent_id, IntentStatus.VALIDATED)
@@ -226,15 +368,24 @@ class OrderRouter:
             self.intent_store.update(
                 intent.intent_id, "REJECTED", order_state=OrderState.REJECTED
             )
-            self._set_order_state(intent.intent_id, OrderState.REJECTED)
+            self._set_order_state(
+                intent.intent_id,
+                OrderState.REJECTED,
+                action="broker_error",
+                message=f"place_order failed: {e}",
+            )
             return
 
         if order_id is None:
             self._consecutive_failures += 1
             if self.engine_logger:
                 self.engine_logger.log("risk_block", "Broker place_order returned None")
+            else:
+                logger.warning("Broker place_order returned None for %s %s qty=%s", sym, side, qty)
             if self.telegram_alert:
-                self.telegram_alert(f"Broker returned no order_id: {sym} {side} qty={qty}")
+                self.telegram_alert(
+                    f"Broker returned no order_id: {sym} {side} qty={qty}"
+                )
             if (
                 self._consecutive_failures >= self.circuit_breaker_threshold
                 and self.risk
@@ -247,32 +398,74 @@ class OrderRouter:
             self.intent_store.update(
                 intent.intent_id, "REJECTED", order_state=OrderState.REJECTED
             )
-            self._set_order_state(intent.intent_id, OrderState.REJECTED)
+            self._set_order_state(
+                intent.intent_id,
+                OrderState.REJECTED,
+                action="broker_no_order_id",
+                message="Broker place_order returned None",
+            )
             return
 
         self._consecutive_failures = 0
-        self._set_order_state(intent.intent_id, OrderState.SENT)
-        if self.telegram_alert:
-            self.telegram_alert(f"Order placed: {sym} {side} qty={qty} order_id={order_id}")
-        if self.engine_logger:
-            self.engine_logger.order_placed(
-                symbol=sym,
-                side=side,
-                qty=qty,
-                price=exec_price,
-                order_id=order_id,
-                intent_id=getattr(intent, "intent_id", None),
-            )
-        self.intent_store.update(
-            intent.intent_id,
-            "SENT",
-            broker_order_id=order_id,
-            order_state=OrderState.SENT,
+        # Paper/sim broker may call process_fill inside place_order, so intent can already be FILLED.
+        # Do not overwrite terminal status with SENT so has_pending_intent stays correct.
+        rec = self.intent_store.get(intent.intent_id)
+        already_terminal = rec and rec.get("status") in (
+            IntentStatus.FILLED,
+            IntentStatus.REJECTED,
+            IntentStatus.CANCELLED,
+            IntentStatus.EXPIRED,
         )
-        if getattr(intent, "action", "") == "EXIT":
-            sent_rec = self.intent_store.get(intent.intent_id)
-            if sent_rec:
-                sent_rec["last_price_update_ts"] = time.time()
+        if not already_terminal:
+            self._set_order_state(
+                intent.intent_id,
+                OrderState.SENT,
+                action="order_placed",
+                message=f"order_id={order_id}",
+            )
+            if self.telegram_alert:
+                self.telegram_alert(
+                    f"Order placed: {sym} {side} qty={qty} order_id={order_id},price={exec_price},"
+                )
+            if self.engine_logger:
+                self.engine_logger.order_placed(
+                    symbol=sym,
+                    side=side,
+                    qty=qty,
+                    price=exec_price,
+                    order_id=order_id,
+                    intent_id=getattr(intent, "intent_id", None),
+                )
+            self.intent_store.update(
+                intent.intent_id,
+                "SENT",
+                broker_order_id=order_id,
+                order_state=OrderState.SENT,
+            )
+            if getattr(intent, "action", "") == "EXIT":
+                sent_rec = self.intent_store.get(intent.intent_id)
+                if sent_rec:
+                    sent_rec["last_price_update_ts"] = time.time()
+        else:
+            # Paper/sim filled synchronously: keep status FILLED, still log order_placed for audit.
+            if self.telegram_alert:
+                self.telegram_alert(
+                    f"Order placed: {sym} {side} qty={qty} order_id={order_id},price={exec_price},"
+                )
+            if self.engine_logger:
+                self.engine_logger.order_placed(
+                    symbol=sym,
+                    side=side,
+                    qty=qty,
+                    price=exec_price,
+                    order_id=order_id,
+                    intent_id=getattr(intent, "intent_id", None),
+                )
+            self.intent_store.update(
+                intent.intent_id,
+                rec["status"],
+                broker_order_id=order_id,
+            )
 
     def refresh_stale_exit_orders(
         self,
@@ -403,7 +596,12 @@ class OrderRouter:
                 self.engine_logger.order_state_mismatch(
                     f"Failed to fetch broker open orders: {e}"
                 )
+            else:
+                logger.warning("Failed to fetch broker open orders: %s", e)
             return False, {"error": str(e)}
+
+        # Trade-led: sync trades (fills) first so positions are up to date before we compare order state
+        self.sync_trades_from_broker()
 
         # Consider both VALIDATED (in flight) and SENT
         local_pending = self.intent_store.list_by_status(
@@ -481,7 +679,12 @@ class OrderRouter:
                     broker_order_id=o.get("order_id"),
                     order_state=OrderState.OPEN,
                 )
-                self._set_order_state(tag, OrderState.OPEN)  # Seen on broker
+                self._set_order_state(
+                    tag,
+                    OrderState.OPEN,
+                    action="adopt_orphan",
+                    message="Order seen on broker open list; adopted as local intent",
+                )
 
                 # Augment record for process_fill
                 intent_record = self.intent_store.get(tag)
@@ -500,7 +703,12 @@ class OrderRouter:
 
             elif tag in local_intent_ids:
                 # Local thinks it's pending, broker confirms it's open. Sync order ID and persist OPEN.
-                self._set_order_state(tag, OrderState.OPEN)
+                self._set_order_state(
+                    tag,
+                    OrderState.OPEN,
+                    action="sync_open",
+                    message="Broker confirms order is open",
+                )
                 intent = self.intent_store.get(tag)
                 self.intent_store.update(
                     tag,
@@ -546,7 +754,12 @@ class OrderRouter:
 
                         # Partial fill: filled > 0 and unfilled > 0 (filled < size)
                         if size > 0 and filled > 0 and filled < size:
-                            self._set_order_state(tag, OrderState.PARTIAL)
+                            self._set_order_state(
+                                tag,
+                                OrderState.PARTIAL,
+                                action="sync_partial",
+                                message=f"Polling: filled={filled} size={size}",
+                            )
                             self.intent_store.update(
                                 tag,
                                 IntentStatus.SENT,  # Still in flight
@@ -586,7 +799,12 @@ class OrderRouter:
                                 "instrument"
                             )  # If stored in dict; depends on intent_store implementation
 
-                            self._set_order_state(tag, OrderState.FILLED)
+                            self._set_order_state(
+                                tag,
+                                OrderState.FILLED,
+                                action="sync_filled",
+                                message="Syncing fill discovered via polling",
+                            )
                             self.intent_store.update(
                                 tag,
                                 IntentStatus.FILLED,
@@ -622,10 +840,65 @@ class OrderRouter:
                                     else OrderState.EXPIRED
                                 )
                             )
-                            self._set_order_state(tag, ost)
+                            self._set_order_state(
+                                tag,
+                                ost,
+                                action="sync_terminal",
+                                message=f"Broker status={status!r}",
+                            )
                             self.intent_store.update(
                                 tag, IntentStatus.REJECTED, order_state=ost
                             )
+                    else:
+                        # Trade-led: order missing from open list. Resolve fill by client_order_id first,
+                        # then by broker order_id (fills API often returns only order_id, not client_order_id).
+                        fill_info = None
+                        if hasattr(self.broker, "get_fill_for_client_order_id"):
+                            try:
+                                fill_info = self.broker.get_fill_for_client_order_id(tag)
+                            except Exception:
+                                pass
+                        if not fill_info and i.get("broker_order_id") and hasattr(self.broker, "get_fill_by_order_id"):
+                            try:
+                                fill_info = self.broker.get_fill_by_order_id(str(i["broker_order_id"]))
+                            except Exception:
+                                pass
+                        if fill_info and float(fill_info.get("price") or 0) > 0:
+                            # Only apply trade if not already FILLED (e.g. by sync_trades)
+                            if self._order_state.get(tag) not in _TERMINAL_ORDER_STATES:
+                                trade = {
+                                    "trade_id": f"fill_{tag}_{fill_info.get('order_id', '')}",
+                                    "order_id": fill_info.get("order_id"),
+                                    "intent_id": tag,
+                                    "client_order_id": tag,
+                                    "tag": tag,
+                                    "price": float(fill_info["price"]),
+                                    "size": float(fill_info.get("size") or 0),
+                                    "side": (fill_info.get("side") or i.get("side") or "").upper(),
+                                }
+                                if self.process_trade(trade):
+                                    if self.engine_logger:
+                                        self.engine_logger.log(
+                                            "oms",
+                                            f"Missing order {tag}: applied trade from /v2/fills (trade-led)",
+                                        )
+                            else:
+                                self._set_order_state(
+                                    tag,
+                                    OrderState.FILLED,
+                                    action="assume_filled",
+                                    message="Fill from API; trade already applied by sync_trades",
+                                )
+                                self.intent_store.update(
+                                    tag, IntentStatus.FILLED, order_state=OrderState.FILLED
+                                )
+                        else:
+                            # No trade found: do not update position or mark FILLED (trade-led: no trade → no position change)
+                            if self.engine_logger:
+                                self.engine_logger.log(
+                                    "oms",
+                                    f"Missing order {tag}: no fill in API; leaving state unchanged (trade-led OMS)",
+                                )
                 except Exception as e:
                     if self.engine_logger:
                         self.engine_logger.log(
@@ -677,6 +950,11 @@ class OrderRouter:
                 intent_id=intent_id,
             )
             return
+        metadata_extras = None
+        if intent_id and self.intent_store:
+            _ir = self.intent_store.get(intent_id)
+            if _ir:
+                metadata_extras = (_ir.get("payload") or {}).get("strategy_meta")
         position_closed, realized_pnl = self.position_manager.on_fill(
             instrument=instrument,
             side=side,
@@ -689,6 +967,7 @@ class OrderRouter:
             tag=tag,
             candle_ts=candle_ts,
             action=action,
+            metadata_extras=metadata_extras,
         )
         if position_closed and realized_pnl is not None:
             self.risk.record_realized_pnl(realized_pnl)
@@ -703,13 +982,140 @@ class OrderRouter:
             intent_id=intent_id,
         )
         if intent_id and self.intent_store:
-            self._set_order_state(intent_id, OrderState.FILLED)
+            self._set_order_state(
+                intent_id,
+                OrderState.FILLED,
+                action="process_fill",
+                message="Fill processed from callback or engine",
+            )
             self.intent_store.update(
                 intent_id,
                 IntentStatus.FILLED,
                 broker_order_id=order_id,
                 order_state=OrderState.FILLED,
             )
+
+    def process_trade(self, trade: Dict[str, Any]) -> bool:
+        """
+        Trade-led OMS: update position from a trade event (fill). Orders are metadata;
+        positions are driven only by trades. Idempotent by trade_id.
+        Returns True if trade was applied, False if skipped (e.g. already processed).
+        """
+        trade_id = str(
+            trade.get("trade_id")
+            or trade.get("id")
+            or f"{trade.get('order_id', '')}_{trade.get('created_at', '')}"
+        )
+        if not trade_id or trade_id in getattr(self, "_processed_trade_ids", set()):
+            return False
+        intent_id = trade.get("intent_id") or trade.get("client_order_id") or trade.get("tag")
+        if not intent_id:
+            return False
+        price = float(trade.get("price") or 0)
+        size = float(trade.get("size") or 0)
+        if price <= 0 or size <= 0:
+            return False
+        side = (trade.get("side") or "").upper()
+        order_id = trade.get("order_id")
+        # Resolve instrument and metadata from intent_store
+        intent = self.intent_store.get(intent_id) if self.intent_store else None
+        if not intent:
+            return False
+        instrument = trade.get("instrument") or intent.get("instrument")
+        if not instrument:
+            return False
+        if self.position_manager:
+            payload = intent.get("payload") or {}
+            position_closed, realized_pnl = self.position_manager.on_fill(
+                instrument=instrument,
+                side=side,
+                qty=int(size),
+                price=price,
+                intent_id=intent_id,
+                order_id=order_id,
+                strategy=(
+                    intent.get("strategy")
+                    or payload.get("strategy_id")
+                    or trade.get("strategy")
+                ),
+                structure_id=(
+                    intent.get("structure_id")
+                    or payload.get("structure_id")
+                    or trade.get("structure_id")
+                ),
+                tag=intent.get("tag") or trade.get("tag"),
+                candle_ts=intent.get("candle_ts") or trade.get("candle_ts"),
+                action=intent.get("action") or payload.get("action") or trade.get("action"),
+                metadata_extras=payload.get("strategy_meta"),
+            )
+            if position_closed and realized_pnl is not None:
+                self.risk.record_realized_pnl(realized_pnl)
+        sym = getattr(instrument, "trading_symbol", "")
+        self.report_fill(
+            sym, side, int(size), trade.get("expected_price"), price,
+            order_id=order_id, intent_id=intent_id,
+        )
+        self._set_order_state(
+            intent_id,
+            OrderState.FILLED,
+            action="process_trade",
+            message="Position updated from trade (fills API)",
+        )
+        self.intent_store.update(
+            intent_id,
+            IntentStatus.FILLED,
+            broker_order_id=order_id,
+            order_state=OrderState.FILLED,
+        )
+        self._processed_trade_ids.add(trade_id)
+        if len(self._processed_trade_ids) > getattr(self, "_processed_trade_ids_max", 10000):
+            self._processed_trade_ids = set(list(self._processed_trade_ids)[-self._processed_trade_ids_max // 2 :])
+        return True
+
+    def sync_trades_from_broker(self) -> None:
+        """
+        Trade-led OMS: pull recent fills from broker and apply any new trades.
+        Call before order-state verification so positions are up to date from trades.
+        """
+        if not getattr(self.broker, "get_recent_fills", None):
+            return
+        try:
+            fills = self.broker.get_recent_fills(page_size=50)
+        except Exception:
+            return
+        # Match by broker order_id when fill has no client_order_id (e.g. Delta often returns only order_id)
+        broker_order_id_to_intent: Dict[str, str] = {}
+        try:
+            pending = self.intent_store.list_by_status(IntentStatus.SENT) + self.intent_store.list_by_status(IntentStatus.VALIDATED)
+            for rec in pending:
+                bid = rec.get("broker_order_id")
+                iid = rec.get("intent_id")
+                if bid is not None and iid:
+                    broker_order_id_to_intent[str(bid)] = iid
+        except Exception:
+            pass
+        for f in fills or []:
+            intent_id = (
+                f.get("client_order_id")
+                or f.get("tag")
+                or broker_order_id_to_intent.get(str(f.get("order_id") or f.get("id") or ""))
+            )
+            if not intent_id:
+                continue
+            trade = {
+                "trade_id": f.get("id"),
+                "id": f.get("id"),
+                "order_id": str(f.get("order_id") or f.get("id", "")),
+                "intent_id": intent_id,
+                "client_order_id": intent_id,
+                "tag": intent_id,
+                "price": float(f.get("price") or 0),
+                "size": float(f.get("size") or 0),
+                "side": (f.get("side") or "").upper(),
+                "created_at": f.get("created_at"),
+            }
+            self.process_trade(trade)
+        return
 
     def report_fill(
         self,

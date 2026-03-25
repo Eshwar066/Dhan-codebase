@@ -8,7 +8,7 @@ Two fully isolated engines: **Engine_Dhan** (India markets) and **Engine_Delta**
 
 ```
 run/
-  config.py              # RUN_MODE, STRATEGY_JOBS (each job has "venue": "DHAN" | "DELTA")
+  config.py              # RUN_MODE (default), STRATEGY_JOBS (per-job venue, optional run_mode: PAPER|LIVE)
   engine_config.py       # EngineConfig dataclass, example_dhan_* / example_delta_* configs
   main.py                # Entry point; --venue filter; uses EngineFactory
 
@@ -75,7 +75,7 @@ engine.run(symbols=config.symbols, **config.backtest)
 | Component           | Dhan stack                    | Delta stack                     |
 |--------------------|-------------------------------|---------------------------------|
 | Data provider       | DhanDataProvider(DhanSource)  | DeltaDataProvider(DeltaSource)  |
-| Instrument store   | InstrumentStore(Dependencies/all_instrument*.csv) | InstrumentStore(DELTA, delta_instrument_*.csv) |
+| Instrument store   | InstrumentStore(Dependencies/all_instrument*.csv) | InstrumentStore(DELTA, delta_instrument_*.csv); when creating new Delta cache, previous delta_instrument_*.csv are removed. |
 | PositionManager    | New instance                  | New instance                    |
 | RiskManager        | New instance                  | New instance                    |
 | IntentStore        | New instance                  | New instance                    |

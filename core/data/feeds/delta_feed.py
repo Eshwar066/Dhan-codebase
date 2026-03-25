@@ -5,10 +5,13 @@ Subscribes to v2/ticker and candlestick_* for symbols, optional private channels
 Used by LiveEngine when BROKER_NAME == "DELTA" for real-time data.
 """
 
+import logging
 from typing import Any, Dict, List, Optional
 import pdb
 
 from core.data.feeds.base_feed import RealtimeFeed
+
+logger = logging.getLogger(__name__)
 from core.library.delta_websocket import DeltaWebSocket
 
 # Map strategy timeframe to Delta candlestick channel name
@@ -44,6 +47,8 @@ class DeltaWebSocketFeed(RealtimeFeed):
         testnet: bool = True,
         india: bool = True,
         subscribe_private: bool = True,
+        engine_logger: Optional[Any] = None,
+        telegram_alert: Optional[Any] = None,
     ):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -52,6 +57,8 @@ class DeltaWebSocketFeed(RealtimeFeed):
         self.testnet = testnet
         self.india = india
         self.subscribe_private = subscribe_private
+        self._engine_logger = engine_logger
+        self._telegram_alert = telegram_alert
 
         self._ws: Optional[DeltaWebSocket] = None
         self._auth_done = False
@@ -75,8 +82,8 @@ class DeltaWebSocketFeed(RealtimeFeed):
                     "timestamp": timestamp_sec,
                 }
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Delta feed: tick queue put failed: %s", e)
 
     def _channel_candlestick(self) -> str:
         res = RESOLUTION_MAP.get(self.timeframe, "1h")
@@ -86,6 +93,17 @@ class DeltaWebSocketFeed(RealtimeFeed):
         if self._ws:
             return
         on_tick = self._push_tick if self._tick_queue else None
+
+        def _on_feed_stall(stall_sec: float) -> None:
+            msg = f"Delta feed stall: no ticks received for {stall_sec:.0f}s"
+            if self._engine_logger:
+                self._engine_logger.feed_health_warning(message=msg)
+            if self._telegram_alert:
+                try:
+                    self._telegram_alert(f"⚠️ {msg}")
+                except Exception as e:
+                    logger.debug("Delta feed: telegram stall alert failed: %s", e)
+
         self._ws = DeltaWebSocket(
             api_key=self.api_key,
             api_secret=self.api_secret,
@@ -93,6 +111,7 @@ class DeltaWebSocketFeed(RealtimeFeed):
             india=self.india,
             on_auth=self._on_auth,
             on_tick=on_tick,
+            on_feed_stall=_on_feed_stall if (self._engine_logger or self._telegram_alert) else None,
         )
         self._ws.connect()
         # Subscribe to public channels after socket is ready; private after auth success.

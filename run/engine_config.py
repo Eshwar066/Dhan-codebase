@@ -44,6 +44,11 @@ class EngineConfig:
     # Risk limits (optional)
     daily_max_loss: Optional[float] = None
     max_open_positions: Optional[int] = None
+    max_portfolio_exposure: Optional[float] = None
+    cooldown_seconds: Optional[int] = None
+
+    # Option shorting: if False, do not use broker's check_short_option_margin (e.g. futures-only).
+    check_short_option_margin_enabled: Optional[bool] = None
 
     # Feed health: warn/pause when no data for this many seconds (live only).
     feed_stale_seconds: Optional[float] = None
@@ -57,6 +62,8 @@ class EngineConfig:
     # Venue-specific options (optional overrides)
     delta_testnet: bool = True
     delta_india: bool = True
+    # Delta Exchange: leverage to set per product (e.g. 10 for 10x). Applied at engine start for config.symbols.
+    delta_leverage: Optional[int] = None
 
     # Paths (defaults; override for tests)
     base_dir: Optional[Path] = None

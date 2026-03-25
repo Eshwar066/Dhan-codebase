@@ -6,12 +6,13 @@ SignalFloodTestStrategy: pipeline test strategy for both Delta and Dhan.
 - 10% of entries use oversized qty (to trigger risk rejection).
 - 10% of entries return duplicate intents (to trigger duplicate_signal_blocked).
 - Uses futures instrument and IndiaMktMixins for intent creation.
+- Risk limits (daily_max_loss, max_open_positions, max_portfolio_exposure) are set
+  in run/config.py per job; RiskManager blocks entries when limits are breached.
 """
 
 import random
 from dataclasses import replace
 from typing import Any, List, Optional, TYPE_CHECKING
-import pdb
 
 from core.strategies.base import BaseStrategy
 from core.strategies.IndiaMktMixins import IndiaMktMixins
@@ -54,13 +55,24 @@ class SignalFloodTestStrategy(IndiaMktMixins, BaseStrategy):
         if not symbol:
             return None
 
-        # Check if we already have an open position for this symbol
+        structure_id = f"{self.name}:{symbol}:FLAT"
         has_open = ctx.position_store.has_open_structure(
-            strategy=self.name, structure_id=f"{self.name}:{symbol}:FLAT", tag="MAIN"
+            strategy=self.name,
+            structure_id=structure_id,
+            tag="MAIN",
         )
-        if has_open:
-            return None  # Exit is handled by should_exit
+        has_pending = (
+            ctx.intent_store.has_pending_intent(
+                strategy=self.name,
+                structure_id=structure_id,
+            )
+            if getattr(ctx, "intent_store", None)
+            else False
+        )
 
+        if has_open or has_pending:
+            print(">>has open, pending order exits")
+            return None
         # Resolve instrument
         exchange = self.api
         expiry = None
@@ -81,10 +93,10 @@ class SignalFloodTestStrategy(IndiaMktMixins, BaseStrategy):
         self._next_side = "SELL" if side == "BUY" else "BUY"
         structure_id = f"{self.name}:{symbol}:FLAT"
 
-        # 10% oversized qty (to trigger risk rejection)
         qty = int(inst.lot_size)
-        if random.random() < 0.10:
-            qty = max(qty, 99999)
+        # 10% oversized qty (to trigger risk rejection) ==> max_qty_per_symbol in risk manager
+        # if random.random() < 0.50:
+        #     qty = max(qty, 99999)
 
         intent = self.map_futures_instrument_to_intent(
             inst=inst,
@@ -97,24 +109,26 @@ class SignalFloodTestStrategy(IndiaMktMixins, BaseStrategy):
             action="ENTRY",
             tag="MAIN",
         )
+
         if intent and qty != int(inst.lot_size):
             intent = replace(intent, qty=qty)
-        # 10% return same intent twice to trigger duplicate_signal_blocked on second
-        if random.random() < 0.10 and intent:
-            return [intent, intent]
+        # 10% return same intent twice to trigger duplicate_signal_blocked on second ==> tested ✅
+        # if random.random() < 0.10 and intent:
+        #     return [intent, intent]
         return [intent] if intent else None
 
     def should_exit(
         self, pos: Any, candle: Any, ctx: Optional["StrategyContext"] = None
     ) -> bool:
         """Exit after one candle (always exit when in position for this test)."""
-        # pdb.set_trace()
+
         return True
 
     def on_position_exit(
         self, pos: Any, candle: Any, ctx: "StrategyContext"
     ) -> Optional[List[Any]]:
         """Build exit intent from position."""
+        # pdb.set_trace()
         if pos.instrument is None:
             return None
         exit_side = "SELL" if pos.net_qty > 0 else "BUY"

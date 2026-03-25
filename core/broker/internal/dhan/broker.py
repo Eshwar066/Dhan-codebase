@@ -1,7 +1,11 @@
-"""Dhan broker: order placement via DhanBrokerApi."""
+"""Dhan broker: order placement via DhanBrokerApi. Trade-led OMS via get_recent_fills / get_fill_for_client_order_id."""
 
+import logging
 import time
 import uuid
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from core.broker.base import BaseBroker
 
@@ -82,6 +86,93 @@ class DhanBroker(BaseBroker):
             "intent_id": intent.get("intent_id"),
         }
 
+    def check_funds_before_order(
+        self,
+        intent: Any,
+        execution_price: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Check available balance and required/SPAN margin before placing order.
+        Uses Dhan get_balance() and margin_calculator(); on shortage returns ok=False
+        with shortfall and message for logging and Telegram.
+        """
+        try:
+            payload = self._build_payload(intent, execution_price)
+        except Exception:
+            return None
+        source = getattr(self.api, "_source", None)
+        if source is None:
+            return None
+        try:
+            available = float(getattr(source, "get_balance", lambda: 0)())
+        except Exception:
+            return None
+        tsl = getattr(source, "tsl", None)
+        required_margin = None
+        span_margin = None
+        if tsl and getattr(tsl, "margin_calculator", None):
+            try:
+                oc = tsl.margin_calculator(
+                    tradingsymbol=payload["tradingsymbol"],
+                    exchange=payload["exchange"],
+                    transaction_type=payload["transaction_type"],
+                    quantity=payload["quantity"],
+                    trade_type=payload["trade_type"],
+                    price=payload["price"],
+                    trigger_price=payload["trigger_price"],
+                )
+                if isinstance(oc, dict):
+                    required_margin = float(oc.get("totalMargin") or oc.get("total_margin") or 0)
+                    span_margin = float(oc.get("spanMargin") or oc.get("span_margin") or 0)
+                    # API can return availableBalance from margin response
+                    if "availableBalance" in oc or "available_balance" in oc:
+                        available = float(oc.get("availableBalance") or oc.get("available_balance") or available)
+                    insufficient = float(oc.get("insufficientBalance") or oc.get("insufficient_balance") or 0)
+                    if insufficient > 0:
+                        return {
+                            "ok": False,
+                            "available": available,
+                            "required_margin": required_margin,
+                            "span_margin": span_margin if span_margin else None,
+                            "shortfall": insufficient,
+                            "message": (
+                                f"Available={available:.2f}, required_margin={required_margin:.2f}, "
+                                f"SPAN={span_margin:.2f}; shortfall={insufficient:.2f}"
+                            ),
+                        }
+                    return {
+                        "ok": True,
+                        "available": available,
+                        "required_margin": required_margin,
+                        "span_margin": span_margin if span_margin else None,
+                        "shortfall": 0,
+                        "message": "",
+                    }
+            except Exception:
+                pass
+        if required_margin is None:
+            required_margin = payload["price"] * payload["quantity"]
+        if available < required_margin:
+            shortfall = required_margin - available
+            return {
+                "ok": False,
+                "available": available,
+                "required_margin": required_margin,
+                "span_margin": span_margin,
+                "shortfall": shortfall,
+                "message": (
+                    f"Available={available:.2f}, required={required_margin:.2f}; shortfall={shortfall:.2f}"
+                ),
+            }
+        return {
+            "ok": True,
+            "available": available,
+            "required_margin": required_margin,
+            "span_margin": span_margin,
+            "shortfall": 0,
+            "message": "",
+        }
+
     def place_order(self, intent, execution_price=None, retries=2):
         order_payload = self._build_payload(intent, execution_price)
         intent_id = order_payload["intent_id"]
@@ -107,7 +198,7 @@ class DhanBroker(BaseBroker):
                 if not isinstance(resp, dict):
                     raise Exception(f"Invalid broker response: {resp}")
                 if resp.get("status") != "success":
-                    print("❌ Broker rejection:", resp)
+                    logger.warning("Dhan broker rejection: %s", resp)
                     return None
                 order_id = resp.get("order_id")
                 if self.intent_store:
@@ -121,7 +212,7 @@ class DhanBroker(BaseBroker):
                     raise Exception("Order failed after retries")
                 time.sleep(0.4)
             except Exception as e:
-                print("❌ place_order exception:", e)
+                logger.warning("Dhan place_order exception: %s", e, exc_info=True)
                 return None
         return None
 
@@ -130,6 +221,60 @@ class DhanBroker(BaseBroker):
         for o in orders:
             if o.get("tag") == client_order_id:
                 return o
+        return None
+
+    def get_recent_fills(self, page_size: int = 50) -> List[Dict[str, Any]]:
+        """Recent fills from order list (TRADED/filled) for trade-led OMS sync."""
+        if not getattr(self.api, "get_fills", None):
+            return []
+        try:
+            return self.api.get_fills(page_size=page_size) or []
+        except Exception:
+            return []
+
+    def get_fill_for_client_order_id(
+        self, client_order_id: str, page_size: int = 50
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Resolve fill price/size for a given intent_id (tag) from filled orders.
+        For trade-led OMS: do not assume filled with price=0 when order is missing.
+        """
+        fills = self.get_recent_fills(page_size=page_size)
+        for f in fills:
+            if (f.get("client_order_id") or f.get("tag")) == client_order_id:
+                price = float(f.get("price") or 0)
+                size = float(f.get("size") or 0)
+                if price > 0 and size > 0:
+                    return {
+                        "order_id": str(f.get("order_id", "")),
+                        "price": price,
+                        "size": size,
+                        "side": (f.get("side") or "").upper(),
+                    }
+        return None
+
+    def get_fill_by_order_id(
+        self, broker_order_id: str, page_size: int = 50
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Resolve fill by broker order_id when fill/order list does not return tag.
+        Returns dict with price, size, side, order_id.
+        """
+        if not broker_order_id:
+            return None
+        fills = self.get_recent_fills(page_size=page_size)
+        bid_str = str(broker_order_id)
+        for f in fills:
+            if str(f.get("order_id") or f.get("id") or "") == bid_str:
+                price = float(f.get("price") or 0)
+                size = float(f.get("size") or 0)
+                if price > 0 and size > 0:
+                    return {
+                        "order_id": bid_str,
+                        "price": price,
+                        "size": size,
+                        "side": (f.get("side") or "").upper(),
+                    }
         return None
 
     def get_positions(self):

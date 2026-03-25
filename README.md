@@ -222,6 +222,47 @@ Latency logging is done **only on the order path** (when an order is placed), no
 
 ---
 
+## Trade-led OMS (Delta and Dhan)
+
+For **Delta** and **Dhan**, the engine uses a **trade-led** OMS so that positions are driven by **trades** (fills), not by order state. This avoids fabricated fills and zero-price updates when orders disappear from the open list.
+
+| Concept | Meaning |
+| ------- | ------- |
+| **Order** | Metadata only: order_id, intent_id, symbol, qty, side, state. Placing an order does **not** update position. |
+| **Trade** | Source of truth. A trade is a fill from the exchange. Position changes **only** when a trade is applied. |
+| **Flow** | Strategy → OrderRouter → Broker → place order. Separately: `sync_trades_from_broker()` pulls recent fills → for each new fill, `process_trade(trade)` → PositionManager updated, then order marked FILLED. |
+
+**Behaviour:**
+
+- **sync_trades_from_broker()**: Called at the start of order-state verification. Fetches recent fills from the broker (`get_recent_fills()`), then applies each new fill once via `process_trade()` (idempotent by trade id). Positions are updated only from these trades.
+- **process_trade(trade)**: Updates PositionManager from the trade (price, size, side, intent_id); records realized PnL if position closed; marks the corresponding order/intent as FILLED. No position update is ever made from “order disappeared” or “assume filled.”
+- **Missing order**: If an order is not on the broker open list (and not in history for Delta), the router tries to resolve a fill for that intent. If a fill is found, it is applied via `process_trade()` and the order is marked FILLED. If **no** fill is found, the order state is left unchanged and **no** position update is made (no fabricated fill, no zero price).
+- **Fill matching**: Fills are matched by **client_order_id** (intent_id/tag) when present in the fill. When the API returns only **order_id** (e.g. Delta often omits client_order_id), the router also matches by **broker_order_id**: it builds a map from pending intents and applies fills where `fill.order_id == intent.broker_order_id`. For missing orders, it tries `get_fill_for_client_order_id(tag)` first, then `get_fill_by_order_id(broker_order_id)` so fills are detected even when the exchange does not echo the tag.
+
+**Components:**
+
+| Component | Location | Role |
+| --------- | -------- | ---- |
+| **OrderRouter** | `core/orderExecution/order_router.py` | `process_trade()`, `sync_trades_from_broker()`, `_processed_trade_ids` for idempotency. |
+| **Delta broker** | `core/broker/internal/delta/broker.py` | `get_recent_fills()`, `get_fill_for_client_order_id()`, `get_fill_by_order_id()` so fills are matched by order_id when client_order_id is absent. |
+| **Dhan broker** | `core/broker/internal/dhan/broker.py` | `get_recent_fills()`, `get_fill_for_client_order_id()`, `get_fill_by_order_id()` for missing-order resolution. |
+| **Dhan source** | `core/data/sources/dhan_source.py` | `get_fills()` derives fills from order list (status TRADED/filled/complete) for trade-led sync. |
+
+Reconciliation remains position-based: broker positions are compared with local positions that were built from applied trades.
+
+### Delta Exchange: reduce_only (OMS rule)
+
+The **Delta broker** derives `reduce_only` from the intent’s **action** in the broker layer (not in the strategy):
+
+| Intent action | reduce_only | Effect on Delta Exchange |
+| --------------| ----------- | -------------------------|
+| ENTRY         | `false`     | Opens or increases position. |
+| EXIT          | `true`      | Only reduces existing position; rejected if no position. |
+
+Rule applied in `core/broker/internal/delta/broker.py`: `reduce_only = (intent.action == "EXIT")`. This avoids accidental position flips (e.g. an entry SELL after an exit SELL turning a flat position into a short). Strategies send `OrderIntent(action=ENTRY|EXIT)`; the Delta broker adapter sets the exchange flag accordingly.
+
+---
+
 ## Directory structure
 
 ```
@@ -267,7 +308,7 @@ Algo/
 │   │
 │   ├── broker/
 │   │   ├── base.py          # BaseBroker, IBrokerApi
-│   │   └── internal/        # dhan/, delta/, simulated/
+│   │   └── internal/        # dhan/, delta/, simulated/ (SimulatedBroker used for both BACKTEST and PAPER)
 │   │
 │   ├── orderExecution/
 │   │   ├── order_router.py
@@ -302,7 +343,7 @@ Algo/
 | **OMS**          | Order management: PositionManager, RiskManager, IntentStore, OrderRouter, Broker. One OMS per engine.                       |
 | **Strategy**     | Class registered in `STRATEGY_MAP`; implements `on_candle`, `should_evaluate`, `should_exit`, etc.                          |
 | **EngineConfig** | Dataclass: broker_name, run_mode, strategy_name, symbols, capital, risk_per_trade_percent, backtest/live params, engine_id. |
-| **Run mode**     | `BACKTEST` \| `PAPER` \| `LIVE`. Set in `run/config.py` as `RUN_MODE`.                                                      |
+| **Run mode**     | `BACKTEST` \| `PAPER` \| `LIVE`. Default in `run/config.py` is `RUN_MODE`; each job can override with `"run_mode": "PAPER"` or `"run_mode": "LIVE"` so you can run some strategies in paper and others in live in the same process. **SimulatedBroker** for PAPER; real broker for LIVE. |
 
 ---
 
@@ -310,20 +351,25 @@ Algo/
 
 ### 1. Run mode and default venue (`run/config.py`)
 
-- **RUN_MODE**: `RunMode.BACKTEST` \| `RunMode.PAPER` \| `RunMode.LIVE` — applies to all jobs when using `main.py`.
+- **RUN_MODE**: default `RunMode.BACKTEST` \| `RunMode.PAPER` \| `RunMode.LIVE` when a job does not set `run_mode`.
+- **Per-job run_mode**: set `"run_mode": "PAPER"` or `"run_mode": "LIVE"` (or `"BACKTEST"`) on a job to override; you can run some strategies in paper and others in live in the same process.
 - **DEFAULT_VENUE**: used when a job does not set `"venue"` (e.g. `"DELTA"` or `"DHAN"`).
 - **STRATEGY_JOBS**: list of job dicts. Each job has:
-  - **name**: strategy key in `STRATEGY_MAP` (e.g. `"FuturesEMAHighLow"`, `"LEAPS_RSI"`).
+  - **name**: strategy key in `STRATEGY_MAP` (e.g. `"FuturesEMAHighLow"`, `"LEAPS_RSI"`, `"MagicalLines"`).
   - **venue**: `"DHAN"` or `"DELTA"`.
   - **enabled**: if `False`, job is skipped.
+  - **run_mode** (optional): `"PAPER"` \| `"LIVE"` \| `"BACKTEST"`; if omitted, `RUN_MODE` is used.
   - **symbols**: list of symbols (e.g. `["BTCUSD"]`, `["NIFTY"]`).
   - **capital**, **risk_per_trade_percent** (optional; for live risk limits).
   - **backtest**: `start_date`, `end_date`, `timeframe`, `exchange`, `sector`.
   - **live**: `exchange`, `sector`, `rsi` (and any strategy-specific params).
+  - **delta_leverage** (Delta only): optional integer (e.g. `10`); set at engine start for `symbols` via Delta API.
+
+**Delta broker – order format and tick size:** The Delta source converts OMS orders to the exchange payload with a standard order formatter and ensures prices respect the exchange tick size. Limit orders use the formatted payload (product_id, limit_price, size, side, order_type, post_only) plus reduce_only/client_order_id/time_in_force; cancel requests use a standard cancel payload (id, product_id). Prices are rounded to the product’s tick size before sending so the exchange does not reject orders for invalid precision.
 
 ### 2. Engine config (`run/engine_config.py`)
 
-- **EngineConfig**: full config for one engine (used by EngineFactory).
+- **EngineConfig**: full config for one engine (used by EngineFactory). Includes `run_mode`, `delta_leverage` (Delta only; set at engine start for symbols).
 - Helpers: `example_dhan_live_config()`, `example_delta_live_config()`, etc., with `engine_id`, `capital`, `risk_per_trade_percent` where relevant.
 - **engine_id** defaults to `{broker_name}_{strategy_name}` if not set; used for log file and EOD report filename.
 - **Production safeguards** (live only): `order_state_check_interval_min`, `circuit_breaker_threshold`, `allowed_trading_hours`, `slippage_threshold_pct`, `memory_threshold_percent`, `strategy_timeout_seconds`, `latency_critical_ms`, `latency_critical_cycles`, `symbol_error_threshold`, `feed_stale_seconds`, `max_open_positions`. All optional.
@@ -336,6 +382,17 @@ Two jobs in `STRATEGY_JOBS` exercise the full pipeline (Signal → Risk → OMS 
 - **Dhan**: same strategy with `venue: "DHAN"`, `engine_id: "dhan_test_pipeline"`, `symbols: ["NIFTY"]`.
 
 Use **PAPER** or **LIVE** run mode. The strategy (`SignalFloodTest`) generates entry/exit every 1m candle and optionally triggers oversize (risk rejection) and duplicate-signal blocks for verification.
+
+### 2.2 Dhan option strategies (NSE index options)
+
+Two option-selling strategies are available for **DHAN** (NSE index options, e.g. NIFTY):
+
+| Strategy       | Key in STRATEGY_MAP | Description |
+| -------------- | ------------------- | ----------- |
+| **LEAPS RSI**  | `LEAPS_RSI`         | Quarterly RSI-based option selling: short CALL when RSI &lt; 32, short PUT when RSI &gt; 52. Evaluates at fixed times (e.g. 10:15–15:15). Strike in premium range; hedge leg. See `core/strategies/Leaps/LeapsQuatery_RSI_52_32.py`. |
+| **Magical Lines** | `MagicalLines`  | Time-anchored at 3:20 PM. Direction from intraday candle (9:15–15:20): green → short PE, red → short CE. Magical line: spot ±0.25% for level; main leg strike in multiples of 100 with premium in 180–320 range; hedge within 500 points, net credit 90–120. Monthly expiry; after 13th of month new trades use next month; rollover one week before expiry (Wednesday). Reversal: if at 3:20 price crosses and closes opposite to magical line, exit and short in reverse. See `core/strategies/Leaps/MagicalLines.py`. |
+
+Add a job with `"name": "MagicalLines"`, `"venue": "DHAN"`, `"symbols": ["NIFTY"]`, and `backtest` / `live` with `timeframe: "60"`, `exchange: "INDEX"`, `sector: "YES"` as needed.
 
 ### 3. Environment variables
 
@@ -351,7 +408,7 @@ Use **PAPER** or **LIVE** run mode. The strategy (`SignalFloodTest`) generates e
 
 - Python 3.x; install deps: `pip install -r requirements.txt`.
 - `.env` with credentials for the venue(s) you run.
-- **Dependencies/** with instrument file for the venue/date (e.g. `all_instrument{YYYY-MM-DD}.csv` for Dhan, `delta_instrument_{YYYY-MM-DD}.csv` for Delta). Some flows create or fetch these automatically.
+- **Dependencies/** with instrument file for the venue/date (e.g. `all_instrument{YYYY-MM-DD}.csv` for Dhan, `delta_instrument_{YYYY-MM-DD}.csv` for Delta). Dhan: created/fetched by Tradehull. Delta: fetched from API on first use; when a new Delta instrument file is created, previous `delta_instrument_*.csv` files in Dependencies are removed so only the current one remains.
 
 ### Backtest (single venue)
 
@@ -363,11 +420,11 @@ Use **PAPER** or **LIVE** run mode. The strategy (`SignalFloodTest`) generates e
    # or only Delta jobs
    python -m run.main --venue DELTA
    ```
-4. Each job gets its own BacktestEngine and SimulatedBroker; results and trade log go to `logs/` (e.g. strategy trade CSV).
+4. Each job gets its own BacktestEngine and **SimulatedBroker** (same broker as PAPER; used for both backtest and paper). Results and trade log go to `logs/` (e.g. strategy trade CSV).
 
 ### Live / paper (single venue)
 
-1. Set `RUN_MODE = RunMode.LIVE` (or `PAPER`) in `run/config.py`.
+1. 1. Set default `RUN_MODE = RunMode.LIVE` (or `PAPER`) in `run/config.py`, or set per-job `"run_mode": "LIVE"` / `"run_mode": "PAPER"` to mix paper and live in one process.
 2. Set the job’s `venue` to the broker you use; add `live` (e.g. `exchange`, `sector`, `rsi`).
 3. Run that venue only (recommended: one process per venue):
    ```bash
@@ -375,7 +432,7 @@ Use **PAPER** or **LIVE** run mode. The strategy (`SignalFloodTest`) generates e
    # or
    python -m run.main --venue DHAN
    ```
-4. **PAPER** (`RUN_MODE = RunMode.PAPER`): Uses **SimulatedBroker**—same LiveEngine stack and logs as LIVE (engine logger, order_placed, fills, reconciliation, EOD), but no real orders. Feed and candle aggregator still use live data when credentials are set.
+4. **PAPER** (`RUN_MODE = RunMode.PAPER`): Runs **the same validations as LIVE**. Uses **SimulatedBroker** (same as BACKTEST; instant fill, no real exchange), but the engine executes the full live stack: reconciliation on start, order-state verification, trade-led sync, kill switch, feed health, duplicate-signal protection, time-of-day guard, latency/memory guards, EOD export, and structured logs. Use PAPER to validate strategy and OMS behaviour before going LIVE. Feed and candle aggregator use live data when credentials are set.
 5. **LIVE**: Live engine will:
    - Reconcile broker positions with PositionManager on startup.
    - Use Delta WebSocket feed for Delta if credentials are set; otherwise candle_service / REST.
@@ -403,12 +460,27 @@ See `docs/MULTI_VENUE.md`: create a Supervisor, `register_from_config()` for eac
 | ---------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Broker reconciliation**    | LiveEngine   | On start, fetches broker positions, syncs PositionManager, logs mismatches to engine log.                                                       |
 | **Kill switch**              | RiskManager  | `trigger_kill_switch(reason)` blocks all new entries; exits still allowed; logged.                                                              |
+| **Funds/margin check**       | OrderRouter  | Applied only to **ENTRY** intents. **EXIT** and **FORCE_EXIT** never check funds so positions can always be closed.                             |
 | **Risk limits**              | RiskManager  | daily_max_loss, max_open_positions, max_symbol_exposure, max_portfolio_exposure; capital × risk_per_trade_percent → max_risk_amount per trade.  |
 | **Closed-candle validation** | LiveEngine   | Only evaluates candles that are closed and aligned to timeframe; skips forming candles.                                                         |
 | **Structured logging**       | EngineLogger | One JSON line per event in `logs/{engine_id}.log` (order_placed, risk_block, reconciliation, kill_switch, latency, etc.).                       |
-| **Feed health**              | LiveEngine   | Tracks last tick/candle per symbol; warns and can pause entries if no data for `feed_stale_seconds`.                                            |
+| **Feed health**              | LiveEngine   | Tracks last tick/candle per symbol; warns and can pause entries if no data for `feed_stale_seconds`. Delta WebSocket feed stall (no ticks for N seconds) is logged to engine log (`feed_health_warning`) and optional Telegram when configured. |
 | **EOD export**               | LiveEngine   | Writes `reports/{engine_id}_{YYYYMMDD}.csv` (open positions, realized pnl).                                                                     |
 | **Latency**                  | LiveEngine   | Logs strategy_time_ms, broker_latency_ms, total_latency_ms for orders (order path only; not in tick ingestion, so no impact at high tick rate). |
+
+### Position metadata + reconcile (Dhan and Delta)
+
+Brokers only return quantity and average price for open positions. The OMS still needs **strategy-owned fields** (`tag`, `structure_id`, `intent_id`, and optional `strategy_meta` blobs) so strategies stay consistent after restarts and reconciliation.
+
+| Piece | Location | Behavior |
+| ----- | -------- | -------- |
+| **Metadata cache** | `PositionManager.position_metadata` | Updated on every fill from the intent record (`strategy_meta` from the intent payload). |
+| **Intent payload** | `OrderRouter` | Stores `structure_id`, `tag`, and optional `strategy_meta` when the intent is first persisted. |
+| **Open-positions CSV** | `logs/{engine_id}_open_positions.csv` | Journal of fill and broker SYNC events. Fill rows include a JSON `strategy_meta` column (plus `structure_id`, `tag`, `intent_id`). SYNC rows repeat metadata when the position manager still has it. The file is replayed on engine startup and at the beginning of each broker reconcile to rebuild `position_metadata` after restarts. |
+| **Reconcile** | `PositionManager.reconcile_with_broker` | Reloads metadata from the CSV (when configured), applies broker qty/avg, and reapplies merged metadata onto positions; logs a warning if the broker reports an open leg but no metadata exists. |
+| **Startup** | `EngineFactory` | Calls `rebuild_position_metadata_from_intent_store` then `rebuild_position_metadata_from_open_positions_csv`. |
+
+Strategies that need recovery-specific state (for example **OneDayMagicalLine** ML1 / entry premium) can attach a JSON-serializable dict via `OrderIntent.metadata_extras`; it is stored under `payload.strategy_meta`, written as JSON in the open-positions CSV on fills, and reloaded into the strategy after reconcile.
 
 ### Production safeguards (implemented)
 
@@ -464,7 +536,7 @@ Use this as a reference for setup and next steps.
 
 ### Live / paper
 
-7. Set `RUN_MODE = RunMode.LIVE` (or PAPER) in `run/config.py`.
+7. Set `RUN_MODE = RunMode.LIVE` (or PAPER) in `run/config.py`, or use per-job `run_mode` to mix paper and live.
 8. Ensure the job has `live` with `exchange`, `sector`, and optionally `rsi`.
 9. Run one venue per process: `python -m run.main --venue DELTA` or `--venue DHAN`.
 10. Monitor `logs/{engine_id}.log` (JSON lines) and `reports/{engine_id}_{date}.csv` for EOD.

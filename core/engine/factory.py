@@ -10,6 +10,7 @@ Usage:
     # then engine.run(...) or engine.start(...)
 """
 
+import logging
 import os
 import queue
 from datetime import datetime
@@ -18,6 +19,8 @@ from typing import Union
 import pdb
 
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 from run.config import RunMode
 from run.engine_config import EngineConfig
@@ -42,10 +45,11 @@ from core.orderExecution.order_router import OrderRouter
 from core.orderExecution.intent_store import IntentStore
 from core.utils.telegram_alert import send_telegram_alert
 from core.orderExecution.position_manager import PositionManager
-from core.orderExecution.risk_manager import RiskManager
+from core.orderExecution.risk_manager import RiskManager, make_short_option_margin_check
 from core.utils.delta_env import get_delta_credentials
 from core.utils.instruments.instrument_store import InstrumentStore
 from logs.logger.trade_logger import TradeLogger
+from logs.logger.open_positions_logger import OpenPositionsLogger
 from logs.engine_logger import EngineLogger
 
 try:
@@ -97,7 +101,10 @@ class EngineFactory:
 
         # ---------- OMS (isolated per engine) ----------
         logger = TradeLogger()
-        position_manager = PositionManager(logger=logger)
+        position_manager = PositionManager(
+            logger=logger,
+            open_positions_logger=None,
+        )
         intent_store = IntentStore()
         risk_manager = RiskManager(position_manager=position_manager)
         # ---------- Instruments (needed by OrderRouter) ----------
@@ -116,6 +123,7 @@ class EngineFactory:
             strategy_id=config.strategy_name,
         )
         broker.set_order_router(order_router)
+        position_manager.rebuild_position_metadata_from_intent_store(intent_store)
 
         # ---------- Universe (DHAN equity strategies only) ----------
         universe_service = EngineFactory._universe_service(
@@ -167,7 +175,18 @@ class EngineFactory:
 
         # ---------- OMS (isolated per engine) ----------
         logger = TradeLogger()
-        position_manager = PositionManager(logger=logger)
+        _engine_id = config.engine_id or "live"
+        _open_positions_csv = os.path.join("logs", f"{_engine_id}_open_positions.csv")
+        open_positions_logger = OpenPositionsLogger(
+            engine_id=_engine_id,
+            venue=config.broker_name or "",
+            run_mode=config.run_mode,
+        )
+        position_manager = PositionManager(
+            logger=logger,
+            open_positions_logger=open_positions_logger,
+            open_positions_csv_path=_open_positions_csv,
+        )
         intent_store = IntentStore()
         engine_logger = EngineLogger(
             engine_id=config.engine_id,
@@ -180,6 +199,9 @@ class EngineFactory:
             risk_per_trade_percent=config.risk_per_trade_percent,
             daily_max_loss=config.daily_max_loss,
             max_open_positions=getattr(config, "max_open_positions", None) or 20,
+            max_portfolio_exposure=getattr(config, "max_portfolio_exposure", None)
+            or 10000000,
+            cooldown_seconds=getattr(config, "cooldown_seconds", None) or 5,
             engine_logger=engine_logger,
         )
 
@@ -228,7 +250,35 @@ class EngineFactory:
             strategy_id=config.strategy_name,
             telegram_alert=telegram_alert,
         )
+        # Option shorting: validate SPAN + exposure margin when broker supports it (unless disabled in config)
+        if getattr(config, "check_short_option_margin_enabled", True) is not False:
+            _margin_check = make_short_option_margin_check(broker)
+            if _margin_check is not None:
+                order_router.risk.check_short_option_margin = _margin_check
         broker.set_order_router(order_router)
+        position_manager.rebuild_position_metadata_from_intent_store(intent_store)
+        position_manager.rebuild_position_metadata_from_open_positions_csv()
+
+        # ---------- Delta: set leverage from config (live only; skip for SimulatedBroker e.g. PAPER) ----------
+        if (
+            config.broker_name == "DELTA"
+            and hasattr(broker, "api")
+            and getattr(config, "delta_leverage", None) is not None
+            and (getattr(config, "symbols", None) or [])
+        ):
+            lev = int(config.delta_leverage)
+            results = broker.api.set_leverage_for_symbols(config.symbols, lev)
+            for sym, res in results.items():
+                if res.get("ok"):
+                    engine_logger.log(
+                        "delta_leverage",
+                        f"Delta leverage set: {sym} -> {lev}x (product_id={res.get('product_id')})",
+                    )
+                else:
+                    engine_logger.log(
+                        "delta_leverage_warning",
+                        f"Delta leverage failed for {sym}: {res.get('message', res)}",
+                    )
 
         # ---------- Universe (DHAN equity strategies only) ----------
         universe_service = EngineFactory._universe_service(
@@ -248,7 +298,8 @@ class EngineFactory:
         if config.broker_name == "DELTA":
             try:
                 api_key, api_secret = get_delta_credentials(config.delta_testnet)
-            except ValueError:
+            except ValueError as e:
+                logger.warning("Delta credentials missing or invalid: %s", e)
                 api_key, api_secret = None, None
             if api_key and api_secret:
                 timeframe = config.backtest.get("timeframe", "60")
@@ -260,15 +311,21 @@ class EngineFactory:
                     testnet=config.delta_testnet,
                     india=config.delta_india,
                     subscribe_private=True,
+                    engine_logger=engine_logger,
+                    telegram_alert=telegram_alert,
                 )
                 if getattr(strategy, "timeframe", None):
                     tick_queue = queue.Queue(maxsize=50000)
                     candle_aggregator = CandleAggregator()
                     realtime_feed.set_tick_queue(tick_queue)
                 realtime_feed.start()
+            elif not api_key or not api_secret:
+                logger.warning("Delta realtime feed skipped: missing API credentials")
         elif config.broker_name == "DHAN":
             access_token = os.getenv("DHAN_ACCESS_TOKEN")
             client_id = os.getenv("DHAN_CLIENT_CODE")
+            if not access_token or not client_id:
+                logger.warning("Dhan realtime feed skipped: DHAN_ACCESS_TOKEN or DHAN_CLIENT_CODE not set")
             if (
                 access_token
                 and client_id
@@ -276,6 +333,8 @@ class EngineFactory:
             ):
                 symbols_list = config.symbols or []
                 instruments = instrument_store.get_feed_instruments(symbols_list)
+                if not instruments:
+                    logger.warning("Dhan realtime feed skipped: get_feed_instruments returned empty for %s", symbols_list)
                 if instruments:
                     realtime_feed = DhanWebSocketFeed(
                         access_token=access_token,
@@ -313,6 +372,8 @@ class EngineFactory:
             latency_critical_cycles=getattr(config, "latency_critical_cycles", 3),
             symbol_error_threshold=getattr(config, "symbol_error_threshold", 5),
             universe_service=universe_service,
+            run_mode=config.run_mode,
+            open_positions_logger=open_positions_logger,
         )
 
     @staticmethod

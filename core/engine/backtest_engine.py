@@ -30,6 +30,12 @@ class BacktestEngine(BaseEngine):
         # Wire structure-exit callback (ONE TIME)
         self.position_manager.on_structure_exit = strategy.on_structure_exit
 
+    def build_context(self, candle, recent_candles=None):
+        intent_store = getattr(self.order_router, "intent_store", None)
+        return super().build_context(
+            candle, recent_candles=recent_candles, intent_store=intent_store
+        )
+
     # ==========================================================
     # MAIN RUN LOOP
     # ==========================================================
@@ -56,9 +62,9 @@ class BacktestEngine(BaseEngine):
             df["exchange"] = exchange
 
             # -------- Indicators (strategy computes htf_trend in prepare_indicators) --------
-            if self.broker_name == "DHAN" and "timestamp" in df.columns:
-                ts_col = pd.to_datetime(df["timestamp"], utc=True)
-                df["timestamp"] = ts_col.dt.tz_convert("Asia/Kolkata")
+
+            ts_col = pd.to_datetime(df["timestamp"], utc=True)
+            df["timestamp"] = ts_col.dt.tz_convert("Asia/Kolkata")
             if "time" in df.columns:
                 df["time"] = df["timestamp"].dt.time
             df = self.strategy.prepare_indicators(df)
@@ -70,7 +76,7 @@ class BacktestEngine(BaseEngine):
             df = df.iloc[macro_warmup:].reset_index(drop=True)
 
             # Rolling buffer of recent candles for this symbol (max 50)
-            candle_buffer = deque(maxlen=50)
+            candle_buffer = deque(maxlen=220)
 
             # -------- Candle loop (candle["htf_trend"] already set above for macro filter) --------
             for _, row in df.iterrows():

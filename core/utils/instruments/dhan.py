@@ -3,10 +3,13 @@ Dhan broker: instrument loading (CSV) and lookup logic.
 SEM_* schema, NSE/NFO/BSE exchange mapping, backtest dummy rows.
 """
 
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 from run.config import RUN_MODE, RunMode
 
 from .base import BaseInstrumentStore, Instrument
@@ -51,6 +54,43 @@ class DhanInstrumentStore(BaseInstrumentStore):
             self.df["SEM_STRIKE_PRICE"], errors="coerce"
         )
 
+    def get_tick_size(self, symbol: str) -> Optional[float]:
+        """Return tick size for symbol from instrument data (SEM_TICK_SIZE); None if not found."""
+        sym_upper = str(symbol).strip().upper()
+        col = "SEM_TICK_SIZE" if "SEM_TICK_SIZE" in self.df.columns else None
+        if col is None:
+            return None
+        match = self.df[
+            (self.df["SEM_CUSTOM_SYMBOL"].astype(str).str.upper() == sym_upper)
+            | (self.df["SEM_TRADING_SYMBOL"].astype(str).str.upper() == sym_upper)
+        ]
+        if match.empty:
+            return None
+        val = match.iloc[0].get(col)
+        if val is None:
+            return None
+        v = pd.to_numeric(val, errors="coerce")
+        return None if pd.isna(v) else float(v)
+
+    def get_lot_size(self, symbol: str) -> Optional[int]:
+        """Return lot size for symbol from instrument data (LOT_SIZE / SEM_LOT_UNITS); None if not found."""
+        sym_upper = str(symbol).strip().upper()
+        for col in ("LOT_SIZE", "SEM_LOT_UNITS"):
+            if col not in self.df.columns:
+                continue
+            match = self.df[
+                (self.df["SEM_CUSTOM_SYMBOL"].astype(str).str.upper() == sym_upper)
+                | (self.df["SEM_TRADING_SYMBOL"].astype(str).str.upper() == sym_upper)
+            ]
+            if match.empty:
+                continue
+            val = match.iloc[0].get(col)
+            if val is not None:
+                v = pd.to_numeric(val, errors="coerce")
+                if pd.notna(v) and v >= 1:
+                    return int(v)
+        return None
+
     def map_row_to_instrument(self, row) -> Instrument:
         lot = row.get("LOT_SIZE", row.get("SEM_LOT_UNITS", 1))
         return Instrument(
@@ -86,7 +126,7 @@ class DhanInstrumentStore(BaseInstrumentStore):
             df = self.df[eq_mask & no_expiry]
         if df.empty:
             if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
-                print(f"❌ No equity instrument found for {trading_symbol} on {exchange}")
+                logger.warning("No equity instrument found for %s on %s", trading_symbol, exchange)
             return None
         row = df.iloc[0]
         return self.map_row_to_instrument(row)
@@ -105,7 +145,7 @@ class DhanInstrumentStore(BaseInstrumentStore):
                 & (self.df["SEM_EXM_EXCH_ID"] == ex)
             ]
             if df.empty:
-                print(f"❌ No instrument found for {trading_symbol} on {exchange}")
+                logger.warning("No instrument found for %s on %s", trading_symbol, exchange)
                 return None
             return self.map_row_to_instrument(df.iloc[0])
 
@@ -225,7 +265,7 @@ class DhanInstrumentStore(BaseInstrumentStore):
                 & (self.df["SEM_EXM_EXCH_ID"] == ex)
             ]
             if df.empty:
-                print(f"❌ No FUT instrument found for {trading_symbol} on {exchange}")
+                logger.warning("No FUT instrument found for %s on %s", trading_symbol, exchange)
                 return None
             return self.map_row_to_instrument(df.iloc[0])
 
