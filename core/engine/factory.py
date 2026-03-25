@@ -49,6 +49,7 @@ from core.orderExecution.risk_manager import RiskManager, make_short_option_marg
 from core.utils.delta_env import get_delta_credentials
 from core.utils.instruments.instrument_store import InstrumentStore
 from logs.logger.trade_logger import TradeLogger
+from logs.logger.open_positions_logger import OpenPositionsLogger
 from logs.engine_logger import EngineLogger
 
 try:
@@ -100,7 +101,10 @@ class EngineFactory:
 
         # ---------- OMS (isolated per engine) ----------
         logger = TradeLogger()
-        position_manager = PositionManager(logger=logger)
+        position_manager = PositionManager(
+            logger=logger,
+            open_positions_logger=None,
+        )
         intent_store = IntentStore()
         risk_manager = RiskManager(position_manager=position_manager)
         # ---------- Instruments (needed by OrderRouter) ----------
@@ -170,7 +174,15 @@ class EngineFactory:
 
         # ---------- OMS (isolated per engine) ----------
         logger = TradeLogger()
-        position_manager = PositionManager(logger=logger)
+        open_positions_logger = OpenPositionsLogger(
+            engine_id=config.engine_id or "live",
+            venue=config.broker_name or "",
+            run_mode=config.run_mode,
+        )
+        position_manager = PositionManager(
+            logger=logger,
+            open_positions_logger=open_positions_logger,
+        )
         intent_store = IntentStore()
         engine_logger = EngineLogger(
             engine_id=config.engine_id,
@@ -355,6 +367,7 @@ class EngineFactory:
             symbol_error_threshold=getattr(config, "symbol_error_threshold", 5),
             universe_service=universe_service,
             run_mode=config.run_mode,
+            open_positions_logger=open_positions_logger,
         )
 
     @staticmethod

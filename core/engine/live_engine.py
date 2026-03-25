@@ -65,6 +65,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         candle_aggregator: Optional[Any] = None,
         universe_service: Optional[Any] = None,
         run_mode: Optional[RunMode] = None,
+        open_positions_logger: Optional[Any] = None,
     ):
         super().__init__(
             strategy,
@@ -103,6 +104,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self._exit_refresh_interval_seconds = 60
         self._last_exit_refresh_time: float = 0
         self.run_mode = run_mode
+        self._open_positions_logger = open_positions_logger
         # Memory guard
         self.memory_threshold_percent = memory_threshold_percent
         self._entries_paused_memory = False
@@ -218,6 +220,13 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self.position_manager.reconcile_with_broker(
             resolved_broker_positions, strategy=strategy_name
         )
+        if (
+            self._open_positions_logger is not None
+            and self.run_mode == RunMode.LIVE
+        ):
+            self._open_positions_logger.record_broker_reconcile_snapshot(
+                self.position_manager
+            )
         return True
 
     def _do_order_state_check(self) -> None:

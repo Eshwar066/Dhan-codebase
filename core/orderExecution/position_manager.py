@@ -142,9 +142,10 @@ class Position:
 
 
 class PositionManager:
-    def __init__(self, logger):
+    def __init__(self, logger, open_positions_logger=None):
         self._lock = threading.Lock()
         self.logger = TradeLogger()
+        self.open_positions_logger = open_positions_logger
 
         # All Positions, using symbol
         self.positions = {}
@@ -297,6 +298,18 @@ class PositionManager:
                     self.logger.log_trade(trade_row)
 
                 self.logger.log(strategy=strategy, row=row)
+
+            if self.open_positions_logger is not None and prev_qty != new_qty:
+                self.open_positions_logger.record_fill(
+                    symbol=sym,
+                    prev_qty=int(prev_qty),
+                    new_qty=int(new_qty),
+                    avg_price=float(pos.avg_price),
+                    strategy=strategy,
+                    structure_id=structure_id,
+                    tag=tag,
+                    intent_id=intent_id,
+                )
 
             position_closed = prev_qty != 0 and new_qty == 0
             realized_pnl_for_risk = pos.realized_pnl if position_closed else 0.0
@@ -464,6 +477,8 @@ class PositionManager:
     def get_open_positions(self, underlying=None, strategy=None):
         positions = []
         for pos in self.positions.values():
+            print(">>positions Manager", self.positions, underlying, strategy)
+            pdb.set_trace()
             if pos.net_qty == 0:
                 continue
 
