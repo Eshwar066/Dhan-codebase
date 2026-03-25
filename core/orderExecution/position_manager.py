@@ -1,11 +1,11 @@
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
 from logs.logger.trade_logger import TradeLogger
 from datetime import datetime
 import uuid
-import pdb
 from core.utils.instruments.instrument_store import Instrument
 
 logger = logging.getLogger(__name__)
@@ -63,6 +63,7 @@ class Position:
         self.strategy = None
         self.structure_id = None
         self.tag = None
+        self.intent_id = None
         self.on_structure_exit = None
 
         self.last_updated = time.time()
@@ -142,10 +143,16 @@ class Position:
 
 
 class PositionManager:
-    def __init__(self, logger, open_positions_logger=None):
+    def __init__(
+        self,
+        logger,
+        open_positions_logger=None,
+        open_positions_csv_path=None,
+    ):
         self._lock = threading.Lock()
         self.logger = TradeLogger()
         self.open_positions_logger = open_positions_logger
+        self.open_positions_csv_path = open_positions_csv_path
 
         # All Positions, using symbol
         self.positions = {}
@@ -157,6 +164,8 @@ class PositionManager:
         self.trading_paused = False
         # Set by engine: strategy.on_structure_exit (BacktestEngine/LiveEngine)
         self.on_structure_exit = None
+        # trading_symbol -> { strategy, structure_id, tag, intent_id, strategy_meta }
+        self.position_metadata = {}
 
     # ---------------------
     # LOCAL FILL UPDATE
@@ -175,6 +184,7 @@ class PositionManager:
         tag=None,
         candle_ts=None,
         action=None,
+        metadata_extras=None,
     ):
         assert isinstance(instrument, Instrument), "on_fill expects Instrument"
         assert instrument.trading_symbol, "Instrument must have trading_symbol"
@@ -219,6 +229,18 @@ class PositionManager:
                 pos.structure_id = structure_id
             if tag is not None:
                 pos.tag = tag
+
+            if new_qty != 0:
+                self._merge_position_metadata(
+                    sym,
+                    strategy=strategy,
+                    structure_id=structure_id,
+                    tag=tag,
+                    intent_id=intent_id,
+                    metadata_extras=metadata_extras,
+                )
+            else:
+                self.position_metadata.pop(sym, None)
 
             if action == "ENTRY" and prev_qty != 0:
                 raise RuntimeError(
@@ -300,6 +322,7 @@ class PositionManager:
                 self.logger.log(strategy=strategy, row=row)
 
             if self.open_positions_logger is not None and prev_qty != new_qty:
+                _pm = self.position_metadata.get(sym) or {}
                 self.open_positions_logger.record_fill(
                     symbol=sym,
                     prev_qty=int(prev_qty),
@@ -309,11 +332,95 @@ class PositionManager:
                     structure_id=structure_id,
                     tag=tag,
                     intent_id=intent_id,
+                    strategy_meta=_pm.get("strategy_meta"),
                 )
 
             position_closed = prev_qty != 0 and new_qty == 0
             realized_pnl_for_risk = pos.realized_pnl if position_closed else 0.0
             return (position_closed, realized_pnl_for_risk)
+
+    def _merge_position_metadata(
+        self,
+        sym: str,
+        strategy=None,
+        structure_id=None,
+        tag=None,
+        intent_id=None,
+        metadata_extras=None,
+    ) -> None:
+        cur = dict(self.position_metadata.get(sym) or {})
+        if strategy:
+            cur["strategy"] = strategy
+        if structure_id:
+            cur["structure_id"] = structure_id
+        if tag:
+            cur["tag"] = tag
+        if intent_id:
+            cur["intent_id"] = intent_id
+        if metadata_extras is not None:
+            cur["strategy_meta"] = metadata_extras
+        self.position_metadata[sym] = cur
+
+    def get_position_metadata(self, trading_symbol: str):
+        return self.position_metadata.get(trading_symbol)
+
+    def rebuild_position_metadata_from_intent_store(self, intent_store) -> None:
+        """Best-effort: FILLED ENTRY rows in store → position_metadata by instrument symbol."""
+        if intent_store is None:
+            return
+        try:
+            from core.orderExecution.intent_store import IntentStatus
+        except ImportError:
+            return
+
+        best = {}  # sym -> (updated_at, meta dict)
+        for intent_id, rec in intent_store.intents.items():
+            st = rec.get("status")
+            if st != IntentStatus.FILLED and getattr(st, "value", st) != "FILLED":
+                continue
+            payload = rec.get("payload") or {}
+            if (rec.get("action") or payload.get("action") or "") != "ENTRY":
+                continue
+            inst = rec.get("instrument")
+            sym = getattr(inst, "trading_symbol", None) or payload.get("symbol")
+            if not sym:
+                continue
+            meta = {
+                "tag": rec.get("tag") or payload.get("tag"),
+                "structure_id": rec.get("structure_id") or payload.get("structure_id"),
+                "intent_id": intent_id,
+                "strategy": rec.get("strategy") or payload.get("strategy_id"),
+                "strategy_meta": payload.get("strategy_meta"),
+            }
+            upd = float(rec.get("updated_at") or rec.get("created_at") or 0)
+            prev = best.get(sym)
+            if prev is None or upd >= prev[0]:
+                best[sym] = (upd, meta)
+
+        with self._lock:
+            for sym, (_t, meta) in best.items():
+                self.position_metadata[sym] = meta
+
+    def _merge_open_positions_csv_dict(self, file_meta: dict) -> None:
+        for sym, meta in file_meta.items():
+            cur = dict(self.position_metadata.get(sym) or {})
+            for k, v in meta.items():
+                if v not in (None, ""):
+                    cur[k] = v
+            self.position_metadata[sym] = cur
+
+    def rebuild_position_metadata_from_open_positions_csv(self) -> None:
+        """Merge metadata from logs/{engine_id}_open_positions.csv (strategy_meta, etc.)."""
+        path = self.open_positions_csv_path
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            from logs.logger.open_positions_logger import load_position_metadata_from_csv
+        except ImportError:
+            return
+        file_meta = load_position_metadata_from_csv(path)
+        with self._lock:
+            self._merge_open_positions_csv_dict(file_meta)
 
     def has_open_structure(self, strategy: str, structure_id: str, tag: str) -> bool:
         for pos in self.positions.values():
@@ -365,7 +472,22 @@ class PositionManager:
         drift_threshold: if |local_qty - broker_qty| > this, set trading_paused.
         strategy: strategy name to associate with newly discovered positions.
         """
+        file_meta = None
+        if self.open_positions_csv_path and os.path.isfile(self.open_positions_csv_path):
+            try:
+                from logs.logger.open_positions_logger import (
+                    load_position_metadata_from_csv,
+                )
+
+                file_meta = load_position_metadata_from_csv(
+                    self.open_positions_csv_path
+                )
+            except ImportError:
+                file_meta = None
+
         with self._lock:
+            if file_meta:
+                self._merge_open_positions_csv_dict(file_meta)
             self.last_recon_time = time.time()
             broker_symbols = set(broker_positions.keys())
             local_symbols = set(self.positions.keys())
@@ -382,24 +504,38 @@ class PositionManager:
                     lot_size=lot_size,
                 )
 
+                meta = self.position_metadata.get(sym, {}) or {}
+                bqty = int(bp["qty"])
+                if bqty != 0 and not meta:
+                    logger.warning(
+                        "Missing position metadata for %s during reconcile", sym
+                    )
+
+                tag_m = meta.get("tag")
+                structure_id_m = meta.get("structure_id")
+                intent_id_m = meta.get("intent_id")
+                meta_strategy = meta.get("strategy")
+
                 if sym not in self.positions:
                     pos = Position(inst)
-                    pos.net_qty = int(bp["qty"])
+                    pos.net_qty = bqty
                     pos.avg_price = float(bp.get("avg_price", 0))
-                    if strategy:
-                        pos.strategy = strategy
+                    pos.strategy = strategy or meta_strategy
+                    pos.tag = tag_m
+                    pos.structure_id = structure_id_m
+                    pos.intent_id = intent_id_m
                     self.positions[sym] = pos
                     continue
 
                 local = self.positions[sym]
                 if (
-                    local.net_qty != int(bp["qty"])
+                    local.net_qty != bqty
                     or abs(local.avg_price - float(bp.get("avg_price", 0))) > 0.5
                 ):
-                    local.net_qty = int(bp["qty"])
+                    local.net_qty = bqty
                     local.avg_price = float(bp.get("avg_price", 0))
                     local.last_updated = time.time()
-                if abs(local.net_qty - int(bp["qty"])) > drift_threshold:
+                if abs(local.net_qty - bqty) > drift_threshold:
                     self.trading_paused = True
                     logger.warning(
                         "Position drift above threshold: %s local_qty=%s broker_qty=%s threshold=%s",
@@ -409,8 +545,18 @@ class PositionManager:
                         drift_threshold,
                     )
 
+                if not getattr(local, "tag", None):
+                    local.tag = tag_m
+                if not getattr(local, "structure_id", None):
+                    local.structure_id = structure_id_m
+                if not getattr(local, "intent_id", None):
+                    local.intent_id = intent_id_m
+                if not getattr(local, "strategy", None):
+                    local.strategy = strategy or meta_strategy
+
             for sym in local_symbols - broker_symbols:
                 self.positions.pop(sym, None)
+                self.position_metadata.pop(sym, None)
 
     # ---------------------
     # POSITION CHECKS

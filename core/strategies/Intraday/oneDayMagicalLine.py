@@ -24,7 +24,6 @@ from datetime import date, time
 from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
-import pdb
 
 
 from core.strategies.IndiaMktMixins import IndiaMktMixins
@@ -86,6 +85,45 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     def get_warmup_period(self):
         return 0
 
+    def _strategy_meta_dict(self, meta: _PosMeta) -> dict:
+        return {
+            "one_day_ml1": {
+                "symbol": meta.symbol,
+                "entry_date": meta.entry_date.isoformat(),
+                "ml1": meta.ml1,
+                "entry_premium": meta.entry_premium,
+                "level": meta.level,
+            }
+        }
+
+    def _restore_odml_meta_from_position(self, pos: Any, position_store: Any) -> None:
+        if not pos or not getattr(pos, "structure_id", None):
+            return
+        if pos.structure_id in self._meta_by_structure_id:
+            return
+        sym = pos.instrument.trading_symbol
+        bucket = position_store.get_position_metadata(sym)
+        if not bucket:
+            return
+        raw = (bucket.get("strategy_meta") or {}).get("one_day_ml1")
+        if not raw:
+            return
+        try:
+            meta = _PosMeta(
+                symbol=str(raw["symbol"]),
+                entry_date=date.fromisoformat(str(raw["entry_date"])),
+                ml1=float(raw["ml1"]),
+                entry_premium=float(raw["entry_premium"]),
+                level=int(raw["level"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return
+        self._meta_by_structure_id[pos.structure_id] = meta
+        k = (meta.symbol, meta.entry_date)
+        self._reversal_level_counter[k] = max(
+            self._reversal_level_counter.get(k, 0), meta.level
+        )
+
     def _is_delta_testnet_enabled(self) -> bool:
         for job in STRATEGY_JOBS:
             if str(job.get("name")) != self.name:
@@ -145,6 +183,38 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             target_delta=self.delta,
             delta_min=self.delta_range[0],
             delta_max=self.delta_range[1],
+        )
+
+    def find_strike_in_premium_range_live(
+        self,
+        candle,
+        ctx,
+        option_type,
+        *,
+        min_prem=600,
+        max_prem=1500,
+        lookback_sec=60,
+        expiry="Weekly",
+        side="SELL",
+        target_delta=None,
+        delta_min=None,
+        delta_max=None,
+        max_spread_ratio=0.15,
+    ):
+        return DeltaMktMixins.find_strike_in_premium_range_live(
+            self,
+            candle,
+            ctx,
+            option_type,
+            min_prem=min_prem,
+            max_prem=max_prem,
+            lookback_sec=lookback_sec,
+            expiry=expiry,
+            side=side,
+            target_delta=target_delta,
+            delta_min=delta_min,
+            delta_max=delta_max,
+            max_spread_ratio=max_spread_ratio,
         )
 
     # ==================================================
@@ -211,6 +281,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             strike=position.instrument.strike,
             option_type=position.instrument.option_type,
             expiry=position.instrument.expiry,
+            trading_symbol=position.instrument.trading_symbol,
         )
         if curr_prem is None:
             return False
@@ -255,11 +326,9 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         open_positions = ctx.position_store.get_open_positions(
             underlying=symbol, strategy=self.name
         )
-        print(">>open>> in strategy", open_positions)
+
         reversal_entry: Optional[Any] = None
         if open_positions:
-            print(">>open_positions in strategy", open_positions)
-            pdb.set_trace()
             for pos in open_positions:
                 if (
                     getattr(pos, "tag", None) != "MAIN"
@@ -267,6 +336,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 ):
                     continue
 
+                self._restore_odml_meta_from_position(pos, ctx.position_store)
                 meta = self._meta_by_structure_id.get(pos.structure_id)
                 if meta is None:
                     continue
@@ -343,6 +413,13 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                     reversal_entry = None
                     break
 
+                new_meta = _PosMeta(
+                    symbol=meta.symbol,
+                    entry_date=meta.entry_date,
+                    ml1=meta.ml1,
+                    entry_premium=float(premium),
+                    level=next_level,
+                )
                 reversal_entry = self.map_instrument_to_intent(
                     inst=inst,
                     strike_row=row,
@@ -353,14 +430,9 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                     tag="MAIN",
                     symbol=meta.symbol,
                     action="ENTRY",
+                    metadata_extras=self._strategy_meta_dict(new_meta),
                 )
-                self._meta_by_structure_id[new_structure_id] = _PosMeta(
-                    symbol=meta.symbol,
-                    entry_date=meta.entry_date,
-                    ml1=meta.ml1,
-                    entry_premium=float(premium),
-                    level=next_level,
-                )
+                self._meta_by_structure_id[new_structure_id] = new_meta
                 self._exit_reason_by_structure_id.pop(new_structure_id, None)
                 break
 
@@ -444,6 +516,13 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         if inst is None:
             return None
 
+        meta = _PosMeta(
+            symbol=symbol,
+            entry_date=trade_dt,
+            ml1=ml1,
+            entry_premium=float(premium),
+            level=level,
+        )
         entry_intent = self.map_instrument_to_intent(
             inst=inst,
             strike_row=row,
@@ -454,15 +533,9 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             tag="MAIN",
             symbol=symbol,
             action="ENTRY",
+            metadata_extras=self._strategy_meta_dict(meta),
         )
 
-        meta = _PosMeta(
-            symbol=symbol,
-            entry_date=trade_dt,
-            ml1=ml1,
-            entry_premium=float(premium),
-            level=level,
-        )
         self._meta_by_structure_id[structure_id] = meta
         self._exit_reason_by_structure_id.pop(structure_id, None)
 
@@ -479,6 +552,8 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         if structure_id in self._pending_exit_structure_ids:
             return False
 
+        if ctx is not None:
+            self._restore_odml_meta_from_position(position, ctx.position_store)
         meta = self._meta_by_structure_id.get(structure_id)
         if meta is None:
             return False
@@ -510,6 +585,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             strike=position.instrument.strike,
             option_type=position.instrument.option_type,
             expiry=position.instrument.expiry,
+            trading_symbol=position.instrument.trading_symbol,
         )
         return [
             self.create_order_intent(

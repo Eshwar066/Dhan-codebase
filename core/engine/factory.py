@@ -123,6 +123,7 @@ class EngineFactory:
             strategy_id=config.strategy_name,
         )
         broker.set_order_router(order_router)
+        position_manager.rebuild_position_metadata_from_intent_store(intent_store)
 
         # ---------- Universe (DHAN equity strategies only) ----------
         universe_service = EngineFactory._universe_service(
@@ -174,14 +175,17 @@ class EngineFactory:
 
         # ---------- OMS (isolated per engine) ----------
         logger = TradeLogger()
+        _engine_id = config.engine_id or "live"
+        _open_positions_csv = os.path.join("logs", f"{_engine_id}_open_positions.csv")
         open_positions_logger = OpenPositionsLogger(
-            engine_id=config.engine_id or "live",
+            engine_id=_engine_id,
             venue=config.broker_name or "",
             run_mode=config.run_mode,
         )
         position_manager = PositionManager(
             logger=logger,
             open_positions_logger=open_positions_logger,
+            open_positions_csv_path=_open_positions_csv,
         )
         intent_store = IntentStore()
         engine_logger = EngineLogger(
@@ -252,6 +256,8 @@ class EngineFactory:
             if _margin_check is not None:
                 order_router.risk.check_short_option_margin = _margin_check
         broker.set_order_router(order_router)
+        position_manager.rebuild_position_metadata_from_intent_store(intent_store)
+        position_manager.rebuild_position_metadata_from_open_positions_csv()
 
         # ---------- Delta: set leverage from config (live only; skip for SimulatedBroker e.g. PAPER) ----------
         if (

@@ -302,7 +302,12 @@ class OrderRouter:
                 "action": getattr(intent, "action", "ENTRY"),
                 "engine_id": intent_engine_id,
                 "strategy_id": intent_strategy_id,
+                "structure_id": getattr(intent, "structure_id", None),
+                "tag": getattr(intent, "tag", None),
             }
+            _extras = getattr(intent, "metadata_extras", None)
+            if _extras is not None:
+                payload["strategy_meta"] = _extras
             self.intent_store.create(
                 payload=payload,
                 intent_id=intent.intent_id,
@@ -330,6 +335,15 @@ class OrderRouter:
             rec["action"] = getattr(intent, "action", "ENTRY")
             if hasattr(intent, "instrument"):
                 rec["instrument"] = intent.instrument
+            pay = rec.get("payload") or {}
+            if getattr(intent, "structure_id", None) is not None:
+                pay["structure_id"] = intent.structure_id
+            if getattr(intent, "tag", None) is not None:
+                pay["tag"] = intent.tag
+            _extras = getattr(intent, "metadata_extras", None)
+            if _extras is not None:
+                pay["strategy_meta"] = _extras
+            rec["payload"] = pay
 
         # Fix 1: Persistence Before Flight
         self.intent_store.update(intent.intent_id, IntentStatus.VALIDATED)
@@ -936,6 +950,11 @@ class OrderRouter:
                 intent_id=intent_id,
             )
             return
+        metadata_extras = None
+        if intent_id and self.intent_store:
+            _ir = self.intent_store.get(intent_id)
+            if _ir:
+                metadata_extras = (_ir.get("payload") or {}).get("strategy_meta")
         position_closed, realized_pnl = self.position_manager.on_fill(
             instrument=instrument,
             side=side,
@@ -948,6 +967,7 @@ class OrderRouter:
             tag=tag,
             candle_ts=candle_ts,
             action=action,
+            metadata_extras=metadata_extras,
         )
         if position_closed and realized_pnl is not None:
             self.risk.record_realized_pnl(realized_pnl)
@@ -1026,6 +1046,7 @@ class OrderRouter:
                 tag=intent.get("tag") or trade.get("tag"),
                 candle_ts=intent.get("candle_ts") or trade.get("candle_ts"),
                 action=intent.get("action") or payload.get("action") or trade.get("action"),
+                metadata_extras=payload.get("strategy_meta"),
             )
             if position_closed and realized_pnl is not None:
                 self.risk.record_realized_pnl(realized_pnl)

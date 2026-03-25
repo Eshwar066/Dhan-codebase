@@ -23,7 +23,11 @@ IST = timezone(timedelta(hours=5, minutes=30))
 from run.config import RUN_MODE, RunMode
 from core.utils.expiry_resolver import ExpiryResolver
 from core.models.order_intent import OrderIntent
-from core.strategies.deltaMktMixins import ltp_from_strike_row_live
+from core.strategies.deltaMktMixins import (
+    _delta_source_from_ctx,
+    delta_option_trading_symbol,
+    ltp_from_strike_row_live,
+)
 
 
 class IndiaMktMixins:
@@ -138,6 +142,7 @@ class IndiaMktMixins:
         symbol,
         action,
         parent_intent_id=None,
+        metadata_extras=None,
     ):
         return OrderIntent(
             intent_id=uuid.uuid4().hex,
@@ -154,12 +159,59 @@ class IndiaMktMixins:
             parent_intent_id=parent_intent_id,
             symbol=symbol,
             action=action,
+            metadata_extras=metadata_extras,
         )
 
     # ==================================================
     # OPTION PRICING (BACKTEST SAFE)
     # ==================================================
-    def get_option_price_at_candle(self, candle, ctx, strike, option_type, expiry):
+    def _delta_expiry_ddmmyy(self, expiry) -> str:
+        if expiry is None:
+            return ""
+        s = str(expiry).strip()
+        if len(s) == 6 and s.isdigit():
+            return s
+        try:
+            return pd.to_datetime(expiry).strftime("%d%m%y")
+        except (TypeError, ValueError):
+            return s
+
+    def get_option_price_at_candle(
+        self,
+        candle,
+        ctx,
+        strike,
+        option_type,
+        expiry,
+        trading_symbol: Optional[str] = None,
+    ):
+        if getattr(self, "api", None) == "DELTA":
+            source = _delta_source_from_ctx(ctx)
+            if source is None:
+                return None
+            sym = (trading_symbol or "").strip()
+            if not sym:
+                exp_code = self._delta_expiry_ddmmyy(expiry)
+                sym = delta_option_trading_symbol(
+                    None,
+                    float(strike) if strike is not None else 0.0,
+                    option_type or "CE",
+                    exp_code,
+                )
+            try:
+                t = source.get_ticker(sym)
+            except Exception:
+                return None
+            if not t or not isinstance(t, dict):
+                return None
+            px = t.get("mark_price") or t.get("last_price") or t.get("close")
+            if px is None:
+                return None
+            try:
+                return float(px)
+            except (TypeError, ValueError):
+                return None
+
         params = {
             "exchange": ctx.exchange,
             "interval": self.timeframe,
@@ -336,6 +388,7 @@ class IndiaMktMixins:
         action,
         tag=None,
         parent_intent_id=None,
+        metadata_extras=None,
     ):
         option_type = inst.option_type
 
@@ -368,6 +421,7 @@ class IndiaMktMixins:
             parent_intent_id=parent_intent_id,
             symbol=symbol,
             action=action,
+            metadata_extras=metadata_extras,
         )
 
     def map_futures_instrument_to_intent(
@@ -410,6 +464,7 @@ class IndiaMktMixins:
             parent_intent_id=parent_intent_id,
             symbol=symbol,
             action=action,
+            metadata_extras=None,
         )
 
     # ==================================================

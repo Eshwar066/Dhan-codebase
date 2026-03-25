@@ -468,6 +468,20 @@ See `docs/MULTI_VENUE.md`: create a Supervisor, `register_from_config()` for eac
 | **EOD export**               | LiveEngine   | Writes `reports/{engine_id}_{YYYYMMDD}.csv` (open positions, realized pnl).                                                                     |
 | **Latency**                  | LiveEngine   | Logs strategy_time_ms, broker_latency_ms, total_latency_ms for orders (order path only; not in tick ingestion, so no impact at high tick rate). |
 
+### Position metadata + reconcile (Dhan and Delta)
+
+Brokers only return quantity and average price for open positions. The OMS still needs **strategy-owned fields** (`tag`, `structure_id`, `intent_id`, and optional `strategy_meta` blobs) so strategies stay consistent after restarts and reconciliation.
+
+| Piece | Location | Behavior |
+| ----- | -------- | -------- |
+| **Metadata cache** | `PositionManager.position_metadata` | Updated on every fill from the intent record (`strategy_meta` from the intent payload). |
+| **Intent payload** | `OrderRouter` | Stores `structure_id`, `tag`, and optional `strategy_meta` when the intent is first persisted. |
+| **Open-positions CSV** | `logs/{engine_id}_open_positions.csv` | Journal of fill and broker SYNC events. Fill rows include a JSON `strategy_meta` column (plus `structure_id`, `tag`, `intent_id`). SYNC rows repeat metadata when the position manager still has it. The file is replayed on engine startup and at the beginning of each broker reconcile to rebuild `position_metadata` after restarts. |
+| **Reconcile** | `PositionManager.reconcile_with_broker` | Reloads metadata from the CSV (when configured), applies broker qty/avg, and reapplies merged metadata onto positions; logs a warning if the broker reports an open leg but no metadata exists. |
+| **Startup** | `EngineFactory` | Calls `rebuild_position_metadata_from_intent_store` then `rebuild_position_metadata_from_open_positions_csv`. |
+
+Strategies that need recovery-specific state (for example **OneDayMagicalLine** ML1 / entry premium) can attach a JSON-serializable dict via `OrderIntent.metadata_extras`; it is stored under `payload.strategy_meta`, written as JSON in the open-positions CSV on fills, and reloaded into the strategy after reconcile.
+
 ### Production safeguards (implemented)
 
 The following are implemented and configurable via **EngineConfig** (live only; no change to BaseEngine or BacktestEngine):
