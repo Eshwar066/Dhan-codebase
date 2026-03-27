@@ -199,21 +199,19 @@ class DeltaMktMixins:
     def weeklyExpiry(self, candle: dict, ctx: Any):
         ts = pd.to_datetime(candle["timestamp"]).tz_localize(None)
         trade_date = ts.date()
-        weekday = trade_date.weekday()  # Mon=0 ... Thu=3 ... Fri=4
+        weekday = trade_date.weekday()  # Mon=0 ... Fri=4
 
-        # ---- Weekly expiry logic ----
-        if weekday == 3:  # Thursday → next Friday
-            days_to_friday = 8
+        # ---- Correct weekly expiry logic ----
+        if weekday >= 3:  # Thu (3) or Fri (4)
+            days_to_friday = (4 - weekday) + 7
         else:
             days_to_friday = 4 - weekday
-            if days_to_friday < 0:
-                days_to_friday += 7
 
         weekly_expiry = trade_date + pd.Timedelta(days=days_to_friday)
 
-        # 🔥 Convert to DDMMYY format (matches your data)
         ctx.selected_expiry = pd.Timestamp(weekly_expiry).strftime("%d%m%y")
-        return pd.Timestamp(weekly_expiry).strftime("%d%m%y")
+
+        return ctx.selected_expiry
 
     def monthlyExpiry(self, candle: dict, ctx: Any):
         """Monthly expiry label ``DDMMYY`` (last Thursday month roll); aligns with ``ExpiryResolver`` NSE-style month."""
@@ -395,6 +393,7 @@ class DeltaMktMixins:
             scored.append((abs(strike - atm), strike, sym, p))
 
         if not scored:
+            print(">>error in option chain data ")
             return None
         scored.sort(key=lambda x: x[0])
         max_quotes = 48

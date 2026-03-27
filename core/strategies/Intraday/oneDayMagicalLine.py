@@ -33,7 +33,7 @@ from core.utils.expiry_resolver import ExpiryResolver
 from run.config import RUN_MODE, RunMode, STRATEGY_JOBS
 
 
-VALID_TIME_1730 = {time(21, 5)}  # 1hr candle close time (IST)
+VALID_TIME_1730 = {time(22, 15)}  # 1hr candle close time (IST)
 
 # Strike/premium selection (kept conservative and similar to `MagicalLines`)
 STRIKE_STEP = 500
@@ -122,6 +122,80 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         k = (meta.symbol, meta.entry_date)
         self._reversal_level_counter[k] = max(
             self._reversal_level_counter.get(k, 0), meta.level
+        )
+
+    def _has_pending_main_intent(self, ctx: Any, symbol: str) -> bool:
+        intent_store = getattr(ctx, "intent_store", None)
+        if intent_store is None:
+            return False
+
+        terminal_statuses = {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"}
+        intents = getattr(intent_store, "intents", {}) or {}
+        for rec in intents.values():
+            status = rec.get("status")
+            status_value = getattr(status, "value", status)
+            if str(status_value) in terminal_statuses:
+                continue
+
+            payload = rec.get("payload") or {}
+            if payload.get("strategy_id") != self.name:
+                continue
+            # Intent payload symbol is usually option tradingsymbol (C-BTC-...),
+            # while this method receives underlying symbol (BTCUSD). Match via
+            # strategy metadata / structure_id when available.
+            rec_underlyings = set()
+            strategy_meta = payload.get("strategy_meta") or {}
+            odml_meta = (
+                strategy_meta.get("one_day_ml1")
+                if isinstance(strategy_meta, dict)
+                else None
+            )
+            if isinstance(odml_meta, dict) and odml_meta.get("symbol"):
+                rec_underlyings.add(str(odml_meta.get("symbol")))
+            structure_id = str(
+                payload.get("structure_id") or rec.get("structure_id") or ""
+            )
+            parts = structure_id.split(":")
+            if len(parts) >= 3 and parts[0] == self.name:
+                rec_underlyings.add(parts[1])
+            if rec_underlyings:
+                if symbol not in rec_underlyings:
+                    continue
+            elif payload.get("symbol") != symbol:
+                # Backward-compat fallback when metadata/structure are missing.
+                continue
+
+            # Any non-final MAIN/MAIN_EXIT signal for this symbol means
+            # a position lifecycle is still in flight; avoid opposite entry.
+            tag = str(payload.get("tag") or rec.get("tag") or "").upper()
+            action = str(payload.get("action") or rec.get("action") or "").upper()
+            if tag == "MAIN_SL":
+                continue
+            if tag in {"MAIN", "MAIN_EXIT"} or action in {"ENTRY", "EXIT"}:
+                return True
+        return False
+
+    def _build_main_sl_intent(
+        self,
+        entry_intent: Any,
+        trigger_price: float,
+        candle_ts: Any,
+        symbol: str,
+    ) -> Any:
+        return self.create_order_intent(
+            inst=entry_intent.instrument,
+            side="BUY",
+            qty=entry_intent.qty,
+            price=float(trigger_price),
+            order_type="SL-M",  # STOP_LIMIT (to be used here)
+            strategy=self.name,
+            candle_ts=candle_ts,
+            structure_id=entry_intent.structure_id,
+            tag="MAIN_SL",
+            symbol=symbol,
+            action="FORCE_EXIT",
+            parent_intent_id=entry_intent.intent_id,
+            trigger_price=float(trigger_price),
         )
 
     def _is_delta_testnet_enabled(self) -> bool:
@@ -233,8 +307,8 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         """Only enter at `17:30` IST candle close."""
         ts = pd.to_datetime(candle["timestamp"])
 
-        # return self._is_valid_time(ts, self.valid_times)
-        return True
+        return self._is_valid_time(ts, self.valid_times)
+        # return True
 
     def _direction_at_1730(self, candle: dict) -> str:
         open_ = float(candle.get("open", candle.get("close", 0)) or 0)
@@ -318,6 +392,11 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             )
 
         curr_spot_close = float(candle["close"])
+
+        # Entry lock: block new entries while current lifecycle is still in flight.
+        if self._has_pending_main_intent(ctx, symbol):
+            self._pending_spot_close_by_symbol[symbol] = curr_spot_close
+            return None
 
         # --------------------------------------------------
         # 1) Reversal: if we have an open MAIN and ML1 is crossed,
@@ -440,7 +519,16 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         self._pending_spot_close_by_symbol[symbol] = curr_spot_close
 
         if reversal_entry is not None:
-            return reversal_entry
+            sl_trigger = float(
+                self._meta_by_structure_id[reversal_entry.structure_id].entry_premium
+                * (1.0 + SL_PCT)
+            )
+            return [
+                reversal_entry,
+                self._build_main_sl_intent(
+                    reversal_entry, sl_trigger, candle["timestamp"], symbol
+                ),
+            ]
 
         # --------------------------------------------------
         # 2) Initial entry: only at 17:30.
@@ -539,7 +627,13 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         self._meta_by_structure_id[structure_id] = meta
         self._exit_reason_by_structure_id.pop(structure_id, None)
 
-        return entry_intent
+        sl_trigger = float(meta.entry_premium * (1.0 + SL_PCT))
+        return [
+            entry_intent,
+            self._build_main_sl_intent(
+                entry_intent, sl_trigger, candle["timestamp"], symbol
+            ),
+        ]
 
     # ==================================================
     # EXIT: reverse on ML1 cross, else SL by premium
@@ -593,6 +687,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 side="BUY" if position.net_qty < 0 else "SELL",
                 qty=abs(position.net_qty),
                 price=price,
+                order_type="LIMIT",
                 strategy=self.name,
                 candle_ts=candle["timestamp"],
                 structure_id=position.structure_id,
@@ -610,3 +705,16 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         self._pending_exit_structure_ids.discard(structure_id)
         self._exit_reason_by_structure_id.pop(structure_id, None)
         self._meta_by_structure_id.pop(structure_id, None)
+
+    def on_forced_exit(self, **kwargs):
+        """Broker-driven close (liquidation, external reduce-only); keeps strategy state in sync."""
+        structure_id = kwargs.get("structure_id")
+        if not structure_id:
+            return
+        position_closed = bool(kwargs.get("position_closed"))
+        reason = str(kwargs.get("exit_reason") or kwargs.get("execution_source") or "FORCED")
+        if position_closed:
+            self.on_structure_exit(structure_id=structure_id)
+        else:
+            self._exit_reason_by_structure_id[structure_id] = reason
+            self._pending_exit_structure_ids.discard(structure_id)

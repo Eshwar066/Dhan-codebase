@@ -16,7 +16,7 @@ def _get_reduce_only(action: str) -> bool:
     EXIT → reduce_only=True (only reduce existing position).
     Prevents accidental position flips when exit and entry signals are reordered.
     """
-    return (action or "").upper() == "EXIT"
+    return (action or "").upper() in {"EXIT", "FORCE_EXIT"}
 
 
 def _intent_to_delta_payload(intent, execution_price=None):
@@ -37,7 +37,7 @@ def _intent_to_delta_payload(intent, execution_price=None):
             "exchange": segment,
             "quantity": total_qty,
             "price": float(price),
-            "trigger_price": 0,
+            "trigger_price": float(getattr(intent, "trigger_price", 0) or 0),
             "order_type": getattr(intent, "order_type", "MARKET"),
             "transaction_type": intent.side,
             "trade_type": getattr(intent, "trade_type", "MARGIN"),
@@ -164,18 +164,69 @@ class DeltaBroker(BaseBroker):
         payload = _intent_to_delta_payload(intent, execution_price)
         for attempt in range(retries + 1):
             try:
-                result = self.api.place_order(
-                    tradingsymbol=payload["tradingsymbol"],
-                    exchange=payload["exchange"],
-                    quantity=payload["quantity"],
-                    price=payload["price"],
-                    trigger_price=payload["trigger_price"],
-                    order_type=payload["order_type"],
-                    transaction_type=payload["transaction_type"],
-                    trade_type=payload["trade_type"],
-                    tag=payload.get("tag"),
-                    reduce_only=payload.get("reduce_only", "false"),
-                )
+                ot = str(payload.get("order_type") or "MARKET").upper()
+                if ot in {"SL", "SL-M", "STOP", "STOP_MARKET", "STOP_LIMIT"}:
+                    stop_ot = "MARKET" if ot in {"SL-M", "STOP_MARKET"} else "LIMIT"
+                    limit_price = payload["price"] if stop_ot == "LIMIT" else None
+                    result = None
+                    stop_retries = 3
+                    for stop_attempt in range(stop_retries):
+                        try:
+                            result = self.api.place_bracket_stop_loss(
+                                tradingsymbol=payload["tradingsymbol"],
+                                quantity=payload["quantity"],
+                                transaction_type=payload["transaction_type"],
+                                trigger_price=payload["trigger_price"] or payload["price"],
+                                price=limit_price,
+                                stop_trigger_method="mark_price",
+                                tag=payload.get("tag"),
+                            )
+                        except Exception as stop_e:
+                            err_txt = str(stop_e).lower()
+                            if (
+                                "no_open_position" in err_txt
+                                and stop_attempt < (stop_retries - 1)
+                            ):
+                                logger.warning(
+                                    "Delta stop-order no_open_position for %s "
+                                    "(attempt %s/%s); retrying in 60s",
+                                    payload.get("tradingsymbol"),
+                                    stop_attempt + 1,
+                                    stop_retries,
+                                )
+                                time.sleep(60)
+                                continue
+                            raise
+                        if result.get("status") == "success":
+                            break
+                        err_txt = str(result).lower()
+                        if (
+                            "no_open_position" in err_txt
+                            and stop_attempt < (stop_retries - 1)
+                        ):
+                            logger.warning(
+                                "Delta stop-order no_open_position for %s "
+                                "(attempt %s/%s); retrying in 60s",
+                                payload.get("tradingsymbol"),
+                                stop_attempt + 1,
+                                stop_retries,
+                            )
+                            time.sleep(60)
+                            continue
+                        break
+                else:
+                    result = self.api.place_order(
+                        tradingsymbol=payload["tradingsymbol"],
+                        exchange=payload["exchange"],
+                        quantity=payload["quantity"],
+                        price=payload["price"],
+                        trigger_price=payload["trigger_price"],
+                        order_type=payload["order_type"],
+                        transaction_type=payload["transaction_type"],
+                        trade_type=payload["trade_type"],
+                        tag=payload.get("tag"),
+                        reduce_only=payload.get("reduce_only", "false"),
+                    )
                 if result.get("status") == "success":
                     if self.intent_store and payload.get("tag"):
                         self.intent_store.update(payload["tag"], "SENT")
@@ -184,6 +235,28 @@ class DeltaBroker(BaseBroker):
                 return None
             except Exception as e:
                 if attempt == retries:
+                    ot = str(payload.get("order_type") or "MARKET").upper()
+                    err_txt = str(e).lower()
+                    if ot in {"SL", "SL-M", "STOP", "STOP_MARKET", "STOP_LIMIT"} and (
+                        "no_open_position" in err_txt
+                    ):
+                        logger.warning(
+                            "Delta stop-order no_open_position for %s after 3 attempts; "
+                            "skipping broker-side SL intent and relying on strategy exit logic. error=%s",
+                            payload.get("tradingsymbol"),
+                            e,
+                        )
+                        return None
+                    if ot in {"SL", "SL-M", "STOP", "STOP_MARKET", "STOP_LIMIT"} and (
+                        "unsupported" in err_txt or "400" in err_txt
+                    ):
+                        logger.warning(
+                            "Delta stop-order unsupported for %s on current environment; "
+                            "skipping broker-side SL intent and relying on strategy exit logic. error=%s",
+                            payload.get("tradingsymbol"),
+                            e,
+                        )
+                        return None
                     logger.warning("Delta place_order exception (final attempt): %s", e, exc_info=True)
                     raise
                 time.sleep(0.3)

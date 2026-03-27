@@ -135,6 +135,7 @@ class IndiaMktMixins:
         side,
         qty,
         price,
+        order_type,
         strategy,
         candle_ts,
         structure_id,
@@ -143,6 +144,7 @@ class IndiaMktMixins:
         action,
         parent_intent_id=None,
         metadata_extras=None,
+        trigger_price=None,
     ):
         return OrderIntent(
             intent_id=uuid.uuid4().hex,
@@ -150,7 +152,7 @@ class IndiaMktMixins:
             side=side,
             qty=int(inst.lot_size),
             price=price,
-            order_type="LIMIT",
+            order_type=order_type,
             strategy=strategy,
             structure_id=structure_id,
             trade_type="MARGIN",
@@ -160,6 +162,7 @@ class IndiaMktMixins:
             symbol=symbol,
             action=action,
             metadata_extras=metadata_extras,
+            trigger_price=trigger_price,
         )
 
     # ==================================================
@@ -386,9 +389,11 @@ class IndiaMktMixins:
         candle_ts,
         symbol,
         action,
+        order_type="LIMIT",
         tag=None,
         parent_intent_id=None,
         metadata_extras=None,
+        trigger_price=None,
     ):
         option_type = inst.option_type
 
@@ -412,7 +417,7 @@ class IndiaMktMixins:
             side=side,
             qty=int(inst.lot_size),
             price=ltp,
-            order_type="LIMIT",
+            order_type=order_type,
             strategy=strategy,
             structure_id=structure_id,
             trade_type="MARGIN",
@@ -422,6 +427,7 @@ class IndiaMktMixins:
             symbol=symbol,
             action=action,
             metadata_extras=metadata_extras,
+            trigger_price=trigger_price,
         )
 
     def map_futures_instrument_to_intent(
@@ -465,6 +471,7 @@ class IndiaMktMixins:
             symbol=symbol,
             action=action,
             metadata_extras=None,
+            trigger_price=None,
         )
 
     # ==================================================
@@ -526,6 +533,7 @@ class IndiaMktMixins:
             side="BUY",
             qty=1,
             price=hedge_price,
+            order_type="LIMIT",
             strategy=self.name,
             candle_ts=candle["timestamp"],
             structure_id=parent_sell_intent.structure_id,
@@ -563,6 +571,7 @@ class IndiaMktMixins:
             side="BUY" if hedge.net_qty < 0 else "SELL",
             qty=abs(hedge.net_qty),
             price=price,
+            order_type="LIMIT",
             strategy=self.name,
             candle_ts=candle["timestamp"],
             structure_id=hedge.structure_id,

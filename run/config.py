@@ -110,13 +110,14 @@ STRATEGY_JOBS = [
         "name": "OneDayMagicalLine",
         "venue": "DELTA",
         "enabled": True,
-        "run_mode": "PAPER",  # uncomment for Delta paper/live; omit for backtest (uses RUN_MODE)
+        "run_mode": "LIVE",  # uncomment for Delta paper/live; omit for backtest (uses RUN_MODE)
         "capital": 200000,
         "symbols": ["BTCUSD"],
         "instrument": "OPTION",
         "delta_india": True,
-        "delta_testnet": False,
+        "delta_testnet": True,
         "delta_leverage": 10,
+        "max_open_positions": 1,
         "check_short_option_margin_enabled": True,
         "telegram": {
             "bot_token": "8389724629:AAHY_CGcBF8HZCexedsEJFw80Mf6SxH5Bkk",

@@ -77,6 +77,9 @@ class OrderRouter:
         # Trade-led: only apply each trade once; positions = f(trades), not f(order state)
         self._processed_trade_ids: Set[str] = set()
         self._processed_trade_ids_max = 10000
+        # EXTERNAL_CLOSE: additive confidence (see _external_close_confidence_score)
+        self._orphan_close_score_threshold = 6
+        self._orphan_close_suspect_floor = 5
         _logs_dir = Path(__file__).resolve().parents[2] / "logs"
         _logs_dir.mkdir(parents=True, exist_ok=True)
         _safe_id = (engine_id or "default").replace(" ", "_").replace("/", "_")
@@ -719,11 +722,19 @@ class OrderRouter:
 
         # 2. Missing: In local pending but not on broker open list
         # Usually FILLED/REJECTED/CANCELLED. Only poll broker when cache doesn't have terminal state.
-        missing = [
-            i
-            for i in local_pending
-            if i.get("intent_id") and i.get("intent_id") not in broker_tags
-        ]
+        missing = []
+        for i in local_pending:
+            intent_id = i.get("intent_id")
+            if not intent_id or intent_id in broker_tags:
+                continue
+            payload = i.get("payload") or {}
+            action = str(payload.get("action") or i.get("action") or "").upper()
+            # FORCE_EXIT (broker-side SL/trigger) may be absent from open/fills APIs
+            # until trigger/execution. If broker acknowledged with order_id, keep it
+            # as valid pending instead of flagging as missing every reconcile cycle.
+            if action == "FORCE_EXIT" and i.get("broker_order_id"):
+                continue
+            missing.append(i)
         missing_needing_poll = [
             i
             for i in missing
@@ -968,6 +979,7 @@ class OrderRouter:
             candle_ts=candle_ts,
             action=action,
             metadata_extras=metadata_extras,
+            execution_source="INTENT",
         )
         if position_closed and realized_pnl is not None:
             self.risk.record_realized_pnl(realized_pnl)
@@ -994,6 +1006,8 @@ class OrderRouter:
                 broker_order_id=order_id,
                 order_state=OrderState.FILLED,
             )
+        if self.position_manager and sym:
+            self.position_manager.note_trade_led_fill(sym)
 
     def process_trade(self, trade: Dict[str, Any]) -> bool:
         """
@@ -1047,6 +1061,7 @@ class OrderRouter:
                 candle_ts=intent.get("candle_ts") or trade.get("candle_ts"),
                 action=intent.get("action") or payload.get("action") or trade.get("action"),
                 metadata_extras=payload.get("strategy_meta"),
+                execution_source="INTENT",
             )
             if position_closed and realized_pnl is not None:
                 self.risk.record_realized_pnl(realized_pnl)
@@ -1070,6 +1085,368 @@ class OrderRouter:
         self._processed_trade_ids.add(trade_id)
         if len(self._processed_trade_ids) > getattr(self, "_processed_trade_ids_max", 10000):
             self._processed_trade_ids = set(list(self._processed_trade_ids)[-self._processed_trade_ids_max // 2 :])
+        if self.position_manager and sym:
+            self.position_manager.note_trade_led_fill(sym)
+        return True
+
+    @staticmethod
+    def _is_delta_liquidation_fill(f: Dict[str, Any]) -> bool:
+        """True if broker fill is an exchange-driven liquidation (no client_order_id / intent)."""
+        if not isinstance(f, dict):
+            return False
+        if f.get("liquidation") is True or f.get("is_liquidation") is True:
+            return True
+        ft = f.get("fill_type") or f.get("type") or ""
+        if isinstance(ft, str) and "liquid" in ft.lower():
+            return True
+        meta = f.get("meta")
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except (json.JSONDecodeError, TypeError):
+                meta = None
+        if isinstance(meta, dict):
+            for key in ("fill_type", "type", "order_type"):
+                v = meta.get(key)
+                if isinstance(v, str) and "liquid" in v.lower():
+                    return True
+        return False
+
+    @staticmethod
+    def _is_adl_fill(f: Dict[str, Any]) -> bool:
+        """Auto-deleverage close (future-proof; Delta/metadata may expose flags later)."""
+        if not isinstance(f, dict):
+            return False
+        if f.get("adl") is True or f.get("is_adl") is True:
+            return True
+        ft = f.get("fill_type") or f.get("type") or ""
+        if isinstance(ft, str) and (
+            "adl" in ft.lower() or "delever" in ft.lower()
+        ):
+            return True
+        meta = f.get("meta")
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except (json.JSONDecodeError, TypeError):
+                meta = None
+        if isinstance(meta, dict):
+            for key in ("fill_type", "type", "order_type", "liquidation_type"):
+                v = meta.get(key)
+                if isinstance(v, str) and (
+                    "adl" in v.lower() or "delever" in v.lower()
+                ):
+                    return True
+        return False
+
+    def _known_broker_order_ids(self) -> Set[str]:
+        """All broker order IDs we have recorded on intents (own orders)."""
+        out: Set[str] = set()
+        if not self.intent_store or not hasattr(self.intent_store, "intents"):
+            return out
+        try:
+            for rec in self.intent_store.intents.values():
+                bid = rec.get("broker_order_id")
+                if bid is not None and str(bid).strip():
+                    out.add(str(bid).strip())
+        except Exception:
+            pass
+        return out
+
+    def _external_close_confidence_score(
+        self, f: Dict[str, Any], known_order_ids: Set[str]
+    ) -> Tuple[int, Optional[Any]]:
+        """
+        Confidence for treating a fill as EXTERNAL_CLOSE (not boolean) — reduces false positives
+        when the broker drops client_order_id on our own exit orders.
+
+        +2 no client_order_id / tag
+        +2 broker order_id not in known_order_ids
+        +1 reduce_only is True
+        +2 fill direction matches an open leg that would reduce exposure
+        """
+        if not isinstance(f, dict):
+            return 0, None
+        oid = str(f.get("order_id") or f.get("id") or "").strip()
+        cid = str(f.get("client_order_id") or f.get("tag") or "").strip()
+        if cid:
+            return 0, None
+        if not oid or oid in known_order_ids:
+            return 0, None
+        ro = f.get("reduce_only")
+        if ro is False:
+            return 0, None
+        sym = OrderRouter._fill_product_symbol(f)
+        side = (f.get("side") or "").upper()
+        if not sym or side not in ("BUY", "SELL"):
+            return 0, None
+        score = 4
+        if ro is True:
+            score += 1
+        pos = None
+        if self.position_manager:
+            pos = self._find_position_for_external_close(
+                sym, side, float(f.get("size") or 0)
+            )
+        if pos is not None:
+            score += 2
+        return score, pos
+
+    @staticmethod
+    def _fill_product_symbol(f: Dict[str, Any]) -> str:
+        sym = (
+            f.get("product_symbol")
+            or (f.get("product") or {}).get("symbol")
+            or f.get("symbol")
+            or ""
+        )
+        return str(sym).strip()
+
+    @staticmethod
+    def _symbol_keys_close_enough(a: str, b: str) -> bool:
+        """Case-insensitive match for option contract symbols (e.g. C-BTC-65000-030426)."""
+        return (a or "").strip().upper() == (b or "").strip().upper()
+
+    def _close_qty_from_fill(self, pos: Any, raw_size: float) -> float:
+        """
+        Contracts to apply for this fill: supports partial liquidation when size is in contracts
+        or in base currency (e.g. BTC) via instrument.contract_multiplier.
+        If reported size is missing (<=0), assume full local leg.
+        """
+        net = abs(float(pos.net_qty))
+        if net <= 0:
+            return 0.0
+        if raw_size <= 0:
+            return net
+        inst = pos.instrument
+        mult = float(getattr(inst, "contract_multiplier", 0) or 0)
+        # Integer contract count from API
+        if raw_size >= 1.0 - 1e-9:
+            q = float(int(round(raw_size)))
+            return min(net, q) if q > 0 else net
+        # Fractional: often base currency (notional) per contract on Delta
+        if mult > 0 and raw_size < net * mult * 4 + 1e-9:
+            contracts = raw_size / mult
+            if contracts > 0:
+                return min(net, float(contracts))
+        # Unparseable small fraction: treat as partial in contract space
+        if 0 < raw_size < 1:
+            return min(net, float(raw_size))
+        return min(net, float(raw_size))
+
+    def _find_position_for_external_close(
+        self,
+        product_symbol: str,
+        fill_side: str,
+        fill_size_raw: float,
+    ) -> Optional[Any]:
+        """
+        Match external close to an open leg. Priority when multiple: exact size, closest size,
+        most recently updated, then highest exposure (|qty|*avg_price*lot_size).
+        """
+        if not self.position_manager or not product_symbol:
+            return None
+        fs = fill_side.upper()
+        if fs not in ("BUY", "SELL"):
+            return None
+
+        candidates = []
+        for sym_key, pos in self.position_manager.positions.items():
+            if pos.net_qty == 0:
+                continue
+            inst_ts = (
+                getattr(pos.instrument, "trading_symbol", "") or ""
+                if pos.instrument
+                else ""
+            )
+            if (
+                not self._symbol_keys_close_enough(sym_key, product_symbol)
+                and not self._symbol_keys_close_enough(inst_ts, product_symbol)
+            ):
+                continue
+            if fs == "BUY" and pos.net_qty >= 0:
+                continue
+            if fs == "SELL" and pos.net_qty <= 0:
+                continue
+            candidates.append(pos)
+
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+
+        def _rank_tuple(pos: Any) -> Tuple[int, float, float, float]:
+            net = abs(float(pos.net_qty))
+            guessed = self._close_qty_from_fill(pos, fill_size_raw)
+            exact_miss = 0 if abs(net - guessed) < 1e-8 else 1
+            dist = abs(net - guessed)
+            last = float(getattr(pos, "last_updated", 0) or 0)
+            exposure = abs(float(pos.net_qty)) * float(pos.avg_price or 0) * float(
+                getattr(pos.instrument, "lot_size", 1) or 1
+            )
+            return (exact_miss, dist, -last, -exposure)
+
+        return sorted(candidates, key=_rank_tuple)[0]
+
+    def _process_external_close_fill(self, f: Dict[str, Any], execution_source: str) -> bool:
+        """
+        Liquidation / ADL / orphan reduce-only fills without intent linkage.
+        execution_source: LIQUIDATION | EXTERNAL_CLOSE | ADL
+        """
+        if not self.position_manager:
+            return False
+        if execution_source not in ("LIQUIDATION", "EXTERNAL_CLOSE", "ADL"):
+            return False
+
+        trade_id = str(
+            f.get("trade_id")
+            or f.get("id")
+            or f"{f.get('order_id', '')}_{f.get('created_at', '')}"
+        )
+        if not trade_id or trade_id in getattr(self, "_processed_trade_ids", set()):
+            return False
+
+        price = float(f.get("price") or f.get("average_fill_price") or 0)
+        raw_size = float(f.get("size") or f.get("qty") or 0)
+        if price <= 0:
+            return False
+
+        sym = self._fill_product_symbol(f)
+        side = (f.get("side") or "").upper()
+
+        with self.position_manager._lock:
+            pos = self._find_position_for_external_close(sym, side, raw_size)
+            if not pos or pos.net_qty == 0:
+                if pos is None:
+                    logger.warning(
+                        "External close fill could not match open position: source=%s symbol=%s side=%s size=%s",
+                        execution_source,
+                        sym,
+                        side,
+                        raw_size,
+                    )
+                return False
+            inst = pos.instrument
+            sym_ts = getattr(inst, "trading_symbol", sym)
+            close_qty = min(
+                self._close_qty_from_fill(pos, raw_size),
+                abs(float(pos.net_qty)),
+            )
+            prev_signed = int(pos.net_qty)
+            pm_meta = self.position_manager.position_metadata.get(sym_ts) or {}
+            strat = pos.strategy or pm_meta.get("strategy")
+            struct_id = pos.structure_id or pm_meta.get("structure_id")
+            tag = pos.tag or pm_meta.get("tag")
+            intent_id = pos.intent_id or pm_meta.get("intent_id")
+            meta_extras = pm_meta.get("strategy_meta")
+
+        if close_qty <= 0:
+            return False
+
+        exit_reason = {
+            "LIQUIDATION": "LIQUIDATION",
+            "EXTERNAL_CLOSE": "EXTERNAL_CLOSE",
+            "ADL": "ADL",
+        }.get(execution_source, execution_source)
+        order_id = str(f.get("order_id") or f.get("id") or "")
+
+        qty_arg = (
+            int(round(close_qty))
+            if abs(close_qty - round(close_qty)) < 1e-9
+            else close_qty
+        )
+        position_closed, realized_pnl = self.position_manager.on_fill(
+            instrument=inst,
+            side=side,
+            qty=qty_arg,
+            price=price,
+            intent_id=intent_id,
+            order_id=order_id or None,
+            strategy=strat,
+            structure_id=struct_id,
+            tag=tag,
+            candle_ts=None,
+            action="EXIT",
+            metadata_extras=meta_extras,
+            exit_reason=exit_reason,
+            execution_source=execution_source,
+        )
+        np = self.position_manager.positions.get(sym_ts)
+        new_qty = int(np.net_qty) if np else 0
+
+        fn = getattr(self.position_manager, "on_forced_exit", None)
+        debounce_key = struct_id or sym_ts
+        if callable(fn) and self.position_manager.should_emit_forced_exit(
+            debounce_key, position_closed
+        ):
+            try:
+                fn(
+                    instrument=inst,
+                    symbol=sym_ts,
+                    strategy=strat,
+                    structure_id=struct_id,
+                    tag=tag,
+                    intent_id=intent_id,
+                    prev_qty=prev_signed,
+                    new_qty=new_qty,
+                    qty_closed=close_qty,
+                    price=price,
+                    execution_source=execution_source,
+                    exit_reason=exit_reason,
+                    position_closed=position_closed,
+                    order_id=order_id or None,
+                )
+            except Exception as e:
+                logger.warning("on_forced_exit callback failed: %s", e, exc_info=True)
+
+        rec_es = getattr(self.risk, "record_execution_source", None)
+        if callable(rec_es):
+            try:
+                rec_es(
+                    execution_source,
+                    strat,
+                    symbol=sym_ts,
+                    position_closed=position_closed,
+                )
+            except Exception as e:
+                logger.debug("record_execution_source failed: %s", e)
+
+        if position_closed and realized_pnl is not None:
+            self.risk.record_realized_pnl(realized_pnl)
+
+        self.report_fill(
+            sym_ts,
+            side,
+            qty_arg,
+            None,
+            price,
+            order_id=order_id or None,
+            intent_id=intent_id,
+        )
+        if intent_id and self.intent_store:
+            self._set_order_state(
+                intent_id,
+                OrderState.FILLED,
+                action="external_close_fill",
+                message=f"{execution_source} broker_order_id={order_id}",
+            )
+            self.intent_store.update(
+                intent_id,
+                IntentStatus.FILLED,
+                broker_order_id=order_id or None,
+                order_state=OrderState.FILLED,
+            )
+        self._processed_trade_ids.add(trade_id)
+        if len(self._processed_trade_ids) > getattr(self, "_processed_trade_ids_max", 10000):
+            self._processed_trade_ids = set(
+                list(self._processed_trade_ids)[-self._processed_trade_ids_max // 2 :]
+            )
+        self.position_manager.note_trade_led_fill(sym_ts)
+        if self.engine_logger:
+            self.engine_logger.log(
+                "oms",
+                f"Applied {execution_source} fill to {sym_ts} qty={close_qty} intent_id={intent_id or 'none'}",
+            )
         return True
 
     def sync_trades_from_broker(self) -> None:
@@ -1094,27 +1471,60 @@ class OrderRouter:
                     broker_order_id_to_intent[str(bid)] = iid
         except Exception:
             pass
+        known_order_ids = self._known_broker_order_ids()
         for f in fills or []:
             intent_id = (
                 f.get("client_order_id")
                 or f.get("tag")
                 or broker_order_id_to_intent.get(str(f.get("order_id") or f.get("id") or ""))
             )
-            if not intent_id:
+            if intent_id and self.intent_store and self.intent_store.get(intent_id):
+                trade = {
+                    "trade_id": f.get("id"),
+                    "id": f.get("id"),
+                    "order_id": str(f.get("order_id") or f.get("id", "")),
+                    "intent_id": intent_id,
+                    "client_order_id": intent_id,
+                    "tag": intent_id,
+                    "price": float(f.get("price") or 0),
+                    "size": float(f.get("size") or 0),
+                    "side": (f.get("side") or "").upper(),
+                    "created_at": f.get("created_at"),
+                }
+                self.process_trade(trade)
                 continue
-            trade = {
-                "trade_id": f.get("id"),
-                "id": f.get("id"),
-                "order_id": str(f.get("order_id") or f.get("id", "")),
-                "intent_id": intent_id,
-                "client_order_id": intent_id,
-                "tag": intent_id,
-                "price": float(f.get("price") or 0),
-                "size": float(f.get("size") or 0),
-                "side": (f.get("side") or "").upper(),
-                "created_at": f.get("created_at"),
-            }
-            self.process_trade(trade)
+
+            exec_src = None
+            if self._is_adl_fill(f):
+                exec_src = "ADL"
+            elif self._is_delta_liquidation_fill(f):
+                exec_src = "LIQUIDATION"
+            else:
+                score, pos_hint = self._external_close_confidence_score(
+                    f, known_order_ids
+                )
+                th = getattr(self, "_orphan_close_score_threshold", 6)
+                sus = getattr(self, "_orphan_close_suspect_floor", 5)
+                if score >= th and pos_hint is not None:
+                    exec_src = "EXTERNAL_CLOSE"
+                elif score >= th and pos_hint is None:
+                    logger.info(
+                        "Orphan-style fill score=%s but no reducing leg; not applying EXTERNAL_CLOSE (order_id=%s symbol=%s)",
+                        score,
+                        f.get("order_id"),
+                        OrderRouter._fill_product_symbol(f),
+                    )
+                elif sus <= score < th:
+                    logger.info(
+                        "Suspect orphan-style fill below EXTERNAL_CLOSE threshold: score=%s (need %s) order_id=%s symbol=%s",
+                        score,
+                        th,
+                        f.get("order_id"),
+                        OrderRouter._fill_product_symbol(f),
+                    )
+
+            if exec_src and self._process_external_close_fill(f, exec_src):
+                continue
         return
 
     def report_fill(

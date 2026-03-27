@@ -651,28 +651,37 @@ class DeltaSource:
     # -------------------------------------------------------------------------
     # Advanced: stop orders, leverage, margin, batch, history
     # -------------------------------------------------------------------------
-    def place_stop_order(
+    def place_bracket_stop_loss(
         self,
         product_id: int,
         size: int,
         side: str,
-        stop_price: Optional[float] = None,
+        stop_price: float,
         limit_price: Optional[float] = None,
-        trail_amount: Optional[float] = None,
-        order_type: str = "LIMIT",
-        is_trailing_stop_loss: bool = False,
+        stop_trigger_method: str = "mark_price",
+        order_source: str = "positions_TP_SL_order",
+        source: str = "desktop",
+        client_order_id: Optional[str] = None,
     ) -> Any:
-        ot = OrderType.LIMIT if order_type.upper() == "LIMIT" else OrderType.MARKET
-        return self._client.place_stop_order(
-            product_id=product_id,
-            size=size,
-            side=side.lower(),
-            stop_price=stop_price,
-            limit_price=limit_price,
-            trail_amount=trail_amount,
-            order_type=ot,
-            isTrailingStopLoss=is_trailing_stop_loss,
-        )
+        stop_loss_order: Dict[str, str] = {
+            "order_type": "limit_order" if limit_price is not None else "market_order",
+            "stop_price": str(stop_price),
+        }
+        if limit_price is not None:
+            stop_loss_order["limit_price"] = str(limit_price)
+
+        payload = {
+            "product_id": int(product_id),
+            "size": int(size),
+            "side": side.lower(),
+            "bracket_stop_trigger_method": stop_trigger_method,
+            "stop_loss_order": stop_loss_order,
+            "order_source": order_source,
+            "source": source,
+        }
+        if client_order_id:
+            payload["client_order_id"] = str(client_order_id)
+        return self._client.place_bracket_order(payload)
 
     def set_leverage(self, product_id: int, leverage: int) -> Any:
         return self._client.set_leverage(product_id=product_id, leverage=leverage)

@@ -29,6 +29,9 @@ class BacktestEngine(BaseEngine):
         self.broker_name = broker_name or ""
         # Wire structure-exit callback (ONE TIME)
         self.position_manager.on_structure_exit = strategy.on_structure_exit
+        self.position_manager.on_forced_exit = getattr(
+            strategy, "on_forced_exit", None
+        )
 
     def build_context(self, candle, recent_candles=None):
         intent_store = getattr(self.order_router, "intent_store", None)

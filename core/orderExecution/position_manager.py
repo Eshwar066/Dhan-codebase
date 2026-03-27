@@ -65,6 +65,8 @@ class Position:
         self.tag = None
         self.intent_id = None
         self.on_structure_exit = None
+        # Set when position is fully closed via a named path (e.g. LIQUIDATION)
+        self.exit_reason = None
 
         self.last_updated = time.time()
 
@@ -164,6 +166,16 @@ class PositionManager:
         self.trading_paused = False
         # Set by engine: strategy.on_structure_exit (BacktestEngine/LiveEngine)
         self.on_structure_exit = None
+        # Optional: liquidation / external fills (see OrderRouter._process_external_close_fill)
+        self.on_forced_exit = None
+        # Recent trade-led updates: skip broker qty overwrite briefly to avoid races with /v2/fills
+        self._trade_led_symbol_ts = {}
+        self._trade_led_baseline_qty = {}
+        self._trade_led_grace_seconds = 6.0
+        self._trade_led_extended_grace_seconds = 12.0
+        # Partial liquidation bursts: debounce strategy on_forced_exit notifications
+        self._forced_exit_partial_ts = {}
+        self._forced_exit_debounce_seconds = 2.0
         # trading_symbol -> { strategy, structure_id, tag, intent_id, strategy_meta }
         self.position_metadata = {}
 
@@ -185,6 +197,8 @@ class PositionManager:
         candle_ts=None,
         action=None,
         metadata_extras=None,
+        exit_reason=None,
+        execution_source=None,
     ):
         assert isinstance(instrument, Instrument), "on_fill expects Instrument"
         assert instrument.trading_symbol, "Instrument must have trading_symbol"
@@ -205,6 +219,10 @@ class PositionManager:
             pos.update_fill(side, qty, price)
 
             new_qty = pos.net_qty
+            if prev_qty == 0 and new_qty != 0:
+                pos.exit_reason = None
+            elif prev_qty != 0 and new_qty == 0 and exit_reason:
+                pos.exit_reason = exit_reason
 
             # 🔔 STRUCTURE EXIT HOOK (ONLY ON FULL MAIN EXIT) # used to remove state of rollover ids on full exit of position
             if prev_qty != 0 and new_qty == 0 and pos.tag == "MAIN":
@@ -279,6 +297,7 @@ class PositionManager:
                     "pnl": pnl_val,
                     "cumulative_pnl": cumulative_val,
                     "net_qty_after": new_qty,
+                    "execution_source": execution_source or "",
                     # "order_id": order_id,
                     # "intent_id": intent_id,
                     # "trade_id": pos.trade_id,
@@ -289,6 +308,10 @@ class PositionManager:
                 if trade_type == "EXIT":
                     row["mae"] = pos.mae
                     row["mfe"] = pos.mfe
+                    if getattr(pos, "exit_reason", None):
+                        row["exit_reason"] = pos.exit_reason
+                    if execution_source:
+                        row["execution_source"] = execution_source
 
                     # Log complete trade for performance analytics (trade log)
                     entry_time_str = (
@@ -316,6 +339,8 @@ class PositionManager:
                         "pnl": pos.realized_pnl,
                         "symbol": sym,
                         "strategy": strategy or "GLOBAL",
+                        "exit_reason": getattr(pos, "exit_reason", None) or "",
+                        "execution_source": execution_source or "",
                     }
                     self.logger.log_trade(trade_row)
 
@@ -338,6 +363,35 @@ class PositionManager:
             position_closed = prev_qty != 0 and new_qty == 0
             realized_pnl_for_risk = pos.realized_pnl if position_closed else 0.0
             return (position_closed, realized_pnl_for_risk)
+
+    def note_trade_led_fill(self, trading_symbol: str) -> None:
+        """Mark symbol as recently updated from fills API; reconcile_with_broker skips overwrite briefly."""
+        if not trading_symbol:
+            return
+        with self._lock:
+            now = time.time()
+            self._trade_led_symbol_ts[trading_symbol] = now
+            pos = self.positions.get(trading_symbol)
+            self._trade_led_baseline_qty[trading_symbol] = (
+                int(pos.net_qty) if pos else 0
+            )
+
+    def should_emit_forced_exit(self, key: str, position_closed: bool) -> bool:
+        """
+        Debounce on_forced_exit for partial external/liquidation bursts; always emit on full close.
+        """
+        if not key:
+            key = "_default"
+        now = time.time()
+        deb = float(getattr(self, "_forced_exit_debounce_seconds", 2.0))
+        if position_closed:
+            self._forced_exit_partial_ts.pop(key, None)
+            return True
+        last = self._forced_exit_partial_ts.get(key)
+        if last is None or (now - last) >= deb:
+            self._forced_exit_partial_ts[key] = now
+            return True
+        return False
 
     def _merge_position_metadata(
         self,
@@ -415,7 +469,9 @@ class PositionManager:
         if not path or not os.path.isfile(path):
             return
         try:
-            from logs.logger.open_positions_logger import load_position_metadata_from_csv
+            from logs.logger.open_positions_logger import (
+                load_position_metadata_from_csv,
+            )
         except ImportError:
             return
         file_meta = load_position_metadata_from_csv(path)
@@ -473,7 +529,9 @@ class PositionManager:
         strategy: strategy name to associate with newly discovered positions.
         """
         file_meta = None
-        if self.open_positions_csv_path and os.path.isfile(self.open_positions_csv_path):
+        if self.open_positions_csv_path and os.path.isfile(
+            self.open_positions_csv_path
+        ):
             try:
                 from logs.logger.open_positions_logger import (
                     load_position_metadata_from_csv,
@@ -528,14 +586,34 @@ class PositionManager:
                     continue
 
                 local = self.positions[sym]
-                if (
+                now = time.time()
+                ts_led = self._trade_led_symbol_ts.get(sym)
+                grace = float(getattr(self, "_trade_led_grace_seconds", 6.0))
+                ext_grace = float(
+                    getattr(self, "_trade_led_extended_grace_seconds", 12.0)
+                )
+                dt = (now - ts_led) if ts_led is not None else None
+                soft_cap = (
+                    max(2, int(drift_threshold)) if drift_threshold else 5
+                )
+                skip_qty_overwrite = False
+                if ts_led is not None and dt is not None:
+                    if dt < grace:
+                        skip_qty_overwrite = True
+                    elif dt < ext_grace:
+                        if abs(int(local.net_qty) - int(bqty)) <= soft_cap:
+                            skip_qty_overwrite = True
+                if not skip_qty_overwrite and (
                     local.net_qty != bqty
                     or abs(local.avg_price - float(bp.get("avg_price", 0))) > 0.5
                 ):
                     local.net_qty = bqty
                     local.avg_price = float(bp.get("avg_price", 0))
                     local.last_updated = time.time()
-                if abs(local.net_qty - bqty) > drift_threshold:
+                if (
+                    not skip_qty_overwrite
+                    and abs(local.net_qty - bqty) > drift_threshold
+                ):
                     self.trading_paused = True
                     logger.warning(
                         "Position drift above threshold: %s local_qty=%s broker_qty=%s threshold=%s",
@@ -623,7 +701,7 @@ class PositionManager:
     def get_open_positions(self, underlying=None, strategy=None):
         positions = []
         for pos in self.positions.values():
-            print(">>positions Manager", self.positions, underlying, strategy)
+            # print(">>positions Manager", self.positions, underlying, strategy)
 
             if pos.net_qty == 0:
                 continue

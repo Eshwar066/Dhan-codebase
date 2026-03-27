@@ -81,6 +81,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self.position_manager.on_structure_exit = getattr(
             strategy, "on_structure_exit", None
         )
+        self.position_manager.on_forced_exit = getattr(
+            strategy, "on_forced_exit", None
+        )
         self.realtime_feed = realtime_feed
         self.tick_queue = tick_queue
         self.candle_aggregator = candle_aggregator
@@ -722,8 +725,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         "Outside allowed trading hours"
                     )
                 return
+            signal_kind = str(getattr(single_intent, "action", "ENTRY") or "ENTRY").lower()
             signal_hash = self._signal_hash(
-                symbol, timeframe or "", candle.get("timestamp"), "entry"
+                symbol, timeframe or "", candle.get("timestamp"), signal_kind
             )
 
             # Dublicate signal blocker ==> tested ✅

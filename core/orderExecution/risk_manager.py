@@ -8,6 +8,7 @@ make_short_option_margin_check(broker) when broker implements check_short_option
 
 import logging
 import time
+from collections import Counter, defaultdict
 from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,9 @@ class RiskManager:
         self.cooldown_seconds = cooldown_seconds
         self.last_trade_time = {}
 
+        # execution_source -> counts per strategy (EXTERNAL_CLOSE, LIQUIDATION, ADL, INTENT, …)
+        self.execution_source_counts: Dict[str, Counter] = defaultdict(Counter)
+
     def is_engine_blocked(self) -> bool:
         """True if kill switch is triggered. Block new entries; exits still allowed."""
         return self._kill_switch_blocked
@@ -93,6 +97,24 @@ class RiskManager:
     def record_realized_pnl(self, amount: float) -> None:
         """Call when a position is closed and PnL is realized (e.g. from PositionManager)."""
         self.daily_realized_pnl += amount
+
+    def record_execution_source(
+        self,
+        execution_source: Optional[str],
+        strategy: Optional[str] = None,
+        *,
+        symbol: Optional[str] = None,
+        position_closed: bool = False,
+    ) -> None:
+        """
+        Aggregate exits by source for risk analytics (liquidation rate, forced vs planned, etc.).
+        """
+        if not execution_source:
+            return
+        key = strategy or "GLOBAL"
+        self.execution_source_counts[key][str(execution_source)] += 1
+        _ = symbol
+        _ = position_closed
 
     def reset_daily(self) -> None:
         """Reset daily PnL (call at start of new trading day)."""
