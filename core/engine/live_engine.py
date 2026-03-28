@@ -632,6 +632,114 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             except Exception:
                 pass
 
+    def _process_entry_like_intent(
+        self,
+        single_intent,
+        symbol,
+        candle,
+        strategy_time_ms: Optional[float],
+        timeframe: Optional[str],
+        risk_manager,
+    ) -> None:
+        """LIMIT/ENTRY/SL-M and other non-MAIN_EXIT intents (depth-based entry pricing)."""
+        self._log_and_telegram_signal(
+            single_intent,
+            symbol,
+            action=getattr(single_intent, "action", "ENTRY"),
+        )
+
+        if risk_manager and risk_manager.is_engine_blocked():
+            return
+        if symbol not in self._symbol_state:
+            self._symbol_state[symbol] = {
+                "paused": False,
+                "feed_stale": False,
+                "error_count": 0,
+            }
+        if self._symbol_state[symbol].get("paused"):
+            return
+        if not self._within_trading_hours():
+            if self.engine_logger:
+                self.engine_logger.time_window_blocked(
+                    "Outside allowed trading hours"
+                )
+            return
+        signal_kind = str(getattr(single_intent, "action", "ENTRY") or "ENTRY").lower()
+        signal_hash = self._signal_hash(
+            symbol, timeframe or "", candle.get("timestamp"), signal_kind
+        )
+
+        # Dublicate signal blocker ==> tested ✅
+        if self._last_signal_hash_per_symbol.get(symbol) == signal_hash:
+            if self.engine_logger:
+                self.engine_logger.duplicate_signal_blocked(
+                    symbol=symbol, signal_hash=str(signal_hash)
+                )
+            return
+
+        if (
+            self.strategy_timeout_seconds
+            and strategy_time_ms is not None
+            and strategy_time_ms > self.strategy_timeout_seconds * 1000
+        ):
+            if self.engine_logger:
+                self.engine_logger.strategy_timeout(
+                    symbol=symbol,
+                    elapsed_ms=strategy_time_ms,
+                    threshold_ms=self.strategy_timeout_seconds * 1000.0,
+                )
+            return
+
+        side = getattr(single_intent, "side", "").upper()
+        is_buy = side == "BUY"
+
+        trading_sym = getattr(
+            getattr(single_intent, "instrument", None), "trading_symbol", symbol
+        )
+
+        if trading_sym:
+            exec_price = self._entry_price_from_depth(trading_sym, is_buy)
+
+            if exec_price is None:
+                exec_price = getattr(single_intent, "price", None)
+
+            if exec_price is None:
+                exec_price = candle.get("close")
+
+        else:
+            exec_price = (
+                self._entry_price_from_depth(symbol, is_buy)
+                or getattr(single_intent, "price", None)
+                or candle.get("close")
+            )
+        if exec_price is not None:
+            trading_sym = getattr(
+                getattr(single_intent, "instrument", None), "trading_symbol", symbol
+            )
+            self._validate_lot_size(single_intent, trading_sym)
+            self._last_signal_hash_per_symbol[symbol] = signal_hash
+            t0 = time.perf_counter()
+            price_map = {trading_sym: exec_price}
+            self.order_router.process_intent(single_intent, price_map)
+            broker_latency_ms = (time.perf_counter() - t0) * 1000
+            total_ms = (strategy_time_ms or 0) + broker_latency_ms
+            if self.engine_logger and strategy_time_ms is not None:
+                self.engine_logger.latency(
+                    strategy_time_ms=strategy_time_ms,
+                    broker_latency_ms=broker_latency_ms,
+                    total_latency_ms=total_ms,
+                )
+            if total_ms > self.latency_critical_ms:
+                self._latency_critical_count += 1
+                if self._latency_critical_count >= self.latency_critical_cycles:
+                    self._entries_paused_latency = True
+                    if self.engine_logger:
+                        self.engine_logger.latency_critical_pause(
+                            "Latency critical for N cycles; entries paused"
+                        )
+            else:
+                self._latency_critical_count = 0
+
     def _run_strategy(
         self,
         symbol,
@@ -661,7 +769,25 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             abs(position.net_qty),
                             "Strategy exit",
                         )
-                    for exit_intent in exit_intents:
+                    for raw_intent in exit_intents:
+                        # e.g. OneDayMagicalLine reversal: [MAIN_EXIT, ENTRY, MAIN_SL]
+                        is_main_exit = (
+                            str(getattr(raw_intent, "action", "") or "").upper()
+                            == "EXIT"
+                            and str(getattr(raw_intent, "tag", "") or "").upper()
+                            == "MAIN_EXIT"
+                        )
+                        if not is_main_exit:
+                            self._process_entry_like_intent(
+                                raw_intent,
+                                symbol,
+                                candle,
+                                strategy_time_ms,
+                                timeframe,
+                                risk_manager,
+                            )
+                            continue
+                        exit_intent = raw_intent
                         # Position direction validation: exit side must match position (prevents accidental reversal)
                         if getattr(exit_intent, "side", None) != required_exit_side:
                             exit_intent = dataclasses.replace(
@@ -703,105 +829,14 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         )
         # pdb.set_trace()
         for single_intent in entry_intents:
-            self._log_and_telegram_signal(
+            self._process_entry_like_intent(
                 single_intent,
                 symbol,
-                action=getattr(single_intent, "action", "ENTRY"),
+                candle,
+                strategy_time_ms,
+                timeframe,
+                risk_manager,
             )
-
-            if risk_manager and risk_manager.is_engine_blocked():
-                return
-            if symbol not in self._symbol_state:
-                self._symbol_state[symbol] = {
-                    "paused": False,
-                    "feed_stale": False,
-                    "error_count": 0,
-                }
-            if self._symbol_state[symbol].get("paused"):
-                return
-            if not self._within_trading_hours():
-                if self.engine_logger:
-                    self.engine_logger.time_window_blocked(
-                        "Outside allowed trading hours"
-                    )
-                return
-            signal_kind = str(getattr(single_intent, "action", "ENTRY") or "ENTRY").lower()
-            signal_hash = self._signal_hash(
-                symbol, timeframe or "", candle.get("timestamp"), signal_kind
-            )
-
-            # Dublicate signal blocker ==> tested ✅
-            if self._last_signal_hash_per_symbol.get(symbol) == signal_hash:
-                if self.engine_logger:
-                    self.engine_logger.duplicate_signal_blocked(
-                        symbol=symbol, signal_hash=str(signal_hash)
-                    )
-                continue
-
-            if (
-                self.strategy_timeout_seconds
-                and strategy_time_ms is not None
-                and strategy_time_ms > self.strategy_timeout_seconds * 1000
-            ):
-                if self.engine_logger:
-                    self.engine_logger.strategy_timeout(
-                        symbol=symbol,
-                        elapsed_ms=strategy_time_ms,
-                        threshold_ms=self.strategy_timeout_seconds * 1000.0,
-                    )
-                return
-
-            side = getattr(single_intent, "side", "").upper()
-            is_buy = side == "BUY"
-
-            trading_sym = getattr(
-                getattr(single_intent, "instrument", None), "trading_symbol", symbol
-            )
-
-            if trading_sym:
-                exec_price = self._entry_price_from_depth(trading_sym, is_buy)
-
-                if exec_price is None:
-                    exec_price = getattr(single_intent, "price", None)
-
-                if exec_price is None:
-                    exec_price = candle.get("close")
-
-                # pdb.set_trace()
-            else:
-                exec_price = (
-                    self._entry_price_from_depth(symbol, is_buy)
-                    or getattr(single_intent, "price", None)
-                    or candle.get("close")
-                )
-            if exec_price is not None:
-                trading_sym = getattr(
-                    getattr(single_intent, "instrument", None), "trading_symbol", symbol
-                )
-                self._validate_lot_size(single_intent, trading_sym)
-                self._last_signal_hash_per_symbol[symbol] = signal_hash
-                t0 = time.perf_counter()
-                price_map = {trading_sym: exec_price}
-                # pdb.set_trace()
-                self.order_router.process_intent(single_intent, price_map)
-                broker_latency_ms = (time.perf_counter() - t0) * 1000
-                total_ms = (strategy_time_ms or 0) + broker_latency_ms
-                if self.engine_logger and strategy_time_ms is not None:
-                    self.engine_logger.latency(
-                        strategy_time_ms=strategy_time_ms,
-                        broker_latency_ms=broker_latency_ms,
-                        total_latency_ms=total_ms,
-                    )
-                if total_ms > self.latency_critical_ms:
-                    self._latency_critical_count += 1
-                    if self._latency_critical_count >= self.latency_critical_cycles:
-                        self._entries_paused_latency = True
-                        if self.engine_logger:
-                            self.engine_logger.latency_critical_pause(
-                                "Latency critical for N cycles; entries paused"
-                            )
-                else:
-                    self._latency_critical_count = 0
 
     def update_risk_metrics(self, symbol, ltp):
         pos = self.position_manager.positions.get(symbol)
