@@ -56,6 +56,10 @@ class OrderRouter:
         engine_id: Optional[str] = None,
         strategy_id: Optional[str] = None,
         telegram_alert: OptionalAlert = None,
+        # Orphan fill sync (no intent match): ignore stale / pre-session broker rows
+        max_orphan_fill_age_seconds: Optional[float] = 300,
+        reject_orphan_fills_before_oms_session: bool = True,
+        reject_orphan_fill_if_predates_position_open: bool = True,
     ):
         self.risk = risk_manager
         self.broker = broker
@@ -69,6 +73,13 @@ class OrderRouter:
         self.engine_id = engine_id
         self.strategy_id = strategy_id
         self.telegram_alert = telegram_alert
+        self.max_orphan_fill_age_seconds = max_orphan_fill_age_seconds
+        self.reject_orphan_fills_before_oms_session = (
+            reject_orphan_fills_before_oms_session
+        )
+        self.reject_orphan_fill_if_predates_position_open = (
+            reject_orphan_fill_if_predates_position_open
+        )
         self._consecutive_failures = 0
         # Order state cache: intent_id -> OrderState. Persisted to logs/order_state_{engine_id}.json.
         self._order_state: Dict[str, OrderState] = {}
@@ -86,6 +97,12 @@ class OrderRouter:
         self._order_state_file = _logs_dir / f"order_state_{_safe_id}.json"
         self._load_order_state()
         self._rebuild_order_state_cache()
+        # Fills before this instant are ignored for orphan EXTERNAL_CLOSE / LIQUIDATION / ADL paths.
+        self._oms_session_start_unix = time.time()
+
+    def reset_oms_session_boundary(self) -> None:
+        """Call when starting a new trading session (same process) to tighten orphan fill acceptance."""
+        self._oms_session_start_unix = time.time()
 
     def _load_order_state(self) -> None:
         """Load intent_id -> OrderState and optional action log from logs/order_state_{engine_id}.json."""
@@ -1090,6 +1107,20 @@ class OrderRouter:
         return True
 
     @staticmethod
+    def _string_indicates_exchange_liquidation(s: str) -> bool:
+        """
+        True only for explicit liquidation semantics — not bare 'liquid' (matches 'illiquid', etc.).
+        """
+        if not isinstance(s, str) or not s.strip():
+            return False
+        sl = s.lower()
+        if "liquidation" in sl or "liquidated" in sl:
+            return True
+        if "force_liquid" in sl:
+            return True
+        return False
+
+    @staticmethod
     def _is_delta_liquidation_fill(f: Dict[str, Any]) -> bool:
         """True if broker fill is an exchange-driven liquidation (no client_order_id / intent)."""
         if not isinstance(f, dict):
@@ -1097,7 +1128,7 @@ class OrderRouter:
         if f.get("liquidation") is True or f.get("is_liquidation") is True:
             return True
         ft = f.get("fill_type") or f.get("type") or ""
-        if isinstance(ft, str) and "liquid" in ft.lower():
+        if isinstance(ft, str) and OrderRouter._string_indicates_exchange_liquidation(ft):
             return True
         meta = f.get("meta")
         if isinstance(meta, str):
@@ -1106,9 +1137,9 @@ class OrderRouter:
             except (json.JSONDecodeError, TypeError):
                 meta = None
         if isinstance(meta, dict):
-            for key in ("fill_type", "type", "order_type"):
+            for key in ("fill_type", "type", "order_type", "liquidation_type"):
                 v = meta.get(key)
-                if isinstance(v, str) and "liquid" in v.lower():
+                if isinstance(v, str) and OrderRouter._string_indicates_exchange_liquidation(v):
                     return True
         return False
 
@@ -1201,6 +1232,65 @@ class OrderRouter:
             or ""
         )
         return str(sym).strip()
+
+    @staticmethod
+    def _fill_timestamp_unix(f: Dict[str, Any]) -> Optional[float]:
+        """Parse broker fill time to UTC unix seconds (float). None if missing or unparseable."""
+        raw = f.get("created_at")
+        if raw is None:
+            raw = f.get("filled_at") or f.get("timestamp") or f.get("time")
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            ts = float(raw)
+            if ts > 1e12:
+                ts /= 1000.0
+            return ts
+        if isinstance(raw, str):
+            s = raw.strip()
+            if not s:
+                return None
+            try:
+                uf = float(s)
+                if uf > 1e12:
+                    uf /= 1000.0
+                return uf
+            except ValueError:
+                pass
+            try:
+                iso = s.replace("Z", "+00:00")
+                dt = datetime.datetime.fromisoformat(iso)
+                return dt.timestamp()
+            except (ValueError, TypeError, OSError):
+                return None
+        return None
+
+    def _orphan_fill_fails_time_gates(self, t_fill: Optional[float], order_id: Any) -> bool:
+        """True => do not run orphan EXTERNAL_CLOSE / LIQUIDATION / ADL for this fill."""
+        if t_fill is None:
+            logger.debug(
+                "Orphan fill skipped: no parseable fill time (order_id=%s)",
+                order_id,
+            )
+            return True
+        if self.reject_orphan_fills_before_oms_session:
+            if t_fill + 0.5 < self._oms_session_start_unix:
+                logger.debug(
+                    "Orphan fill skipped: before OMS session start (order_id=%s)",
+                    order_id,
+                )
+                return True
+        if (
+            self.max_orphan_fill_age_seconds is not None
+            and self.max_orphan_fill_age_seconds > 0
+        ):
+            if time.time() - t_fill > self.max_orphan_fill_age_seconds:
+                logger.debug(
+                    "Orphan fill skipped: exceeds max_orphan_fill_age_seconds (order_id=%s)",
+                    order_id,
+                )
+                return True
+        return False
 
     @staticmethod
     def _symbol_keys_close_enough(a: str, b: str) -> bool:
@@ -1306,6 +1396,14 @@ class OrderRouter:
         if not trade_id or trade_id in getattr(self, "_processed_trade_ids", set()):
             return False
 
+        fill_ts = self._fill_timestamp_unix(f)
+        if fill_ts is None:
+            logger.debug(
+                "Orphan close skipped: missing fill timestamp (trade_id=%s)",
+                trade_id,
+            )
+            return False
+
         price = float(f.get("price") or f.get("average_fill_price") or 0)
         raw_size = float(f.get("size") or f.get("qty") or 0)
         if price <= 0:
@@ -1318,14 +1416,26 @@ class OrderRouter:
             pos = self._find_position_for_external_close(sym, side, raw_size)
             if not pos or pos.net_qty == 0:
                 if pos is None:
-                    logger.warning(
-                        "External close fill could not match open position: source=%s symbol=%s side=%s size=%s",
+                    # Expected when: stale fills in get_recent_fills, manual close already flat,
+                    # or another account/session — not actionable for local OMS.
+                    logger.debug(
+                        "Orphan fill skipped (no reducing leg in local book): source=%s symbol=%s side=%s size=%s",
                         execution_source,
                         sym,
                         side,
                         raw_size,
                     )
                 return False
+            if self.reject_orphan_fill_if_predates_position_open:
+                et = getattr(pos, "entry_time", None)
+                if et is not None and fill_ts < float(et) - 1.0:
+                    logger.debug(
+                        "Orphan fill skipped: fill before local position open (symbol=%s fill_ts=%s entry_time=%s)",
+                        getattr(pos.instrument, "trading_symbol", sym),
+                        fill_ts,
+                        et,
+                    )
+                    return False
             inst = pos.instrument
             sym_ts = getattr(inst, "trading_symbol", sym)
             close_qty = min(
@@ -1460,18 +1570,20 @@ class OrderRouter:
             fills = self.broker.get_recent_fills(page_size=50)
         except Exception:
             return
-        # Match by broker order_id when fill has no client_order_id (e.g. Delta often returns only order_id)
+        # Match by broker order_id when fill has no client_order_id (e.g. Delta often returns only order_id).
+        # Include FILLED/CANCELLED intents so delayed API rows still map to process_trade (idempotent by trade_id).
         broker_order_id_to_intent: Dict[str, str] = {}
+        known_order_ids = self._known_broker_order_ids()
         try:
-            pending = self.intent_store.list_by_status(IntentStatus.SENT) + self.intent_store.list_by_status(IntentStatus.VALIDATED)
-            for rec in pending:
+            for rec in self.intent_store.intents.values():
                 bid = rec.get("broker_order_id")
                 iid = rec.get("intent_id")
                 if bid is not None and iid:
-                    broker_order_id_to_intent[str(bid)] = iid
+                    k = str(bid).strip()
+                    if k:
+                        broker_order_id_to_intent.setdefault(k, iid)
         except Exception:
             pass
-        known_order_ids = self._known_broker_order_ids()
         for f in fills or []:
             intent_id = (
                 f.get("client_order_id")
@@ -1494,20 +1606,27 @@ class OrderRouter:
                 self.process_trade(trade)
                 continue
 
+            t_fill = self._fill_timestamp_unix(f)
+            if self._orphan_fill_fails_time_gates(t_fill, f.get("order_id")):
+                continue
+
+            # Manual / untagged fills: prefer EXTERNAL_CLOSE when a reducing leg exists locally,
+            # before LIQUIDATION — avoids false 'liquid' substring matches stealing the path.
             exec_src = None
+            score, pos_hint = self._external_close_confidence_score(
+                f, known_order_ids
+            )
+            th = getattr(self, "_orphan_close_score_threshold", 6)
+            sus = getattr(self, "_orphan_close_suspect_floor", 5)
+
             if self._is_adl_fill(f):
                 exec_src = "ADL"
+            elif score >= th and pos_hint is not None:
+                exec_src = "EXTERNAL_CLOSE"
             elif self._is_delta_liquidation_fill(f):
                 exec_src = "LIQUIDATION"
             else:
-                score, pos_hint = self._external_close_confidence_score(
-                    f, known_order_ids
-                )
-                th = getattr(self, "_orphan_close_score_threshold", 6)
-                sus = getattr(self, "_orphan_close_suspect_floor", 5)
-                if score >= th and pos_hint is not None:
-                    exec_src = "EXTERNAL_CLOSE"
-                elif score >= th and pos_hint is None:
+                if score >= th and pos_hint is None:
                     logger.info(
                         "Orphan-style fill score=%s but no reducing leg; not applying EXTERNAL_CLOSE (order_id=%s symbol=%s)",
                         score,
