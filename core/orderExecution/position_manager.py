@@ -168,6 +168,9 @@ class PositionManager:
         self.on_structure_exit = None
         # Optional: liquidation / external fills (see OrderRouter._process_external_close_fill)
         self.on_forced_exit = None
+        # Optional: engines wire these to place broker SL after MAIN entry fill and reversal entry after MAIN_EXIT fill.
+        self.on_main_entry_fill = None
+        self.on_main_exit_fill = None
         # Recent trade-led updates: skip broker qty overwrite briefly to avoid races with /v2/fills
         self._trade_led_symbol_ts = {}
         self._trade_led_baseline_qty = {}
@@ -206,6 +209,8 @@ class PositionManager:
         if not isinstance(instrument, Instrument):
             raise TypeError(f"on_fill expects Instrument, got {type(instrument)}")
 
+        hook_main_entry = None
+        hook_main_exit = None
         with self._lock:
             sym = instrument.trading_symbol
             lot_size = instrument.lot_size
@@ -362,7 +367,85 @@ class PositionManager:
 
             position_closed = prev_qty != 0 and new_qty == 0
             realized_pnl_for_risk = pos.realized_pnl if position_closed else 0.0
-            return (position_closed, realized_pnl_for_risk)
+
+            if prev_qty == 0 and new_qty != 0:
+                if str(tag or "").upper() == "MAIN" and str(action or "").upper() == "ENTRY":
+                    hook_main_entry = {
+                        "instrument": instrument,
+                        "side": side,
+                        "qty": qty,
+                        "price": price,
+                        "strategy": strategy,
+                        "structure_id": structure_id,
+                        "tag": tag,
+                        "action": action,
+                        "candle_ts": candle_ts,
+                        "intent_id": intent_id,
+                        "metadata_extras": metadata_extras,
+                    }
+            if prev_qty != 0 and new_qty == 0:
+                if str(tag or "").upper() == "MAIN_EXIT" and str(
+                    action or ""
+                ).upper() == "EXIT":
+                    hook_main_exit = {
+                        "instrument": instrument,
+                        "side": side,
+                        "qty": qty,
+                        "price": price,
+                        "strategy": strategy,
+                        "structure_id": structure_id,
+                        "tag": tag,
+                        "action": action,
+                        "candle_ts": candle_ts,
+                        "intent_id": intent_id,
+                        "metadata_extras": metadata_extras,
+                    }
+
+            result = (position_closed, realized_pnl_for_risk)
+
+        if hook_main_entry and callable(getattr(self, "on_main_entry_fill", None)):
+            try:
+                self.on_main_entry_fill(**hook_main_entry)
+            except Exception as e:
+                if self.logger:
+                    self.logger.log(
+                        strategy=hook_main_entry.get("strategy"),
+                        row={
+                            "symbol": instrument.trading_symbol,
+                            "trade_type": "HOOK_ERROR",
+                            "side": "",
+                            "qty": "",
+                            "price": "",
+                            "pnl": "",
+                            "cumulative_pnl": "",
+                            "net_qty_after": "",
+                            "candle_timestamp": "",
+                            "tag": "on_main_entry_fill",
+                            "execution_source": str(e),
+                        },
+                    )
+        if hook_main_exit and callable(getattr(self, "on_main_exit_fill", None)):
+            try:
+                self.on_main_exit_fill(**hook_main_exit)
+            except Exception as e:
+                if self.logger:
+                    self.logger.log(
+                        strategy=hook_main_exit.get("strategy"),
+                        row={
+                            "symbol": instrument.trading_symbol,
+                            "trade_type": "HOOK_ERROR",
+                            "side": "",
+                            "qty": "",
+                            "price": "",
+                            "pnl": "",
+                            "cumulative_pnl": "",
+                            "net_qty_after": "",
+                            "candle_timestamp": "",
+                            "tag": "on_main_exit_fill",
+                            "execution_source": str(e),
+                        },
+                    )
+        return result
 
     def note_trade_led_fill(self, trading_symbol: str) -> None:
         """Mark symbol as recently updated from fills API; reconcile_with_broker skips overwrite briefly."""

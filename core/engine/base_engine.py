@@ -52,3 +52,25 @@ class BaseEngine:
 
         intent = self.strategy.on_candle(candle, ctx)
         return ctx, intent
+
+    def build_context_only(
+        self, candle, recent_candles=None, intent_store=None
+    ) -> "StrategyContext":
+        """StrategyContext without calling ``on_candle`` (for fill-time hooks)."""
+        ts = candle["timestamp"]
+        if not isinstance(ts, datetime):
+            ts = datetime.fromisoformat(str(ts))
+        if intent_store is None and hasattr(self, "order_router"):
+            intent_store = getattr(self.order_router, "intent_store", None)
+        return StrategyContext(
+            symbol=candle["symbol"],
+            exchange=candle.get("exchange"),
+            timestamp=ts,
+            spot_price=float(candle.get("close", 0) or 0),
+            instrument_store=self.instrument_store,
+            position_store=self.position_manager,
+            option_chain_service=self.option_chain_service,
+            universe_service=getattr(self, "universe_service", None),
+            recent_candles=recent_candles,
+            intent_store=intent_store,
+        )

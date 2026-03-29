@@ -81,9 +81,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self.position_manager.on_structure_exit = getattr(
             strategy, "on_structure_exit", None
         )
-        self.position_manager.on_forced_exit = getattr(
-            strategy, "on_forced_exit", None
-        )
+        self.position_manager.on_forced_exit = getattr(strategy, "on_forced_exit", None)
+        self.position_manager.on_main_entry_fill = self._on_pm_main_entry_fill
+        self.position_manager.on_main_exit_fill = self._on_pm_main_exit_fill
         self.realtime_feed = realtime_feed
         self.tick_queue = tick_queue
         self.candle_aggregator = candle_aggregator
@@ -144,6 +144,70 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         return super().build_context(
             candle, recent_candles=recent_candles, intent_store=intent_store
         )
+
+    def _underlying_from_strategy_meta(self, metadata_extras: Any) -> Optional[str]:
+        if isinstance(metadata_extras, dict):
+            od = metadata_extras.get("one_day_ml1")
+            if isinstance(od, dict) and od.get("symbol"):
+                return str(od["symbol"])
+        return None
+
+    def _on_pm_main_entry_fill(self, **kwargs: Any) -> None:
+        strategy = kwargs.get("strategy")
+        if strategy != self.strategy.name:
+            return
+        fn = getattr(self.strategy, "on_main_entry_filled", None)
+        if not callable(fn):
+            return
+        meta_ex = kwargs.get("metadata_extras")
+        sym = self._underlying_from_strategy_meta(meta_ex)
+        if not sym and self.symbols:
+            sym = self.symbols[0]
+        if not sym:
+            return
+        ts = kwargs.get("candle_ts")
+        if ts is None:
+            ts = dt.datetime.utcnow()
+        spot = self.get_price_map(sym)
+        if spot is None:
+            spot = 0.0
+        candle = {"symbol": sym, "timestamp": ts, "close": float(spot), "exchange": None}
+        ctx = self.build_context_only(candle)
+        intents = fn(ctx=ctx, **kwargs) or []
+        risk_manager = getattr(self.order_router, "risk", None)
+        for intent in intents:
+            self._process_entry_like_intent(
+                intent,
+                sym,
+                candle,
+                None,
+                None,
+                risk_manager,
+            )
+
+    def _on_pm_main_exit_fill(self, **kwargs: Any) -> None:
+        strategy = kwargs.get("strategy")
+        if strategy != self.strategy.name:
+            return
+        fn = getattr(self.strategy, "on_main_exit_filled", None)
+        if not callable(fn):
+            return
+        pairs = fn(**kwargs) or []
+        risk_manager = getattr(self.order_router, "risk", None)
+        for intent, candle in pairs:
+            sym = candle.get("symbol")
+            if not sym and self.symbols:
+                sym = self.symbols[0]
+            if not sym:
+                continue
+            self._process_entry_like_intent(
+                intent,
+                sym,
+                candle,
+                None,
+                None,
+                risk_manager,
+            )
 
     def _graceful_shutdown_handler(self, signum: int, frame: Any) -> None:
         """Per-engine: set flag so main loop exits; snapshot and flush in loop or on exit."""
@@ -223,10 +287,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self.position_manager.reconcile_with_broker(
             resolved_broker_positions, strategy=strategy_name
         )
-        if (
-            self._open_positions_logger is not None
-            and self.run_mode == RunMode.LIVE
-        ):
+        if self._open_positions_logger is not None and self.run_mode == RunMode.LIVE:
             self._open_positions_logger.record_broker_reconcile_snapshot(
                 self.position_manager
             )
@@ -660,9 +721,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             return
         if not self._within_trading_hours():
             if self.engine_logger:
-                self.engine_logger.time_window_blocked(
-                    "Outside allowed trading hours"
-                )
+                self.engine_logger.time_window_blocked("Outside allowed trading hours")
             return
         signal_kind = str(getattr(single_intent, "action", "ENTRY") or "ENTRY").lower()
         signal_hash = self._signal_hash(
@@ -755,6 +814,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         )
         for position in open_positions:
             exit_signal = self.strategy.should_exit(position, candle, ctx)
+            print(">>exit_signal", exit_signal)
             if exit_signal:
                 exit_intents = (
                     self.strategy.on_position_exit(position, candle, ctx) or []
@@ -770,7 +830,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             "Strategy exit",
                         )
                     for raw_intent in exit_intents:
-                        # e.g. OneDayMagicalLine reversal: [MAIN_EXIT, ENTRY, MAIN_SL]
+                        # e.g. OneDayMagicalLine reversal: MAIN_EXIT only here; ENTRY after exit fill
                         is_main_exit = (
                             str(getattr(raw_intent, "action", "") or "").upper()
                             == "EXIT"

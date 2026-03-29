@@ -5,6 +5,7 @@ Import LiveEngineHelpersMixin and use as: class LiveEngine(LiveEngineHelpersMixi
 
 import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple
+import pdb
 
 DEFAULT_FEED_STALE_SECONDS = 60
 
@@ -20,9 +21,7 @@ def _parse_time(s: str) -> Tuple[int, int]:
     return h, m
 
 
-def _within_trading_hours_utc(
-    now: dt.datetime, windows: List[Tuple[str, str]]
-) -> bool:
+def _within_trading_hours_utc(now: dt.datetime, windows: List[Tuple[str, str]]) -> bool:
     """True if now (UTC) falls within any (start, end) window. Times in 'HH:MM' UTC."""
     if not windows:
         return True
@@ -95,6 +94,7 @@ class LiveEngineHelpersMixin:
 
     def _entry_price_from_depth(self, symbol: str, is_buy: bool):
         bid, ask = self._get_bid_ask(symbol)
+        print(">>entry ask, bid", symbol, ask, bid)
         if not self._is_spread_acceptable(bid, ask):
             return None
         tick = self._get_tick_size(symbol)
@@ -108,6 +108,7 @@ class LiveEngineHelpersMixin:
 
     def _exit_price_from_depth(self, symbol: str, is_sell: bool):
         bid, ask = self._get_bid_ask(symbol)
+        print(">exxit bid and ask", symbol, bid, ask)
         if not self._is_spread_acceptable(bid, ask):
             return None
         tick = self._get_tick_size(symbol)
