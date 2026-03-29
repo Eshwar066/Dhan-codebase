@@ -25,7 +25,6 @@ from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
 
-
 from core.strategies.IndiaMktMixins import IndiaMktMixins
 from core.strategies.deltaMktMixins import DeltaMktMixins
 from core.strategies.base import BaseStrategy
@@ -33,7 +32,7 @@ from core.utils.expiry_resolver import ExpiryResolver
 from run.config import RUN_MODE, RunMode, STRATEGY_JOBS
 
 
-VALID_TIME_1730 = {time(10, 25)}  # 1hr candle close time (IST)
+VALID_TIME_1730 = {time(1, 40)}  # 1hr candle close time (IST)
 
 # Strike/premium selection (kept conservative and similar to `MagicalLines`)
 STRIKE_STEP = 500
@@ -156,11 +155,12 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     ) -> Optional[float]:
         key = ("opt_px", position.instrument.trading_symbol, candle["timestamp"])
         if key not in self._candle_cache:
+            ot = self._resolved_option_type_ce_pe(position.instrument)
             self._candle_cache[key] = self.get_option_price_at_candle(
                 candle=candle,
                 ctx=ctx,
                 strike=position.instrument.strike,
-                option_type=position.instrument.option_type,
+                option_type=ot or position.instrument.option_type,
                 expiry=position.instrument.expiry,
                 trading_symbol=position.instrument.trading_symbol,
             )
@@ -355,11 +355,36 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     def _direction_at_1730(self, candle: dict) -> str:
         open_ = float(candle.get("open", candle.get("close", 0)) or 0)
         close = float(candle["close"])
+
         # Green => short PE, else short CE
         return "SHORT_PE" if close > open_ else "SHORT_CE"
 
     def _option_type_for_direction(self, direction: str) -> str:
         return "PE" if direction == "SHORT_PE" else "CE"
+
+    def _resolved_option_type_ce_pe(self, inst: Any) -> str:
+        """
+        PE or CE for greeks / reversal / chain APIs. Delta often has empty
+        ``instrument.option_type`` while ``trading_symbol`` uses ``P-`` / ``C-`` prefixes.
+        """
+        raw = getattr(inst, "option_type", None)
+        if raw is not None and str(raw).strip():
+            s = str(raw).strip().upper()
+            if s in ("PE", "PUT", "P"):
+                return "PE"
+            if s in ("CE", "CALL", "C"):
+                return "CE"
+        sym = (
+            getattr(inst, "trading_symbol", None)
+            or getattr(inst, "custom_symbol", None)
+            or ""
+        )
+        su = str(sym).strip().upper()
+        if len(su) >= 2 and su[0] == "P" and su[1] == "-":
+            return "PE"
+        if len(su) >= 2 and su[0] == "C" and su[1] == "-":
+            return "CE"
+        return ""
 
     # ==================================================
     # ML1 CROSS DETECTION (uses stored prev candle close)
@@ -376,12 +401,12 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         if prev_close is None:
             return False
 
-        opt_type = (position.instrument.option_type or "").upper()
+        opt_side = self._resolved_option_type_ce_pe(position.instrument)
         # For short PE position: reverse to CE when spot crosses above ML1
-        if opt_type in ("PE", "PUT"):
+        if opt_side == "PE":
             return prev_close <= ml1 and curr_close > ml1
         # For short CE position: reverse to PE when spot crosses below ML1
-        if opt_type in ("CE", "CALL"):
+        if opt_side == "CE":
             return prev_close >= ml1 and curr_close < ml1
         return False
 
@@ -461,8 +486,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 underlying=symbol, strategy=self.name
             )
             if any(
-                getattr(p, "tag", None) == "MAIN"
-                and getattr(p, "net_qty", 0) != 0
+                getattr(p, "tag", None) == "MAIN" and getattr(p, "net_qty", 0) != 0
                 for p in open_positions
             ):
                 return None
@@ -605,8 +629,10 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         if reason != "REVERSAL" or meta is None:
             return [exit_intent]
 
-        opt_type = (position.instrument.option_type or "").upper()
-        reverse_option_type = "CE" if opt_type in ("PE", "PUT") else "PE"
+        opt_side = self._resolved_option_type_ce_pe(position.instrument)
+        if opt_side not in ("PE", "CE"):
+            return [exit_intent]
+        reverse_option_type = "CE" if opt_side == "PE" else "PE"
 
         next_level = (
             self._reversal_level_counter.get((meta.symbol, meta.entry_date), meta.level)
