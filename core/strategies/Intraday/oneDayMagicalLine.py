@@ -34,7 +34,7 @@ from core.utils.expiry_resolver import ExpiryResolver
 from run.config import RUN_MODE, RunMode, STRATEGY_JOBS
 
 
-VALID_TIME_1730 = {time(20, 28)}  # 1hr candle close time (IST)
+VALID_TIME_1730 = {time(23, 27)}  # 1hr candle close time (IST)
 
 # Strike/premium selection (kept conservative and similar to `MagicalLines`)
 STRIKE_STEP = 500
@@ -593,7 +593,6 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         if structure_id in self._pending_exit_structure_ids:
             return False
 
-        print(">>structure_id", structure_id)
         if ctx is not None:
             self._restore_odml_meta_from_position(position, ctx.position_store)
         meta = self._meta_by_structure_id.get(structure_id)
@@ -601,7 +600,6 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             return False
 
         reason = self._get_exit_reason(position, candle, ctx, meta)
-        print(">>reason", reason, meta)
         if reason:
             self._exit_reason_by_structure_id[structure_id] = reason
             return True

@@ -978,6 +978,30 @@ class OrderRouter:
                 intent_id=intent_id,
             )
             return
+        # Guard against duplicate callback/polling for the same fully-filled intent.
+        # Trade-led paths can mark an intent FILLED before a delayed callback arrives.
+        if intent_id and self.intent_store:
+            rec = self.intent_store.get(intent_id)
+            if rec:
+                st = rec.get("status")
+                stv = getattr(st, "value", st)
+                ord_state = self._order_state.get(intent_id)
+                rec_order_id = rec.get("broker_order_id")
+                same_order = (
+                    order_id is not None
+                    and rec_order_id is not None
+                    and str(order_id) == str(rec_order_id)
+                )
+                if str(stv) == "FILLED" and (
+                    ord_state == OrderState.FILLED or ord_state == "FILLED"
+                ):
+                    if same_order or order_id is None:
+                        if self.engine_logger:
+                            self.engine_logger.log(
+                                "oms",
+                                f"Skipping duplicate fill callback for already-filled intent {intent_id}",
+                            )
+                        return
         metadata_extras = None
         if intent_id and self.intent_store:
             _ir = self.intent_store.get(intent_id)
@@ -1057,6 +1081,48 @@ class OrderRouter:
             return False
         if self.position_manager:
             payload = intent.get("payload") or {}
+            action_to_apply = intent.get("action") or payload.get("action") or trade.get("action")
+            action_upper = str(action_to_apply or "").upper()
+            sym = getattr(
+                (trade.get("instrument") or intent.get("instrument") or None),
+                "trading_symbol",
+                "",
+            ) or ""
+
+            # Defensive guard:
+            # Broker reconcile may have already opened a local position (via get positions),
+            # so an ENTRY fill for the same intent can arrive later from sync/polling.
+            # PositionManager forbids ENTRY while already open (expects SCALE_IN), so skip
+            # such late/duplicate ENTRY fills to avoid crashing.
+            if (
+                action_upper == "ENTRY"
+                and sym
+                and sym in self.position_manager.positions
+                and int(self.position_manager.positions[sym].net_qty) != 0
+            ):
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "oms",
+                        f"Skipping duplicate/late ENTRY fill for already-open {sym} (intent_id={intent_id})",
+                    )
+                # Mark as processed so we don't try again for the same trade_id.
+                self._processed_trade_ids.add(trade_id)
+                # Keep intent/order state consistent to reduce order-state drift.
+                self._set_order_state(
+                    intent_id,
+                    OrderState.FILLED,
+                    action="skip_duplicate_entry_on_open",
+                    message="ENTRY arrived after reconcile already opened position",
+                )
+                self.intent_store.update(
+                    intent_id,
+                    IntentStatus.FILLED,
+                    broker_order_id=order_id,
+                    order_state=OrderState.FILLED,
+                )
+                self.position_manager.note_trade_led_fill(sym)
+                return True
+
             position_closed, realized_pnl = self.position_manager.on_fill(
                 instrument=instrument,
                 side=side,
