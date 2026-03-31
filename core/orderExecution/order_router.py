@@ -827,19 +827,8 @@ class OrderRouter:
                                 "instrument"
                             )  # If stored in dict; depends on intent_store implementation
 
-                            self._set_order_state(
-                                tag,
-                                OrderState.FILLED,
-                                action="sync_filled",
-                                message="Syncing fill discovered via polling",
-                            )
-                            self.intent_store.update(
-                                tag,
-                                IntentStatus.FILLED,
-                                broker_order_id=order.get("order_id"),
-                                order_state=OrderState.FILLED,
-                            )
-
+                            # Apply fill FIRST. Do not mark intent FILLED before process_fill:
+                            # process_fill used to see FILLED + skip, so on_fill never ran (no PM, no SL).
                             if self.position_manager:
                                 self.process_fill(
                                     instrument=i.get("instrument"),
@@ -857,6 +846,18 @@ class OrderRouter:
                                     candle_ts=i.get("candle_ts"),
                                     action=i.get("action"),
                                 )
+                            self._set_order_state(
+                                tag,
+                                OrderState.FILLED,
+                                action="sync_filled",
+                                message="Syncing fill discovered via polling",
+                            )
+                            self.intent_store.update(
+                                tag,
+                                IntentStatus.FILLED,
+                                broker_order_id=order.get("order_id"),
+                                order_state=OrderState.FILLED,
+                            )
 
                         elif status in ("cancelled", "rejected", "expired"):
                             ost = (
@@ -947,6 +948,152 @@ class OrderRouter:
 
         return True, {}
 
+    def _terminal_fill_reflected_in_pm(
+        self,
+        instrument,
+        side: str,
+        qty: int,
+        action: Optional[str],
+        intent_id: Optional[str],
+    ) -> bool:
+        """
+        True only if PositionManager already matches this terminal fill — safe to skip a duplicate
+        broker callback. For ENTRY, requires matching signed qty and intent_id when present.
+        """
+        if not self.position_manager or instrument is None:
+            return False
+        sym = getattr(instrument, "trading_symbol", None)
+        if not sym:
+            return False
+        act = str(action or "").upper()
+        q = int(qty)
+        sd = str(side or "").upper()
+        net = int(self.position_manager.get_qty(sym))
+        pos = self.position_manager.positions.get(sym)
+
+        if act == "ENTRY":
+            if net == 0:
+                return False
+            if sd == "SELL":
+                ok = net == -q
+            elif sd == "BUY":
+                ok = net == q
+            else:
+                return False
+            if not ok:
+                return False
+            if not intent_id:
+                return False
+            pid = getattr(pos, "intent_id", None) if pos else None
+            pm_mid = (self.position_manager.position_metadata.get(sym) or {}).get(
+                "intent_id"
+            )
+            if pid and str(pid) != str(intent_id):
+                return False
+            if not pid and pm_mid and str(pm_mid) != str(intent_id):
+                return False
+            # Same size on book but no intent linkage — not a confirmed duplicate (reconcile ghost).
+            if not pid and not pm_mid:
+                return False
+            return True
+
+        if act in ("EXIT", "FORCE_EXIT"):
+            return net == 0
+
+        return False
+
+    def _adopt_main_entry_shadow_fill(
+        self,
+        instrument,
+        intent: Dict[str, Any],
+        intent_id: str,
+        side: str,
+        qty: int,
+        price: float,
+        order_id: Any,
+        trade_id: str,
+    ) -> None:
+        """
+        Broker/reconcile already shows the correct net qty for a MAIN ENTRY, but PM lacked
+        intent/metadata (e.g. FILLED was set before on_fill). Attach linkage and run the same
+        on_main_entry_fill hook as a normal open — does not change net_qty.
+        """
+        payload = intent.get("payload") or {}
+        sym = getattr(instrument, "trading_symbol", None) or payload.get("symbol") or ""
+        if not sym or not self.position_manager:
+            return
+        strategy = intent.get("strategy") or payload.get("strategy_id")
+        structure_id = intent.get("structure_id") or payload.get("structure_id")
+        tag = intent.get("tag") or payload.get("tag") or "MAIN"
+        meta_extras = payload.get("strategy_meta")
+        with self.position_manager._lock:
+            self.position_manager._merge_position_metadata(
+                sym,
+                strategy=strategy,
+                structure_id=structure_id,
+                tag=tag,
+                intent_id=intent_id,
+                metadata_extras=meta_extras,
+            )
+            pos = self.position_manager.positions.get(sym)
+            if pos:
+                if strategy:
+                    pos.strategy = strategy
+                if structure_id:
+                    pos.structure_id = structure_id
+                if tag:
+                    pos.tag = tag
+                pos.intent_id = intent_id
+        hook = getattr(self.position_manager, "on_main_entry_fill", None)
+        if callable(hook) and str(tag or "").upper() == "MAIN":
+            try:
+                hook(
+                    instrument=instrument,
+                    side=side,
+                    qty=qty,
+                    price=price,
+                    strategy=strategy,
+                    structure_id=structure_id,
+                    tag=tag,
+                    action="ENTRY",
+                    candle_ts=intent.get("candle_ts"),
+                    intent_id=intent_id,
+                    metadata_extras=meta_extras,
+                )
+            except Exception as e:
+                logger.warning("on_main_entry_fill after shadow adopt failed: %s", e)
+        self._set_order_state(
+            intent_id,
+            OrderState.FILLED,
+            action="adopt_main_entry_shadow",
+            message="Metadata + SL hook; qty already at broker",
+        )
+        self.intent_store.update(
+            intent_id,
+            IntentStatus.FILLED,
+            broker_order_id=order_id,
+            order_state=OrderState.FILLED,
+        )
+        self._processed_trade_ids.add(trade_id)
+        if len(self._processed_trade_ids) > getattr(
+            self, "_processed_trade_ids_max", 10000
+        ):
+            self._processed_trade_ids = set(
+                list(self._processed_trade_ids)[
+                    -self._processed_trade_ids_max // 2 :
+                ]
+            )
+        self.position_manager.note_trade_led_fill(sym)
+        self.report_fill(
+            sym,
+            side,
+            int(qty),
+            None,
+            price,
+            order_id=order_id,
+            intent_id=intent_id,
+        )
+
     def process_fill(
         self,
         instrument,
@@ -978,8 +1125,8 @@ class OrderRouter:
                 intent_id=intent_id,
             )
             return
-        # Guard against duplicate callback/polling for the same fully-filled intent.
-        # Trade-led paths can mark an intent FILLED before a delayed callback arrives.
+        # Skip duplicate callback only when PM already reflects this fill — not merely when
+        # intent_store says FILLED (polling used to set FILLED before process_fill, skipping on_fill).
         if intent_id and self.intent_store:
             rec = self.intent_store.get(intent_id)
             if rec:
@@ -992,16 +1139,27 @@ class OrderRouter:
                     and rec_order_id is not None
                     and str(order_id) == str(rec_order_id)
                 )
+                action_eff = action or rec.get("action") or (rec.get("payload") or {}).get(
+                    "action"
+                )
                 if str(stv) == "FILLED" and (
                     ord_state == OrderState.FILLED or ord_state == "FILLED"
                 ):
                     if same_order or order_id is None:
+                        if self._terminal_fill_reflected_in_pm(
+                            instrument, side, int(qty), str(action_eff or ""), intent_id
+                        ):
+                            if self.engine_logger:
+                                self.engine_logger.log(
+                                    "oms",
+                                    f"Skipping duplicate fill callback for already-filled intent {intent_id}",
+                                )
+                            return
                         if self.engine_logger:
                             self.engine_logger.log(
                                 "oms",
-                                f"Skipping duplicate fill callback for already-filled intent {intent_id}",
+                                f"CRITICAL: intent {intent_id} terminal but PM not updated — applying fill anyway",
                             )
-                        return
         metadata_extras = None
         if intent_id and self.intent_store:
             _ir = self.intent_store.get(intent_id)
@@ -1089,30 +1247,58 @@ class OrderRouter:
                 "",
             ) or ""
 
-            # Defensive guard:
-            # Broker reconcile may have already opened a local position (via get positions),
-            # so an ENTRY fill for the same intent can arrive later from sync/polling.
-            # PositionManager forbids ENTRY while already open (expects SCALE_IN), so skip
-            # such late/duplicate ENTRY fills to avoid crashing.
-            if (
-                action_upper == "ENTRY"
-                and sym
-                and sym in self.position_manager.positions
-                and int(self.position_manager.positions[sym].net_qty) != 0
+            tag_u = str(intent.get("tag") or payload.get("tag") or "MAIN").upper()
+            if action_upper == "ENTRY" and sym and tag_u == "MAIN":
+                prev_q = int(self.position_manager.get_qty(sym))
+                if prev_q != 0:
+                    iq = int(size)
+                    exp = -iq if side == "SELL" else iq
+                    if prev_q == exp and not self._terminal_fill_reflected_in_pm(
+                        instrument,
+                        side,
+                        iq,
+                        action_upper,
+                        intent_id,
+                    ):
+                        if self.engine_logger:
+                            self.engine_logger.log(
+                                "oms",
+                                f"Adopting MAIN ENTRY linkage for {sym} intent_id={intent_id} "
+                                f"(qty already at broker; attaching metadata + SL)",
+                            )
+                        self._adopt_main_entry_shadow_fill(
+                            instrument=instrument,
+                            intent=intent,
+                            intent_id=intent_id,
+                            side=side,
+                            qty=iq,
+                            price=price,
+                            order_id=order_id,
+                            trade_id=trade_id,
+                        )
+                        return True
+
+            # Skip ENTRY from fills API only when this intent's ENTRY is already reflected in PM
+            # (true duplicate). Do not skip merely because the symbol is open — that can hide
+            # a never-applied ENTRY after reconcile vs. fill races.
+            if action_upper == "ENTRY" and self._terminal_fill_reflected_in_pm(
+                instrument,
+                side,
+                int(size),
+                action_upper,
+                intent_id,
             ):
                 if self.engine_logger:
                     self.engine_logger.log(
                         "oms",
-                        f"Skipping duplicate/late ENTRY fill for already-open {sym} (intent_id={intent_id})",
+                        f"Skipping duplicate ENTRY trade for {sym} (intent_id={intent_id}) — PM already matches",
                     )
-                # Mark as processed so we don't try again for the same trade_id.
                 self._processed_trade_ids.add(trade_id)
-                # Keep intent/order state consistent to reduce order-state drift.
                 self._set_order_state(
                     intent_id,
                     OrderState.FILLED,
-                    action="skip_duplicate_entry_on_open",
-                    message="ENTRY arrived after reconcile already opened position",
+                    action="skip_duplicate_entry_trade",
+                    message="ENTRY trade already in PM",
                 )
                 self.intent_store.update(
                     intent_id,

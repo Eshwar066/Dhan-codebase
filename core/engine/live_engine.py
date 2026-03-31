@@ -284,6 +284,13 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             )
 
         strategy_name = getattr(self.strategy, "name", None)
+        intent_store = getattr(self.order_router, "intent_store", None)
+        if intent_store and hasattr(
+            self.position_manager, "rebuild_position_metadata_from_intent_store"
+        ):
+            self.position_manager.rebuild_position_metadata_from_intent_store(
+                intent_store
+            )
         self.position_manager.reconcile_with_broker(
             resolved_broker_positions, strategy=strategy_name
         )
@@ -291,7 +298,57 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             self._open_positions_logger.record_broker_reconcile_snapshot(
                 self.position_manager
             )
+        self._ensure_broker_sl_after_reconcile()
         return True
+
+    def _ensure_broker_sl_after_reconcile(self) -> None:
+        """If MAIN is open but MAIN_SL was never armed (reconcile / fill race), place SL once."""
+        if self.run_mode != RunMode.LIVE:
+            return
+        strategy_name = getattr(self.strategy, "name", None)
+        if not strategy_name:
+            return
+        intent_store = getattr(self.order_router, "intent_store", None)
+        if not intent_store:
+            return
+        restore = getattr(self.strategy, "_restore_odml_meta_from_position", None)
+        for sym, pos in list(self.position_manager.positions.items()):
+            if int(pos.net_qty or 0) == 0:
+                continue
+            if getattr(pos, "strategy", None) != strategy_name:
+                continue
+            if str(getattr(pos, "tag", "") or "").upper() != "MAIN":
+                continue
+            struct_id = getattr(pos, "structure_id", None)
+            if not struct_id:
+                continue
+            if intent_store.has_pending_intent(
+                strategy_name,
+                struct_id,
+                tags=["MAIN_SL"],
+                actions=["FORCE_EXIT"],
+            ):
+                continue
+            if callable(restore):
+                try:
+                    restore(pos, self.position_manager)
+                except Exception:
+                    pass
+            meta_bucket = self.position_manager.get_position_metadata(sym) or {}
+            self._on_pm_main_entry_fill(
+                instrument=pos.instrument,
+                side="SELL" if pos.net_qty < 0 else "BUY",
+                qty=abs(int(pos.net_qty)),
+                price=float(pos.avg_price or 0),
+                strategy=strategy_name,
+                structure_id=struct_id,
+                tag="MAIN",
+                action="ENTRY",
+                candle_ts=None,
+                intent_id=getattr(pos, "intent_id", None)
+                or meta_bucket.get("intent_id"),
+                metadata_extras=meta_bucket.get("strategy_meta"),
+            )
 
     def _do_order_state_check(self) -> None:
         # PAPER: skip broker order comparison (SimulatedBroker has no real orders; avoids false mismatches).
