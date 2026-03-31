@@ -80,7 +80,7 @@ class LiveEngineHelpersMixin:
             ticker = self.realtime_feed.get_last_ticker(symbol)
             if ticker and ticker.get("close") is not None:
                 print(">>exit ticker price ", ticker["close"])
-                return ticker["close"] + 100
+                return ticker["close"]
         if self.data:
             candles = self.data.get_latest_candles([symbol])
             if (

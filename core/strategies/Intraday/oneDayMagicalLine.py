@@ -34,7 +34,7 @@ from core.utils.expiry_resolver import ExpiryResolver
 from run.config import RUN_MODE, RunMode, STRATEGY_JOBS
 
 
-VALID_TIME_1730 = {time(23, 27)}  # 1hr candle close time (IST)
+VALID_TIME_1730 = {time(18, 53)}  # 1hr candle close time (IST)
 
 # Strike/premium selection (kept conservative and similar to `MagicalLines`)
 STRIKE_STEP = 500
@@ -286,7 +286,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 ctx,
                 option_type,
                 min_prem=10,
-                max_prem=30000,
+                max_prem=2500,
                 expiry="Weekly",
                 side="SELL",
                 lookback_sec=lookback_sec,
