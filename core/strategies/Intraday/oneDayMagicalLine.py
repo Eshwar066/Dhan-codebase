@@ -30,11 +30,9 @@ import pandas as pd
 from core.strategies.IndiaMktMixins import IndiaMktMixins
 from core.strategies.deltaMktMixins import DeltaMktMixins
 from core.strategies.base import BaseStrategy
-from core.utils.expiry_resolver import ExpiryResolver
-from run.config import RUN_MODE, RunMode, STRATEGY_JOBS
 
 
-VALID_TIME_1730 = {time(18, 53)}  # 1hr candle close time (IST)
+VALID_TIME_1730 = {time(21, 23)}  # 1hr candle close time (IST)
 
 # Strike/premium selection (kept conservative and similar to `MagicalLines`)
 STRIKE_STEP = 500
@@ -249,15 +247,6 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             trigger_price=float(trigger_price),
         )
 
-    def _is_delta_testnet_enabled(self) -> bool:
-        for job in STRATEGY_JOBS:
-            if str(job.get("name")) != self.name:
-                continue
-            if str(job.get("venue", "")).upper() != "DELTA":
-                continue
-            return bool(job.get("delta_testnet", False))
-        return False
-
     # Strike selection: backtest = Delta tick CSV; live/paper = products + tickers (``deltaMktMixins``).
     # Branch uses ``run.config.RUN_MODE`` — for live engines set global ``RUN_MODE`` or ensure it matches the job.
     def find_strike_in_premium_range(
@@ -269,34 +258,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         max_prem=1500,
         lookback_sec=60,
     ):
-        if RUN_MODE == RunMode.BACKTEST:
-            return DeltaMktMixins.find_strike_in_premium_range(
-                self,
-                candle,
-                ctx,
-                option_type,
-                min_prem=min_prem,
-                max_prem=max_prem,
-                lookback_sec=lookback_sec,
-                expiry="Weekly",
-            )
-        if self._is_delta_testnet_enabled():
-            return self.find_strike_in_premium_range_live(
-                candle,
-                ctx,
-                option_type,
-                min_prem=10,
-                max_prem=2500,
-                expiry="Weekly",
-                side="SELL",
-                lookback_sec=lookback_sec,
-                target_delta=0.1,
-                delta_min=0.01,
-                delta_max=1,
-                max_spread_ratio=20,
-            )
-        return DeltaMktMixins.find_strike_in_premium_range_live(
-            self,
+        return self.find_strike_in_premium_range_by_mode(
             candle,
             ctx,
             option_type,
@@ -372,28 +334,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         return "PE" if direction == "SHORT_PE" else "CE"
 
     def _resolved_option_type_ce_pe(self, inst: Any) -> str:
-        """
-        PE or CE for greeks / reversal / chain APIs. Delta often has empty
-        ``instrument.option_type`` while ``trading_symbol`` uses ``P-`` / ``C-`` prefixes.
-        """
-        raw = getattr(inst, "option_type", None)
-        if raw is not None and str(raw).strip():
-            s = str(raw).strip().upper()
-            if s in ("PE", "PUT", "P"):
-                return "PE"
-            if s in ("CE", "CALL", "C"):
-                return "CE"
-        sym = (
-            getattr(inst, "trading_symbol", None)
-            or getattr(inst, "custom_symbol", None)
-            or ""
-        )
-        su = str(sym).strip().upper()
-        if len(su) >= 2 and su[0] == "P" and su[1] == "-":
-            return "PE"
-        if len(su) >= 2 and su[0] == "C" and su[1] == "-":
-            return "CE"
-        return ""
+        return self.resolved_option_type_ce_pe(inst)
 
     # ==================================================
     # ML1 CROSS DETECTION (uses stored prev candle close)

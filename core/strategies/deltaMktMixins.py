@@ -16,6 +16,7 @@ import pdb
 
 from core.utils.expiry_resolver import ExpiryResolver
 from core.utils.lag_diag import lag_diag_enabled
+from run.config import RUN_MODE, RunMode, STRATEGY_JOBS
 
 logger = logging.getLogger(__name__)
 
@@ -517,6 +518,112 @@ class DeltaMktMixins:
             }
         )
         return strike, ltp, row
+
+    def is_delta_testnet_enabled(self) -> bool:
+        """
+        Resolve whether current strategy job enables Delta testnet behavior.
+        Expects strategy class to define ``name``.
+        """
+        strategy_name = str(getattr(self, "name", ""))
+        if not strategy_name:
+            return False
+        for job in STRATEGY_JOBS:
+            if str(job.get("name")) != strategy_name:
+                continue
+            if str(job.get("venue", "")).upper() != "DELTA":
+                continue
+            return bool(job.get("delta_testnet", False))
+        return False
+
+    def resolved_option_type_ce_pe(self, inst: Any) -> str:
+        """
+        Resolve CE/PE for Delta option instruments.
+        Delta may leave ``instrument.option_type`` empty while trading_symbol
+        contains ``P-`` / ``C-`` prefixes.
+        """
+        raw = getattr(inst, "option_type", None)
+        if raw is not None and str(raw).strip():
+            s = str(raw).strip().upper()
+            if s in ("PE", "PUT", "P"):
+                return "PE"
+            if s in ("CE", "CALL", "C"):
+                return "CE"
+        sym = (
+            getattr(inst, "trading_symbol", None)
+            or getattr(inst, "custom_symbol", None)
+            or ""
+        )
+        su = str(sym).strip().upper()
+        if len(su) >= 2 and su[0] == "P" and su[1] == "-":
+            return "PE"
+        if len(su) >= 2 and su[0] == "C" and su[1] == "-":
+            return "CE"
+        return ""
+
+    def find_strike_in_premium_range_by_mode(
+        self,
+        candle,
+        ctx,
+        option_type,
+        *,
+        min_prem=600,
+        max_prem=1500,
+        lookback_sec=60,
+        expiry="Weekly",
+        side="SELL",
+        target_delta=None,
+        delta_min=None,
+        delta_max=None,
+        max_spread_ratio=0.15,
+    ):
+        """
+        Strategy-facing strike selection router:
+        - backtest: tick CSV path
+        - live/paper testnet: permissive live selection
+        - live/paper prod: live selection with configured delta filters
+        """
+        if RUN_MODE == RunMode.BACKTEST:
+            return DeltaMktMixins.find_strike_in_premium_range(
+                self,
+                candle,
+                ctx,
+                option_type,
+                min_prem=min_prem,
+                max_prem=max_prem,
+                lookback_sec=lookback_sec,
+                expiry=expiry,
+            )
+        if self.is_delta_testnet_enabled():
+            return DeltaMktMixins.find_strike_in_premium_range_live(
+                self,
+                candle,
+                ctx,
+                option_type,
+                min_prem=10,
+                max_prem=2500,
+                lookback_sec=lookback_sec,
+                expiry=expiry,
+                side=side,
+                target_delta=0.1,
+                delta_min=0.01,
+                delta_max=1,
+                max_spread_ratio=20,
+            )
+        return DeltaMktMixins.find_strike_in_premium_range_live(
+            self,
+            candle,
+            ctx,
+            option_type,
+            min_prem=min_prem,
+            max_prem=max_prem,
+            lookback_sec=lookback_sec,
+            expiry=expiry,
+            side=side,
+            target_delta=target_delta,
+            delta_min=delta_min,
+            delta_max=delta_max,
+            max_spread_ratio=max_spread_ratio,
+        )
 
     def find_strike(self, strike, expiry):
         df = self.load_delta_data_for_candle(candle, ctx)
