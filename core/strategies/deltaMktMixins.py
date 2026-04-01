@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 import pandas as pd
-import pdb
 
 from core.utils.expiry_resolver import ExpiryResolver
 from core.utils.lag_diag import lag_diag_enabled
@@ -343,7 +342,11 @@ class DeltaMktMixins:
         """
         Live/paper: strike + premium from Delta ``/v2/products`` and tickers.
 
-        Uses one batch ``GET /v2/tickers`` (underlying + expiry + call/put) when
+        Only **ATM and OTM** strikes are considered (ITM excluded):
+        - **Calls** (``C``): ``strike >= spot`` (spot = ``candle["close"]``).
+        - **Puts** (``P``): ``strike <= spot``.
+
+        Uses one batch ``GET /v2/tickers`` when
         ``DeltaSource.get_option_tickers_for_expiry`` is available; falls back to
         per-symbol ``get_ticker`` if the batch fails or misses a symbol.
 
@@ -372,8 +375,6 @@ class DeltaMktMixins:
 
         products = source.get_products(use_cache=True) or []
         spot = float(candle["close"])
-        step = 500
-        atm = round(spot / step) * step
 
         scored = []
         for p in products:
@@ -391,10 +392,24 @@ class DeltaMktMixins:
                     continue
             else:
                 strike = float(strike)
-            scored.append((abs(strike - atm), strike, sym, p))
+
+            if opt_letter == "C":
+                if strike < spot:
+                    continue
+            else:
+                if strike > spot:
+                    continue
+
+            scored.append((abs(strike - spot), strike, sym, p))
 
         if not scored:
-            print(">>error in option chain data ")
+            print(
+                "find_strike_in_premium_range_live: no ATM/OTM option products for "
+                "underlying=%s expiry=%s opt=%s",
+                und,
+                selected_expiry,
+                opt_letter,
+            )
             return None
         scored.sort(key=lambda x: x[0])
         max_quotes = 48
@@ -421,8 +436,7 @@ class DeltaMktMixins:
                 delta_min = float(strategy_delta_range[0])
                 delta_max = float(strategy_delta_range[1])
             except (TypeError, ValueError):
-                delta_min = delta_min
-                delta_max = delta_max
+                pass
 
         if delta_min is None:
             delta_min = 0.15
@@ -433,7 +447,6 @@ class DeltaMktMixins:
 
         trade_side = str(side or "SELL").upper()
 
-        # One batch REST call for this underlying + expiry + call/put (avoids N× get_ticker).
         tickers_map: dict[str, Any] = {}
         if hasattr(source, "get_option_tickers_for_expiry"):
             try:
@@ -443,7 +456,7 @@ class DeltaMktMixins:
                 )
                 if lag_diag_enabled() and api_start is not None:
                     print(
-                        "🌐 API time:",
+                        "find_strike_in_premium_range_live: batch tickers API time=%.3fs",
                         (datetime.now() - api_start).total_seconds(),
                     )
             except Exception as e:
@@ -458,7 +471,6 @@ class DeltaMktMixins:
                 "find_strike_in_premium_range_live: batch tickers map size=%s",
                 len(tickers_map),
             )
-
         for _, strike, sym, _prod in scored:
             try:
                 sym_u = (sym or "").upper()
@@ -479,31 +491,40 @@ class DeltaMktMixins:
                 spread = ask - bid
                 if spread < 0:
                     continue
-                if (spread / ask) > max_spread_ratio:
+                if ask > 0 and (spread / ask) > max_spread_ratio:
                     continue
 
                 ltp = ask if trade_side == "BUY" else bid
                 delta = float(greeks.get("delta") or 0)
                 abs_delta = abs(delta)
-            except Exception:
-                continue
-            if ltp <= 0:
-                continue
-            if not (delta_min <= abs_delta <= delta_max):
-                continue
-            if min_prem <= ltp <= max_prem:
+                if ltp <= 0:
+                    continue
+                if not (delta_min <= abs_delta <= delta_max):
+                    continue
+                if not (min_prem <= ltp <= max_prem):
+                    continue
+
                 score = (
                     abs(ltp - target) * 0.6
                     + spread * 0.3
                     + abs(abs_delta - target_delta) * 0.1
                 )
+
                 if best is None or score < best_score:
                     best = (strike, ltp, sym, bid, ask, spread, delta)
                     best_score = score
-
+            except Exception:
+                continue
         if best is None:
+            print(
+                "find_strike_in_premium_range_live: no strike passed "
+                "premium/delta/spread among ATM/OTM candidates (underlying=%s expiry=%s)",
+                und,
+                selected_expiry,
+            )
             return None
         strike, ltp, sym, bid, ask, spread, delta = best
+
         row = pd.Series(
             {
                 "symbol": sym,
