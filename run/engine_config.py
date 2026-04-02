@@ -3,16 +3,48 @@ Engine configuration for multi-venue architecture.
 
 One config = one venue (one broker, one OMS stack).
 Use EngineFactory.create_engine(config) to build an isolated BacktestEngine or LiveEngine.
+
+Call ``configure_process_logging`` early (see ``run.main`` / ``EngineFactory.create_engine``)
+so ``logging.getLogger(__name__)`` loggers emit to stderr with a consistent format.
 """
 
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from __future__ import annotations
 
-from run.config import RunMode
+import logging
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+
+from run.config import (
+    DEFAULT_LIBRARY_LOG_LEVEL,
+    DEFAULT_ROOT_LOG_LEVEL,
+    RunMode,
+)
 
 
 BrokerName = Literal["DHAN", "DELTA"]
+
+_logging_configured = False
+
+_NOISY_LIBRARY_LOGGERS = (
+    "urllib3",
+    "urllib3.connectionpool",
+    "requests",
+    "requests.packages.urllib3",
+    "websocket",
+)
+
+
+def resolve_log_level(value: Optional[Union[str, int]]) -> int:
+    if value is None:
+        return logging.INFO
+    if isinstance(value, int):
+        return int(value)
+    s = str(value).strip().upper()
+    if s.isdigit():
+        return int(s)
+    return getattr(logging, s, logging.INFO)
 
 # Allowed trading hours: list of (start_time, end_time) as "HH:MM" in UTC (or configurable timezone).
 # E.g. [("09:15", "15:30")] for India NSE.
@@ -87,6 +119,10 @@ class EngineConfig:
     # Symbol-level failure: pause only this symbol after this many consecutive errors.
     symbol_error_threshold: int = 5
 
+    # Stdlib logging: env ALGO_LOG_LEVEL / ALGO_LIBRARY_LOG_LEVEL override when set.
+    root_log_level: str = DEFAULT_ROOT_LOG_LEVEL
+    library_log_level: str = DEFAULT_LIBRARY_LOG_LEVEL
+
     # Telegram alerts (e.g. for Delta): order placed, broker errors, slippage. Optional.
     telegram_bot_token: Optional[str] = None
     telegram_chat_id: Optional[str] = None
@@ -104,6 +140,51 @@ class EngineConfig:
     @property
     def dependencies_dir(self) -> Path:
         return self.base_dir / "Dependencies"
+
+
+def configure_process_logging(
+    config: Optional[EngineConfig] = None,
+    *,
+    force: bool = False,
+) -> None:
+    """
+    Attach a StreamHandler to the root logger and set levels so module loggers
+    (e.g. ``core.strategies.deltaMktMixins``) print INFO+ to stderr by default.
+
+    Env ``ALGO_LOG_LEVEL`` and ``ALGO_LIBRARY_LOG_LEVEL`` override config when non-empty.
+    Idempotent unless ``force=True``.
+    """
+    global _logging_configured
+    if _logging_configured and not force:
+        return
+
+    env_root = os.environ.get("ALGO_LOG_LEVEL", "").strip()
+    env_lib = os.environ.get("ALGO_LIBRARY_LOG_LEVEL", "").strip()
+
+    root_level = resolve_log_level(
+        env_root or (config.root_log_level if config else DEFAULT_ROOT_LOG_LEVEL)
+    )
+    lib_level = resolve_log_level(
+        env_lib or (config.library_log_level if config else DEFAULT_LIBRARY_LOG_LEVEL)
+    )
+
+    fmt = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+    logging.basicConfig(
+        level=root_level,
+        format=fmt,
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=force or not _logging_configured,
+    )
+
+    for name in _NOISY_LIBRARY_LOGGERS:
+        logging.getLogger(name).setLevel(lib_level)
+
+    logging.getLogger(__name__).debug(
+        "process logging: root=%s noisy_libs=%s",
+        logging.getLevelName(root_level),
+        logging.getLevelName(lib_level),
+    )
+    _logging_configured = True
 
 
 # ---------------------------------------------------------------------------

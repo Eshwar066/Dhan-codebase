@@ -32,7 +32,7 @@ from core.strategies.deltaMktMixins import DeltaMktMixins
 from core.strategies.base import BaseStrategy
 
 
-VALID_TIME_1730 = {time(21, 23)}  # 1hr candle close time (IST)
+VALID_TIME_1730 = {time(11, 21)}  # 1hr candle close time (IST)
 
 # Strike/premium selection (kept conservative and similar to `MagicalLines`)
 STRIKE_STEP = 500
@@ -40,7 +40,7 @@ STRIKE_LOOKBACK = 5  # +/- 15 steps around ATM => 31 strikes
 TARGET_PREMIUM_MIN = 700
 TARGET_PREMIUM_MAX = 1500
 TARGET_DELTA = 0.25
-DELTA_RANGE = (0.2, 0.3)
+DELTA_RANGE = (0.2, 0.4)
 
 # Risk
 SL_PCT = 0.15  # 15% rise in short option premium triggers exit
@@ -270,38 +270,6 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             target_delta=self.delta,
             delta_min=self.delta_range[0],
             delta_max=self.delta_range[1],
-        )
-
-    def find_strike_in_premium_range_live(
-        self,
-        candle,
-        ctx,
-        option_type,
-        *,
-        min_prem=600,
-        max_prem=1500,
-        lookback_sec=60,
-        expiry="Weekly",
-        side="SELL",
-        target_delta=None,
-        delta_min=None,
-        delta_max=None,
-        max_spread_ratio=0.15,
-    ):
-        return DeltaMktMixins.find_strike_in_premium_range_live(
-            self,
-            candle,
-            ctx,
-            option_type,
-            min_prem=min_prem,
-            max_prem=max_prem,
-            lookback_sec=lookback_sec,
-            expiry=expiry,
-            side=side,
-            target_delta=target_delta,
-            delta_min=delta_min,
-            delta_max=delta_max,
-            max_spread_ratio=max_spread_ratio,
         )
 
     # ==================================================

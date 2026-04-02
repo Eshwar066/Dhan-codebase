@@ -5,7 +5,6 @@ Import LiveEngineHelpersMixin and use as: class LiveEngine(LiveEngineHelpersMixi
 
 import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple
-import pdb
 
 DEFAULT_FEED_STALE_SECONDS = 60
 
@@ -95,6 +94,7 @@ class LiveEngineHelpersMixin:
 
     def _entry_price_from_depth(self, symbol: str, is_buy: bool):
         bid, ask = self._get_bid_ask(symbol)
+
         print(">>entry ask, bid", symbol, ask, bid)
         if not self._is_spread_acceptable(bid, ask):
             return None

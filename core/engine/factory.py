@@ -16,14 +16,13 @@ import queue
 from datetime import datetime
 from pathlib import Path
 from typing import Union
-import pdb
 
 from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
 from run.config import RunMode
-from run.engine_config import EngineConfig
+from run.engine_config import EngineConfig, configure_process_logging
 from core.strategies.registry import STRATEGY_MAP
 from core.engine.base_engine import BaseEngine
 from core.engine.backtest_engine import BacktestEngine
@@ -69,6 +68,7 @@ class EngineFactory:
         """
         Build engine from config. Backtest vs Live is determined by config.run_mode.
         """
+        configure_process_logging(config)
         if config.run_mode == RunMode.BACKTEST:
             return EngineFactory.create_backtest_engine(config)
         return EngineFactory.create_live_engine(config)

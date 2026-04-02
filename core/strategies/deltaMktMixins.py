@@ -6,18 +6,83 @@ from strike rows. Import module functions or mix in ``DeltaMktMixins``.
 
 from __future__ import annotations
 
+import csv
 import logging
-from datetime import datetime
+import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 import pandas as pd
+import pdb
 
 from core.utils.expiry_resolver import ExpiryResolver
 from core.utils.lag_diag import lag_diag_enabled
 from run.config import RUN_MODE, RunMode, STRATEGY_JOBS
 
 logger = logging.getLogger(__name__)
+
+_STRIKE_SCAN_FIELDNAMES = (
+    "ts_utc",
+    "candle_ts",
+    "strategy_name",
+    "underlying",
+    "spot",
+    "expiry",
+    "opt_letter",
+    "symbol",
+    "strike",
+    "dist_from_spot",
+    "trade_side",
+    "bid",
+    "ask",
+    "spread",
+    "spread_ratio",
+    "ltp",
+    "mark_price",
+    "delta",
+    "abs_delta",
+    "gamma",
+    "vega",
+    "theta",
+    "min_prem",
+    "max_prem",
+    "delta_min",
+    "delta_max",
+    "max_spread_ratio",
+    "target_prem_mid",
+    "target_delta",
+    "score",
+    "reject_reason",
+    "eligible",
+    "winner",
+)
+
+
+def _strike_scan_csv_path() -> Path:
+    base = Path(__file__).resolve().parents[2] / "logs" / "strike_selection"
+    override = os.environ.get("ALGO_STRIKE_SCAN_DIR", "").strip()
+    if override:
+        base = Path(override)
+    name = (
+        os.environ.get("ALGO_STRIKE_SCAN_FILE", "live_strike_scan.csv").strip()
+        or "live_strike_scan.csv"
+    )
+    return base / name
+
+
+def _append_live_strike_scan_rows(rows: list[dict[str, Any]]) -> None:
+    if os.environ.get("ALGO_STRIKE_SCAN_LOG", "1").strip() == "0" or not rows:
+        return
+    path = _strike_scan_csv_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists() or path.stat().st_size == 0
+    with path.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=_STRIKE_SCAN_FIELDNAMES, extrasaction="ignore")
+        if write_header:
+            w.writeheader()
+        for r in rows:
+            w.writerow(r)
 
 
 def delta_option_trading_symbol(
@@ -324,6 +389,268 @@ class DeltaMktMixins:
 
         return (selected["strike"], float(selected["price"]), selected)
 
+    def _prepare_live_atm_otm_chain(
+        self,
+        candle: dict,
+        ctx: Any,
+        option_type: str,
+        *,
+        expiry: Optional[str] = None,
+        max_quotes: int = 48,
+        log_prefix: str = "find_strike_in_premium_range_live",
+    ) -> Optional[
+        tuple[
+            Any,
+            str,
+            str,
+            str,
+            float,
+            list[tuple[float, float, str, Any]],
+            dict[str, Any],
+        ]
+    ]:
+        """
+        Shared live setup: DeltaSource, weekly/monthly expiry, ATM+OTM product list
+        (sorted by distance to spot), capped ``max_quotes``, and option tickers map.
+        """
+        source = _delta_source_from_ctx(ctx)
+        if source is None:
+            logger.warning(
+                "%s: DeltaSource not available on context",
+                log_prefix,
+            )
+            return None
+
+        if expiry == "Weekly":
+            selected_expiry = self.weeklyExpiry(candle, ctx)
+        elif expiry == "Monthly":
+            selected_expiry = self.monthlyExpiry(candle, ctx)
+        else:
+            selected_expiry = getattr(
+                ctx, "selected_expiry", None
+            ) or self.weeklyExpiry(candle, ctx)
+
+        opt_letter = option_type.strip().upper()[0]
+        und = _delta_underlying_prefix(candle.get("symbol", "BTCUSD"))
+
+        products = source.get_products(use_cache=True) or []
+        spot = float(candle["close"])
+
+        scored: list[tuple[float, float, str, Any]] = []
+        for p in products:
+            sym = (p.get("symbol") or "").upper()
+            if not sym.startswith(f"{opt_letter}-{und}-"):
+                continue
+            parts = sym.split("-")
+            if len(parts) < 4 or parts[-1] != selected_expiry:
+                continue
+            strike = p.get("strike_price")
+            if strike is None:
+                try:
+                    strike = float(parts[2])
+                except (ValueError, TypeError):
+                    continue
+            else:
+                strike = float(strike)
+
+            if opt_letter == "C":
+                if strike < spot:
+                    continue
+            else:
+                if strike > spot:
+                    continue
+
+            scored.append((abs(strike - spot), strike, sym, p))
+
+        if not scored:
+            logger.warning(
+                "%s: no ATM/OTM option products for underlying=%s expiry=%s opt=%s",
+                log_prefix,
+                und,
+                selected_expiry,
+                opt_letter,
+            )
+            return None
+        scored.sort(key=lambda x: x[0])
+        scored = scored[:max_quotes]
+
+        tickers_map: dict[str, Any] = {}
+        if hasattr(source, "get_option_tickers_for_expiry"):
+            try:
+                api_start = datetime.now() if lag_diag_enabled() else None
+                tickers_map = source.get_option_tickers_for_expiry(
+                    und, str(selected_expiry), opt_letter
+                )
+                if lag_diag_enabled() and api_start is not None:
+                    logger.debug(
+                        "%s: batch tickers API time=%.3fs",
+                        log_prefix,
+                        (datetime.now() - api_start).total_seconds(),
+                    )
+            except Exception as e:
+                logger.warning(
+                    "%s: batch tickers failed (%s); falling back to per-symbol get_ticker",
+                    log_prefix,
+                    e,
+                )
+                tickers_map = {}
+        if tickers_map:
+            logger.debug(
+                "%s: batch tickers map size=%s",
+                log_prefix,
+                len(tickers_map),
+            )
+
+        return source, und, selected_expiry, opt_letter, spot, scored, tickers_map
+
+    def find_strike_by_delta_live(
+        self,
+        candle,
+        ctx,
+        option_type,
+        expiry=None,
+        *,
+        target_delta=None,
+        delta_min=None,
+        delta_max=None,
+        side="SELL",
+        max_quotes=48,
+        require_quotes: bool = True,
+    ):
+        """
+        Live/paper: pick the ATM/OTM strike whose **|delta|** is closest to
+        ``target_delta``. No premium or spread filters—only valid ticker + greeks.
+
+        - **Calls** (``C``): ``strike >= spot``.
+        - **Puts** (``P``): ``strike <= spot``.
+
+        If ``delta_min`` / ``delta_max`` are set, only strikes with
+        ``delta_min <= |delta| <= delta_max`` are considered.
+
+        Returns ``(strike, ltp, row)`` like ``find_strike_in_premium_range_live``, or
+        ``None`` if no candidate has a usable delta (and quotes when ``require_quotes``).
+        """
+        prepared = self._prepare_live_atm_otm_chain(
+            candle,
+            ctx,
+            option_type,
+            expiry=expiry,
+            max_quotes=max_quotes,
+            log_prefix="find_strike_by_delta_live",
+        )
+        # pdb.set_trace()
+        if prepared is None:
+            return None
+        source, und, selected_expiry, opt_letter, spot, scored, tickers_map = prepared
+
+        strategy_delta = getattr(self, "delta", None)
+        if target_delta is None and strategy_delta is not None:
+            try:
+                target_delta = float(strategy_delta)
+            except (TypeError, ValueError):
+                target_delta = None
+
+        strategy_delta_range = getattr(self, "delta_range", None)
+        if (
+            (delta_min is None or delta_max is None)
+            and isinstance(strategy_delta_range, (tuple, list))
+            and len(strategy_delta_range) == 2
+        ):
+            try:
+                delta_min = float(strategy_delta_range[0])
+                delta_max = float(strategy_delta_range[1])
+            except (TypeError, ValueError):
+                pass
+
+        if target_delta is None:
+            if delta_min is not None and delta_max is not None:
+                target_delta = (float(delta_min) + float(delta_max)) / 2.0
+            else:
+                target_delta = 0.25
+
+        trade_side = str(side or "SELL").upper()
+
+        best: Optional[tuple[float, float, str, float, float, float, float]] = None
+        best_delta_dist: Optional[float] = None
+        best_spot_dist: Optional[float] = None
+
+        for spot_dist, strike, sym, _prod in scored:
+            try:
+                sym_u = (sym or "").upper()
+                t = tickers_map.get(sym_u) if tickers_map else None
+                if t is None:
+                    t = source.get_ticker(sym)
+                if not isinstance(t, dict):
+                    continue
+                quotes = t.get("quotes") or {}
+                greeks = t.get("greeks") or {}
+                bid = float(quotes.get("best_bid") or 0)
+                ask = float(quotes.get("best_ask") or 0)
+                if require_quotes and (bid <= 0 or ask <= 0):
+                    continue
+                spread = ask - bid if bid > 0 and ask > 0 else 0.0
+                ltp = ask if trade_side == "BUY" else bid
+                if require_quotes and ltp <= 0:
+                    continue
+
+                raw_delta = greeks.get("delta")
+                if raw_delta is None:
+                    continue
+                delta = float(raw_delta)
+                abs_delta = abs(delta)
+                if abs_delta <= 0 and target_delta > 0:
+                    continue
+                if delta_min is not None and abs_delta < float(delta_min):
+                    continue
+                if delta_max is not None and abs_delta > float(delta_max):
+                    continue
+
+                ddist = abs(abs_delta - float(target_delta))
+                if best is None:
+                    best = (strike, ltp, sym, bid, ask, spread, delta)
+                    best_delta_dist = ddist
+                    best_spot_dist = spot_dist
+                    continue
+                if best_delta_dist is None:
+                    continue
+                if ddist < best_delta_dist - 1e-12:
+                    best = (strike, ltp, sym, bid, ask, spread, delta)
+                    best_delta_dist = ddist
+                    best_spot_dist = spot_dist
+                elif (
+                    abs(ddist - best_delta_dist) <= 1e-12 and best_spot_dist is not None
+                ):
+                    if spot_dist < best_spot_dist:
+                        best = (strike, ltp, sym, bid, ask, spread, delta)
+                        best_delta_dist = ddist
+                        best_spot_dist = spot_dist
+            except Exception:
+                continue
+
+        if best is None:
+            logger.info(
+                "find_strike_by_delta_live: no strike with usable delta (underlying=%s expiry=%s)",
+                und,
+                selected_expiry,
+            )
+            return None
+
+        strike, ltp, sym, bid, ask, spread, delta = best
+        row = pd.Series(
+            {
+                "symbol": sym,
+                "price": ltp,
+                "strike": strike,
+                "close": ltp,
+                "qty": 1,
+                "best_bid": bid,
+                "best_ask": ask,
+                "spread": spread,
+                "delta": delta,
+            }
+        )
+        return strike, ltp, row
+
     def find_strike_in_premium_range_live(
         self,
         candle,
@@ -354,66 +681,17 @@ class DeltaMktMixins:
         """
 
         del lookback_sec
-        source = _delta_source_from_ctx(ctx)
-        if source is None:
-            logger.warning(
-                "find_strike_in_premium_range_live: DeltaSource not available on context"
-            )
+        prepared = self._prepare_live_atm_otm_chain(
+            candle,
+            ctx,
+            option_type,
+            expiry=expiry,
+            max_quotes=48,
+            log_prefix="find_strike_in_premium_range_live",
+        )
+        if prepared is None:
             return None
-
-        if expiry == "Weekly":
-            selected_expiry = self.weeklyExpiry(candle, ctx)
-        elif expiry == "Monthly":
-            selected_expiry = self.monthlyExpiry(candle, ctx)
-        else:
-            selected_expiry = getattr(
-                ctx, "selected_expiry", None
-            ) or self.weeklyExpiry(candle, ctx)
-
-        opt_letter = option_type.strip().upper()[0]
-        und = _delta_underlying_prefix(candle.get("symbol", "BTCUSD"))
-
-        products = source.get_products(use_cache=True) or []
-        spot = float(candle["close"])
-
-        scored = []
-        for p in products:
-            sym = (p.get("symbol") or "").upper()
-            if not sym.startswith(f"{opt_letter}-{und}-"):
-                continue
-            parts = sym.split("-")
-            if len(parts) < 4 or parts[-1] != selected_expiry:
-                continue
-            strike = p.get("strike_price")
-            if strike is None:
-                try:
-                    strike = float(parts[2])
-                except (ValueError, TypeError):
-                    continue
-            else:
-                strike = float(strike)
-
-            if opt_letter == "C":
-                if strike < spot:
-                    continue
-            else:
-                if strike > spot:
-                    continue
-
-            scored.append((abs(strike - spot), strike, sym, p))
-
-        if not scored:
-            print(
-                "find_strike_in_premium_range_live: no ATM/OTM option products for "
-                "underlying=%s expiry=%s opt=%s",
-                und,
-                selected_expiry,
-                opt_letter,
-            )
-            return None
-        scored.sort(key=lambda x: x[0])
-        max_quotes = 48
-        scored = scored[:max_quotes]
+        source, und, selected_expiry, opt_letter, spot, scored, tickers_map = prepared
 
         target = (min_prem + max_prem) / 2
         best = None
@@ -447,31 +725,47 @@ class DeltaMktMixins:
 
         trade_side = str(side or "SELL").upper()
 
-        tickers_map: dict[str, Any] = {}
-        if hasattr(source, "get_option_tickers_for_expiry"):
-            try:
-                api_start = datetime.now() if lag_diag_enabled() else None
-                tickers_map = source.get_option_tickers_for_expiry(
-                    und, str(selected_expiry), opt_letter
-                )
-                if lag_diag_enabled() and api_start is not None:
-                    print(
-                        "find_strike_in_premium_range_live: batch tickers API time=%.3fs",
-                        (datetime.now() - api_start).total_seconds(),
-                    )
-            except Exception as e:
-                logger.warning(
-                    "find_strike_in_premium_range_live: batch tickers failed (%s); "
-                    "falling back to per-symbol get_ticker",
-                    e,
-                )
-                tickers_map = {}
-        if tickers_map:
-            logger.debug(
-                "find_strike_in_premium_range_live: batch tickers map size=%s",
-                len(tickers_map),
-            )
+        scan_rows: list[dict[str, Any]] = []
+        ts_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        candle_ts = str(candle.get("timestamp", ""))
+        strategy_nm = str(getattr(self, "name", "") or "")
+
         for _, strike, sym, _prod in scored:
+            rec: dict[str, Any] = {
+                "ts_utc": ts_utc,
+                "candle_ts": candle_ts,
+                "strategy_name": strategy_nm,
+                "underlying": und,
+                "spot": spot,
+                "expiry": selected_expiry,
+                "opt_letter": opt_letter,
+                "symbol": sym,
+                "strike": strike,
+                "dist_from_spot": round(abs(strike - spot), 8),
+                "trade_side": trade_side,
+                "min_prem": min_prem,
+                "max_prem": max_prem,
+                "delta_min": delta_min,
+                "delta_max": delta_max,
+                "max_spread_ratio": max_spread_ratio,
+                "target_prem_mid": target,
+                "target_delta": target_delta,
+                "bid": "",
+                "ask": "",
+                "spread": "",
+                "spread_ratio": "",
+                "ltp": "",
+                "mark_price": "",
+                "delta": "",
+                "abs_delta": "",
+                "gamma": "",
+                "vega": "",
+                "theta": "",
+                "score": "",
+                "reject_reason": "",
+                "eligible": "",
+                "winner": "N",
+            }
             try:
                 sym_u = (sym or "").upper()
                 t = tickers_map.get(sym_u) if tickers_map else None
@@ -479,29 +773,57 @@ class DeltaMktMixins:
                     t = source.get_ticker(sym)
 
                 if not isinstance(t, dict):
+                    rec["reject_reason"] = "no_ticker"
+                    scan_rows.append(rec)
                     continue
                 quotes = t.get("quotes") or {}
                 greeks = t.get("greeks") or {}
+                mp = t.get("mark_price")
+                rec["mark_price"] = mp if mp is not None else ""
 
                 bid = float(quotes.get("best_bid") or 0)
                 ask = float(quotes.get("best_ask") or 0)
+                rec["bid"] = bid
+                rec["ask"] = ask
                 if bid <= 0 or ask <= 0:
+                    rec["reject_reason"] = "missing_bid_ask"
+                    scan_rows.append(rec)
                     continue
 
                 spread = ask - bid
+                rec["spread"] = spread
+                rec["spread_ratio"] = round(spread / ask, 8) if ask > 0 else ""
                 if spread < 0:
+                    rec["reject_reason"] = "negative_spread"
+                    scan_rows.append(rec)
                     continue
                 if ask > 0 and (spread / ask) > max_spread_ratio:
+                    rec["reject_reason"] = "spread_too_wide"
+                    scan_rows.append(rec)
                     continue
 
                 ltp = ask if trade_side == "BUY" else bid
+                rec["ltp"] = ltp
                 delta = float(greeks.get("delta") or 0)
                 abs_delta = abs(delta)
+                rec["delta"] = delta
+                rec["abs_delta"] = abs_delta
+                if greeks:
+                    for gk in ("gamma", "vega", "theta"):
+                        if gk in greeks and greeks[gk] is not None:
+                            rec[gk] = greeks.get(gk)
+
                 if ltp <= 0:
+                    rec["reject_reason"] = "ltp_non_positive"
+                    scan_rows.append(rec)
                     continue
                 if not (delta_min <= abs_delta <= delta_max):
+                    rec["reject_reason"] = "delta_out_of_range"
+                    scan_rows.append(rec)
                     continue
                 if not (min_prem <= ltp <= max_prem):
+                    rec["reject_reason"] = "premium_out_of_range"
+                    scan_rows.append(rec)
                     continue
 
                 score = (
@@ -509,14 +831,38 @@ class DeltaMktMixins:
                     + spread * 0.3
                     + abs(abs_delta - target_delta) * 0.1
                 )
+                rec["score"] = round(score, 8)
+                rec["eligible"] = "Y"
+                scan_rows.append(rec)
 
                 if best is None or score < best_score:
                     best = (strike, ltp, sym, bid, ask, spread, delta)
                     best_score = score
-            except Exception:
+            except Exception as e:
+                rec["reject_reason"] = f"exception:{e!s}"
+                scan_rows.append(rec)
                 continue
+
+        if scan_rows:
+            if best is not None:
+                bstrike, _, bsym, _, _, _, _ = best
+                for r in scan_rows:
+                    if (
+                        r.get("eligible") == "Y"
+                        and (r.get("symbol") or "").upper() == (bsym or "").upper()
+                        and float(r.get("strike", 0)) == float(bstrike)
+                    ):
+                        r["winner"] = "Y"
+                        break
+            _append_live_strike_scan_rows(scan_rows)
+            logger.debug(
+                "find_strike_in_premium_range_live: wrote %s strike scan row(s) -> %s",
+                len(scan_rows),
+                _strike_scan_csv_path(),
+            )
+
         if best is None:
-            print(
+            logger.info(
                 "find_strike_in_premium_range_live: no strike passed "
                 "premium/delta/spread among ATM/OTM candidates (underlying=%s expiry=%s)",
                 und,
@@ -603,6 +949,7 @@ class DeltaMktMixins:
         - live/paper testnet: permissive live selection
         - live/paper prod: live selection with configured delta filters
         """
+        # pdb.set_trace()
         if RUN_MODE == RunMode.BACKTEST:
             return DeltaMktMixins.find_strike_in_premium_range(
                 self,
@@ -630,20 +977,20 @@ class DeltaMktMixins:
                 delta_max=1,
                 max_spread_ratio=20,
             )
-        return DeltaMktMixins.find_strike_in_premium_range_live(
+        return DeltaMktMixins.find_strike_by_delta_live(
             self,
             candle,
             ctx,
             option_type,
-            min_prem=min_prem,
-            max_prem=max_prem,
-            lookback_sec=lookback_sec,
+            # min_prem=min_prem,
+            # max_prem=max_prem,
+            # lookback_sec=lookback_sec,
             expiry=expiry,
             side=side,
             target_delta=target_delta,
             delta_min=delta_min,
             delta_max=delta_max,
-            max_spread_ratio=max_spread_ratio,
+            # max_spread_ratio=max_spread_ratio,
         )
 
     def find_strike(self, strike, expiry):

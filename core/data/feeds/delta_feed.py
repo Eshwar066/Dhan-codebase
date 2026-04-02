@@ -6,8 +6,8 @@ Used by LiveEngine when BROKER_NAME == "DELTA" for real-time data.
 """
 
 import logging
+import threading
 from typing import Any, Dict, List, Optional
-import pdb
 
 from core.data.feeds.base_feed import RealtimeFeed
 
@@ -60,6 +60,12 @@ class DeltaWebSocketFeed(RealtimeFeed):
         self._engine_logger = engine_logger
         self._telegram_alert = telegram_alert
 
+        # l2_orderbook is per-instrument on Delta; underlying (e.g. BTCUSD) is subscribed in
+        # _do_subscribe_public. Option symbols are added on demand.
+        self._l2_sub_lock = threading.Lock()
+        self._subscribed_l2_symbols: set[str] = set()
+        self._l2_gen_applied: int = -1
+
         self._ws: Optional[DeltaWebSocket] = None
         self._auth_done = False
         self._tick_queue: Optional[Any] = None
@@ -111,7 +117,11 @@ class DeltaWebSocketFeed(RealtimeFeed):
             india=self.india,
             on_auth=self._on_auth,
             on_tick=on_tick,
-            on_feed_stall=_on_feed_stall if (self._engine_logger or self._telegram_alert) else None,
+            on_feed_stall=(
+                _on_feed_stall
+                if (self._engine_logger or self._telegram_alert)
+                else None
+            ),
         )
         self._ws.connect()
         # Subscribe to public channels after socket is ready; private after auth success.
@@ -141,6 +151,36 @@ class DeltaWebSocketFeed(RealtimeFeed):
             {"name": "l2_orderbook", "symbols": self.symbols},
         ]
         self._ws.subscribe(channels)
+        with self._l2_sub_lock:
+            self._subscribed_l2_symbols = {str(s).strip().upper() for s in self.symbols}
+            self._l2_gen_applied = self._ws.connect_generation
+
+    def ensure_l2_orderbook_subscription(self, symbol: str) -> None:
+        """
+        Subscribe to ``l2_orderbook`` for ``symbol`` if not already covered.
+
+        Underlying symbols from ``self.symbols`` are subscribed at startup; each option
+        contract (e.g. ``C-BTC-70000-100426``) must be subscribed explicitly—Delta does
+        not inherit depth from BTCUSD.
+        """
+        if not symbol or not self._ws:
+            return
+        raw = str(symbol).strip()
+        if not raw:
+            return
+        key = raw.upper()
+        if not self._ws.is_connected():
+            return
+        gen = self._ws.connect_generation
+        with self._l2_sub_lock:
+            if self._l2_gen_applied != gen:
+                self._subscribed_l2_symbols = {str(s).strip().upper() for s in self.symbols}
+                self._l2_gen_applied = gen
+            if key in self._subscribed_l2_symbols:
+                return
+            self._ws.subscribe([{"name": "l2_orderbook", "symbols": [raw]}])
+            self._subscribed_l2_symbols.add(key)
+            logger.info("DeltaWebSocketFeed: subscribed l2_orderbook for %s", raw)
 
     def _do_subscribe_private(self) -> None:
         if (
@@ -225,11 +265,15 @@ class DeltaWebSocketFeed(RealtimeFeed):
         """Raw L2 order book for symbol (bids/asks). Used for best bid/ask."""
         if not self._ws:
             return None
+        self.ensure_l2_orderbook_subscription(symbol)
         return self._ws.get_last_l2_orderbook(symbol)
 
     def get_best_bid(self, symbol: str) -> Optional[float]:
         """Best bid price for symbol from L2 order book. For Delta limit BUY at best bid."""
-        ob = self.get_last_l2_orderbook(symbol)
+        if not self._ws:
+            return None
+        self.ensure_l2_orderbook_subscription(symbol)
+        ob = self._ws.get_last_l2_orderbook(symbol)
         if not ob:
             return None
         bids = ob.get("bids") or ob.get("buy") or []
@@ -249,7 +293,10 @@ class DeltaWebSocketFeed(RealtimeFeed):
 
     def get_best_ask(self, symbol: str) -> Optional[float]:
         """Best ask price for symbol from L2 order book. For Delta limit SELL at best ask."""
-        ob = self.get_last_l2_orderbook(symbol)
+        if not self._ws:
+            return None
+        self.ensure_l2_orderbook_subscription(symbol)
+        ob = self._ws.get_last_l2_orderbook(symbol)
         if not ob:
             return None
         asks = ob.get("asks") or ob.get("sell") or []
