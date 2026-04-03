@@ -21,3 +21,7 @@ class BaseStrategy:
 
     def get_warmup_period(self):
         return 0
+
+    def on_forced_exit(self, **kwargs: Any) -> None:
+        """Optional: broker-driven close (liquidation, orphan fill, etc.). Override to sync strategy state."""
+        return None

@@ -13,7 +13,8 @@ Rules (per user spec)
 Implementation notes
 - Uses `IndiaMktMixins` for option strike/premium selection and option LTP fetching.
 - Delta product symbols via `DeltaMktMixins.delta_option_trading_symbol` (see `deltaMktMixins.py`).
-- Reversal ENTRY is emitted from `on_candle` (engine expects entry intents from `on_candle`).
+- Broker SL (`MAIN_SL`) is placed only after the MAIN sell fills (avoids Delta `no_open_position`).
+- On reversal: emit `MAIN_EXIT` first; when that exit fills, emit reversal ENTRY; SL again after the new MAIN fills.
 - ML1 is stored per opened position via `structure_id` to enable correct reversal + SL.
 """
 
@@ -21,19 +22,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, time
-from typing import Any, Dict, Optional, Tuple
+from types import SimpleNamespace
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
-
-
+import uuid
+import pdb
 from core.strategies.IndiaMktMixins import IndiaMktMixins
 from core.strategies.deltaMktMixins import DeltaMktMixins
 from core.strategies.base import BaseStrategy
-from core.utils.expiry_resolver import ExpiryResolver
-from run.config import RUN_MODE, RunMode, STRATEGY_JOBS
 
 
-VALID_TIME_1730 = {time(21, 5)}  # 1hr candle close time (IST)
+VALID_TIME_1730 = {time(15, 25)}  # 1hr candle close time (IST)
 
 # Strike/premium selection (kept conservative and similar to `MagicalLines`)
 STRIKE_STEP = 500
@@ -41,10 +41,12 @@ STRIKE_LOOKBACK = 5  # +/- 15 steps around ATM => 31 strikes
 TARGET_PREMIUM_MIN = 700
 TARGET_PREMIUM_MAX = 1500
 TARGET_DELTA = 0.25
-DELTA_RANGE = (0.2, 0.3)
+DELTA_RANGE = (0.2, 0.4)
 
 # Risk
 SL_PCT = 0.15  # 15% rise in short option premium triggers exit
+MAX_REVERSALS = 5  # max reversal levels per ML1 day (L1 initial + reversals)
+_CANDLE_CACHE_MAX = 1000
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,12 @@ class _PosMeta:
     ml1: float
     entry_premium: float
     level: int
+
+
+@dataclass(frozen=True)
+class _PendingReversal:
+    entry_intent: Any
+    candle: dict
 
 
 class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
@@ -81,6 +89,8 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         # - `_pending_spot_close_by_symbol` is the current candle close (set in on_candle, committed next candle)
         self._last_spot_close_by_symbol: Dict[str, float] = {}
         self._pending_spot_close_by_symbol: Dict[str, float] = {}
+        self._candle_cache: Dict[Any, Any] = {}
+        self._pending_reversal_by_exit_structure_id: Dict[str, _PendingReversal] = {}
 
     def get_warmup_period(self):
         return 0
@@ -124,14 +134,119 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             self._reversal_level_counter.get(k, 0), meta.level
         )
 
-    def _is_delta_testnet_enabled(self) -> bool:
-        for job in STRATEGY_JOBS:
-            if str(job.get("name")) != self.name:
+    def _build_structure_id(self, symbol: str, trade_dt: date, level: int) -> str:
+        return f"{self.name}:{symbol}:ML1:{trade_dt}:L{level}:{uuid.uuid4().hex[:6]}"
+
+    def _get_cached_strike_in_premium_range(
+        self,
+        candle: dict,
+        ctx: Any,
+        symbol: str,
+        option_type: str,
+    ):
+        strike_cache_key = (symbol, option_type, candle["timestamp"])
+        if strike_cache_key not in self._candle_cache:
+            self._candle_cache[strike_cache_key] = self.find_strike_in_premium_range(
+                candle,
+                ctx,
+                option_type,
+                min_prem=TARGET_PREMIUM_MIN,
+                max_prem=TARGET_PREMIUM_MAX,
+            )
+        return self._candle_cache[strike_cache_key]
+
+    def _get_cached_option_price(
+        self,
+        candle: dict,
+        ctx: Any,
+        position: Any,
+    ) -> Optional[float]:
+        key = ("opt_px", position.instrument.trading_symbol, candle["timestamp"])
+        if key not in self._candle_cache:
+            ot = self._resolved_option_type_ce_pe(position.instrument)
+            self._candle_cache[key] = self.get_option_price_at_candle(
+                candle=candle,
+                ctx=ctx,
+                strike=position.instrument.strike,
+                option_type=ot or position.instrument.option_type,
+                expiry=position.instrument.expiry,
+                trading_symbol=position.instrument.trading_symbol,
+            )
+        return self._candle_cache[key]
+
+    def _has_pending_main_intent(self, ctx: Any, symbol: str) -> bool:
+        intent_store = getattr(ctx, "intent_store", None)
+        if intent_store is None:
+            return False
+
+        terminal_statuses = {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"}
+        intents = getattr(intent_store, "intents", {}) or {}
+        for rec in intents.values():
+            status = rec.get("status")
+            status_value = getattr(status, "value", status)
+            if str(status_value) in terminal_statuses:
                 continue
-            if str(job.get("venue", "")).upper() != "DELTA":
+
+            payload = rec.get("payload") or {}
+            if payload.get("strategy_id") != self.name:
                 continue
-            return bool(job.get("delta_testnet", False))
+            # Intent payload symbol is usually option tradingsymbol (C-BTC-...),
+            # while this method receives underlying symbol (BTCUSD). Match via
+            # strategy metadata / structure_id when available.
+            rec_underlyings = set()
+            strategy_meta = payload.get("strategy_meta") or {}
+            odml_meta = (
+                strategy_meta.get("one_day_ml1")
+                if isinstance(strategy_meta, dict)
+                else None
+            )
+            if isinstance(odml_meta, dict) and odml_meta.get("symbol"):
+                rec_underlyings.add(str(odml_meta.get("symbol")))
+            structure_id = str(
+                payload.get("structure_id") or rec.get("structure_id") or ""
+            )
+            parts = structure_id.split(":")
+            if len(parts) >= 3 and parts[0] == self.name:
+                rec_underlyings.add(parts[1])
+            if rec_underlyings:
+                if symbol not in rec_underlyings:
+                    continue
+            elif payload.get("symbol") != symbol:
+                # Backward-compat fallback when metadata/structure are missing.
+                continue
+
+            # Any non-final MAIN/MAIN_EXIT signal for this symbol means
+            # a position lifecycle is still in flight; avoid opposite entry.
+            tag = str(payload.get("tag") or rec.get("tag") or "").upper()
+            action = str(payload.get("action") or rec.get("action") or "").upper()
+            if tag == "MAIN_SL":
+                continue
+            if tag in {"MAIN", "MAIN_EXIT"} or action in {"ENTRY", "EXIT"}:
+                return True
         return False
+
+    def _build_main_sl_intent(
+        self,
+        entry_intent: Any,
+        trigger_price: float,
+        candle_ts: Any,
+        symbol: str,
+    ) -> Any:
+        return self.create_order_intent(
+            inst=entry_intent.instrument,
+            side="BUY",
+            qty=entry_intent.qty,
+            price=float(trigger_price),
+            order_type="SL-M",  # STOP_LIMIT (to be used here)
+            strategy=self.name,
+            candle_ts=candle_ts,
+            structure_id=entry_intent.structure_id,
+            tag="MAIN_SL",
+            symbol=symbol,
+            action="FORCE_EXIT",
+            parent_intent_id=entry_intent.intent_id,
+            trigger_price=float(trigger_price),
+        )
 
     # Strike selection: backtest = Delta tick CSV; live/paper = products + tickers (``deltaMktMixins``).
     # Branch uses ``run.config.RUN_MODE`` — for live engines set global ``RUN_MODE`` or ensure it matches the job.
@@ -144,34 +259,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         max_prem=1500,
         lookback_sec=60,
     ):
-        if RUN_MODE == RunMode.BACKTEST:
-            return DeltaMktMixins.find_strike_in_premium_range(
-                self,
-                candle,
-                ctx,
-                option_type,
-                min_prem=min_prem,
-                max_prem=max_prem,
-                lookback_sec=lookback_sec,
-                expiry="Weekly",
-            )
-        if self._is_delta_testnet_enabled():
-            return self.find_strike_in_premium_range_live(
-                candle,
-                ctx,
-                option_type,
-                min_prem=10,
-                max_prem=30000,
-                expiry="Weekly",
-                side="SELL",
-                lookback_sec=lookback_sec,
-                target_delta=0.1,
-                delta_min=0.01,
-                delta_max=1,
-                max_spread_ratio=20,
-            )
-        return DeltaMktMixins.find_strike_in_premium_range_live(
-            self,
+        return self.find_strike_in_premium_range_by_mode(
             candle,
             ctx,
             option_type,
@@ -183,38 +271,6 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             target_delta=self.delta,
             delta_min=self.delta_range[0],
             delta_max=self.delta_range[1],
-        )
-
-    def find_strike_in_premium_range_live(
-        self,
-        candle,
-        ctx,
-        option_type,
-        *,
-        min_prem=600,
-        max_prem=1500,
-        lookback_sec=60,
-        expiry="Weekly",
-        side="SELL",
-        target_delta=None,
-        delta_min=None,
-        delta_max=None,
-        max_spread_ratio=0.15,
-    ):
-        return DeltaMktMixins.find_strike_in_premium_range_live(
-            self,
-            candle,
-            ctx,
-            option_type,
-            min_prem=min_prem,
-            max_prem=max_prem,
-            lookback_sec=lookback_sec,
-            expiry=expiry,
-            side=side,
-            target_delta=target_delta,
-            delta_min=delta_min,
-            delta_max=delta_max,
-            max_spread_ratio=max_spread_ratio,
         )
 
     # ==================================================
@@ -233,17 +289,21 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         """Only enter at `17:30` IST candle close."""
         ts = pd.to_datetime(candle["timestamp"])
 
-        # return self._is_valid_time(ts, self.valid_times)
-        return True
+        return self._is_valid_time(ts, self.valid_times)
+        # return True
 
     def _direction_at_1730(self, candle: dict) -> str:
         open_ = float(candle.get("open", candle.get("close", 0)) or 0)
-        close = float(candle.get("close", 0) or 0)
+        close = float(candle["close"])
+
         # Green => short PE, else short CE
         return "SHORT_PE" if close > open_ else "SHORT_CE"
 
     def _option_type_for_direction(self, direction: str) -> str:
         return "PE" if direction == "SHORT_PE" else "CE"
+
+    def _resolved_option_type_ce_pe(self, inst: Any) -> str:
+        return self.resolved_option_type_ce_pe(inst)
 
     # ==================================================
     # ML1 CROSS DETECTION (uses stored prev candle close)
@@ -257,16 +317,20 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         symbol = candle["symbol"]
         prev_close = self._last_spot_close_by_symbol.get(symbol)
         curr_close = float(candle["close"])
+        print(">>prev_close", prev_close, ">>current close", curr_close)
         if prev_close is None:
             return False
 
-        opt_type = (position.instrument.option_type or "").upper()
+        opt_side = self._resolved_option_type_ce_pe(position.instrument)
+
         # For short PE position: reverse to CE when spot crosses above ML1
-        if opt_type in ("PE", "PUT"):
+        if opt_side == "PE":
             return prev_close <= ml1 and curr_close > ml1
+            # return curr_close < ml1
         # For short CE position: reverse to PE when spot crosses below ML1
-        if opt_type in ("CE", "CALL"):
+        if opt_side == "CE":
             return prev_close >= ml1 and curr_close < ml1
+            # return curr_close > ml1
         return False
 
     # ==================================================
@@ -275,17 +339,20 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     def _is_sl_triggered(
         self, position: Any, candle: dict, ctx: Any, meta: _PosMeta
     ) -> bool:
-        curr_prem = self.get_option_price_at_candle(
-            candle=candle,
-            ctx=ctx,
-            strike=position.instrument.strike,
-            option_type=position.instrument.option_type,
-            expiry=position.instrument.expiry,
-            trading_symbol=position.instrument.trading_symbol,
-        )
+        curr_prem = self._get_cached_option_price(candle, ctx, position)
         if curr_prem is None:
             return False
         return curr_prem >= meta.entry_premium * (1.0 + SL_PCT)
+
+    def _get_exit_reason(
+        self, position: Any, candle: dict, ctx: Any, meta: _PosMeta
+    ) -> Optional[str]:
+        """SL takes strict priority over reversal when both could apply same candle."""
+        if self._is_sl_triggered(position, candle, ctx, meta):
+            return "SL"
+        if self._is_reversal_cross(position, candle, meta.ml1):
+            return "REVERSAL"
+        return None
 
     # ==================================================
     # ENTRY
@@ -310,236 +377,127 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
 
     def _on_candle_body(self, candle: dict, ctx: Any):
         symbol = candle["symbol"]
+        try:
+            # Commit previous candle close for cross detection.
+            if symbol in self._pending_spot_close_by_symbol:
+                self._last_spot_close_by_symbol[symbol] = (
+                    self._pending_spot_close_by_symbol.pop(symbol)
+                )
 
-        # Commit previous candle close for cross detection.
-        if symbol in self._pending_spot_close_by_symbol:
-            self._last_spot_close_by_symbol[symbol] = (
-                self._pending_spot_close_by_symbol.pop(symbol)
+            spot_key = (symbol, candle["timestamp"])
+            if spot_key not in self._candle_cache:
+                self._candle_cache[spot_key] = {"spot": float(candle["close"])}
+            curr_spot_close = self._candle_cache[spot_key]["spot"]
+
+            # Entry lock: block new entries while current lifecycle is still in flight.
+            if self._has_pending_main_intent(ctx, symbol):
+                self._pending_spot_close_by_symbol[symbol] = curr_spot_close
+                return None
+
+            # Always stage current close for the next candle's cross detection.
+            self._pending_spot_close_by_symbol[symbol] = curr_spot_close
+
+            # --------------------------------------------------
+            # Initial entry: only at 17:30 (reversal ENTRY is handled in
+            # on_position_exit after MAIN exit).
+            # --------------------------------------------------
+            if not self.should_enter(candle):
+                return None
+
+            trade_dt = pd.to_datetime(candle["timestamp"]).date()
+            open_positions = ctx.position_store.get_open_positions(
+                underlying=symbol, strategy=self.name
+            )
+            # pdb.set_trace()
+            max_positions = 5
+
+            open_main_positions = [
+                p
+                for p in open_positions
+                if getattr(p, "tag", None) == "MAIN" and getattr(p, "net_qty", 0) != 0
+            ]
+
+            if len(open_main_positions) >= max_positions:
+                return None
+
+            direction = self._direction_at_1730(candle)
+            option_type = self._option_type_for_direction(direction)
+
+            ml1 = float(candle["close"])
+
+            level = 1
+            self._reversal_level_counter[(symbol, trade_dt)] = level
+
+            structure_id = self._build_structure_id(symbol, trade_dt, level)
+
+            if ctx.position_store.has_open_structure(
+                strategy=self.name, structure_id=structure_id, tag="MAIN"
+            ):
+                return None
+
+            has_pending = (
+                ctx.intent_store.has_pending_intent(
+                    strategy=self.name,
+                    structure_id=structure_id,
+                )
+                if getattr(ctx, "intent_store", None)
+                else False
+            )
+            if has_pending:
+                return None
+
+            result = self._get_cached_strike_in_premium_range(
+                candle, ctx, symbol, option_type
             )
 
-        curr_spot_close = float(candle["close"])
+            if result is None:
+                return None
 
-        # --------------------------------------------------
-        # 1) Reversal: if we have an open MAIN and ML1 is crossed,
-        #    open the reverse option from on_candle.
-        # --------------------------------------------------
-        open_positions = ctx.position_store.get_open_positions(
-            underlying=symbol, strategy=self.name
-        )
+            strike, premium, row = result
+            if not strike:
+                return None
 
-        reversal_entry: Optional[Any] = None
-        if open_positions:
-            for pos in open_positions:
-                if (
-                    getattr(pos, "tag", None) != "MAIN"
-                    or getattr(pos, "net_qty", 0) == 0
-                ):
-                    continue
+            expiry = ctx.selected_expiry
 
-                self._restore_odml_meta_from_position(pos, ctx.position_store)
-                meta = self._meta_by_structure_id.get(pos.structure_id)
-                if meta is None:
-                    continue
+            trading_symbol = self.delta_option_trading_symbol(
+                row,
+                float(strike),
+                option_type,
+                str(expiry),
+            )
+            inst = ctx.instrument_store.intent_creation_details(
+                trading_symbol, ctx.exchange, expiry, option_type, strike
+            )
+            if inst is None:
+                return None
 
-                if not self._is_reversal_cross(pos, candle, meta.ml1):
-                    continue
-
-                # If SL triggered, we exit but do NOT reverse.
-                if self._is_sl_triggered(pos, candle, ctx, meta):
-                    continue
-
-                opt_type = (pos.instrument.option_type or "").upper()
-                reverse_option_type = "CE" if opt_type in ("PE", "PUT") else "PE"
-
-                # Next reversal level for this ML1 entry day
-                next_level = (
-                    self._reversal_level_counter.get(
-                        (meta.symbol, meta.entry_date), meta.level
-                    )
-                    + 1
-                )
-                self._reversal_level_counter[(meta.symbol, meta.entry_date)] = (
-                    next_level
-                )
-                new_structure_id = (
-                    f"{self.name}:{meta.symbol}:ML1:{meta.entry_date}:L{next_level}"
-                )
-
-                if ctx.position_store.has_open_structure(
-                    strategy=self.name, structure_id=new_structure_id, tag="MAIN"
-                ):
-                    reversal_entry = None
-                    break
-                if getattr(
-                    ctx, "intent_store", None
-                ) and ctx.intent_store.has_pending_intent(
-                    strategy=self.name,
-                    structure_id=new_structure_id,
-                ):
-                    reversal_entry = None
-                    break
-
-                result = self.find_strike_in_premium_range(
-                    candle,
-                    ctx,
-                    reverse_option_type,
-                    min_prem=TARGET_PREMIUM_MIN,
-                    max_prem=TARGET_PREMIUM_MAX,
-                )
-                if result is None:
-                    reversal_entry = None
-                    break
-
-                strike, premium, row = result
-                if not strike:
-                    reversal_entry = None
-                    break
-
-                expiry = ctx.selected_expiry
-                trading_symbol = self.delta_option_trading_symbol(
-                    row,
-                    float(strike),
-                    reverse_option_type,
-                    str(expiry),
-                )
-                inst = ctx.instrument_store.intent_creation_details(
-                    trading_symbol,
-                    ctx.exchange,
-                    expiry,
-                    reverse_option_type,
-                    strike,
-                )
-                if inst is None:
-                    reversal_entry = None
-                    break
-
-                new_meta = _PosMeta(
-                    symbol=meta.symbol,
-                    entry_date=meta.entry_date,
-                    ml1=meta.ml1,
-                    entry_premium=float(premium),
-                    level=next_level,
-                )
-                reversal_entry = self.map_instrument_to_intent(
-                    inst=inst,
-                    strike_row=row,
-                    strategy=self.name,
-                    side="SELL",
-                    structure_id=new_structure_id,
-                    candle_ts=candle["timestamp"],
-                    tag="MAIN",
-                    symbol=meta.symbol,
-                    action="ENTRY",
-                    metadata_extras=self._strategy_meta_dict(new_meta),
-                )
-                self._meta_by_structure_id[new_structure_id] = new_meta
-                self._exit_reason_by_structure_id.pop(new_structure_id, None)
-                break
-
-        # Always stage current close for the next candle's cross detection.
-        self._pending_spot_close_by_symbol[symbol] = curr_spot_close
-
-        if reversal_entry is not None:
-            return reversal_entry
-
-        # --------------------------------------------------
-        # 2) Initial entry: only at 17:30.
-        # --------------------------------------------------
-        if not self.should_enter(candle):
-            return None
-
-        trade_dt = pd.to_datetime(candle["timestamp"]).date()
-        # Enforce: at most one MAIN structure open for this underlying
-        open_positions = ctx.position_store.get_open_positions(
-            underlying=symbol, strategy=self.name
-        )
-        if any(
-            getattr(p, "tag", None) == "MAIN" and getattr(p, "net_qty", 0) != 0
-            for p in open_positions
-        ):
-            return None
-
-        direction = self._direction_at_1730(candle)
-        option_type = self._option_type_for_direction(direction)
-
-        # ML1 is spot close at 17:30 candle close
-        ml1 = float(candle["close"])
-
-        # Level starts at 1 for this day
-        level = self._reversal_level_counter.get((symbol, trade_dt), 0) + 1
-        self._reversal_level_counter[(symbol, trade_dt)] = level
-
-        structure_id = f"{self.name}:{symbol}:ML1:{trade_dt}:L{level}"
-        if ctx.position_store.has_open_structure(
-            strategy=self.name, structure_id=structure_id, tag="MAIN"
-        ):
-            return None
-
-        has_pending = (
-            ctx.intent_store.has_pending_intent(
+            meta = _PosMeta(
+                symbol=symbol,
+                entry_date=trade_dt,
+                ml1=ml1,
+                entry_premium=float(premium),
+                level=level,
+            )
+            entry_intent = self.map_instrument_to_intent(
+                inst=inst,
+                strike_row=row,
                 strategy=self.name,
+                side="SELL",
                 structure_id=structure_id,
+                candle_ts=candle["timestamp"],
+                tag="MAIN",
+                symbol=symbol,
+                action="ENTRY",
+                metadata_extras=self._strategy_meta_dict(meta),
             )
-            if getattr(ctx, "intent_store", None)
-            else False
-        )
-        if has_pending:
-            return None
+            print(">>entry_intent", entry_intent)
+            self._meta_by_structure_id[structure_id] = meta
+            self._exit_reason_by_structure_id.pop(structure_id, None)
 
-        # Select strike by target premium range for delta excahnage
-        result = self.find_strike_in_premium_range(
-            candle,
-            ctx,
-            option_type,
-            min_prem=TARGET_PREMIUM_MIN,
-            max_prem=TARGET_PREMIUM_MAX,
-        )
-
-        if result is None:
-            return None
-
-        strike, premium, row = result
-        if not strike:
-            return None
-
-        expiry = ctx.selected_expiry
-
-        trading_symbol = self.delta_option_trading_symbol(
-            row,
-            float(strike),
-            option_type,
-            str(expiry),
-        )
-        inst = ctx.instrument_store.intent_creation_details(
-            trading_symbol, ctx.exchange, expiry, option_type, strike
-        )
-        if inst is None:
-            return None
-
-        meta = _PosMeta(
-            symbol=symbol,
-            entry_date=trade_dt,
-            ml1=ml1,
-            entry_premium=float(premium),
-            level=level,
-        )
-        entry_intent = self.map_instrument_to_intent(
-            inst=inst,
-            strike_row=row,
-            strategy=self.name,
-            side="SELL",
-            structure_id=structure_id,
-            candle_ts=candle["timestamp"],
-            tag="MAIN",
-            symbol=symbol,
-            action="ENTRY",
-            metadata_extras=self._strategy_meta_dict(meta),
-        )
-
-        self._meta_by_structure_id[structure_id] = meta
-        self._exit_reason_by_structure_id.pop(structure_id, None)
-
-        return entry_intent
+            return [entry_intent]
+        finally:
+            if len(self._candle_cache) > _CANDLE_CACHE_MAX:
+                self._candle_cache.clear()
 
     # ==================================================
     # EXIT: reverse on ML1 cross, else SL by premium
@@ -555,52 +513,181 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         if ctx is not None:
             self._restore_odml_meta_from_position(position, ctx.position_store)
         meta = self._meta_by_structure_id.get(structure_id)
+        print(">>position", position)
+        print(">>meta", meta)
         if meta is None:
             return False
 
-        # Reversal has priority over SL (either way we exit; SL means "no reversal").
-        if self._is_reversal_cross(position, candle, meta.ml1):
-            self._exit_reason_by_structure_id[structure_id] = "REVERSAL"
+        reason = self._get_exit_reason(position, candle, ctx, meta)
+        if reason:
+            self._exit_reason_by_structure_id[structure_id] = reason
             return True
-
-        if self._is_sl_triggered(position, candle, ctx, meta):
-            self._exit_reason_by_structure_id[structure_id] = "SL"
-            return True
-
         return False
+
+    def on_main_entry_filled(
+        self,
+        *,
+        ctx: Any,
+        instrument: Any,
+        structure_id: Optional[str],
+        intent_id: Optional[str],
+        candle_ts: Any,
+        metadata_extras: Any = None,
+        **_: Any,
+    ) -> List[Any]:
+        """Engine calls after MAIN ENTRY fill; place broker SL when position exists."""
+        del ctx, metadata_extras
+        if not structure_id or not intent_id:
+            return []
+        meta = self._meta_by_structure_id.get(structure_id)
+        if meta is None:
+            return []
+        sl_trigger = float(meta.entry_premium * (1.0 + SL_PCT))
+        ref = SimpleNamespace(
+            instrument=instrument,
+            structure_id=structure_id,
+            intent_id=intent_id,
+            qty=int(getattr(instrument, "lot_size", 0) or 0),
+        )
+        return [self._build_main_sl_intent(ref, sl_trigger, candle_ts, meta.symbol)]
+
+    def on_main_exit_filled(self, **kwargs: Any) -> List[Tuple[Any, dict]]:
+        """Engine calls after MAIN_EXIT fill; emit deferred reversal ENTRY if any."""
+        structure_id = kwargs.get("structure_id")
+        if not structure_id:
+            return []
+        pending = self._pending_reversal_by_exit_structure_id.pop(
+            str(structure_id), None
+        )
+        if pending is None:
+            return []
+        return [(pending.entry_intent, pending.candle)]
 
     def on_position_exit(self, position: Any, candle: dict, ctx: Any):
         structure_id = position.structure_id
+        # Do not treat MAIN_SL (FORCE_EXIT) as blocking; it shares structure_id with MAIN.
         if getattr(ctx, "intent_store", None) and ctx.intent_store.has_pending_intent(
             strategy=self.name,
             structure_id=structure_id,
+            tags=["MAIN_EXIT"],
+            actions=["EXIT"],
         ):
             return []
+
         # Prevent duplicate exit intents if broker fill is delayed
         self._pending_exit_structure_ids.add(structure_id)
 
-        price = self.get_option_price_at_candle(
-            candle=candle,
-            ctx=ctx,
-            strike=position.instrument.strike,
-            option_type=position.instrument.option_type,
-            expiry=position.instrument.expiry,
-            trading_symbol=position.instrument.trading_symbol,
+        price = self._get_cached_option_price(candle, ctx, position)
+        exit_intent = self.create_order_intent(
+            inst=position.instrument,
+            side="BUY" if position.net_qty < 0 else "SELL",
+            qty=abs(position.net_qty),
+            price=price,
+            order_type="LIMIT",
+            strategy=self.name,
+            candle_ts=candle["timestamp"],
+            structure_id=position.structure_id,
+            tag="MAIN_EXIT",
+            symbol=candle["symbol"],
+            action="EXIT",
         )
-        return [
-            self.create_order_intent(
-                inst=position.instrument,
-                side="BUY" if position.net_qty < 0 else "SELL",
-                qty=abs(position.net_qty),
-                price=price,
-                strategy=self.name,
-                candle_ts=candle["timestamp"],
-                structure_id=position.structure_id,
-                tag="MAIN_EXIT",
-                symbol=candle["symbol"],
-                action="EXIT",
-            )
-        ]
+
+        meta = self._meta_by_structure_id.get(structure_id)
+        reason = self._exit_reason_by_structure_id.get(structure_id)
+
+        if reason != "REVERSAL" or meta is None:
+            return [exit_intent]
+
+        opt_side = self._resolved_option_type_ce_pe(position.instrument)
+        if opt_side not in ("PE", "CE"):
+            return [exit_intent]
+        reverse_option_type = "CE" if opt_side == "PE" else "PE"
+
+        next_level = (
+            self._reversal_level_counter.get((meta.symbol, meta.entry_date), meta.level)
+            + 1
+        )
+        if next_level > MAX_REVERSALS:
+            return [exit_intent]
+
+        structure_id_new = self._build_structure_id(
+            meta.symbol, meta.entry_date, next_level
+        )
+
+        if ctx.position_store.has_open_structure(
+            strategy=self.name, structure_id=structure_id_new, tag="MAIN"
+        ):
+            return [exit_intent]
+        if getattr(ctx, "intent_store", None) and ctx.intent_store.has_pending_intent(
+            strategy=self.name,
+            structure_id=structure_id_new,
+            tags=["MAIN"],
+            actions=["ENTRY"],
+        ):
+            return [exit_intent]
+
+        result = self._get_cached_strike_in_premium_range(
+            candle, ctx, meta.symbol, reverse_option_type
+        )
+        if not result:
+            return [exit_intent]
+        strike, premium, row = result
+        if not strike:
+            return [exit_intent]
+
+        expiry = ctx.selected_expiry
+        trading_symbol = self.delta_option_trading_symbol(
+            row,
+            float(strike),
+            reverse_option_type,
+            str(expiry),
+        )
+        inst = ctx.instrument_store.intent_creation_details(
+            trading_symbol,
+            ctx.exchange,
+            expiry,
+            reverse_option_type,
+            strike,
+        )
+        if inst is None:
+            return [exit_intent]
+
+        self._reversal_level_counter[(meta.symbol, meta.entry_date)] = next_level
+
+        new_meta = _PosMeta(
+            symbol=meta.symbol,
+            entry_date=meta.entry_date,
+            ml1=meta.ml1,
+            entry_premium=float(premium),
+            level=next_level,
+        )
+        entry_intent = self.map_instrument_to_intent(
+            inst=inst,
+            strike_row=row,
+            strategy=self.name,
+            side="SELL",
+            structure_id=structure_id_new,
+            candle_ts=candle["timestamp"],
+            tag="MAIN",
+            symbol=meta.symbol,
+            action="ENTRY",
+            metadata_extras=self._strategy_meta_dict(new_meta),
+        )
+        self._meta_by_structure_id[structure_id_new] = new_meta
+        self._exit_reason_by_structure_id.pop(structure_id_new, None)
+
+        self._pending_reversal_by_exit_structure_id[structure_id] = _PendingReversal(
+            entry_intent=entry_intent,
+            candle={
+                "symbol": meta.symbol,
+                "timestamp": candle["timestamp"],
+                "close": float(candle.get("close", 0) or 0),
+                "open": candle.get("open"),
+                "exchange": candle.get("exchange"),
+            },
+        )
+
+        return [exit_intent]
 
     # ==================================================
     # CLEANUP: remove cached ML1/meta for exited structures
@@ -610,3 +697,19 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         self._pending_exit_structure_ids.discard(structure_id)
         self._exit_reason_by_structure_id.pop(structure_id, None)
         self._meta_by_structure_id.pop(structure_id, None)
+
+    def on_forced_exit(self, **kwargs):
+        """Broker-driven close (liquidation, external reduce-only); keeps strategy state in sync."""
+        structure_id = kwargs.get("structure_id")
+        if not structure_id:
+            return
+        self._pending_reversal_by_exit_structure_id.pop(str(structure_id), None)
+        position_closed = bool(kwargs.get("position_closed"))
+        reason = str(
+            kwargs.get("exit_reason") or kwargs.get("execution_source") or "FORCED"
+        )
+        if position_closed:
+            self.on_structure_exit(structure_id=structure_id)
+        else:
+            self._exit_reason_by_structure_id[structure_id] = reason
+            self._pending_exit_structure_ids.discard(structure_id)

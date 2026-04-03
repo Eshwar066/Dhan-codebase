@@ -25,7 +25,6 @@ import os
 import socket
 import threading
 import time
-import pdb
 from typing import Any, Callable, Dict, List, Optional
 
 import websocket
@@ -138,6 +137,8 @@ class DeltaWebSocket:
         self._orders: Dict[str, List[Dict]] = {}
         self._positions: Dict[str, Dict] = {}
         self._ws_msg_sample_count = 0
+        # Incremented on each successful WebSocket open (incl. reconnect); feeds use to re-apply L2 subs.
+        self._connect_generation = 0
 
     def _send(self, payload: Dict) -> None:
         if self._ws and self._ws.sock and self._ws.sock.connected:
@@ -417,6 +418,8 @@ class DeltaWebSocket:
 
     def _on_open(self, _ws) -> None:
         self._connect_failures = 0  # reset on successful connect
+        with self._lock:
+            self._connect_generation += 1
         logger.info("Delta WebSocket connected to %s", self.ws_url)
         self._enable_heartbeat()
         timestamp, signature = _ws_signature(self.api_secret)
@@ -570,7 +573,21 @@ class DeltaWebSocket:
 
     def get_last_l2_orderbook(self, symbol: str) -> Optional[Dict]:
         with self._lock:
-            return self._last_l2.get(symbol) or self._last_orderbook_l2.get(symbol)
+            if not symbol:
+                return None
+            s = str(symbol).strip()
+            su = s.upper()
+            return (
+                self._last_l2.get(s)
+                or self._last_orderbook_l2.get(s)
+                or self._last_l2.get(su)
+                or self._last_orderbook_l2.get(su)
+            )
+
+    @property
+    def connect_generation(self) -> int:
+        with self._lock:
+            return int(self._connect_generation)
 
     def get_orders(self, symbol: str) -> List[Dict]:
         with self._lock:

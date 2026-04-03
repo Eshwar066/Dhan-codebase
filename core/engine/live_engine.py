@@ -24,6 +24,7 @@ from core.engine.live_engine_common import (
     DEFAULT_FEED_STALE_SECONDS,
     LiveEngineHelpersMixin,
 )
+from core.data.candle_aggregator import _resolution_to_seconds
 
 try:
     from logs.engine_logger import REPORTS_DIR
@@ -81,6 +82,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self.position_manager.on_structure_exit = getattr(
             strategy, "on_structure_exit", None
         )
+        self.position_manager.on_forced_exit = getattr(strategy, "on_forced_exit", None)
+        self.position_manager.on_main_entry_fill = self._on_pm_main_entry_fill
+        self.position_manager.on_main_exit_fill = self._on_pm_main_exit_fill
         self.realtime_feed = realtime_feed
         self.tick_queue = tick_queue
         self.candle_aggregator = candle_aggregator
@@ -136,11 +140,150 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 tick = self.instrument_store.get_tick_size(sym)
                 self._tick_cache[sym] = float(tick) if tick is not None else 0.01
 
+        # Largest accepted bar bucket start (unix) per symbol; blocks REST replay / time regression
+        self._max_candle_bucket_unix: Dict[str, int] = {}
+        # After at least one tick-built bar (bucket_ts set), drop REST rows without bucket_ts
+        self._has_seen_aggregator_bucket: Dict[str, bool] = {}
+
+    @staticmethod
+    def _candle_bucket_start_unix(candle: Dict[str, Any]) -> Optional[int]:
+        bt = candle.get("bucket_ts")
+        if bt is not None:
+            try:
+                return int(bt)
+            except (TypeError, ValueError):
+                pass
+        ts = candle.get("timestamp")
+        if isinstance(ts, dt.datetime):
+            return int(ts.timestamp())
+        if isinstance(ts, (int, float)):
+            t = float(ts)
+            if t > 1e12:
+                return int(t / 1e6)
+            return int(t)
+        return None
+
+    def _live_bar_is_stale_or_replay(
+        self, symbol: str, candle: Dict[str, Any], tf: str
+    ) -> bool:
+        """
+        When ticks + CandleAggregator are active, reject:
+        - REST fallback rows without bucket_ts after we have seen real buckets
+        - bar bucket time going backwards (duplicate old bar after restart)
+        - \"last closed\" rows far behind wall clock (stale historical replay)
+        """
+        max_seen = self._max_candle_bucket_unix.get(symbol)
+        bt = candle.get("bucket_ts")
+        bs = self._candle_bucket_start_unix(candle)
+
+        if bt is None and self._has_seen_aggregator_bucket.get(symbol):
+            logger.debug(
+                "Skip %s: missing bucket_ts after live aggregated bars (REST replay)",
+                symbol,
+            )
+            return True
+
+        if bs is None:
+            return False
+
+        if max_seen is not None and bs < max_seen:
+            logger.debug(
+                "Skip %s: non-monotonic bucket %s < max_seen %s",
+                symbol,
+                bs,
+                max_seen,
+            )
+            return True
+
+        tf_sec = max(60, int(_resolution_to_seconds(tf)))
+        age_sec = time.time() - float(bs)
+        stale_sec = max(15 * 60, 5 * tf_sec)
+        if age_sec > stale_sec:
+            logger.debug(
+                "Skip %s: stale bar wall_age=%.0fs > %s (bucket=%s)",
+                symbol,
+                age_sec,
+                stale_sec,
+                bs,
+            )
+            return True
+
+        return False
+
     def build_context(self, candle, recent_candles=None):
         intent_store = getattr(self.order_router, "intent_store", None)
         return super().build_context(
             candle, recent_candles=recent_candles, intent_store=intent_store
         )
+
+    def _underlying_from_strategy_meta(self, metadata_extras: Any) -> Optional[str]:
+        if isinstance(metadata_extras, dict):
+            od = metadata_extras.get("one_day_ml1")
+            if isinstance(od, dict) and od.get("symbol"):
+                return str(od["symbol"])
+        return None
+
+    def _on_pm_main_entry_fill(self, **kwargs: Any) -> None:
+        strategy = kwargs.get("strategy")
+        if strategy != self.strategy.name:
+            return
+        fn = getattr(self.strategy, "on_main_entry_filled", None)
+        if not callable(fn):
+            return
+        meta_ex = kwargs.get("metadata_extras")
+        sym = self._underlying_from_strategy_meta(meta_ex)
+        if not sym and self.symbols:
+            sym = self.symbols[0]
+        if not sym:
+            return
+        ts = kwargs.get("candle_ts")
+        if ts is None:
+            ts = dt.datetime.utcnow()
+        spot = self.get_price_map(sym)
+        if spot is None:
+            spot = 0.0
+        candle = {
+            "symbol": sym,
+            "timestamp": ts,
+            "close": float(spot),
+            "exchange": None,
+        }
+        ctx = self.build_context_only(candle)
+        intents = fn(ctx=ctx, **kwargs) or []
+        risk_manager = getattr(self.order_router, "risk", None)
+        for intent in intents:
+            self._process_entry_like_intent(
+                intent,
+                sym,
+                candle,
+                None,
+                None,
+                risk_manager,
+            )
+
+    def _on_pm_main_exit_fill(self, **kwargs: Any) -> None:
+        strategy = kwargs.get("strategy")
+        if strategy != self.strategy.name:
+            return
+        fn = getattr(self.strategy, "on_main_exit_filled", None)
+        if not callable(fn):
+            return
+        pairs = fn(**kwargs) or []
+        risk_manager = getattr(self.order_router, "risk", None)
+        for intent, candle in pairs:
+            sym = candle.get("symbol")
+            if not sym and self.symbols:
+                sym = self.symbols[0]
+            if not sym:
+                continue
+            self._process_entry_like_intent(
+                intent,
+                sym,
+                candle,
+                None,
+                None,
+                risk_manager,
+            )
 
     def _graceful_shutdown_handler(self, signum: int, frame: Any) -> None:
         """Per-engine: set flag so main loop exits; snapshot and flush in loop or on exit."""
@@ -217,17 +360,77 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             )
 
         strategy_name = getattr(self.strategy, "name", None)
+        intent_store = getattr(self.order_router, "intent_store", None)
+        if intent_store and hasattr(
+            self.position_manager, "rebuild_position_metadata_from_intent_store"
+        ):
+            self.position_manager.rebuild_position_metadata_from_intent_store(
+                intent_store
+            )
+            if hasattr(
+                self.position_manager, "rebuild_structure_slices_from_intent_store"
+            ):
+                self.position_manager.rebuild_structure_slices_from_intent_store(
+                    intent_store
+                )
         self.position_manager.reconcile_with_broker(
             resolved_broker_positions, strategy=strategy_name
         )
-        if (
-            self._open_positions_logger is not None
-            and self.run_mode == RunMode.LIVE
-        ):
+        if self._open_positions_logger is not None and self.run_mode == RunMode.LIVE:
             self._open_positions_logger.record_broker_reconcile_snapshot(
                 self.position_manager
             )
+        self._ensure_broker_sl_after_reconcile()
         return True
+
+    def _ensure_broker_sl_after_reconcile(self) -> None:
+        """If MAIN is open but MAIN_SL was never armed (reconcile / fill race), place SL once."""
+        if self.run_mode != RunMode.LIVE:
+            return
+        strategy_name = getattr(self.strategy, "name", None)
+        if not strategy_name:
+            return
+        intent_store = getattr(self.order_router, "intent_store", None)
+        if not intent_store:
+            return
+        restore = getattr(self.strategy, "_restore_odml_meta_from_position", None)
+        for sym, pos in list(self.position_manager.positions.items()):
+            if int(pos.net_qty or 0) == 0:
+                continue
+            if getattr(pos, "strategy", None) != strategy_name:
+                continue
+            if str(getattr(pos, "tag", "") or "").upper() != "MAIN":
+                continue
+            struct_id = getattr(pos, "structure_id", None)
+            if not struct_id:
+                continue
+            if intent_store.has_pending_intent(
+                strategy_name,
+                struct_id,
+                tags=["MAIN_SL"],
+                actions=["FORCE_EXIT"],
+            ):
+                continue
+            if callable(restore):
+                try:
+                    restore(pos, self.position_manager)
+                except Exception:
+                    pass
+            meta_bucket = self.position_manager.get_position_metadata(sym) or {}
+            self._on_pm_main_entry_fill(
+                instrument=pos.instrument,
+                side="SELL" if pos.net_qty < 0 else "BUY",
+                qty=abs(int(pos.net_qty)),
+                price=float(pos.avg_price or 0),
+                strategy=strategy_name,
+                structure_id=struct_id,
+                tag="MAIN",
+                action="ENTRY",
+                candle_ts=None,
+                intent_id=getattr(pos, "intent_id", None)
+                or meta_bucket.get("intent_id"),
+                metadata_extras=meta_bucket.get("strategy_meta"),
+            )
 
     def _do_order_state_check(self) -> None:
         # PAPER: skip broker order comparison (SimulatedBroker has no real orders; avoids false mismatches).
@@ -479,7 +682,18 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         continue
 
                     if use_aggregator:
-                        self._last_evaluated_candle_ts[symbol] = candle.get("bucket_ts")
+                        if self._live_bar_is_stale_or_replay(symbol, candle, tf):
+                            continue
+                        bt_ok = candle.get("bucket_ts")
+                        if bt_ok is not None:
+                            self._last_evaluated_candle_ts[symbol] = bt_ok
+                            self._has_seen_aggregator_bucket[symbol] = True
+                        bs_ok = self._candle_bucket_start_unix(candle)
+                        if bs_ok is not None:
+                            self._max_candle_bucket_unix[symbol] = max(
+                                self._max_candle_bucket_unix.get(symbol, 0),
+                                bs_ok,
+                            )
 
                     if not self.strategy.should_evaluate(candle):
                         continue
@@ -629,6 +843,112 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             except Exception:
                 pass
 
+    def _process_entry_like_intent(
+        self,
+        single_intent,
+        symbol,
+        candle,
+        strategy_time_ms: Optional[float],
+        timeframe: Optional[str],
+        risk_manager,
+    ) -> None:
+        """LIMIT/ENTRY/SL-M and other non-MAIN_EXIT intents (depth-based entry pricing)."""
+        self._log_and_telegram_signal(
+            single_intent,
+            symbol,
+            action=getattr(single_intent, "action", "ENTRY"),
+        )
+
+        if risk_manager and risk_manager.is_engine_blocked():
+            return
+        if symbol not in self._symbol_state:
+            self._symbol_state[symbol] = {
+                "paused": False,
+                "feed_stale": False,
+                "error_count": 0,
+            }
+        if self._symbol_state[symbol].get("paused"):
+            return
+        if not self._within_trading_hours():
+            if self.engine_logger:
+                self.engine_logger.time_window_blocked("Outside allowed trading hours")
+            return
+        signal_kind = str(getattr(single_intent, "action", "ENTRY") or "ENTRY").lower()
+        signal_hash = self._signal_hash(
+            symbol, timeframe or "", candle.get("timestamp"), signal_kind
+        )
+
+        # Dublicate signal blocker ==> tested ✅
+        if self._last_signal_hash_per_symbol.get(symbol) == signal_hash:
+            if self.engine_logger:
+                self.engine_logger.duplicate_signal_blocked(
+                    symbol=symbol, signal_hash=str(signal_hash)
+                )
+            return
+
+        if (
+            self.strategy_timeout_seconds
+            and strategy_time_ms is not None
+            and strategy_time_ms > self.strategy_timeout_seconds * 1000
+        ):
+            if self.engine_logger:
+                self.engine_logger.strategy_timeout(
+                    symbol=symbol,
+                    elapsed_ms=strategy_time_ms,
+                    threshold_ms=self.strategy_timeout_seconds * 1000.0,
+                )
+            return
+
+        side = getattr(single_intent, "side", "").upper()
+        is_buy = side == "BUY"
+
+        trading_sym = getattr(
+            getattr(single_intent, "instrument", None), "trading_symbol", symbol
+        )
+
+        if trading_sym:
+            exec_price = self._entry_price_from_depth(trading_sym, is_buy)
+
+            if exec_price is None:
+                exec_price = getattr(single_intent, "price", None)
+
+            if exec_price is None:
+                exec_price = candle.get("close")
+
+        else:
+            exec_price = (
+                self._entry_price_from_depth(symbol, is_buy)
+                or getattr(single_intent, "price", None)
+                or candle.get("close")
+            )
+        if exec_price is not None:
+            trading_sym = getattr(
+                getattr(single_intent, "instrument", None), "trading_symbol", symbol
+            )
+            self._validate_lot_size(single_intent, trading_sym)
+            self._last_signal_hash_per_symbol[symbol] = signal_hash
+            t0 = time.perf_counter()
+            price_map = {trading_sym: exec_price}
+            self.order_router.process_intent(single_intent, price_map)
+            broker_latency_ms = (time.perf_counter() - t0) * 1000
+            total_ms = (strategy_time_ms or 0) + broker_latency_ms
+            if self.engine_logger and strategy_time_ms is not None:
+                self.engine_logger.latency(
+                    strategy_time_ms=strategy_time_ms,
+                    broker_latency_ms=broker_latency_ms,
+                    total_latency_ms=total_ms,
+                )
+            if total_ms > self.latency_critical_ms:
+                self._latency_critical_count += 1
+                if self._latency_critical_count >= self.latency_critical_cycles:
+                    self._entries_paused_latency = True
+                    if self.engine_logger:
+                        self.engine_logger.latency_critical_pause(
+                            "Latency critical for N cycles; entries paused"
+                        )
+            else:
+                self._latency_critical_count = 0
+
     def _run_strategy(
         self,
         symbol,
@@ -644,6 +964,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         )
         for position in open_positions:
             exit_signal = self.strategy.should_exit(position, candle, ctx)
+            print(">>exit_signal", exit_signal)
             if exit_signal:
                 exit_intents = (
                     self.strategy.on_position_exit(position, candle, ctx) or []
@@ -658,7 +979,25 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             abs(position.net_qty),
                             "Strategy exit",
                         )
-                    for exit_intent in exit_intents:
+                    for raw_intent in exit_intents:
+                        # e.g. OneDayMagicalLine reversal: MAIN_EXIT only here; ENTRY after exit fill
+                        is_main_exit = (
+                            str(getattr(raw_intent, "action", "") or "").upper()
+                            == "EXIT"
+                            and str(getattr(raw_intent, "tag", "") or "").upper()
+                            == "MAIN_EXIT"
+                        )
+                        if not is_main_exit:
+                            self._process_entry_like_intent(
+                                raw_intent,
+                                symbol,
+                                candle,
+                                strategy_time_ms,
+                                timeframe,
+                                risk_manager,
+                            )
+                            continue
+                        exit_intent = raw_intent
                         # Position direction validation: exit side must match position (prevents accidental reversal)
                         if getattr(exit_intent, "side", None) != required_exit_side:
                             exit_intent = dataclasses.replace(
@@ -700,104 +1039,14 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         )
         # pdb.set_trace()
         for single_intent in entry_intents:
-            self._log_and_telegram_signal(
+            self._process_entry_like_intent(
                 single_intent,
                 symbol,
-                action=getattr(single_intent, "action", "ENTRY"),
+                candle,
+                strategy_time_ms,
+                timeframe,
+                risk_manager,
             )
-
-            if risk_manager and risk_manager.is_engine_blocked():
-                return
-            if symbol not in self._symbol_state:
-                self._symbol_state[symbol] = {
-                    "paused": False,
-                    "feed_stale": False,
-                    "error_count": 0,
-                }
-            if self._symbol_state[symbol].get("paused"):
-                return
-            if not self._within_trading_hours():
-                if self.engine_logger:
-                    self.engine_logger.time_window_blocked(
-                        "Outside allowed trading hours"
-                    )
-                return
-            signal_hash = self._signal_hash(
-                symbol, timeframe or "", candle.get("timestamp"), "entry"
-            )
-
-            # Dublicate signal blocker ==> tested ✅
-            if self._last_signal_hash_per_symbol.get(symbol) == signal_hash:
-                if self.engine_logger:
-                    self.engine_logger.duplicate_signal_blocked(
-                        symbol=symbol, signal_hash=str(signal_hash)
-                    )
-                continue
-
-            if (
-                self.strategy_timeout_seconds
-                and strategy_time_ms is not None
-                and strategy_time_ms > self.strategy_timeout_seconds * 1000
-            ):
-                if self.engine_logger:
-                    self.engine_logger.strategy_timeout(
-                        symbol=symbol,
-                        elapsed_ms=strategy_time_ms,
-                        threshold_ms=self.strategy_timeout_seconds * 1000.0,
-                    )
-                return
-
-            side = getattr(single_intent, "side", "").upper()
-            is_buy = side == "BUY"
-
-            trading_sym = getattr(
-                getattr(single_intent, "instrument", None), "trading_symbol", symbol
-            )
-
-            if trading_sym:
-                exec_price = self._entry_price_from_depth(trading_sym, is_buy)
-
-                if exec_price is None:
-                    exec_price = getattr(single_intent, "price", None)
-
-                if exec_price is None:
-                    exec_price = candle.get("close")
-
-                # pdb.set_trace()
-            else:
-                exec_price = (
-                    self._entry_price_from_depth(symbol, is_buy)
-                    or getattr(single_intent, "price", None)
-                    or candle.get("close")
-                )
-            if exec_price is not None:
-                trading_sym = getattr(
-                    getattr(single_intent, "instrument", None), "trading_symbol", symbol
-                )
-                self._validate_lot_size(single_intent, trading_sym)
-                self._last_signal_hash_per_symbol[symbol] = signal_hash
-                t0 = time.perf_counter()
-                price_map = {trading_sym: exec_price}
-                # pdb.set_trace()
-                self.order_router.process_intent(single_intent, price_map)
-                broker_latency_ms = (time.perf_counter() - t0) * 1000
-                total_ms = (strategy_time_ms or 0) + broker_latency_ms
-                if self.engine_logger and strategy_time_ms is not None:
-                    self.engine_logger.latency(
-                        strategy_time_ms=strategy_time_ms,
-                        broker_latency_ms=broker_latency_ms,
-                        total_latency_ms=total_ms,
-                    )
-                if total_ms > self.latency_critical_ms:
-                    self._latency_critical_count += 1
-                    if self._latency_critical_count >= self.latency_critical_cycles:
-                        self._entries_paused_latency = True
-                        if self.engine_logger:
-                            self.engine_logger.latency_critical_pause(
-                                "Latency critical for N cycles; entries paused"
-                            )
-                else:
-                    self._latency_critical_count = 0
 
     def update_risk_metrics(self, symbol, ltp):
         pos = self.position_manager.positions.get(symbol)

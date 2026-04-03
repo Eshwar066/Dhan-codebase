@@ -17,6 +17,7 @@ import calendar
 import pandas as pd
 from datetime import date, timedelta, datetime, timezone
 from typing import Any, List, Optional, Tuple
+
 # India Standard Time (UTC+5:30) for strategy time-of-day filters.
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -84,16 +85,14 @@ class IndiaMktMixins:
         ts_ist = ts.tz_convert(IST)
 
         print("Now IST:", datetime.now(IST))
-        print("Candle IST:", ts_ist)
+        print("Candle IST:", ts_ist, candle)
         if candle is not None:
             print("Raw timestamp:", candle.get("timestamp"))
 
         delay = (datetime.now(IST) - ts_ist.to_pydatetime()).total_seconds()
         lag_limit = getattr(self, "max_signal_lag_seconds", None)
         if lag_limit is not None and lag_limit > 0 and delay > lag_limit:
-            print(
-                f"⚠️ Late signal, skipping (lag {delay:.1f}s > {lag_limit}s)"
-            )
+            print(f"⚠️ Late signal, skipping (lag {delay:.1f}s > {lag_limit}s)")
             return False
 
         sample = next(iter(times))
@@ -105,17 +104,7 @@ class IndiaMktMixins:
             match = current_time in times
 
         print(
-            ">>times",
-            times,
-            ">>UTC ts",
-            ts_utc,
-            ">>IST ts",
-            ts_ist,
-            ">>lag_sec",
-            delay,
-            ">>current_time",
-            current_time,
-            ">>match",
+            ">>>>match",
             match,
         )
         return match
@@ -135,6 +124,7 @@ class IndiaMktMixins:
         side,
         qty,
         price,
+        order_type,
         strategy,
         candle_ts,
         structure_id,
@@ -143,6 +133,7 @@ class IndiaMktMixins:
         action,
         parent_intent_id=None,
         metadata_extras=None,
+        trigger_price=None,
     ):
         return OrderIntent(
             intent_id=uuid.uuid4().hex,
@@ -150,7 +141,7 @@ class IndiaMktMixins:
             side=side,
             qty=int(inst.lot_size),
             price=price,
-            order_type="LIMIT",
+            order_type=order_type,
             strategy=strategy,
             structure_id=structure_id,
             trade_type="MARGIN",
@@ -160,6 +151,7 @@ class IndiaMktMixins:
             symbol=symbol,
             action=action,
             metadata_extras=metadata_extras,
+            trigger_price=trigger_price,
         )
 
     # ==================================================
@@ -386,9 +378,11 @@ class IndiaMktMixins:
         candle_ts,
         symbol,
         action,
+        order_type="LIMIT",
         tag=None,
         parent_intent_id=None,
         metadata_extras=None,
+        trigger_price=None,
     ):
         option_type = inst.option_type
 
@@ -412,7 +406,7 @@ class IndiaMktMixins:
             side=side,
             qty=int(inst.lot_size),
             price=ltp,
-            order_type="LIMIT",
+            order_type=order_type,
             strategy=strategy,
             structure_id=structure_id,
             trade_type="MARGIN",
@@ -422,6 +416,7 @@ class IndiaMktMixins:
             symbol=symbol,
             action=action,
             metadata_extras=metadata_extras,
+            trigger_price=trigger_price,
         )
 
     def map_futures_instrument_to_intent(
@@ -465,6 +460,7 @@ class IndiaMktMixins:
             symbol=symbol,
             action=action,
             metadata_extras=None,
+            trigger_price=None,
         )
 
     # ==================================================
@@ -526,6 +522,7 @@ class IndiaMktMixins:
             side="BUY",
             qty=1,
             price=hedge_price,
+            order_type="LIMIT",
             strategy=self.name,
             candle_ts=candle["timestamp"],
             structure_id=parent_sell_intent.structure_id,
@@ -563,6 +560,7 @@ class IndiaMktMixins:
             side="BUY" if hedge.net_qty < 0 else "SELL",
             qty=abs(hedge.net_qty),
             price=price,
+            order_type="LIMIT",
             strategy=self.name,
             candle_ts=candle["timestamp"],
             structure_id=hedge.structure_id,

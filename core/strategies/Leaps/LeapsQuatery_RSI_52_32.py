@@ -165,6 +165,7 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
                 side="BUY" if position.net_qty < 0 else "SELL",
                 qty=abs(position.net_qty),
                 price=price,
+                order_type="LIMIT",
                 strategy=self.name,
                 candle_ts=candle["timestamp"],
                 structure_id=position.structure_id,

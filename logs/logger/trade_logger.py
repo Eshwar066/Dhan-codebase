@@ -14,6 +14,8 @@ TRADE_LOG_COLUMNS = [
     "pnl",
     "symbol",
     "strategy",
+    "exit_reason",
+    "execution_source",
 ]
 
 

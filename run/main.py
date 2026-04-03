@@ -17,12 +17,18 @@ import logging
 import os
 import sys
 from pathlib import Path
-import pdb
 
-from run.config import RUN_MODE, RunMode, STRATEGY_JOBS, DEFAULT_VENUE
+from run.config import (
+    RUN_MODE,
+    RunMode,
+    STRATEGY_JOBS,
+    DEFAULT_VENUE,
+    DEFAULT_ROOT_LOG_LEVEL,
+    DEFAULT_LIBRARY_LOG_LEVEL,
+)
 
 logger = logging.getLogger(__name__)
-from run.engine_config import EngineConfig
+from run.engine_config import EngineConfig, configure_process_logging
 from core.engine.factory import EngineFactory
 
 
@@ -69,6 +75,8 @@ def job_to_engine_config(job: dict) -> EngineConfig:
         telegram_chat_id=(
             (job.get("telegram") or {}).get("chat_id") if isinstance(job.get("telegram"), dict) else None
         ) or os.getenv("TELEGRAM_CHAT_ID"),
+        root_log_level=str(job.get("log_level") or DEFAULT_ROOT_LOG_LEVEL),
+        library_log_level=str(job.get("library_log_level") or DEFAULT_LIBRARY_LOG_LEVEL),
     )
 
 
@@ -124,9 +132,12 @@ def main():
     if args.venue:
         configs = [c for c in configs if c.broker_name == args.venue]
         if not configs:
+            configure_process_logging(None)
             logger.warning("No enabled jobs for venue %s", args.venue)
             print(f"No enabled jobs for venue {args.venue}")
             sys.exit(0)
+
+    configure_process_logging(configs[0] if configs else None)
 
     mode_summary = ", ".join(f"{c.strategy_name}({c.run_mode.value})" for c in configs)
     print(f"Default run mode: {RUN_MODE.value} | Jobs: {mode_summary}")

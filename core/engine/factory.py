@@ -16,14 +16,13 @@ import queue
 from datetime import datetime
 from pathlib import Path
 from typing import Union
-import pdb
 
 from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
 from run.config import RunMode
-from run.engine_config import EngineConfig
+from run.engine_config import EngineConfig, configure_process_logging
 from core.strategies.registry import STRATEGY_MAP
 from core.engine.base_engine import BaseEngine
 from core.engine.backtest_engine import BacktestEngine
@@ -50,7 +49,7 @@ from core.utils.delta_env import get_delta_credentials
 from core.utils.instruments.instrument_store import InstrumentStore
 from logs.logger.trade_logger import TradeLogger
 from logs.logger.open_positions_logger import OpenPositionsLogger
-from logs.engine_logger import EngineLogger
+from logs.logger.engine_logger import EngineLogger
 
 try:
     from core.universe.equity_universe_service import EquityUniverseService
@@ -69,6 +68,7 @@ class EngineFactory:
         """
         Build engine from config. Backtest vs Live is determined by config.run_mode.
         """
+        configure_process_logging(config)
         if config.run_mode == RunMode.BACKTEST:
             return EngineFactory.create_backtest_engine(config)
         return EngineFactory.create_live_engine(config)
@@ -124,6 +124,7 @@ class EngineFactory:
         )
         broker.set_order_router(order_router)
         position_manager.rebuild_position_metadata_from_intent_store(intent_store)
+        position_manager.rebuild_structure_slices_from_intent_store(intent_store)
 
         # ---------- Universe (DHAN equity strategies only) ----------
         universe_service = EngineFactory._universe_service(
@@ -257,6 +258,7 @@ class EngineFactory:
                 order_router.risk.check_short_option_margin = _margin_check
         broker.set_order_router(order_router)
         position_manager.rebuild_position_metadata_from_intent_store(intent_store)
+        position_manager.rebuild_structure_slices_from_intent_store(intent_store)
         position_manager.rebuild_position_metadata_from_open_positions_csv()
 
         # ---------- Delta: set leverage from config (live only; skip for SimulatedBroker e.g. PAPER) ----------

@@ -20,9 +20,7 @@ def _parse_time(s: str) -> Tuple[int, int]:
     return h, m
 
 
-def _within_trading_hours_utc(
-    now: dt.datetime, windows: List[Tuple[str, str]]
-) -> bool:
+def _within_trading_hours_utc(now: dt.datetime, windows: List[Tuple[str, str]]) -> bool:
     """True if now (UTC) falls within any (start, end) window. Times in 'HH:MM' UTC."""
     if not windows:
         return True
@@ -80,6 +78,7 @@ class LiveEngineHelpersMixin:
         if self.realtime_feed and self.realtime_feed.is_connected():
             ticker = self.realtime_feed.get_last_ticker(symbol)
             if ticker and ticker.get("close") is not None:
+                print(">>exit ticker price ", ticker["close"])
                 return ticker["close"]
         if self.data:
             candles = self.data.get_latest_candles([symbol])
@@ -95,6 +94,8 @@ class LiveEngineHelpersMixin:
 
     def _entry_price_from_depth(self, symbol: str, is_buy: bool):
         bid, ask = self._get_bid_ask(symbol)
+
+        print(">>entry ask, bid", symbol, ask, bid)
         if not self._is_spread_acceptable(bid, ask):
             return None
         tick = self._get_tick_size(symbol)
@@ -108,6 +109,7 @@ class LiveEngineHelpersMixin:
 
     def _exit_price_from_depth(self, symbol: str, is_sell: bool):
         bid, ask = self._get_bid_ask(symbol)
+        print(">exxit bid and ask", symbol, bid, ask)
         if not self._is_spread_acceptable(bid, ask):
             return None
         tick = self._get_tick_size(symbol)

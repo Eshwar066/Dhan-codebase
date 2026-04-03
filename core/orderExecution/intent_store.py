@@ -2,6 +2,7 @@ import threading
 import time
 import uuid
 from enum import Enum
+from typing import Iterable, List, Optional, Union
 
 #  idempotency_key = hash(strategy + symbol + candle_time + signal)
 
@@ -129,12 +130,42 @@ class IntentStore:
     # -------------------------
     # PENDING INTENT CHECK (for strategy duplicate-signal guard)
     # -------------------------
-    def has_pending_intent(self, strategy: str, structure_id: str) -> bool:
-        """True if any intent in SENT or VALIDATED matches strategy and structure_id.
-        structure_id is expected as \"StrategyName:SYMBOL:FLAT\"; symbol is matched from payload."""
+    @staticmethod
+    def _upper_set(
+        vals: Optional[Union[str, Iterable[str]]],
+    ) -> Optional[List[str]]:
+        """Normalize tag/action filter to a list of upper-case strings; None => no filter."""
+        if vals is None:
+            return None
+        if isinstance(vals, str):
+            return [vals.strip().upper()]
+        out: List[str] = []
+        for v in vals:
+            if v is None:
+                continue
+            s = str(v).strip().upper()
+            if s:
+                out.append(s)
+        return out or None
+
+    def has_pending_intent(
+        self,
+        strategy: str,
+        structure_id: str,
+        tags: Optional[Union[str, Iterable[str]]] = None,
+        actions: Optional[Union[str, Iterable[str]]] = None,
+    ) -> bool:
+        """True if any in-flight intent matches strategy + structure (and optional tag/action).
+
+        Lifecycle vs risk: same ``structure_id`` is shared by MAIN and MAIN_SL on Delta, so
+        callers that guard duplicate MAIN_EXIT should pass
+        ``tags=[\"MAIN_EXIT\"], actions=[\"EXIT\"]`` instead of matching all pendings.
+        """
         pending = list(self.list_by_status(IntentStatus.SENT)) + list(
             self.list_by_status(IntentStatus.VALIDATED)
         )
+        tag_filter = self._upper_set(tags)
+        action_filter = self._upper_set(actions)
         # Parse symbol from structure_id "StrategyName:SYMBOL:FLAT"
         parts = (structure_id or "").split(":")
         sym = parts[1] if len(parts) >= 2 else None
@@ -142,10 +173,20 @@ class IntentStore:
             p = i.get("payload") or {}
             if p.get("strategy_id") != strategy:
                 continue
-            if sym is not None and p.get("symbol") == sym:
-                return True
-            if p.get("structure_id") == structure_id:
-                return True
+            struct_match = p.get("structure_id") == structure_id
+            sym_match = sym is not None and p.get("symbol") == sym
+            if not struct_match and not sym_match:
+                continue
+
+            if tag_filter is not None:
+                rec_tag = str(p.get("tag") or "").strip().upper()
+                if rec_tag not in tag_filter:
+                    continue
+            if action_filter is not None:
+                rec_action = str(p.get("action") or "").strip().upper()
+                if rec_action not in action_filter:
+                    continue
+            return True
         return False
 
     # -------------------------

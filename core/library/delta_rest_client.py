@@ -148,6 +148,11 @@ class DeltaRestClient:
         response = self.request("POST", "/v2/orders", order, auth=True)
         return parseResponse(response)
 
+    def place_bracket_order(self, payload):
+        """Place bracket TP/SL order via /v2/orders/bracket."""
+        response = self.request("POST", "/v2/orders/bracket", payload, auth=True)
+        return parseResponse(response)
+
     def batch_cancel(self, product_id, orders):
         response = self.request(
             "DELETE",
@@ -238,41 +243,6 @@ class DeltaRestClient:
         """Cancel order using a pre-built payload (e.g. from cancel_order_format)."""
         response = self.request("DELETE", "/v2/orders", payload, auth=True)
         return parseResponse(response)
-
-    def place_stop_order(
-        self,
-        product_id,
-        size,
-        side,
-        stop_price=None,
-        limit_price=None,
-        trail_amount=None,
-        order_type=OrderType.LIMIT,
-        isTrailingStopLoss=False,
-    ):
-        order = {
-            "product_id": product_id,
-            "size": int(size),
-            "side": side,
-            "order_type": order_type.value,
-            "stop_order_type": "stop_loss_order",
-        }
-        if order_type.value == "limit_order":
-            if limit_price is None:
-                raise Exception("limit_price is nil")
-            order["limit_price"] = str(limit_price)
-
-        if isTrailingStopLoss is True:
-            if trail_amount is None:
-                raise Exception("trail_amount is nil")
-            order["trail_amount"] = (
-                str(trail_amount) if side == "buy" else str(-1 * trail_amount)
-            )
-        else:
-            if stop_price is None:
-                raise Exception("stop_price is nil")
-            order["stop_price"] = str(stop_price)
-        return self.create_order(order)
 
     def place_order(
         self,

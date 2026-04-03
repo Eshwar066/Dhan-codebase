@@ -32,3 +32,5 @@ class OrderIntent:
     parent_intent_id: str | None = None
     # Optional JSON-serializable blob (e.g. strategy ML1 state); stored on intent payload as strategy_meta
     metadata_extras: Optional[dict[str, Any]] = None
+    # Optional trigger price for stop orders (SL / SL-M / STOP*)
+    trigger_price: float | None = None

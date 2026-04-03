@@ -56,6 +56,10 @@ class OrderRouter:
         engine_id: Optional[str] = None,
         strategy_id: Optional[str] = None,
         telegram_alert: OptionalAlert = None,
+        # Orphan fill sync (no intent match): ignore stale / pre-session broker rows
+        max_orphan_fill_age_seconds: Optional[float] = 300,
+        reject_orphan_fills_before_oms_session: bool = True,
+        reject_orphan_fill_if_predates_position_open: bool = True,
     ):
         self.risk = risk_manager
         self.broker = broker
@@ -69,6 +73,13 @@ class OrderRouter:
         self.engine_id = engine_id
         self.strategy_id = strategy_id
         self.telegram_alert = telegram_alert
+        self.max_orphan_fill_age_seconds = max_orphan_fill_age_seconds
+        self.reject_orphan_fills_before_oms_session = (
+            reject_orphan_fills_before_oms_session
+        )
+        self.reject_orphan_fill_if_predates_position_open = (
+            reject_orphan_fill_if_predates_position_open
+        )
         self._consecutive_failures = 0
         # Order state cache: intent_id -> OrderState. Persisted to logs/order_state_{engine_id}.json.
         self._order_state: Dict[str, OrderState] = {}
@@ -77,12 +88,21 @@ class OrderRouter:
         # Trade-led: only apply each trade once; positions = f(trades), not f(order state)
         self._processed_trade_ids: Set[str] = set()
         self._processed_trade_ids_max = 10000
+        # EXTERNAL_CLOSE: additive confidence (see _external_close_confidence_score)
+        self._orphan_close_score_threshold = 6
+        self._orphan_close_suspect_floor = 5
         _logs_dir = Path(__file__).resolve().parents[2] / "logs"
         _logs_dir.mkdir(parents=True, exist_ok=True)
         _safe_id = (engine_id or "default").replace(" ", "_").replace("/", "_")
         self._order_state_file = _logs_dir / f"order_state_{_safe_id}.json"
         self._load_order_state()
         self._rebuild_order_state_cache()
+        # Fills before this instant are ignored for orphan EXTERNAL_CLOSE / LIQUIDATION / ADL paths.
+        self._oms_session_start_unix = time.time()
+
+    def reset_oms_session_boundary(self) -> None:
+        """Call when starting a new trading session (same process) to tighten orphan fill acceptance."""
+        self._oms_session_start_unix = time.time()
 
     def _load_order_state(self) -> None:
         """Load intent_id -> OrderState and optional action log from logs/order_state_{engine_id}.json."""
@@ -507,9 +527,9 @@ class OrderRouter:
             elif now - last_price_ts < stale_seconds:
                 continue
 
-            symbol = (rec.get("payload") or {}).get("symbol") or ""
-            if not symbol:
-                symbol = getattr(rec.get("instrument"), "trading_symbol", "") or ""
+            symbol = self._instrument_trading_symbol(rec.get("instrument")) or (
+                (rec.get("payload") or {}).get("symbol") or ""
+            )
             if not symbol:
                 if self.engine_logger:
                     self.engine_logger.log(
@@ -719,11 +739,19 @@ class OrderRouter:
 
         # 2. Missing: In local pending but not on broker open list
         # Usually FILLED/REJECTED/CANCELLED. Only poll broker when cache doesn't have terminal state.
-        missing = [
-            i
-            for i in local_pending
-            if i.get("intent_id") and i.get("intent_id") not in broker_tags
-        ]
+        missing = []
+        for i in local_pending:
+            intent_id = i.get("intent_id")
+            if not intent_id or intent_id in broker_tags:
+                continue
+            payload = i.get("payload") or {}
+            action = str(payload.get("action") or i.get("action") or "").upper()
+            # FORCE_EXIT (broker-side SL/trigger) may be absent from open/fills APIs
+            # until trigger/execution. If broker acknowledged with order_id, keep it
+            # as valid pending instead of flagging as missing every reconcile cycle.
+            if action == "FORCE_EXIT" and i.get("broker_order_id"):
+                continue
+            missing.append(i)
         missing_needing_poll = [
             i
             for i in missing
@@ -799,19 +827,8 @@ class OrderRouter:
                                 "instrument"
                             )  # If stored in dict; depends on intent_store implementation
 
-                            self._set_order_state(
-                                tag,
-                                OrderState.FILLED,
-                                action="sync_filled",
-                                message="Syncing fill discovered via polling",
-                            )
-                            self.intent_store.update(
-                                tag,
-                                IntentStatus.FILLED,
-                                broker_order_id=order.get("order_id"),
-                                order_state=OrderState.FILLED,
-                            )
-
+                            # Apply fill FIRST. Do not mark intent FILLED before process_fill:
+                            # process_fill used to see FILLED + skip, so on_fill never ran (no PM, no SL).
                             if self.position_manager:
                                 self.process_fill(
                                     instrument=i.get("instrument"),
@@ -829,6 +846,18 @@ class OrderRouter:
                                     candle_ts=i.get("candle_ts"),
                                     action=i.get("action"),
                                 )
+                            self._set_order_state(
+                                tag,
+                                OrderState.FILLED,
+                                action="sync_filled",
+                                message="Syncing fill discovered via polling",
+                            )
+                            self.intent_store.update(
+                                tag,
+                                IntentStatus.FILLED,
+                                broker_order_id=order.get("order_id"),
+                                order_state=OrderState.FILLED,
+                            )
 
                         elif status in ("cancelled", "rejected", "expired"):
                             ost = (
@@ -919,6 +948,196 @@ class OrderRouter:
 
         return True, {}
 
+    @staticmethod
+    def _instrument_trading_symbol(inst: Any) -> str:
+        """Resolve PM/broker symbol from an Instrument instance or serialized dict."""
+        if inst is None:
+            return ""
+        ts = getattr(inst, "trading_symbol", None)
+        if ts:
+            return str(ts).strip()
+        if isinstance(inst, dict):
+            d = inst
+            return str(
+                d.get("trading_symbol")
+                or d.get("tradingsymbol")
+                or d.get("tradingSymbol")
+                or d.get("symbol")
+                or ""
+            ).strip()
+        return ""
+
+    def _terminal_fill_reflected_in_pm(
+        self,
+        instrument,
+        side: str,
+        qty: int,
+        action: Optional[str],
+        intent_id: Optional[str],
+        structure_id: Optional[str] = None,
+    ) -> bool:
+        """
+        True only if PositionManager already matches this terminal fill — safe to skip a duplicate
+        broker callback. For ENTRY, prefers structure_id slice match (intent-centric), then legacy net match.
+        """
+        if not self.position_manager or instrument is None:
+            return False
+        sym = self._instrument_trading_symbol(instrument)
+        if not sym:
+            return False
+        act = str(action or "").upper()
+        q = int(qty)
+        sd = str(side or "").upper()
+        net = int(self.position_manager.get_qty(sym))
+        pos = self.position_manager.positions.get(sym)
+
+        if act == "ENTRY":
+            signed_exp = -q if sd == "SELL" else q
+            stid = str(structure_id).strip() if structure_id else ""
+            if stid:
+                slice_q = self.position_manager.get_structure_slice(sym, stid)
+                if slice_q != 0 and slice_q == signed_exp:
+                    if not intent_id:
+                        return False
+                    pid = getattr(pos, "intent_id", None) if pos else None
+                    pm_mid = (
+                        self.position_manager.position_metadata.get(sym) or {}
+                    ).get("intent_id")
+                    if pid and str(pid) != str(intent_id):
+                        return False
+                    if not pid and pm_mid and str(pm_mid) != str(intent_id):
+                        return False
+                    if not pid and not pm_mid:
+                        return False
+                    return True
+            if net == 0:
+                return False
+            if sd == "SELL":
+                ok = net == -q
+            elif sd == "BUY":
+                ok = net == q
+            else:
+                return False
+            if not ok:
+                return False
+            if not intent_id:
+                return False
+            pid = getattr(pos, "intent_id", None) if pos else None
+            pm_mid = (self.position_manager.position_metadata.get(sym) or {}).get(
+                "intent_id"
+            )
+            if pid and str(pid) != str(intent_id):
+                return False
+            if not pid and pm_mid and str(pm_mid) != str(intent_id):
+                return False
+            if not pid and not pm_mid:
+                return False
+            return True
+
+        if act in ("EXIT", "FORCE_EXIT"):
+            return net == 0
+
+        return False
+
+    def _adopt_main_entry_shadow_fill(
+        self,
+        instrument,
+        intent: Dict[str, Any],
+        intent_id: str,
+        side: str,
+        qty: int,
+        price: float,
+        order_id: Any,
+        trade_id: str,
+    ) -> None:
+        """
+        Broker/reconcile already shows the correct net qty for a MAIN ENTRY, but PM lacked
+        intent/metadata (e.g. FILLED was set before on_fill). Attach linkage and run the same
+        on_main_entry_fill hook as a normal open — does not change net_qty.
+        """
+        sym = self._instrument_trading_symbol(instrument)
+        if not sym or not self.position_manager:
+            return
+        payload = intent.get("payload") or {}
+        strategy = intent.get("strategy") or payload.get("strategy_id")
+        structure_id = intent.get("structure_id") or payload.get("structure_id")
+        tag = intent.get("tag") or payload.get("tag") or "MAIN"
+        meta_extras = payload.get("strategy_meta")
+        iq = int(qty)
+        signed = -iq if str(side).upper() == "SELL" else iq
+        with self.position_manager._lock:
+            self.position_manager._merge_position_metadata(
+                sym,
+                strategy=strategy,
+                structure_id=structure_id,
+                tag=tag,
+                intent_id=intent_id,
+                metadata_extras=meta_extras,
+            )
+            pos = self.position_manager.positions.get(sym)
+            if pos:
+                if strategy:
+                    pos.strategy = strategy
+                if structure_id:
+                    pos.structure_id = structure_id
+                if tag:
+                    pos.tag = tag
+                pos.intent_id = intent_id
+            if structure_id and str(tag or "").upper() == "MAIN":
+                d = self.position_manager._structure_slices.setdefault(sym, {})
+                sid = str(structure_id)
+                if d.get(sid) in (None, 0):
+                    d[sid] = signed
+        hook = getattr(self.position_manager, "on_main_entry_fill", None)
+        if callable(hook) and str(tag or "").upper() == "MAIN":
+            try:
+                hook(
+                    instrument=instrument,
+                    side=side,
+                    qty=qty,
+                    price=price,
+                    strategy=strategy,
+                    structure_id=structure_id,
+                    tag=tag,
+                    action="ENTRY",
+                    candle_ts=intent.get("candle_ts"),
+                    intent_id=intent_id,
+                    metadata_extras=meta_extras,
+                )
+            except Exception as e:
+                logger.warning("on_main_entry_fill after shadow adopt failed: %s", e)
+        self._set_order_state(
+            intent_id,
+            OrderState.FILLED,
+            action="adopt_main_entry_shadow",
+            message="Metadata + SL hook; qty already at broker",
+        )
+        self.intent_store.update(
+            intent_id,
+            IntentStatus.FILLED,
+            broker_order_id=order_id,
+            order_state=OrderState.FILLED,
+        )
+        self._processed_trade_ids.add(trade_id)
+        if len(self._processed_trade_ids) > getattr(
+            self, "_processed_trade_ids_max", 10000
+        ):
+            self._processed_trade_ids = set(
+                list(self._processed_trade_ids)[
+                    -self._processed_trade_ids_max // 2 :
+                ]
+            )
+        self.position_manager.note_trade_led_fill(sym)
+        self.report_fill(
+            sym,
+            side,
+            int(qty),
+            None,
+            price,
+            order_id=order_id,
+            intent_id=intent_id,
+        )
+
     def process_fill(
         self,
         instrument,
@@ -941,7 +1160,7 @@ class OrderRouter:
         """
         if not self.position_manager:
             self.report_fill(
-                getattr(instrument, "trading_symbol", ""),
+                self._instrument_trading_symbol(instrument),
                 side,
                 qty,
                 expected_price,
@@ -950,11 +1169,81 @@ class OrderRouter:
                 intent_id=intent_id,
             )
             return
-        metadata_extras = None
+        # Skip duplicate callback only when PM already reflects this fill — not merely when
+        # intent_store says FILLED (polling used to set FILLED before process_fill, skipping on_fill).
         if intent_id and self.intent_store:
-            _ir = self.intent_store.get(intent_id)
-            if _ir:
-                metadata_extras = (_ir.get("payload") or {}).get("strategy_meta")
+            rec = self.intent_store.get(intent_id)
+            if rec:
+                st = rec.get("status")
+                stv = getattr(st, "value", st)
+                ord_state = self._order_state.get(intent_id)
+                rec_order_id = rec.get("broker_order_id")
+                same_order = (
+                    order_id is not None
+                    and rec_order_id is not None
+                    and str(order_id) == str(rec_order_id)
+                )
+                action_eff = action or rec.get("action") or (rec.get("payload") or {}).get(
+                    "action"
+                )
+                if str(stv) == "FILLED" and (
+                    ord_state == OrderState.FILLED or ord_state == "FILLED"
+                ):
+                    if same_order or order_id is None:
+                        pay0 = rec.get("payload") or {}
+                        stid0 = rec.get("structure_id") or pay0.get("structure_id")
+                        if self._terminal_fill_reflected_in_pm(
+                            instrument,
+                            side,
+                            int(qty),
+                            str(action_eff or ""),
+                            intent_id,
+                            structure_id=stid0,
+                        ):
+                            if self.engine_logger:
+                                self.engine_logger.log(
+                                    "oms",
+                                    f"Skipping duplicate fill callback for already-filled intent {intent_id}",
+                                )
+                            return
+                        if self.engine_logger:
+                            self.engine_logger.log(
+                                "oms",
+                                f"CRITICAL: intent {intent_id} terminal but PM not updated — applying fill anyway",
+                            )
+        metadata_extras = None
+        _ir = self.intent_store.get(intent_id) if intent_id and self.intent_store else None
+        if _ir:
+            metadata_extras = (_ir.get("payload") or {}).get("strategy_meta")
+        if self.position_manager and intent_id and _ir:
+            pay_pf = _ir.get("payload") or {}
+            act_pf = str(
+                action or _ir.get("action") or pay_pf.get("action") or ""
+            ).upper()
+            tag_pf = str(tag or _ir.get("tag") or pay_pf.get("tag") or "MAIN").upper()
+            stid_pf = structure_id or _ir.get("structure_id") or pay_pf.get("structure_id")
+            sym_pf = self._instrument_trading_symbol(instrument)
+            if (
+                act_pf == "ENTRY"
+                and sym_pf
+                and stid_pf
+                and tag_pf == "MAIN"
+                and self.position_manager.has_structure_slice_open(sym_pf, str(stid_pf))
+                and not self._terminal_fill_reflected_in_pm(
+                    instrument,
+                    side,
+                    int(qty),
+                    act_pf,
+                    intent_id,
+                    structure_id=str(stid_pf),
+                )
+            ):
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "oms",
+                        f"Skipping duplicate MAIN ENTRY fill callback structure_id={stid_pf}",
+                    )
+                return
         position_closed, realized_pnl = self.position_manager.on_fill(
             instrument=instrument,
             side=side,
@@ -968,10 +1257,11 @@ class OrderRouter:
             candle_ts=candle_ts,
             action=action,
             metadata_extras=metadata_extras,
+            execution_source="INTENT",
         )
         if position_closed and realized_pnl is not None:
             self.risk.record_realized_pnl(realized_pnl)
-        sym = getattr(instrument, "trading_symbol", "")
+        sym = self._instrument_trading_symbol(instrument)
         self.report_fill(
             sym,
             side,
@@ -994,6 +1284,8 @@ class OrderRouter:
                 broker_order_id=order_id,
                 order_state=OrderState.FILLED,
             )
+        if self.position_manager and sym:
+            self.position_manager.note_trade_led_fill(sym)
 
     def process_trade(self, trade: Dict[str, Any]) -> bool:
         """
@@ -1026,6 +1318,116 @@ class OrderRouter:
             return False
         if self.position_manager:
             payload = intent.get("payload") or {}
+            action_to_apply = intent.get("action") or payload.get("action") or trade.get("action")
+            action_upper = str(action_to_apply or "").upper()
+            sym = self._instrument_trading_symbol(instrument)
+
+            tag_u = str(intent.get("tag") or payload.get("tag") or "MAIN").upper()
+            stid = (
+                intent.get("structure_id")
+                or payload.get("structure_id")
+                or trade.get("structure_id")
+            )
+            if action_upper == "ENTRY" and sym and tag_u == "MAIN":
+                prev_q = int(self.position_manager.get_qty(sym))
+                if prev_q != 0:
+                    iq = int(size)
+                    exp = -iq if side == "SELL" else iq
+                    if prev_q == exp and not self._terminal_fill_reflected_in_pm(
+                        instrument,
+                        side,
+                        iq,
+                        action_upper,
+                        intent_id,
+                        structure_id=stid,
+                    ):
+                        if self.engine_logger:
+                            self.engine_logger.log(
+                                "oms",
+                                f"Adopting MAIN ENTRY linkage for {sym} intent_id={intent_id} "
+                                f"(qty already at broker; attaching metadata + SL)",
+                            )
+                        self._adopt_main_entry_shadow_fill(
+                            instrument=instrument,
+                            intent=intent,
+                            intent_id=intent_id,
+                            side=side,
+                            qty=iq,
+                            price=price,
+                            order_id=order_id,
+                            trade_id=trade_id,
+                        )
+                        return True
+
+            # Skip ENTRY from fills API only when this intent's ENTRY is already reflected in PM
+            # (true duplicate). Do not skip merely because the symbol is open — that can hide
+            # a never-applied ENTRY after reconcile vs. fill races.
+            if action_upper == "ENTRY" and self._terminal_fill_reflected_in_pm(
+                instrument,
+                side,
+                int(size),
+                action_upper,
+                intent_id,
+                structure_id=stid,
+            ):
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "oms",
+                        f"Skipping duplicate ENTRY trade for {sym} (intent_id={intent_id}) — PM already matches",
+                    )
+                self._processed_trade_ids.add(trade_id)
+                self._set_order_state(
+                    intent_id,
+                    OrderState.FILLED,
+                    action="skip_duplicate_entry_trade",
+                    message="ENTRY trade already in PM",
+                )
+                self.intent_store.update(
+                    intent_id,
+                    IntentStatus.FILLED,
+                    broker_order_id=order_id,
+                    order_state=OrderState.FILLED,
+                )
+                self.position_manager.note_trade_led_fill(sym)
+                return True
+
+            if (
+                action_upper == "ENTRY"
+                and sym
+                and stid
+                and tag_u == "MAIN"
+                and self.position_manager.has_structure_slice_open(sym, str(stid))
+                and not self._terminal_fill_reflected_in_pm(
+                    instrument,
+                    side,
+                    int(size),
+                    action_upper,
+                    intent_id,
+                    structure_id=str(stid),
+                )
+            ):
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "oms",
+                        f"Skipping duplicate MAIN ENTRY for structure_id={stid} on {sym} "
+                        f"(intent_id={intent_id})",
+                    )
+                self._processed_trade_ids.add(trade_id)
+                self._set_order_state(
+                    intent_id,
+                    OrderState.FILLED,
+                    action="skip_duplicate_structure_entry",
+                    message="MAIN ENTRY already open for this structure_id",
+                )
+                self.intent_store.update(
+                    intent_id,
+                    IntentStatus.FILLED,
+                    broker_order_id=order_id,
+                    order_state=OrderState.FILLED,
+                )
+                self.position_manager.note_trade_led_fill(sym)
+                return True
+
             position_closed, realized_pnl = self.position_manager.on_fill(
                 instrument=instrument,
                 side=side,
@@ -1047,10 +1449,11 @@ class OrderRouter:
                 candle_ts=intent.get("candle_ts") or trade.get("candle_ts"),
                 action=intent.get("action") or payload.get("action") or trade.get("action"),
                 metadata_extras=payload.get("strategy_meta"),
+                execution_source="INTENT",
             )
             if position_closed and realized_pnl is not None:
                 self.risk.record_realized_pnl(realized_pnl)
-        sym = getattr(instrument, "trading_symbol", "")
+        sym = self._instrument_trading_symbol(instrument)
         self.report_fill(
             sym, side, int(size), trade.get("expected_price"), price,
             order_id=order_id, intent_id=intent_id,
@@ -1070,6 +1473,462 @@ class OrderRouter:
         self._processed_trade_ids.add(trade_id)
         if len(self._processed_trade_ids) > getattr(self, "_processed_trade_ids_max", 10000):
             self._processed_trade_ids = set(list(self._processed_trade_ids)[-self._processed_trade_ids_max // 2 :])
+        if self.position_manager and sym:
+            self.position_manager.note_trade_led_fill(sym)
+        return True
+
+    @staticmethod
+    def _string_indicates_exchange_liquidation(s: str) -> bool:
+        """
+        True only for explicit liquidation semantics — not bare 'liquid' (matches 'illiquid', etc.).
+        """
+        if not isinstance(s, str) or not s.strip():
+            return False
+        sl = s.lower()
+        if "liquidation" in sl or "liquidated" in sl:
+            return True
+        if "force_liquid" in sl:
+            return True
+        return False
+
+    @staticmethod
+    def _is_delta_liquidation_fill(f: Dict[str, Any]) -> bool:
+        """True if broker fill is an exchange-driven liquidation (no client_order_id / intent)."""
+        if not isinstance(f, dict):
+            return False
+        if f.get("liquidation") is True or f.get("is_liquidation") is True:
+            return True
+        ft = f.get("fill_type") or f.get("type") or ""
+        if isinstance(ft, str) and OrderRouter._string_indicates_exchange_liquidation(ft):
+            return True
+        meta = f.get("meta")
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except (json.JSONDecodeError, TypeError):
+                meta = None
+        if isinstance(meta, dict):
+            for key in ("fill_type", "type", "order_type", "liquidation_type"):
+                v = meta.get(key)
+                if isinstance(v, str) and OrderRouter._string_indicates_exchange_liquidation(v):
+                    return True
+        return False
+
+    @staticmethod
+    def _is_adl_fill(f: Dict[str, Any]) -> bool:
+        """Auto-deleverage close (future-proof; Delta/metadata may expose flags later)."""
+        if not isinstance(f, dict):
+            return False
+        if f.get("adl") is True or f.get("is_adl") is True:
+            return True
+        ft = f.get("fill_type") or f.get("type") or ""
+        if isinstance(ft, str) and (
+            "adl" in ft.lower() or "delever" in ft.lower()
+        ):
+            return True
+        meta = f.get("meta")
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except (json.JSONDecodeError, TypeError):
+                meta = None
+        if isinstance(meta, dict):
+            for key in ("fill_type", "type", "order_type", "liquidation_type"):
+                v = meta.get(key)
+                if isinstance(v, str) and (
+                    "adl" in v.lower() or "delever" in v.lower()
+                ):
+                    return True
+        return False
+
+    def _known_broker_order_ids(self) -> Set[str]:
+        """All broker order IDs we have recorded on intents (own orders)."""
+        out: Set[str] = set()
+        if not self.intent_store or not hasattr(self.intent_store, "intents"):
+            return out
+        try:
+            for rec in self.intent_store.intents.values():
+                bid = rec.get("broker_order_id")
+                if bid is not None and str(bid).strip():
+                    out.add(str(bid).strip())
+        except Exception:
+            pass
+        return out
+
+    def _external_close_confidence_score(
+        self, f: Dict[str, Any], known_order_ids: Set[str]
+    ) -> Tuple[int, Optional[Any]]:
+        """
+        Confidence for treating a fill as EXTERNAL_CLOSE (not boolean) — reduces false positives
+        when the broker drops client_order_id on our own exit orders.
+
+        +2 no client_order_id / tag
+        +2 broker order_id not in known_order_ids
+        +1 reduce_only is True
+        +2 fill direction matches an open leg that would reduce exposure
+        """
+        if not isinstance(f, dict):
+            return 0, None
+        oid = str(f.get("order_id") or f.get("id") or "").strip()
+        cid = str(f.get("client_order_id") or f.get("tag") or "").strip()
+        if cid:
+            return 0, None
+        if not oid or oid in known_order_ids:
+            return 0, None
+        ro = f.get("reduce_only")
+        if ro is False:
+            return 0, None
+        sym = OrderRouter._fill_product_symbol(f)
+        side = (f.get("side") or "").upper()
+        if not sym or side not in ("BUY", "SELL"):
+            return 0, None
+        score = 4
+        if ro is True:
+            score += 1
+        pos = None
+        if self.position_manager:
+            pos = self._find_position_for_external_close(
+                sym, side, float(f.get("size") or 0)
+            )
+        if pos is not None:
+            score += 2
+        return score, pos
+
+    @staticmethod
+    def _fill_product_symbol(f: Dict[str, Any]) -> str:
+        sym = (
+            f.get("product_symbol")
+            or (f.get("product") or {}).get("symbol")
+            or f.get("symbol")
+            or ""
+        )
+        return str(sym).strip()
+
+    #checked
+    @staticmethod
+    def _fill_timestamp_unix(f: Dict[str, Any]) -> Optional[float]:
+        """Parse broker fill time to UTC unix seconds (float). None if missing or unparseable."""
+        raw = f.get("created_at")
+        if raw is None:
+            raw = f.get("filled_at") or f.get("timestamp") or f.get("time")
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            ts = float(raw)
+            if ts > 1e12:
+                ts /= 1000.0
+            return ts
+        if isinstance(raw, str):
+            s = raw.strip()
+            if not s:
+                return None
+            try:
+                uf = float(s)
+                if uf > 1e12:
+                    uf /= 1000.0
+                return uf
+            except ValueError:
+                pass
+            try:
+                iso = s.replace("Z", "+00:00")
+                dt = datetime.datetime.fromisoformat(iso)
+                return dt.timestamp()
+            except (ValueError, TypeError, OSError):
+                return None
+        return None
+
+    def _orphan_fill_fails_time_gates(self, t_fill: Optional[float], order_id: Any) -> bool:
+        """True => do not run orphan EXTERNAL_CLOSE / LIQUIDATION / ADL for this fill."""
+        if t_fill is None:
+            logger.debug(
+                "Orphan fill skipped: no parseable fill time (order_id=%s)",
+                order_id,
+            )
+            return True
+        if self.reject_orphan_fills_before_oms_session:
+            if t_fill + 0.5 < self._oms_session_start_unix:
+                logger.debug(
+                    "Orphan fill skipped: before OMS session start (order_id=%s)",
+                    order_id,
+                )
+                return True
+        if (
+            self.max_orphan_fill_age_seconds is not None
+            and self.max_orphan_fill_age_seconds > 0
+        ):
+            if time.time() - t_fill > self.max_orphan_fill_age_seconds:
+                logger.debug(
+                    "Orphan fill skipped: exceeds max_orphan_fill_age_seconds (order_id=%s)",
+                    order_id,
+                )
+                return True
+        return False
+
+    @staticmethod
+    def _symbol_keys_close_enough(a: str, b: str) -> bool:
+        """Case-insensitive match for option contract symbols (e.g. C-BTC-65000-030426)."""
+        return (a or "").strip().upper() == (b or "").strip().upper()
+
+    def _close_qty_from_fill(self, pos: Any, raw_size: float) -> float:
+        """
+        Contracts to apply for this fill: supports partial liquidation when size is in contracts
+        or in base currency (e.g. BTC) via instrument.contract_multiplier.
+        If reported size is missing (<=0), assume full local leg.
+        """
+        net = abs(float(pos.net_qty))
+        if net <= 0:
+            return 0.0
+        if raw_size <= 0:
+            return net
+        inst = pos.instrument
+        mult = float(getattr(inst, "contract_multiplier", 0) or 0)
+        # Integer contract count from API
+        if raw_size >= 1.0 - 1e-9:
+            q = float(int(round(raw_size)))
+            return min(net, q) if q > 0 else net
+        # Fractional: often base currency (notional) per contract on Delta
+        if mult > 0 and raw_size < net * mult * 4 + 1e-9:
+            contracts = raw_size / mult
+            if contracts > 0:
+                return min(net, float(contracts))
+        # Unparseable small fraction: treat as partial in contract space
+        if 0 < raw_size < 1:
+            return min(net, float(raw_size))
+        return min(net, float(raw_size))
+
+    def _find_position_for_external_close(
+        self,
+        product_symbol: str,
+        fill_side: str,
+        fill_size_raw: float,
+    ) -> Optional[Any]:
+        """
+        Match external close to an open leg. Priority when multiple: exact size, closest size,
+        most recently updated, then highest exposure (|qty|*avg_price*lot_size).
+        """
+        if not self.position_manager or not product_symbol:
+            return None
+        fs = fill_side.upper()
+        if fs not in ("BUY", "SELL"):
+            return None
+
+        candidates = []
+        for sym_key, pos in self.position_manager.positions.items():
+            if pos.net_qty == 0:
+                continue
+            inst_ts = (
+                getattr(pos.instrument, "trading_symbol", "") or ""
+                if pos.instrument
+                else ""
+            )
+            if (
+                not self._symbol_keys_close_enough(sym_key, product_symbol)
+                and not self._symbol_keys_close_enough(inst_ts, product_symbol)
+            ):
+                continue
+            if fs == "BUY" and pos.net_qty >= 0:
+                continue
+            if fs == "SELL" and pos.net_qty <= 0:
+                continue
+            candidates.append(pos)
+
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+
+        def _rank_tuple(pos: Any) -> Tuple[int, float, float, float]:
+            net = abs(float(pos.net_qty))
+            guessed = self._close_qty_from_fill(pos, fill_size_raw)
+            exact_miss = 0 if abs(net - guessed) < 1e-8 else 1
+            dist = abs(net - guessed)
+            last = float(getattr(pos, "last_updated", 0) or 0)
+            exposure = abs(float(pos.net_qty)) * float(pos.avg_price or 0) * float(
+                getattr(pos.instrument, "lot_size", 1) or 1
+            )
+            return (exact_miss, dist, -last, -exposure)
+
+        return sorted(candidates, key=_rank_tuple)[0]
+
+    def _process_external_close_fill(self, f: Dict[str, Any], execution_source: str) -> bool:
+        """
+        Liquidation / ADL / orphan reduce-only fills without intent linkage.
+        execution_source: LIQUIDATION | EXTERNAL_CLOSE | ADL
+        """
+        if not self.position_manager:
+            return False
+        if execution_source not in ("LIQUIDATION", "EXTERNAL_CLOSE", "ADL"):
+            return False
+
+        trade_id = str(
+            f.get("trade_id")
+            or f.get("id")
+            or f"{f.get('order_id', '')}_{f.get('created_at', '')}"
+        )
+        if not trade_id or trade_id in getattr(self, "_processed_trade_ids", set()):
+            return False
+
+        fill_ts = self._fill_timestamp_unix(f)
+        if fill_ts is None:
+            logger.debug(
+                "Orphan close skipped: missing fill timestamp (trade_id=%s)",
+                trade_id,
+            )
+            return False
+
+        price = float(f.get("price") or f.get("average_fill_price") or 0)
+        raw_size = float(f.get("size") or f.get("qty") or 0)
+        if price <= 0:
+            return False
+
+        sym = self._fill_product_symbol(f)
+        side = (f.get("side") or "").upper()
+
+        with self.position_manager._lock:
+            pos = self._find_position_for_external_close(sym, side, raw_size)
+            if not pos or pos.net_qty == 0:
+                if pos is None:
+                    # Expected when: stale fills in get_recent_fills, manual close already flat,
+                    # or another account/session — not actionable for local OMS.
+                    logger.debug(
+                        "Orphan fill skipped (no reducing leg in local book): source=%s symbol=%s side=%s size=%s",
+                        execution_source,
+                        sym,
+                        side,
+                        raw_size,
+                    )
+                return False
+            if self.reject_orphan_fill_if_predates_position_open:
+                et = getattr(pos, "entry_time", None)
+                if et is not None and fill_ts < float(et) - 1.0:
+                    logger.debug(
+                        "Orphan fill skipped: fill before local position open (symbol=%s fill_ts=%s entry_time=%s)",
+                        getattr(pos.instrument, "trading_symbol", sym),
+                        fill_ts,
+                        et,
+                    )
+                    return False
+            inst = pos.instrument
+            sym_ts = getattr(inst, "trading_symbol", sym)
+            close_qty = min(
+                self._close_qty_from_fill(pos, raw_size),
+                abs(float(pos.net_qty)),
+            )
+            prev_signed = int(pos.net_qty)
+            pm_meta = self.position_manager.position_metadata.get(sym_ts) or {}
+            strat = pos.strategy or pm_meta.get("strategy")
+            struct_id = pos.structure_id or pm_meta.get("structure_id")
+            tag = pos.tag or pm_meta.get("tag")
+            intent_id = pos.intent_id or pm_meta.get("intent_id")
+            meta_extras = pm_meta.get("strategy_meta")
+
+        if close_qty <= 0:
+            return False
+
+        exit_reason = {
+            "LIQUIDATION": "LIQUIDATION",
+            "EXTERNAL_CLOSE": "EXTERNAL_CLOSE",
+            "ADL": "ADL",
+        }.get(execution_source, execution_source)
+        order_id = str(f.get("order_id") or f.get("id") or "")
+
+        qty_arg = (
+            int(round(close_qty))
+            if abs(close_qty - round(close_qty)) < 1e-9
+            else close_qty
+        )
+        position_closed, realized_pnl = self.position_manager.on_fill(
+            instrument=inst,
+            side=side,
+            qty=qty_arg,
+            price=price,
+            intent_id=intent_id,
+            order_id=order_id or None,
+            strategy=strat,
+            structure_id=struct_id,
+            tag=tag,
+            candle_ts=None,
+            action="EXIT",
+            metadata_extras=meta_extras,
+            exit_reason=exit_reason,
+            execution_source=execution_source,
+        )
+        np = self.position_manager.positions.get(sym_ts)
+        new_qty = int(np.net_qty) if np else 0
+
+        fn = getattr(self.position_manager, "on_forced_exit", None)
+        debounce_key = struct_id or sym_ts
+        if callable(fn) and self.position_manager.should_emit_forced_exit(
+            debounce_key, position_closed
+        ):
+            try:
+                fn(
+                    instrument=inst,
+                    symbol=sym_ts,
+                    strategy=strat,
+                    structure_id=struct_id,
+                    tag=tag,
+                    intent_id=intent_id,
+                    prev_qty=prev_signed,
+                    new_qty=new_qty,
+                    qty_closed=close_qty,
+                    price=price,
+                    execution_source=execution_source,
+                    exit_reason=exit_reason,
+                    position_closed=position_closed,
+                    order_id=order_id or None,
+                )
+            except Exception as e:
+                logger.warning("on_forced_exit callback failed: %s", e, exc_info=True)
+
+        rec_es = getattr(self.risk, "record_execution_source", None)
+        if callable(rec_es):
+            try:
+                rec_es(
+                    execution_source,
+                    strat,
+                    symbol=sym_ts,
+                    position_closed=position_closed,
+                )
+            except Exception as e:
+                logger.debug("record_execution_source failed: %s", e)
+
+        if position_closed and realized_pnl is not None:
+            self.risk.record_realized_pnl(realized_pnl)
+
+        self.report_fill(
+            sym_ts,
+            side,
+            qty_arg,
+            None,
+            price,
+            order_id=order_id or None,
+            intent_id=intent_id,
+        )
+        if intent_id and self.intent_store:
+            self._set_order_state(
+                intent_id,
+                OrderState.FILLED,
+                action="external_close_fill",
+                message=f"{execution_source} broker_order_id={order_id}",
+            )
+            self.intent_store.update(
+                intent_id,
+                IntentStatus.FILLED,
+                broker_order_id=order_id or None,
+                order_state=OrderState.FILLED,
+            )
+        self._processed_trade_ids.add(trade_id)
+        if len(self._processed_trade_ids) > getattr(self, "_processed_trade_ids_max", 10000):
+            self._processed_trade_ids = set(
+                list(self._processed_trade_ids)[-self._processed_trade_ids_max // 2 :]
+            )
+        self.position_manager.note_trade_led_fill(sym_ts)
+        if self.engine_logger:
+            self.engine_logger.log(
+                "oms",
+                f"Applied {execution_source} fill to {sym_ts} qty={close_qty} intent_id={intent_id or 'none'}",
+            )
         return True
 
     def sync_trades_from_broker(self) -> None:
@@ -1083,15 +1942,18 @@ class OrderRouter:
             fills = self.broker.get_recent_fills(page_size=50)
         except Exception:
             return
-        # Match by broker order_id when fill has no client_order_id (e.g. Delta often returns only order_id)
+        # Match by broker order_id when fill has no client_order_id (e.g. Delta often returns only order_id).
+        # Include FILLED/CANCELLED intents so delayed API rows still map to process_trade (idempotent by trade_id).
         broker_order_id_to_intent: Dict[str, str] = {}
+        known_order_ids = self._known_broker_order_ids()
         try:
-            pending = self.intent_store.list_by_status(IntentStatus.SENT) + self.intent_store.list_by_status(IntentStatus.VALIDATED)
-            for rec in pending:
+            for rec in self.intent_store.intents.values():
                 bid = rec.get("broker_order_id")
                 iid = rec.get("intent_id")
                 if bid is not None and iid:
-                    broker_order_id_to_intent[str(bid)] = iid
+                    k = str(bid).strip()
+                    if k:
+                        broker_order_id_to_intent.setdefault(k, iid)
         except Exception:
             pass
         for f in fills or []:
@@ -1100,21 +1962,60 @@ class OrderRouter:
                 or f.get("tag")
                 or broker_order_id_to_intent.get(str(f.get("order_id") or f.get("id") or ""))
             )
-            if not intent_id:
+            if intent_id and self.intent_store and self.intent_store.get(intent_id):
+                trade = {
+                    "trade_id": f.get("id"),
+                    "id": f.get("id"),
+                    "order_id": str(f.get("order_id") or f.get("id", "")),
+                    "intent_id": intent_id,
+                    "client_order_id": intent_id,
+                    "tag": intent_id,
+                    "price": float(f.get("price") or 0),
+                    "size": float(f.get("size") or 0),
+                    "side": (f.get("side") or "").upper(),
+                    "created_at": f.get("created_at"),
+                }
+                self.process_trade(trade)
                 continue
-            trade = {
-                "trade_id": f.get("id"),
-                "id": f.get("id"),
-                "order_id": str(f.get("order_id") or f.get("id", "")),
-                "intent_id": intent_id,
-                "client_order_id": intent_id,
-                "tag": intent_id,
-                "price": float(f.get("price") or 0),
-                "size": float(f.get("size") or 0),
-                "side": (f.get("side") or "").upper(),
-                "created_at": f.get("created_at"),
-            }
-            self.process_trade(trade)
+
+            t_fill = self._fill_timestamp_unix(f)
+            if self._orphan_fill_fails_time_gates(t_fill, f.get("order_id")):
+                continue
+
+            # Manual / untagged fills: prefer EXTERNAL_CLOSE when a reducing leg exists locally,
+            # before LIQUIDATION — avoids false 'liquid' substring matches stealing the path.
+            exec_src = None
+            score, pos_hint = self._external_close_confidence_score(
+                f, known_order_ids
+            )
+            th = getattr(self, "_orphan_close_score_threshold", 6)
+            sus = getattr(self, "_orphan_close_suspect_floor", 5)
+
+            if self._is_adl_fill(f):
+                exec_src = "ADL"
+            elif score >= th and pos_hint is not None:
+                exec_src = "EXTERNAL_CLOSE"
+            elif self._is_delta_liquidation_fill(f):
+                exec_src = "LIQUIDATION"
+            else:
+                if score >= th and pos_hint is None:
+                    logger.info(
+                        "Orphan-style fill score=%s but no reducing leg; not applying EXTERNAL_CLOSE (order_id=%s symbol=%s)",
+                        score,
+                        f.get("order_id"),
+                        OrderRouter._fill_product_symbol(f),
+                    )
+                elif sus <= score < th:
+                    logger.info(
+                        "Suspect orphan-style fill below EXTERNAL_CLOSE threshold: score=%s (need %s) order_id=%s symbol=%s",
+                        score,
+                        th,
+                        f.get("order_id"),
+                        OrderRouter._fill_product_symbol(f),
+                    )
+
+            if exec_src and self._process_external_close_fill(f, exec_src):
+                continue
         return
 
     def report_fill(

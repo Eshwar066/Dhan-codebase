@@ -13,6 +13,10 @@ RUN_MODE = RunMode.LIVE
 # Default venue when job does not specify "venue". Used for single-venue runs.
 DEFAULT_VENUE = "DHAN"  # "DHAN" | "DELTA"
 
+# Stdlib logging defaults (override with job "log_level" / "library_log_level" or ALGO_LOG_LEVEL / ALGO_LIBRARY_LOG_LEVEL).
+DEFAULT_ROOT_LOG_LEVEL = "INFO"
+DEFAULT_LIBRARY_LOG_LEVEL = "WARNING"
+
 # Per-job run_mode: set "run_mode": "PAPER" or "run_mode": "LIVE" (or "BACKTEST") on each job.
 # If omitted, RUN_MODE above is used. You can run some strategies in paper and others in live in the same process.
 STRATEGY_JOBS = [
@@ -110,13 +114,14 @@ STRATEGY_JOBS = [
         "name": "OneDayMagicalLine",
         "venue": "DELTA",
         "enabled": True,
-        "run_mode": "PAPER",  # uncomment for Delta paper/live; omit for backtest (uses RUN_MODE)
+        "run_mode": "LIVE",  # uncomment for Delta paper/live; omit for backtest (uses RUN_MODE)
         "capital": 200000,
         "symbols": ["BTCUSD"],
         "instrument": "OPTION",
         "delta_india": True,
-        "delta_testnet": False,
+        "delta_testnet": True,
         "delta_leverage": 10,
+        "max_open_positions": 5,
         "check_short_option_margin_enabled": True,
         "telegram": {
             "bot_token": "8389724629:AAHY_CGcBF8HZCexedsEJFw80Mf6SxH5Bkk",

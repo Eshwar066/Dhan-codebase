@@ -67,6 +67,42 @@ class DeltaBrokerApi:
     def get_order_list(self) -> List[Dict[str, Any]]:
         return self._source.get_order_list()
 
+    def place_bracket_stop_loss(
+        self,
+        tradingsymbol: str,
+        quantity: int,
+        transaction_type: str = "BUY",
+        trigger_price: float = 0,
+        price: Optional[float] = None,
+        stop_trigger_method: str = "mark_price",
+        tag: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        product_id = self._source.product_id_for_symbol(tradingsymbol)
+        if product_id is None:
+            return {
+                "status": "error",
+                "order_id": None,
+                "message": f"Unknown symbol: {tradingsymbol}",
+            }
+        side = (transaction_type or "BUY").lower()
+        raw = self._source.place_bracket_stop_loss(
+            product_id=int(product_id),
+            size=int(quantity),
+            side="buy" if side == "buy" else "sell",
+            stop_price=float(trigger_price),
+            limit_price=float(price) if price is not None else None,
+            stop_trigger_method=stop_trigger_method,
+            client_order_id=tag,
+        )
+        sl = (raw or {}).get("stop_loss_order") or {}
+        oid = (
+            sl.get("id")
+            or sl.get("order_id")
+            or (raw or {}).get("id")
+            or (raw or {}).get("order_id")
+        )
+        return {"status": "success", "order_id": str(oid) if oid is not None else None}
+
     def get_orders_history(
         self, page_size: int = 50
     ) -> List[Dict[str, Any]]:

@@ -8,6 +8,7 @@ make_short_option_margin_check(broker) when broker implements check_short_option
 
 import logging
 import time
+from collections import Counter, defaultdict
 from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,9 @@ class RiskManager:
         self.cooldown_seconds = cooldown_seconds
         self.last_trade_time = {}
 
+        # execution_source -> counts per strategy (EXTERNAL_CLOSE, LIQUIDATION, ADL, INTENT, …)
+        self.execution_source_counts: Dict[str, Counter] = defaultdict(Counter)
+
     def is_engine_blocked(self) -> bool:
         """True if kill switch is triggered. Block new entries; exits still allowed."""
         return self._kill_switch_blocked
@@ -93,6 +97,24 @@ class RiskManager:
     def record_realized_pnl(self, amount: float) -> None:
         """Call when a position is closed and PnL is realized (e.g. from PositionManager)."""
         self.daily_realized_pnl += amount
+
+    def record_execution_source(
+        self,
+        execution_source: Optional[str],
+        strategy: Optional[str] = None,
+        *,
+        symbol: Optional[str] = None,
+        position_closed: bool = False,
+    ) -> None:
+        """
+        Aggregate exits by source for risk analytics (liquidation rate, forced vs planned, etc.).
+        """
+        if not execution_source:
+            return
+        key = strategy or "GLOBAL"
+        self.execution_source_counts[key][str(execution_source)] += 1
+        _ = symbol
+        _ = position_closed
 
     def reset_daily(self) -> None:
         """Reset daily PnL (call at start of new trading day)."""
@@ -158,7 +180,10 @@ class RiskManager:
             return False
 
         # 3️⃣ Position count limit
-        open_count = self._open_positions_count()
+        # Only count actual MAIN positions; broker reconcile can temporarily
+        # create non-tagged/unknown positions that must not block the next
+        # valid MAIN ENTRY after a MAIN_EXIT fills.
+        open_count = self._open_positions_count(strategy=strategy)
         if open_count >= self.max_open_positions:
             if self.engine_logger:
                 self.engine_logger.max_positions_blocked(
@@ -252,8 +277,31 @@ class RiskManager:
                 return False
         return True
 
-    def _open_positions_count(self):
-        return sum(1 for p in self.pm.positions.values() if p.net_qty != 0)
+    def _open_positions_count(self, *, strategy: Optional[str] = None) -> int:
+        """
+        Count open positions relevant for `max_open_positions`.
+
+        We intentionally count only `tag == "MAIN"` positions (or "MAIN-like"
+        positions where `tag` is empty but `intent_id` is present). This prevents
+        broker reconciliation artifacts from blocking the next valid entry.
+        """
+        count = 0
+        for p in self.pm.positions.values():
+            if p.net_qty == 0:
+                continue
+            if strategy and getattr(p, "strategy", None) != strategy:
+                continue
+
+            tag_norm = str(getattr(p, "tag", "") or "").upper()
+            if tag_norm == "MAIN":
+                count += 1
+                continue
+
+            # Belt-and-suspenders: if tag is missing but we have intent linkage,
+            # treat it as MAIN-like.
+            if not tag_norm and getattr(p, "intent_id", None):
+                count += 1
+        return count
 
     def _get_event_time(self, candle_ts):
         if candle_ts is None:

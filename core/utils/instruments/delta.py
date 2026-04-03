@@ -7,9 +7,9 @@ import logging
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
-import pdb
 
 import pandas as pd
+import pdb
 
 logger = logging.getLogger(__name__)
 import requests
@@ -87,11 +87,41 @@ class DeltaInstrumentStore(BaseInstrumentStore):
                 pid = row.get("id")
                 if pid is not None:
                     self._symbol_to_row[str(pid)] = row
+                    num = pd.to_numeric(pid, errors="coerce")
+                    if pd.notna(num):
+                        try:
+                            self._symbol_to_row[str(int(num))] = row
+                        except (ValueError, OverflowError):
+                            pass
+
+    def _row_for_contract_key(self, trading_symbol) -> Optional[pd.Series]:
+        """Resolve CSV row by contract symbol or numeric product id (string)."""
+        if trading_symbol is None:
+            return None
+        s = str(trading_symbol).strip()
+        if not s:
+            return None
+        row = self._symbol_to_row.get(s.upper())
+        if row is not None:
+            return row
+        num = pd.to_numeric(s, errors="coerce")
+        if pd.notna(num):
+            try:
+                return self._symbol_to_row.get(str(int(num)))
+            except (ValueError, OverflowError):
+                pass
+        return None
 
     def get_tick_size(self, symbol: str) -> Optional[float]:
         """Return tick size for symbol from product data; None if not found."""
         key = str(symbol).upper()
         row = self._symbol_to_row.get(key)
+        if row is not None:
+            tick = row.get("tick_size")
+            if tick is not None:
+                v = pd.to_numeric(tick, errors="coerce")
+                return None if pd.isna(v) else float(v)
+        row = self._row_for_contract_key(symbol)
         if row is not None:
             tick = row.get("tick_size")
             if tick is not None:
@@ -103,6 +133,13 @@ class DeltaInstrumentStore(BaseInstrumentStore):
         """Return lot size for symbol from product data; None if not found. Delta often uses 1."""
         key = str(symbol).upper()
         row = self._symbol_to_row.get(key)
+        if row is not None:
+            lot = row.get("lot_size")
+            if lot is not None:
+                v = pd.to_numeric(lot, errors="coerce")
+                if pd.notna(v) and v >= 1:
+                    return int(v)
+        row = self._row_for_contract_key(symbol)
         if row is not None:
             lot = row.get("lot_size")
             if lot is not None:
@@ -140,8 +177,7 @@ class DeltaInstrumentStore(BaseInstrumentStore):
     def intent_creation_details(
         self, trading_symbol, exchange, expiry, option_type, strike
     ) -> Optional[Instrument]:
-        key = (str(trading_symbol)).upper()
-        row = self._symbol_to_row.get(key)
+        row = self._row_for_contract_key(trading_symbol)
         if row is not None:
             return self._row_to_instrument(row)
 
@@ -167,8 +203,7 @@ class DeltaInstrumentStore(BaseInstrumentStore):
     def futures_intent_creation_details(
         self, trading_symbol: str, exchange: str, expiry
     ) -> Optional[Instrument]:
-        key = (str(trading_symbol)).upper()
-        row = self._symbol_to_row.get(key)
+        row = self._row_for_contract_key(trading_symbol)
         if row is not None:
             return self._row_to_instrument(row)
 

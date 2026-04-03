@@ -30,6 +30,8 @@ FIELDNAMES = [
     "structure_id",
     "tag",
     "intent_id",
+    "ml1",
+    "level",
     "strategy_meta",
 ]
 
@@ -132,15 +134,15 @@ class OpenPositionsLogger:
         self._path = os.path.join(log_dir, f"{self.engine_id}_open_positions.csv")
         self._lock = threading.Lock()
         os.makedirs(log_dir, exist_ok=True)
-        self._ensure_csv_has_strategy_meta_column()
+        self._ensure_csv_schema()
 
-    def _ensure_csv_has_strategy_meta_column(self) -> None:
-        """One-time migrate older CSVs missing strategy_meta (rewrite in place)."""
+    def _ensure_csv_schema(self) -> None:
+        """One-time migrate older CSVs when new columns are introduced (rewrite in place)."""
         if not os.path.exists(self._path) or os.path.getsize(self._path) == 0:
             return
         with open(self._path, newline="", encoding="utf-8") as f:
             first = f.readline()
-        if "strategy_meta" in first:
+        if all(col in first for col in ("strategy_meta", "ml1", "level")):
             return
         with open(self._path, newline="", encoding="utf-8") as f:
             old_rows = list(csv.DictReader(f))
@@ -156,8 +158,26 @@ class OpenPositionsLogger:
     def _append_row(self, row: dict) -> None:
         out = {k: row.get(k, "") for k in FIELDNAMES}
         sm = out.get("strategy_meta")
+        sm_obj = None
         if sm is not None and not isinstance(sm, str):
+            sm_obj = sm
             out["strategy_meta"] = json.dumps(sm, default=str)
+        elif isinstance(sm, str) and sm.strip():
+            try:
+                sm_obj = json.loads(sm)
+            except json.JSONDecodeError:
+                sm_obj = None
+        if sm_obj is None and isinstance(sm, dict):
+            sm_obj = sm
+
+        # Convenience columns for quick grep/reporting on OneDayMagicalLine rows.
+        if out.get("ml1", "") in ("", None) or out.get("level", "") in ("", None):
+            odml = (sm_obj or {}).get("one_day_ml1") if isinstance(sm_obj, dict) else None
+            if isinstance(odml, dict):
+                if out.get("ml1", "") in ("", None):
+                    out["ml1"] = odml.get("ml1", "")
+                if out.get("level", "") in ("", None):
+                    out["level"] = odml.get("level", "")
         with self._lock:
             write_header = not os.path.exists(self._path)
             with open(self._path, "a", newline="", encoding="utf-8") as f:
