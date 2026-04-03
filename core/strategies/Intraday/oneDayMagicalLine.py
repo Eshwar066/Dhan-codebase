@@ -4,9 +4,9 @@ BTCUSD One-Day Magical Line (Intraday Option Selling)
 Rules (per user spec)
 1. On 1hr candles, at `17:30` IST candle close mark spot as `ML1`.
 2. At `17:30`, if candle is green (close > open) => short `PE` else short `CE`.
-3. If market crosses `ML1`, reverse direction:
-   - Currently short `PE` => reverse to short `CE` when spot crosses above ML1
-   - Currently short `CE` => reverse to short `PE` when spot crosses below ML1
+3. If market crosses `ML1`, reverse direction (above line => PE short, below => CE short):
+   - Currently short `PE` => reverse to short `CE` when spot crosses **below** ML1
+   - Currently short `CE` => reverse to short `PE` when spot crosses **above** ML1
 5. From short premium use 15% as SL:
    - If option premium rises by >= 15% from entry premium => exit (no reversal).
 
@@ -201,9 +201,9 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             strategy_meta = payload.get("strategy_meta") or {}
             odml_meta = None
             if isinstance(strategy_meta, dict):
-                odml_meta = strategy_meta.get("one_day_magical_line") or strategy_meta.get(
-                    "one_day_ml1"
-                )
+                odml_meta = strategy_meta.get(
+                    "one_day_magical_line"
+                ) or strategy_meta.get("one_day_ml1")
             if isinstance(odml_meta, dict) and odml_meta.get("symbol"):
                 rec_underlyings.add(str(odml_meta.get("symbol")))
             structure_id = str(
@@ -327,14 +327,13 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
 
         opt_side = self._resolved_option_type_ce_pe(position.instrument)
 
-        # For short PE position: reverse to CE when spot crosses above magical line
+        # Above line => PE short, below => CE short: reverse when leaving that zone.
+        # Short PE (above): reverse to CE when spot crosses below magical line.
         if opt_side == "PE":
-            return prev_close <= magical_line and curr_close > magical_line
-            # return curr_close < magical_line
-        # For short CE position: reverse to PE when spot crosses below magical line
-        if opt_side == "CE":
             return prev_close >= magical_line and curr_close < magical_line
-            # return curr_close > magical_line
+        # Short CE (below): reverse to PE when spot crosses above magical line.
+        if opt_side == "CE":
+            return prev_close <= magical_line and curr_close > magical_line
         return False
 
     # ==================================================
