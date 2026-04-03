@@ -26,13 +26,14 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
-
+import uuid
+import pdb
 from core.strategies.IndiaMktMixins import IndiaMktMixins
 from core.strategies.deltaMktMixins import DeltaMktMixins
 from core.strategies.base import BaseStrategy
 
 
-VALID_TIME_1730 = {time(11, 21)}  # 1hr candle close time (IST)
+VALID_TIME_1730 = {time(15, 25)}  # 1hr candle close time (IST)
 
 # Strike/premium selection (kept conservative and similar to `MagicalLines`)
 STRIKE_STEP = 500
@@ -134,7 +135,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         )
 
     def _build_structure_id(self, symbol: str, trade_dt: date, level: int) -> str:
-        return f"{self.name}:{symbol}:ML1:{trade_dt}:L{level}"
+        return f"{self.name}:{symbol}:ML1:{trade_dt}:L{level}:{uuid.uuid4().hex[:6]}"
 
     def _get_cached_strike_in_premium_range(
         self,
@@ -316,20 +317,20 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         symbol = candle["symbol"]
         prev_close = self._last_spot_close_by_symbol.get(symbol)
         curr_close = float(candle["close"])
-        print(">>prev_close", prev_close, curr_close)
-        # if prev_close is None:
-        #     return False
+        print(">>prev_close", prev_close, ">>current close", curr_close)
+        if prev_close is None:
+            return False
 
         opt_side = self._resolved_option_type_ce_pe(position.instrument)
-        print(">>_is_reversal_cross", prev_close, curr_close, opt_side)
+
         # For short PE position: reverse to CE when spot crosses above ML1
         if opt_side == "PE":
-            # return prev_close <= ml1 and curr_close > ml1
-            return curr_close < ml1
+            return prev_close <= ml1 and curr_close > ml1
+            # return curr_close < ml1
         # For short CE position: reverse to PE when spot crosses below ML1
         if opt_side == "CE":
-            # return prev_close >= ml1 and curr_close < ml1
-            return curr_close > ml1
+            return prev_close >= ml1 and curr_close < ml1
+            # return curr_close > ml1
         return False
 
     # ==================================================
@@ -407,10 +408,16 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             open_positions = ctx.position_store.get_open_positions(
                 underlying=symbol, strategy=self.name
             )
-            if any(
-                getattr(p, "tag", None) == "MAIN" and getattr(p, "net_qty", 0) != 0
+            # pdb.set_trace()
+            max_positions = 5
+
+            open_main_positions = [
+                p
                 for p in open_positions
-            ):
+                if getattr(p, "tag", None) == "MAIN" and getattr(p, "net_qty", 0) != 0
+            ]
+
+            if len(open_main_positions) >= max_positions:
                 return None
 
             direction = self._direction_at_1730(candle)
@@ -418,10 +425,11 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
 
             ml1 = float(candle["close"])
 
-            level = self._reversal_level_counter.get((symbol, trade_dt), 0) + 1
+            level = 1
             self._reversal_level_counter[(symbol, trade_dt)] = level
 
             structure_id = self._build_structure_id(symbol, trade_dt, level)
+
             if ctx.position_store.has_open_structure(
                 strategy=self.name, structure_id=structure_id, tag="MAIN"
             ):
@@ -482,7 +490,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 action="ENTRY",
                 metadata_extras=self._strategy_meta_dict(meta),
             )
-
+            print(">>entry_intent", entry_intent)
             self._meta_by_structure_id[structure_id] = meta
             self._exit_reason_by_structure_id.pop(structure_id, None)
 
@@ -505,6 +513,8 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         if ctx is not None:
             self._restore_odml_meta_from_position(position, ctx.position_store)
         meta = self._meta_by_structure_id.get(structure_id)
+        print(">>position", position)
+        print(">>meta", meta)
         if meta is None:
             return False
 

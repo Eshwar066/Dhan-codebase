@@ -527,9 +527,9 @@ class OrderRouter:
             elif now - last_price_ts < stale_seconds:
                 continue
 
-            symbol = (rec.get("payload") or {}).get("symbol") or ""
-            if not symbol:
-                symbol = getattr(rec.get("instrument"), "trading_symbol", "") or ""
+            symbol = self._instrument_trading_symbol(rec.get("instrument")) or (
+                (rec.get("payload") or {}).get("symbol") or ""
+            )
             if not symbol:
                 if self.engine_logger:
                     self.engine_logger.log(
@@ -948,6 +948,25 @@ class OrderRouter:
 
         return True, {}
 
+    @staticmethod
+    def _instrument_trading_symbol(inst: Any) -> str:
+        """Resolve PM/broker symbol from an Instrument instance or serialized dict."""
+        if inst is None:
+            return ""
+        ts = getattr(inst, "trading_symbol", None)
+        if ts:
+            return str(ts).strip()
+        if isinstance(inst, dict):
+            d = inst
+            return str(
+                d.get("trading_symbol")
+                or d.get("tradingsymbol")
+                or d.get("tradingSymbol")
+                or d.get("symbol")
+                or ""
+            ).strip()
+        return ""
+
     def _terminal_fill_reflected_in_pm(
         self,
         instrument,
@@ -955,14 +974,15 @@ class OrderRouter:
         qty: int,
         action: Optional[str],
         intent_id: Optional[str],
+        structure_id: Optional[str] = None,
     ) -> bool:
         """
         True only if PositionManager already matches this terminal fill — safe to skip a duplicate
-        broker callback. For ENTRY, requires matching signed qty and intent_id when present.
+        broker callback. For ENTRY, prefers structure_id slice match (intent-centric), then legacy net match.
         """
         if not self.position_manager or instrument is None:
             return False
-        sym = getattr(instrument, "trading_symbol", None)
+        sym = self._instrument_trading_symbol(instrument)
         if not sym:
             return False
         act = str(action or "").upper()
@@ -972,6 +992,24 @@ class OrderRouter:
         pos = self.position_manager.positions.get(sym)
 
         if act == "ENTRY":
+            signed_exp = -q if sd == "SELL" else q
+            stid = str(structure_id).strip() if structure_id else ""
+            if stid:
+                slice_q = self.position_manager.get_structure_slice(sym, stid)
+                if slice_q != 0 and slice_q == signed_exp:
+                    if not intent_id:
+                        return False
+                    pid = getattr(pos, "intent_id", None) if pos else None
+                    pm_mid = (
+                        self.position_manager.position_metadata.get(sym) or {}
+                    ).get("intent_id")
+                    if pid and str(pid) != str(intent_id):
+                        return False
+                    if not pid and pm_mid and str(pm_mid) != str(intent_id):
+                        return False
+                    if not pid and not pm_mid:
+                        return False
+                    return True
             if net == 0:
                 return False
             if sd == "SELL":
@@ -992,7 +1030,6 @@ class OrderRouter:
                 return False
             if not pid and pm_mid and str(pm_mid) != str(intent_id):
                 return False
-            # Same size on book but no intent linkage — not a confirmed duplicate (reconcile ghost).
             if not pid and not pm_mid:
                 return False
             return True
@@ -1018,14 +1055,16 @@ class OrderRouter:
         intent/metadata (e.g. FILLED was set before on_fill). Attach linkage and run the same
         on_main_entry_fill hook as a normal open — does not change net_qty.
         """
-        payload = intent.get("payload") or {}
-        sym = getattr(instrument, "trading_symbol", None) or payload.get("symbol") or ""
+        sym = self._instrument_trading_symbol(instrument)
         if not sym or not self.position_manager:
             return
+        payload = intent.get("payload") or {}
         strategy = intent.get("strategy") or payload.get("strategy_id")
         structure_id = intent.get("structure_id") or payload.get("structure_id")
         tag = intent.get("tag") or payload.get("tag") or "MAIN"
         meta_extras = payload.get("strategy_meta")
+        iq = int(qty)
+        signed = -iq if str(side).upper() == "SELL" else iq
         with self.position_manager._lock:
             self.position_manager._merge_position_metadata(
                 sym,
@@ -1044,6 +1083,11 @@ class OrderRouter:
                 if tag:
                     pos.tag = tag
                 pos.intent_id = intent_id
+            if structure_id and str(tag or "").upper() == "MAIN":
+                d = self.position_manager._structure_slices.setdefault(sym, {})
+                sid = str(structure_id)
+                if d.get(sid) in (None, 0):
+                    d[sid] = signed
         hook = getattr(self.position_manager, "on_main_entry_fill", None)
         if callable(hook) and str(tag or "").upper() == "MAIN":
             try:
@@ -1116,7 +1160,7 @@ class OrderRouter:
         """
         if not self.position_manager:
             self.report_fill(
-                getattr(instrument, "trading_symbol", ""),
+                self._instrument_trading_symbol(instrument),
                 side,
                 qty,
                 expected_price,
@@ -1146,8 +1190,15 @@ class OrderRouter:
                     ord_state == OrderState.FILLED or ord_state == "FILLED"
                 ):
                     if same_order or order_id is None:
+                        pay0 = rec.get("payload") or {}
+                        stid0 = rec.get("structure_id") or pay0.get("structure_id")
                         if self._terminal_fill_reflected_in_pm(
-                            instrument, side, int(qty), str(action_eff or ""), intent_id
+                            instrument,
+                            side,
+                            int(qty),
+                            str(action_eff or ""),
+                            intent_id,
+                            structure_id=stid0,
                         ):
                             if self.engine_logger:
                                 self.engine_logger.log(
@@ -1161,10 +1212,38 @@ class OrderRouter:
                                 f"CRITICAL: intent {intent_id} terminal but PM not updated — applying fill anyway",
                             )
         metadata_extras = None
-        if intent_id and self.intent_store:
-            _ir = self.intent_store.get(intent_id)
-            if _ir:
-                metadata_extras = (_ir.get("payload") or {}).get("strategy_meta")
+        _ir = self.intent_store.get(intent_id) if intent_id and self.intent_store else None
+        if _ir:
+            metadata_extras = (_ir.get("payload") or {}).get("strategy_meta")
+        if self.position_manager and intent_id and _ir:
+            pay_pf = _ir.get("payload") or {}
+            act_pf = str(
+                action or _ir.get("action") or pay_pf.get("action") or ""
+            ).upper()
+            tag_pf = str(tag or _ir.get("tag") or pay_pf.get("tag") or "MAIN").upper()
+            stid_pf = structure_id or _ir.get("structure_id") or pay_pf.get("structure_id")
+            sym_pf = self._instrument_trading_symbol(instrument)
+            if (
+                act_pf == "ENTRY"
+                and sym_pf
+                and stid_pf
+                and tag_pf == "MAIN"
+                and self.position_manager.has_structure_slice_open(sym_pf, str(stid_pf))
+                and not self._terminal_fill_reflected_in_pm(
+                    instrument,
+                    side,
+                    int(qty),
+                    act_pf,
+                    intent_id,
+                    structure_id=str(stid_pf),
+                )
+            ):
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "oms",
+                        f"Skipping duplicate MAIN ENTRY fill callback structure_id={stid_pf}",
+                    )
+                return
         position_closed, realized_pnl = self.position_manager.on_fill(
             instrument=instrument,
             side=side,
@@ -1182,7 +1261,7 @@ class OrderRouter:
         )
         if position_closed and realized_pnl is not None:
             self.risk.record_realized_pnl(realized_pnl)
-        sym = getattr(instrument, "trading_symbol", "")
+        sym = self._instrument_trading_symbol(instrument)
         self.report_fill(
             sym,
             side,
@@ -1241,13 +1320,14 @@ class OrderRouter:
             payload = intent.get("payload") or {}
             action_to_apply = intent.get("action") or payload.get("action") or trade.get("action")
             action_upper = str(action_to_apply or "").upper()
-            sym = getattr(
-                (trade.get("instrument") or intent.get("instrument") or None),
-                "trading_symbol",
-                "",
-            ) or ""
+            sym = self._instrument_trading_symbol(instrument)
 
             tag_u = str(intent.get("tag") or payload.get("tag") or "MAIN").upper()
+            stid = (
+                intent.get("structure_id")
+                or payload.get("structure_id")
+                or trade.get("structure_id")
+            )
             if action_upper == "ENTRY" and sym and tag_u == "MAIN":
                 prev_q = int(self.position_manager.get_qty(sym))
                 if prev_q != 0:
@@ -1259,6 +1339,7 @@ class OrderRouter:
                         iq,
                         action_upper,
                         intent_id,
+                        structure_id=stid,
                     ):
                         if self.engine_logger:
                             self.engine_logger.log(
@@ -1287,6 +1368,7 @@ class OrderRouter:
                 int(size),
                 action_upper,
                 intent_id,
+                structure_id=stid,
             ):
                 if self.engine_logger:
                     self.engine_logger.log(
@@ -1299,6 +1381,43 @@ class OrderRouter:
                     OrderState.FILLED,
                     action="skip_duplicate_entry_trade",
                     message="ENTRY trade already in PM",
+                )
+                self.intent_store.update(
+                    intent_id,
+                    IntentStatus.FILLED,
+                    broker_order_id=order_id,
+                    order_state=OrderState.FILLED,
+                )
+                self.position_manager.note_trade_led_fill(sym)
+                return True
+
+            if (
+                action_upper == "ENTRY"
+                and sym
+                and stid
+                and tag_u == "MAIN"
+                and self.position_manager.has_structure_slice_open(sym, str(stid))
+                and not self._terminal_fill_reflected_in_pm(
+                    instrument,
+                    side,
+                    int(size),
+                    action_upper,
+                    intent_id,
+                    structure_id=str(stid),
+                )
+            ):
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "oms",
+                        f"Skipping duplicate MAIN ENTRY for structure_id={stid} on {sym} "
+                        f"(intent_id={intent_id})",
+                    )
+                self._processed_trade_ids.add(trade_id)
+                self._set_order_state(
+                    intent_id,
+                    OrderState.FILLED,
+                    action="skip_duplicate_structure_entry",
+                    message="MAIN ENTRY already open for this structure_id",
                 )
                 self.intent_store.update(
                     intent_id,
@@ -1334,7 +1453,7 @@ class OrderRouter:
             )
             if position_closed and realized_pnl is not None:
                 self.risk.record_realized_pnl(realized_pnl)
-        sym = getattr(instrument, "trading_symbol", "")
+        sym = self._instrument_trading_symbol(instrument)
         self.report_fill(
             sym, side, int(size), trade.get("expected_price"), price,
             order_id=order_id, intent_id=intent_id,

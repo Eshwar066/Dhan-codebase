@@ -181,6 +181,8 @@ class PositionManager:
         self._forced_exit_debounce_seconds = 2.0
         # trading_symbol -> { strategy, structure_id, tag, intent_id, strategy_meta }
         self.position_metadata = {}
+        # trading_symbol -> structure_id -> signed qty (MAIN ENTRY legs; EXIT w/ structure_id unwinds)
+        self._structure_slices = defaultdict(dict)
 
     # ---------------------
     # LOCAL FILL UPDATE
@@ -243,8 +245,6 @@ class PositionManager:
                 signed = qty if side == "BUY" else -qty
                 self.strategy_pos[strategy][sym] += signed
 
-            if prev_qty == 0 and new_qty != 0:
-                pos.intent_id = intent_id
             # Always update strategy/structure_id/tag when provided (so positions get strategy name from fills)
             if strategy is not None:
                 pos.strategy = strategy
@@ -252,6 +252,13 @@ class PositionManager:
                 pos.structure_id = structure_id
             if tag is not None:
                 pos.tag = tag
+            if (
+                new_qty != 0
+                and str(tag or "").upper() == "MAIN"
+                and str(action or "").upper() == "ENTRY"
+                and intent_id is not None
+            ):
+                pos.intent_id = intent_id
 
             if new_qty != 0:
                 self._merge_position_metadata(
@@ -265,14 +272,35 @@ class PositionManager:
             else:
                 self.position_metadata.pop(sym, None)
 
-            if action == "ENTRY" and prev_qty != 0:
-                raise RuntimeError(
-                    f"ENTRY received for open position {sym}. Use SCALE_IN."
-                )
+            act_u = str(action or "").upper()
+            if new_qty == 0:
+                self._structure_slices.pop(sym, None)
+            elif structure_id and str(tag or "").upper() == "MAIN":
+                iq = int(qty)
+                signed = iq if side == "BUY" else -iq
+                d = self._structure_slices.setdefault(sym, {})
+                if act_u == "ENTRY":
+                    d[str(structure_id)] = d.get(str(structure_id), 0) + signed
+                elif act_u in ("EXIT", "FORCE_EXIT"):
+                    sid = str(structure_id)
+                    cur = d.get(sid, 0)
+                    nxt = cur + signed
+                    if nxt == 0:
+                        d.pop(sid, None)
+                    else:
+                        d[sid] = nxt
+                    if not d:
+                        self._structure_slices.pop(sym, None)
 
             # -------- TRADE TYPE --------
             if action:
-                trade_type = action
+                au = str(action).upper()
+                if au == "ENTRY" and prev_qty != 0 and new_qty != 0:
+                    inc = qty if side == "BUY" else -qty
+                    same_dir = (prev_qty > 0 and inc > 0) or (prev_qty < 0 and inc < 0)
+                    trade_type = "SCALE_IN" if same_dir else action
+                else:
+                    trade_type = action
             else:
                 # fallback only if action is missing (should not happen)
                 if prev_qty == 0 and new_qty != 0:
@@ -368,8 +396,14 @@ class PositionManager:
             position_closed = prev_qty != 0 and new_qty == 0
             realized_pnl_for_risk = pos.realized_pnl if position_closed else 0.0
 
-            if prev_qty == 0 and new_qty != 0:
-                if str(tag or "").upper() == "MAIN" and str(action or "").upper() == "ENTRY":
+            if str(tag or "").upper() == "MAIN" and act_u == "ENTRY":
+                inc = qty if side == "BUY" else -qty
+                same_dir = (
+                    prev_qty == 0
+                    or (prev_qty > 0 and inc > 0)
+                    or (prev_qty < 0 and inc < 0)
+                )
+                if same_dir:
                     hook_main_entry = {
                         "instrument": instrument,
                         "side": side,
@@ -538,6 +572,72 @@ class PositionManager:
             for sym, (_t, meta) in best.items():
                 self.position_metadata[sym] = meta
 
+    def get_structure_slice(self, trading_symbol: str, structure_id: str) -> int:
+        if not trading_symbol or not structure_id:
+            return 0
+        with self._lock:
+            return int(
+                self._structure_slices.get(trading_symbol, {}).get(
+                    str(structure_id), 0
+                )
+            )
+
+    def has_structure_slice_open(self, trading_symbol: str, structure_id: str) -> bool:
+        return self.get_structure_slice(trading_symbol, structure_id) != 0
+
+    def rebuild_structure_slices_from_intent_store(self, intent_store) -> None:
+        """Rebuild MAIN ENTRY slices from FILLED intents (intent-centric duplicate + risk guards)."""
+        if intent_store is None:
+            return
+        try:
+            from core.orderExecution.intent_store import IntentStatus
+        except ImportError:
+            return
+
+        acc: dict = {}
+        for intent_id, rec in intent_store.intents.items():
+            st = rec.get("status")
+            if st != IntentStatus.FILLED and getattr(st, "value", st) != "FILLED":
+                continue
+            payload = rec.get("payload") or {}
+            if (rec.get("action") or payload.get("action") or "") != "ENTRY":
+                continue
+            tag = rec.get("tag") or payload.get("tag") or "MAIN"
+            if str(tag).upper() != "MAIN":
+                continue
+            stid = rec.get("structure_id") or payload.get("structure_id")
+            if not stid:
+                continue
+            inst = rec.get("instrument")
+            sym = getattr(inst, "trading_symbol", None) if inst is not None else None
+            if not sym and isinstance(inst, dict):
+                sym = (
+                    inst.get("trading_symbol")
+                    or inst.get("tradingsymbol")
+                    or inst.get("symbol")
+                )
+            if not sym:
+                sym = payload.get("symbol")
+            if not sym:
+                continue
+            side = (rec.get("side") or payload.get("side") or "").upper()
+            try:
+                q = int(rec.get("qty") or payload.get("qty") or 0)
+            except (TypeError, ValueError):
+                continue
+            if q <= 0 or side not in ("BUY", "SELL"):
+                continue
+            signed = q if side == "BUY" else -q
+            if sym not in acc:
+                acc[sym] = {}
+            skey = str(stid)
+            acc[sym][skey] = acc[sym].get(skey, 0) + signed
+
+        with self._lock:
+            self._structure_slices.clear()
+            for sym, slices in acc.items():
+                self._structure_slices[sym] = dict(slices)
+
     def _merge_open_positions_csv_dict(self, file_meta: dict) -> None:
         for sym, meta in file_meta.items():
             cur = dict(self.position_metadata.get(sym) or {})
@@ -562,13 +662,18 @@ class PositionManager:
             self._merge_open_positions_csv_dict(file_meta)
 
     def has_open_structure(self, strategy: str, structure_id: str, tag: str) -> bool:
-        for pos in self.positions.values():
-            if (
-                pos.net_qty != 0
-                and pos.strategy == strategy
-                and pos.structure_id == structure_id
-                and pos.tag == tag
-            ):
+        tag_u = str(tag or "").upper()
+        sid = str(structure_id)
+        for sym, pos in self.positions.items():
+            if pos.net_qty == 0:
+                continue
+            if strategy and pos.strategy != strategy:
+                continue
+            if tag and str(pos.tag or "").upper() != tag_u:
+                continue
+            if self.get_structure_slice(sym, sid) != 0:
+                return True
+            if pos.structure_id is not None and str(pos.structure_id) == sid:
                 return True
         return False
 

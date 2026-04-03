@@ -24,6 +24,7 @@ from core.engine.live_engine_common import (
     DEFAULT_FEED_STALE_SECONDS,
     LiveEngineHelpersMixin,
 )
+from core.data.candle_aggregator import _resolution_to_seconds
 
 try:
     from logs.engine_logger import REPORTS_DIR
@@ -139,6 +140,76 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 tick = self.instrument_store.get_tick_size(sym)
                 self._tick_cache[sym] = float(tick) if tick is not None else 0.01
 
+        # Largest accepted bar bucket start (unix) per symbol; blocks REST replay / time regression
+        self._max_candle_bucket_unix: Dict[str, int] = {}
+        # After at least one tick-built bar (bucket_ts set), drop REST rows without bucket_ts
+        self._has_seen_aggregator_bucket: Dict[str, bool] = {}
+
+    @staticmethod
+    def _candle_bucket_start_unix(candle: Dict[str, Any]) -> Optional[int]:
+        bt = candle.get("bucket_ts")
+        if bt is not None:
+            try:
+                return int(bt)
+            except (TypeError, ValueError):
+                pass
+        ts = candle.get("timestamp")
+        if isinstance(ts, dt.datetime):
+            return int(ts.timestamp())
+        if isinstance(ts, (int, float)):
+            t = float(ts)
+            if t > 1e12:
+                return int(t / 1e6)
+            return int(t)
+        return None
+
+    def _live_bar_is_stale_or_replay(
+        self, symbol: str, candle: Dict[str, Any], tf: str
+    ) -> bool:
+        """
+        When ticks + CandleAggregator are active, reject:
+        - REST fallback rows without bucket_ts after we have seen real buckets
+        - bar bucket time going backwards (duplicate old bar after restart)
+        - \"last closed\" rows far behind wall clock (stale historical replay)
+        """
+        max_seen = self._max_candle_bucket_unix.get(symbol)
+        bt = candle.get("bucket_ts")
+        bs = self._candle_bucket_start_unix(candle)
+
+        if bt is None and self._has_seen_aggregator_bucket.get(symbol):
+            logger.debug(
+                "Skip %s: missing bucket_ts after live aggregated bars (REST replay)",
+                symbol,
+            )
+            return True
+
+        if bs is None:
+            return False
+
+        if max_seen is not None and bs < max_seen:
+            logger.debug(
+                "Skip %s: non-monotonic bucket %s < max_seen %s",
+                symbol,
+                bs,
+                max_seen,
+            )
+            return True
+
+        tf_sec = max(60, int(_resolution_to_seconds(tf)))
+        age_sec = time.time() - float(bs)
+        stale_sec = max(15 * 60, 5 * tf_sec)
+        if age_sec > stale_sec:
+            logger.debug(
+                "Skip %s: stale bar wall_age=%.0fs > %s (bucket=%s)",
+                symbol,
+                age_sec,
+                stale_sec,
+                bs,
+            )
+            return True
+
+        return False
+
     def build_context(self, candle, recent_candles=None):
         intent_store = getattr(self.order_router, "intent_store", None)
         return super().build_context(
@@ -171,7 +242,12 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         spot = self.get_price_map(sym)
         if spot is None:
             spot = 0.0
-        candle = {"symbol": sym, "timestamp": ts, "close": float(spot), "exchange": None}
+        candle = {
+            "symbol": sym,
+            "timestamp": ts,
+            "close": float(spot),
+            "exchange": None,
+        }
         ctx = self.build_context_only(candle)
         intents = fn(ctx=ctx, **kwargs) or []
         risk_manager = getattr(self.order_router, "risk", None)
@@ -291,6 +367,12 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             self.position_manager.rebuild_position_metadata_from_intent_store(
                 intent_store
             )
+            if hasattr(
+                self.position_manager, "rebuild_structure_slices_from_intent_store"
+            ):
+                self.position_manager.rebuild_structure_slices_from_intent_store(
+                    intent_store
+                )
         self.position_manager.reconcile_with_broker(
             resolved_broker_positions, strategy=strategy_name
         )
@@ -600,7 +682,18 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         continue
 
                     if use_aggregator:
-                        self._last_evaluated_candle_ts[symbol] = candle.get("bucket_ts")
+                        if self._live_bar_is_stale_or_replay(symbol, candle, tf):
+                            continue
+                        bt_ok = candle.get("bucket_ts")
+                        if bt_ok is not None:
+                            self._last_evaluated_candle_ts[symbol] = bt_ok
+                            self._has_seen_aggregator_bucket[symbol] = True
+                        bs_ok = self._candle_bucket_start_unix(candle)
+                        if bs_ok is not None:
+                            self._max_candle_bucket_unix[symbol] = max(
+                                self._max_candle_bucket_unix.get(symbol, 0),
+                                bs_ok,
+                            )
 
                     if not self.strategy.should_evaluate(candle):
                         continue

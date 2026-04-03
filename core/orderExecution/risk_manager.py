@@ -180,7 +180,10 @@ class RiskManager:
             return False
 
         # 3️⃣ Position count limit
-        open_count = self._open_positions_count()
+        # Only count actual MAIN positions; broker reconcile can temporarily
+        # create non-tagged/unknown positions that must not block the next
+        # valid MAIN ENTRY after a MAIN_EXIT fills.
+        open_count = self._open_positions_count(strategy=strategy)
         if open_count >= self.max_open_positions:
             if self.engine_logger:
                 self.engine_logger.max_positions_blocked(
@@ -274,8 +277,31 @@ class RiskManager:
                 return False
         return True
 
-    def _open_positions_count(self):
-        return sum(1 for p in self.pm.positions.values() if p.net_qty != 0)
+    def _open_positions_count(self, *, strategy: Optional[str] = None) -> int:
+        """
+        Count open positions relevant for `max_open_positions`.
+
+        We intentionally count only `tag == "MAIN"` positions (or "MAIN-like"
+        positions where `tag` is empty but `intent_id` is present). This prevents
+        broker reconciliation artifacts from blocking the next valid entry.
+        """
+        count = 0
+        for p in self.pm.positions.values():
+            if p.net_qty == 0:
+                continue
+            if strategy and getattr(p, "strategy", None) != strategy:
+                continue
+
+            tag_norm = str(getattr(p, "tag", "") or "").upper()
+            if tag_norm == "MAIN":
+                count += 1
+                continue
+
+            # Belt-and-suspenders: if tag is missing but we have intent linkage,
+            # treat it as MAIN-like.
+            if not tag_norm and getattr(p, "intent_id", None):
+                count += 1
+        return count
 
     def _get_event_time(self, candle_ts):
         if candle_ts is None:

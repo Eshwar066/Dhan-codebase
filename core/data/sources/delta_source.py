@@ -110,7 +110,15 @@ class DeltaSource:
         for p in self._products_cache:
             sym = p.get("symbol") or p.get("trading_symbol") or str(p.get("id", ""))
             self._symbol_to_product[sym] = p
-            self._symbol_to_product[str(p.get("id"))] = p
+            pid = p.get("id")
+            if pid is not None:
+                self._symbol_to_product[str(pid)] = p
+                try:
+                    v = float(pid)
+                    if v == int(v):
+                        self._symbol_to_product[str(int(v))] = p
+                except (TypeError, ValueError):
+                    pass
         return self._products_cache
 
     def product_id_for_symbol(self, symbol: str) -> Optional[int]:
@@ -489,6 +497,52 @@ class DeltaSource:
     def get_margined_position(self, product_id) -> Any:
         return self._client.get_margined_position(product_id)
 
+    def _resolve_position_trading_symbol(self, raw_pos: Dict[str, Any]) -> str:
+        """
+        Map /v2/positions row to a contract symbol for PM/reconcile keys.
+        When product.symbol is missing, resolve via products cache or GET /v2/products/{id}.
+        """
+        product = raw_pos.get("product")
+        if not isinstance(product, dict):
+            product = {}
+        sym = product.get("symbol") or product.get("trading_symbol")
+        if sym:
+            out = str(sym).strip()
+            if out:
+                return out
+        product_id = raw_pos.get("product_id") or raw_pos.get("id")
+        if product_id is None:
+            return ""
+        self.get_products(use_cache=True)
+        pid_keys: List[str] = []
+        try:
+            v = float(product_id)
+            if v == int(v):
+                pid_keys.append(str(int(v)))
+            pid_keys.append(str(product_id))
+        except (TypeError, ValueError):
+            pid_keys.append(str(product_id))
+        for k in pid_keys:
+            prod = self._symbol_to_product.get(k)
+            if prod:
+                out = prod.get("symbol") or prod.get("trading_symbol")
+                if out:
+                    return str(out).strip()
+        try:
+            pid_int = int(float(product_id))
+            res = self._client.get_product(pid_int, auth=False)
+            if isinstance(res, dict):
+                out = res.get("symbol") or res.get("trading_symbol")
+                if out:
+                    return str(out).strip()
+        except Exception as e:
+            logger.debug(
+                "Delta resolve position symbol: get_product(%s) failed: %s",
+                product_id,
+                e,
+            )
+        return str(product_id)
+
     def get_positions(self, debug: str = "NO") -> Any:
         """All positions in a list; normalize to Dhan-like rows for broker sync.
         Delta India API requires product_id or underlying_asset_symbol; we pass
@@ -518,10 +572,12 @@ class DeltaSource:
             entry_price = float(
                 p.get("entry_price") or p.get("average_fill_price") or 0
             )
+            trading_sym = self._resolve_position_trading_symbol(p)
             rows.append(
                 {
-                    "tradingSymbol": str(
-                        p.get("product", {}).get("symbol", product_id)
+                    "tradingSymbol": trading_sym
+                    or str(
+                        (p.get("product") or {}).get("symbol", product_id)
                     ),
                     "product_id": product_id,
                     "netQty": size,
