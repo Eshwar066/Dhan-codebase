@@ -218,7 +218,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
 
     def _underlying_from_strategy_meta(self, metadata_extras: Any) -> Optional[str]:
         if isinstance(metadata_extras, dict):
-            od = metadata_extras.get("one_day_ml1")
+            od = metadata_extras.get("one_day_magical_line") or metadata_extras.get(
+                "one_day_ml1"
+            )
             if isinstance(od, dict) and od.get("symbol"):
                 return str(od["symbol"])
         return None

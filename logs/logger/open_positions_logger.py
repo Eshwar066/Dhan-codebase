@@ -30,7 +30,7 @@ FIELDNAMES = [
     "structure_id",
     "tag",
     "intent_id",
-    "ml1",
+    "magicalLine",
     "level",
     "strategy_meta",
 ]
@@ -142,7 +142,7 @@ class OpenPositionsLogger:
             return
         with open(self._path, newline="", encoding="utf-8") as f:
             first = f.readline()
-        if all(col in first for col in ("strategy_meta", "ml1", "level")):
+        if all(col in first for col in ("strategy_meta", "magicalLine", "level")):
             return
         with open(self._path, newline="", encoding="utf-8") as f:
             old_rows = list(csv.DictReader(f))
@@ -150,7 +150,10 @@ class OpenPositionsLogger:
             w = csv.DictWriter(f, fieldnames=FIELDNAMES)
             w.writeheader()
             for r in old_rows:
-                w.writerow({k: r.get(k, "") for k in FIELDNAMES})
+                row = {k: r.get(k, "") for k in FIELDNAMES}
+                if not str(row.get("magicalLine", "")).strip() and r.get("ml1"):
+                    row["magicalLine"] = r["ml1"]
+                w.writerow(row)
 
     def _now(self) -> str:
         return datetime.now(IST).isoformat()
@@ -171,11 +174,15 @@ class OpenPositionsLogger:
             sm_obj = sm
 
         # Convenience columns for quick grep/reporting on OneDayMagicalLine rows.
-        if out.get("ml1", "") in ("", None) or out.get("level", "") in ("", None):
-            odml = (sm_obj or {}).get("one_day_ml1") if isinstance(sm_obj, dict) else None
+        if out.get("magicalLine", "") in ("", None) or out.get("level", "") in ("", None):
+            odml = None
+            if isinstance(sm_obj, dict):
+                odml = sm_obj.get("one_day_magical_line") or sm_obj.get("one_day_ml1")
             if isinstance(odml, dict):
-                if out.get("ml1", "") in ("", None):
-                    out["ml1"] = odml.get("ml1", "")
+                if out.get("magicalLine", "") in ("", None):
+                    out["magicalLine"] = odml.get(
+                        "magicalLine", odml.get("ml1", "")
+                    )
                 if out.get("level", "") in ("", None):
                     out["level"] = odml.get("level", "")
         with self._lock:
