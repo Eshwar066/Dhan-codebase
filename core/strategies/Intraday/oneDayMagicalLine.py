@@ -4,9 +4,9 @@ BTCUSD One-Day Magical Line (Intraday Option Selling)
 Rules (per user spec)
 1. On 1hr candles, at `17:30` IST candle close mark spot as `ML1`.
 2. At `17:30`, if candle is green (close > open) => short `PE` else short `CE`.
-3. If market crosses `ML1`, reverse direction:
-   - Currently short `PE` => reverse to short `CE` when spot crosses above ML1
-   - Currently short `CE` => reverse to short `PE` when spot crosses below ML1
+3. If market crosses `ML1`, reverse direction (above line => PE short, below => CE short):
+   - Currently short `PE` => reverse to short `CE` when spot crosses **below** ML1
+   - Currently short `CE` => reverse to short `PE` when spot crosses **above** ML1
 5. From short premium use 15% as SL:
    - If option premium rises by >= 15% from entry premium => exit (no reversal).
 
@@ -15,7 +15,7 @@ Implementation notes
 - Delta product symbols via `DeltaMktMixins.delta_option_trading_symbol` (see `deltaMktMixins.py`).
 - Broker SL (`MAIN_SL`) is placed only after the MAIN sell fills (avoids Delta `no_open_position`).
 - On reversal: emit `MAIN_EXIT` first; when that exit fills, emit reversal ENTRY; SL again after the new MAIN fills.
-- ML1 is stored per opened position via `structure_id` to enable correct reversal + SL.
+- The magical line (spot at entry) is stored per opened position via `structure_id` for reversal + SL.
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ _CANDLE_CACHE_MAX = 1000
 class _PosMeta:
     symbol: str
     entry_date: date
-    ml1: float
+    magical_line: float
     entry_premium: float
     level: int
 
@@ -97,10 +97,10 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
 
     def _strategy_meta_dict(self, meta: _PosMeta) -> dict:
         return {
-            "one_day_ml1": {
+            "one_day_magical_line": {
                 "symbol": meta.symbol,
                 "entry_date": meta.entry_date.isoformat(),
-                "ml1": meta.ml1,
+                "magicalLine": meta.magical_line,
                 "entry_premium": meta.entry_premium,
                 "level": meta.level,
             }
@@ -115,14 +115,18 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         bucket = position_store.get_position_metadata(sym)
         if not bucket:
             return
-        raw = (bucket.get("strategy_meta") or {}).get("one_day_ml1")
+        sm = bucket.get("strategy_meta") or {}
+        raw = sm.get("one_day_magical_line") or sm.get("one_day_ml1")
         if not raw:
             return
         try:
+            ml_val = raw.get("magicalLine", raw.get("ml1"))
+            if ml_val is None:
+                return
             meta = _PosMeta(
                 symbol=str(raw["symbol"]),
                 entry_date=date.fromisoformat(str(raw["entry_date"])),
-                ml1=float(raw["ml1"]),
+                magical_line=float(ml_val),
                 entry_premium=float(raw["entry_premium"]),
                 level=int(raw["level"]),
             )
@@ -195,11 +199,11 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             # strategy metadata / structure_id when available.
             rec_underlyings = set()
             strategy_meta = payload.get("strategy_meta") or {}
-            odml_meta = (
-                strategy_meta.get("one_day_ml1")
-                if isinstance(strategy_meta, dict)
-                else None
-            )
+            odml_meta = None
+            if isinstance(strategy_meta, dict):
+                odml_meta = strategy_meta.get(
+                    "one_day_magical_line"
+                ) or strategy_meta.get("one_day_ml1")
             if isinstance(odml_meta, dict) and odml_meta.get("symbol"):
                 rec_underlyings.add(str(odml_meta.get("symbol")))
             structure_id = str(
@@ -306,13 +310,13 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         return self.resolved_option_type_ce_pe(inst)
 
     # ==================================================
-    # ML1 CROSS DETECTION (uses stored prev candle close)
+    # Magical-line cross detection (uses stored prev candle close)
     # ==================================================
     def _is_reversal_cross(
         self,
         position: Any,
         candle: dict,
-        ml1: float,
+        magical_line: float,
     ) -> bool:
         symbol = candle["symbol"]
         prev_close = self._last_spot_close_by_symbol.get(symbol)
@@ -323,14 +327,13 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
 
         opt_side = self._resolved_option_type_ce_pe(position.instrument)
 
-        # For short PE position: reverse to CE when spot crosses above ML1
+        # Above line => PE short, below => CE short: reverse when leaving that zone.
+        # Short PE (above): reverse to CE when spot crosses below magical line.
         if opt_side == "PE":
-            return prev_close <= ml1 and curr_close > ml1
-            # return curr_close < ml1
-        # For short CE position: reverse to PE when spot crosses below ML1
+            return prev_close >= magical_line and curr_close < magical_line
+        # Short CE (below): reverse to PE when spot crosses above magical line.
         if opt_side == "CE":
-            return prev_close >= ml1 and curr_close < ml1
-            # return curr_close > ml1
+            return prev_close <= magical_line and curr_close > magical_line
         return False
 
     # ==================================================
@@ -350,7 +353,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         """SL takes strict priority over reversal when both could apply same candle."""
         if self._is_sl_triggered(position, candle, ctx, meta):
             return "SL"
-        if self._is_reversal_cross(position, candle, meta.ml1):
+        if self._is_reversal_cross(position, candle, meta.magical_line):
             return "REVERSAL"
         return None
 
@@ -423,7 +426,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             direction = self._direction_at_1730(candle)
             option_type = self._option_type_for_direction(direction)
 
-            ml1 = float(candle["close"])
+            magical_line = float(candle["close"])
 
             level = 1
             self._reversal_level_counter[(symbol, trade_dt)] = level
@@ -474,7 +477,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             meta = _PosMeta(
                 symbol=symbol,
                 entry_date=trade_dt,
-                ml1=ml1,
+                magical_line=magical_line,
                 entry_premium=float(premium),
                 level=level,
             )
@@ -500,7 +503,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 self._candle_cache.clear()
 
     # ==================================================
-    # EXIT: reverse on ML1 cross, else SL by premium
+    # EXIT: reverse on magical line cross, else SL by premium
     # ==================================================
     def should_exit(self, position: Any, candle: dict, ctx: Any = None) -> bool:
         if position.tag != "MAIN":
@@ -657,7 +660,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         new_meta = _PosMeta(
             symbol=meta.symbol,
             entry_date=meta.entry_date,
-            ml1=meta.ml1,
+            magical_line=meta.magical_line,
             entry_premium=float(premium),
             level=next_level,
         )
@@ -690,7 +693,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         return [exit_intent]
 
     # ==================================================
-    # CLEANUP: remove cached ML1/meta for exited structures
+    # CLEANUP: remove cached magical-line meta for exited structures
     # ==================================================
     def on_structure_exit(self, structure_id: str, **kwargs):
         super().on_structure_exit(structure_id=structure_id, **kwargs)
