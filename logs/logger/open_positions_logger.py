@@ -1,6 +1,7 @@
 """
-Append-only CSV of open-position events from fills (paper + live) and broker-aligned
-snapshots after reconciliation (live only). File: logs/{engine_id}_open_positions.csv
+CSV snapshot of currently open positions only (fills + live broker reconcile).
+Closed legs are removed when net qty reaches zero; file is rewritten on each update.
+File: logs/{engine_id}_open_positions.csv
 """
 
 from __future__ import annotations
@@ -14,6 +15,15 @@ from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 IST = ZoneInfo("Asia/Kolkata")
+
+def _parse_net_qty(raw: Optional[str]) -> int:
+    if raw is None or str(raw).strip() == "":
+        return 0
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return 0
+
 
 FIELDNAMES = [
     "timestamp",
@@ -54,14 +64,6 @@ def load_position_metadata_from_csv(csv_path: str) -> Dict[str, Dict[str, Any]]:
 
     state: Dict[str, Optional[Dict[str, Any]]] = {}
 
-    def _parse_net_qty(raw: str) -> int:
-        if raw is None or str(raw).strip() == "":
-            return 0
-        try:
-            return int(float(raw))
-        except (TypeError, ValueError):
-            return 0
-
     def _row_to_meta(row: dict) -> Dict[str, Any]:
         meta: Dict[str, Any] = {
             "strategy": (row.get("strategy") or "").strip() or None,
@@ -87,7 +89,7 @@ def load_position_metadata_from_csv(csv_path: str) -> Dict[str, Dict[str, Any]]:
 
         if src == "fill":
             ev = (row.get("event") or "").strip()
-            nq = _parse_net_qty(row.get("net_qty", ""))
+            nq = _parse_net_qty(str(row.get("net_qty", "") or ""))
             if ev == "CLOSE" or nq == 0:
                 state[sym] = None
             else:
@@ -114,8 +116,8 @@ def load_position_metadata_from_csv(csv_path: str) -> Dict[str, Dict[str, Any]]:
 
 class OpenPositionsLogger:
     """
-    - Fills (paper + live): one row per PositionManager.on_fill when qty changes.
-    - Live only: after reconcile_with_broker, rows with source=broker_reconcile for each open leg.
+    - Fills (paper + live): updates that symbol's row when qty changes; removes the row on full exit.
+    - Live only: after reconcile_with_broker, replaces the file with one broker_reconcile row per open leg.
     """
 
     def __init__(
@@ -135,6 +137,15 @@ class OpenPositionsLogger:
         self._lock = threading.Lock()
         os.makedirs(log_dir, exist_ok=True)
         self._ensure_csv_schema()
+        self._compact_legacy_to_snapshot()
+
+    def _compact_legacy_to_snapshot(self) -> None:
+        """On startup, collapse older append-only logs to one row per still-open symbol."""
+        if not os.path.exists(self._path) or os.path.getsize(self._path) == 0:
+            return
+        with self._lock:
+            snap = self._read_open_snapshot()
+            self._write_snapshot(snap)
 
     def _ensure_csv_schema(self) -> None:
         """One-time migrate older CSVs when new columns are introduced (rewrite in place)."""
@@ -158,7 +169,7 @@ class OpenPositionsLogger:
     def _now(self) -> str:
         return datetime.now(IST).isoformat()
 
-    def _append_row(self, row: dict) -> None:
+    def _finalize_row_for_csv(self, row: dict) -> Dict[str, Any]:
         out = {k: row.get(k, "") for k in FIELDNAMES}
         sm = out.get("strategy_meta")
         sm_obj = None
@@ -185,13 +196,45 @@ class OpenPositionsLogger:
                     )
                 if out.get("level", "") in ("", None):
                     out["level"] = odml.get("level", "")
-        with self._lock:
-            write_header = not os.path.exists(self._path)
-            with open(self._path, "a", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=FIELDNAMES)
-                if write_header:
-                    w.writeheader()
-                w.writerow(out)
+        return out
+
+    def _read_open_snapshot(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Last row wins per symbol; keep only symbols that are still open (net_qty != 0
+        and not a fill CLOSE). Supports legacy append-only files until rewritten.
+        """
+        if not os.path.exists(self._path) or os.path.getsize(self._path) == 0:
+            return {}
+        with open(self._path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                return {}
+            rows = list(reader)
+        last_by_sym: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            sym = (row.get("symbol") or "").strip()
+            if sym:
+                last_by_sym[sym] = row
+
+        open_rows: Dict[str, Dict[str, Any]] = {}
+        for sym, row in last_by_sym.items():
+            nq = _parse_net_qty(str(row.get("net_qty") or ""))
+            ev = (row.get("event") or "").strip()
+            src = (row.get("source") or "").strip()
+            if nq == 0:
+                continue
+            if src == "fill" and ev == "CLOSE":
+                continue
+            open_rows[sym] = row
+        return open_rows
+
+    def _write_snapshot(self, rows_by_symbol: Dict[str, Dict[str, Any]]) -> None:
+        with open(self._path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=FIELDNAMES)
+            w.writeheader()
+            for sym in sorted(rows_by_symbol.keys()):
+                r = rows_by_symbol[sym]
+                w.writerow({k: r.get(k, "") for k in FIELDNAMES})
 
     def record_fill(
         self,
@@ -212,7 +255,7 @@ class OpenPositionsLogger:
         else:
             event = "ADJUST"
 
-        self._append_row(
+        finalized = self._finalize_row_for_csv(
             {
                 "timestamp": self._now(),
                 "engine_id": self.engine_id,
@@ -231,9 +274,17 @@ class OpenPositionsLogger:
                 "strategy_meta": strategy_meta if strategy_meta is not None else "",
             }
         )
+        with self._lock:
+            snap = self._read_open_snapshot()
+            if new_qty == 0:
+                snap.pop(symbol, None)
+            else:
+                snap[symbol] = finalized
+            self._write_snapshot(snap)
 
     def record_broker_reconcile_snapshot(self, position_manager: Any) -> None:
-        """Live: one row per non-flat position after PM synced to broker."""
+        """Live: replace file with one row per non-flat position after PM synced to broker."""
+        snap: Dict[str, Dict[str, Any]] = {}
         for sym, pos in position_manager.positions.items():
             if pos.net_qty == 0:
                 continue
@@ -241,7 +292,7 @@ class OpenPositionsLogger:
                 sym, {}
             ) or {}
             sm = pm_bucket.get("strategy_meta")
-            self._append_row(
+            snap[sym] = self._finalize_row_for_csv(
                 {
                     "timestamp": self._now(),
                     "engine_id": self.engine_id,
@@ -264,3 +315,5 @@ class OpenPositionsLogger:
                     "strategy_meta": sm if sm is not None else "",
                 }
             )
+        with self._lock:
+            self._write_snapshot(snap)
