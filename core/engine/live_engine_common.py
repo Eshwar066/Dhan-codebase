@@ -196,6 +196,12 @@ class LiveEngineHelpersMixin:
         if callable(telegram):
             telegram(_msg)
 
+    def _telegram_plain(self, message: str) -> None:
+        """Send a Telegram alert if order_router has telegram_alert configured."""
+        telegram = getattr(getattr(self, "order_router", None), "telegram_alert", None)
+        if callable(telegram):
+            telegram(message)
+
     # ---------- Strategy helpers ----------
 
     def _signal_hash(

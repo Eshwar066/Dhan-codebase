@@ -130,6 +130,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             }
         # Graceful shutdown
         self._shutdown_requested = False
+        self._shutdown_signal: Optional[int] = None
         # Candle aggregator: last evaluated closed-candle timestamp per symbol (avoid re-eval same bar)
         self._last_evaluated_candle_ts: Dict[str, Any] = {}
         self._max_ticks_per_cycle = 10000
@@ -290,6 +291,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
     def _graceful_shutdown_handler(self, signum: int, frame: Any) -> None:
         """Per-engine: set flag so main loop exits; snapshot and flush in loop or on exit."""
         self._shutdown_requested = True
+        self._shutdown_signal = int(signum)
         if self.engine_logger:
             self.engine_logger.graceful_shutdown(f"Signal {signum} received")
 
@@ -591,6 +593,11 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             self.engine_logger.log("critical", "Startup reconciliation failed")
             return
 
+        _rm = getattr(self.run_mode, "value", None) or str(self.run_mode or "")
+        self._telegram_plain(
+            f"Engine started: {self.engine_id} | venue={self.venue} | mode={_rm}"
+        )
+
         self._do_order_state_check()
         tf = getattr(self.strategy, "timeframe", None)
         use_feed = self.realtime_feed and self.realtime_feed.is_connected()
@@ -807,6 +814,16 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 time.sleep(1)
 
         # Graceful shutdown: save position snapshot, flush logger, close broker
+        _rm = getattr(self.run_mode, "value", None) or str(self.run_mode or "")
+        _why = (
+            f"signal {self._shutdown_signal}"
+            if self._shutdown_signal is not None
+            else "shutdown"
+        )
+        self._telegram_plain(
+            f"Engine stopped: {self.engine_id} | venue={self.venue} | mode={_rm} | {_why}"
+        )
+
         snapshot_path = None
         try:
             os.makedirs(REPORTS_DIR, exist_ok=True)
