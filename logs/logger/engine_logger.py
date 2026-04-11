@@ -141,6 +141,9 @@ class EngineLogger:
     def feed_health_warning(self, message: str, symbol: Optional[str] = None) -> None:
         self.log("feed_health_warning", message=message, symbol=symbol)
 
+    def feed_health_recovered(self, message: str, symbol: Optional[str] = None) -> None:
+        self.log("feed_health_recovered", message=message, symbol=symbol)
+
     def closed_candle_skip(self, symbol: str, reason: str) -> None:
         self.log("closed_candle_skip", message=reason, symbol=symbol)
 
