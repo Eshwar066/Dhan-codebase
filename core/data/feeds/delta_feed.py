@@ -110,6 +110,16 @@ class DeltaWebSocketFeed(RealtimeFeed):
                 except Exception as e:
                     logger.debug("Delta feed: telegram stall alert failed: %s", e)
 
+        def _on_feed_recovered() -> None:
+            msg = "Delta feed recovered: ticks resumed after stall (feed healthy)"
+            if self._engine_logger:
+                self._engine_logger.feed_health_recovered(message=msg)
+            if self._telegram_alert:
+                try:
+                    self._telegram_alert(f"✅ {msg}")
+                except Exception as e:
+                    logger.debug("Delta feed: telegram recovered alert failed: %s", e)
+
         self._ws = DeltaWebSocket(
             api_key=self.api_key,
             api_secret=self.api_secret,
@@ -119,6 +129,11 @@ class DeltaWebSocketFeed(RealtimeFeed):
             on_tick=on_tick,
             on_feed_stall=(
                 _on_feed_stall
+                if (self._engine_logger or self._telegram_alert)
+                else None
+            ),
+            on_feed_recovered=(
+                _on_feed_recovered
                 if (self._engine_logger or self._telegram_alert)
                 else None
             ),
