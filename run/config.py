@@ -8,7 +8,7 @@ class RunMode(str, Enum):
 
 
 # 🔁 Default run mode when a job does not specify "run_mode".
-RUN_MODE = RunMode.LIVE
+RUN_MODE = RunMode.BACKTEST
 
 # Default venue when job does not specify "venue". Used for single-venue runs.
 DEFAULT_VENUE = "DHAN"  # "DHAN" | "DELTA"
@@ -25,7 +25,7 @@ STRATEGY_JOBS = [
         "name": "LEAPS_RSI",
         "venue": "DHAN",
         "enabled": False,
-        "run_mode": "PAPER",  # or "LIVE"; omit to use RUN_MODE default
+        # "run_mode": "PAPER",  # or "LIVE"; omit to use RUN_MODE default
         "capital": 200000,
         "symbols": ["NIFTY"],
         "live": {"exchange": "INDEX", "sector": "YES", "rsi": "YES"},
@@ -40,7 +40,7 @@ STRATEGY_JOBS = [
     {
         "name": "MagicalLines",
         "venue": "DHAN",
-        "enabled": True,
+        "enabled": False,
         "capital": 200000,
         "symbols": ["NIFTY"],
         "live": {"exchange": "INDEX", "sector": "YES"},
@@ -48,6 +48,25 @@ STRATEGY_JOBS = [
             "start_date": "2026-01-01",
             "end_date": "2026-02-19",
             "timeframe": "DAY",
+            "exchange": "INDEX",
+            "sector": "YES",
+        },
+    },
+    # Nifty intraday magical line: entry on 15m 9:15–9:30 (close 9:30); SL on 1h :15 closes (10:15…15:15); 15:15 square-off;
+    # monthly expiry (rollover after 15th), delta band + premium fallback. Dhan / NSE chain.
+    {
+        "name": "NiftyIntradayMagicalLine",
+        "venue": "DHAN",
+        "enabled": True,
+        # "run_mode": "PAPER",  # or "LIVE"; omit to use RUN_MODE default
+        "capital": 200000,
+        "symbols": ["NIFTY"],
+        "instrument": "OPTION",
+        "live": {"exchange": "INDEX", "sector": "YES"},
+        "backtest": {
+            "start_date": "2026-03-25",
+            "end_date": "2026-04-02",
+            "timeframe": "15",
             "exchange": "INDEX",
             "sector": "YES",
         },

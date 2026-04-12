@@ -239,6 +239,7 @@ class PositionManager:
                         structure_id=pos.structure_id,
                         instrument=instrument,
                         candle_ts=candle_ts,
+                        exit_reason=exit_reason,
                     )
 
             if strategy:
@@ -312,9 +313,10 @@ class PositionManager:
 
             # -------- LOG --------
             if self.logger:
-                # PnL only on EXIT; leave blank on ENTRY/SCALE_IN
-                pnl_val = pos.realized_pnl if trade_type == "EXIT" else ""
-                cumulative_val = pos.cumulative_pnl if trade_type == "EXIT" else ""
+                # PnL only on EXIT / broker FORCE_EXIT (SL); leave blank on ENTRY/SCALE_IN
+                _exit_like = trade_type in ("EXIT", "FORCE_EXIT")
+                pnl_val = pos.realized_pnl if _exit_like else ""
+                cumulative_val = pos.cumulative_pnl if _exit_like else ""
                 row = {
                     "candle_timestamp": (
                         candle_ts.strftime("%Y-%m-%d %H:%M")
@@ -338,7 +340,7 @@ class PositionManager:
                     # "strategy": strategy,
                 }
 
-                if trade_type == "EXIT":
+                if _exit_like:
                     row["mae"] = pos.mae
                     row["mfe"] = pos.mfe
                     if getattr(pos, "exit_reason", None):

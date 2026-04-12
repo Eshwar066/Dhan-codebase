@@ -2,6 +2,7 @@
 from run.config import RunMode
 from core.strategies.Leaps.LeapsQuatery_RSI_52_32 import LeapsQuarterly
 from core.strategies.MagicalLines.MagicalLines import MagicalLines
+from core.strategies.MagicalLines.NiftyIntradayMagicalLine import NiftyIntradayMagicalLine
 from core.strategies.Intraday.oneDayMagicalLine import OneDayMagicalLine
 from core.strategies.Futures.Futures_EMA.Futures_EMA import FuturesEMAHighLow
 from core.strategies.Futures.Futures_EMA_Momentum.Futures_EMA_Momentum import (
@@ -29,6 +30,15 @@ STRATEGY_MAP = {
     },
     "MagicalLines": {
         "strategy": MagicalLines,
+        "instrument": "OPTION",
+        "allowed_modes": [
+            RunMode.BACKTEST,
+            RunMode.PAPER,
+            RunMode.LIVE,
+        ],
+    },
+    "NiftyIntradayMagicalLine": {
+        "strategy": NiftyIntradayMagicalLine,
         "instrument": "OPTION",
         "allowed_modes": [
             RunMode.BACKTEST,

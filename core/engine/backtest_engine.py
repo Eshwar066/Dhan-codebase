@@ -1,7 +1,7 @@
 import pandas as pd
 import datetime as dt
 from collections import deque
-import pdb
+from typing import Any
 
 from core.engine.base_engine import BaseEngine
 
@@ -32,6 +32,59 @@ class BacktestEngine(BaseEngine):
         self.position_manager.on_forced_exit = getattr(
             strategy, "on_forced_exit", None
         )
+        # Deferred ENTRY after MAIN_EXIT fill (e.g. OneDayMagicalLine / NiftyIntradayMagicalLine reversal)
+        self.position_manager.on_main_exit_fill = self._on_pm_main_exit_fill
+        self.position_manager.on_main_entry_fill = self._on_pm_main_entry_fill
+        self._last_candle: Any = None
+        self._last_candle_buffer: list = []
+
+    def _on_pm_main_entry_fill(self, **kwargs: Any) -> None:
+        strategy = kwargs.get("strategy")
+        if strategy != self.strategy.name:
+            return
+        fn = getattr(self.strategy, "on_main_entry_filled", None)
+        if not callable(fn):
+            return
+        candle = getattr(self, "_last_candle", None)
+        if not candle:
+            return
+        recent = getattr(self, "_last_candle_buffer", None) or []
+        ctx = self.build_context_only(candle, recent_candles=recent)
+        intents = fn(ctx=ctx, **kwargs) or []
+        for intent in intents:
+            inst = intent.instrument
+            sym = inst.trading_symbol
+            px = self.strategy.get_option_price_at_candle(
+                candle,
+                ctx,
+                inst.strike,
+                inst.option_type,
+                inst.expiry,
+                trading_symbol=sym,
+            )
+            if px is None:
+                px = float(candle.get("close", 0) or 0)
+            price_map = {sym: float(px)}
+            self.order_router.process_intent(intent, price_map)
+
+    def _on_pm_main_exit_fill(self, **kwargs: Any) -> None:
+        strategy = kwargs.get("strategy")
+        if strategy != self.strategy.name:
+            return
+        fn = getattr(self.strategy, "on_main_exit_filled", None)
+        if not callable(fn):
+            return
+        pairs = fn(**kwargs) or []
+        for intent, candle in pairs:
+            sym = candle.get("symbol")
+            if not sym:
+                continue
+            price_map = {
+                intent.instrument.trading_symbol: float(
+                    candle.get("close", 0) or 0
+                )
+            }
+            self.order_router.process_intent(intent, price_map)
 
     def build_context(self, candle, recent_candles=None):
         intent_store = getattr(self.order_router, "intent_store", None)
@@ -56,7 +109,6 @@ class BacktestEngine(BaseEngine):
             # df2 = self.data.product_id_for_symbol("BTCUSD")
             # df3 = self.data.get_latest_candles({"BTCUSD", "ETHUSD"})
             # df4 = self.data.get_live_expiry("BTCUSD")
-            # pdb.set_trace()
 
             if df is None or len(df) < 50:
                 continue
@@ -70,6 +122,7 @@ class BacktestEngine(BaseEngine):
             df["timestamp"] = ts_col.dt.tz_convert("Asia/Kolkata")
             if "time" in df.columns:
                 df["time"] = df["timestamp"].dt.time
+
             df = self.strategy.prepare_indicators(df)
             warmup = self.strategy.get_warmup_period()
             # Include macro EMA warmup so first ~50 (slope) or ~100 (ema) candles are stable
@@ -93,12 +146,14 @@ class BacktestEngine(BaseEngine):
                 #     continue
 
                 candle_buffer.append(candle)
+                self._last_candle = candle
+                self._last_candle_buffer = list(candle_buffer)
 
                 # -------- Runtime context --------
                 ctx, entry_intent = self.build_context(
                     candle, recent_candles=list(candle_buffer)
                 )
-                # pdb.set_trace()
+                self.evaluate_sim_broker_stops(candle, ctx)
                 # 🔥 ALWAYS run exits + rollover
                 self._run_risk_and_rollover(symbol, candle, ctx)
 

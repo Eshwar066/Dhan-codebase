@@ -487,6 +487,7 @@ class OrderRouter:
                 broker_order_id=order_id,
             )
 
+    # working
     def refresh_stale_exit_orders(
         self,
         get_bid_ask: Callable[[str], Tuple[float, float]],
@@ -1152,6 +1153,8 @@ class OrderRouter:
         tag=None,
         candle_ts=None,
         action=None,
+        exit_reason=None,
+        execution_source=None,
     ):
         """
         Single entry point for fill processing. Call from broker fill callback or LiveEngine.
@@ -1257,7 +1260,8 @@ class OrderRouter:
             candle_ts=candle_ts,
             action=action,
             metadata_extras=metadata_extras,
-            execution_source="INTENT",
+            exit_reason=exit_reason,
+            execution_source=execution_source or "INTENT",
         )
         if position_closed and realized_pnl is not None:
             self.risk.record_realized_pnl(realized_pnl)

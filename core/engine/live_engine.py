@@ -223,6 +223,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             )
             if isinstance(od, dict) and od.get("symbol"):
                 return str(od["symbol"])
+            niml = metadata_extras.get("nifty_intraday_magical_line")
+            if isinstance(niml, dict) and niml.get("symbol"):
+                return str(niml["symbol"])
         return None
 
     def _on_pm_main_entry_fill(self, **kwargs: Any) -> None:
@@ -493,6 +496,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     )
         self._entries_paused_feed_stale = any_stale
 
+    # working
     def _do_exit_order_refresh(self) -> None:
         """Every 1 min, re-quote open exit orders at near bid/ask until they fill."""
         now = time.time()
@@ -961,12 +965,12 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         timeframe: Optional[str] = None,
     ):
         risk_manager = getattr(self.order_router, "risk", None)
+        self.evaluate_sim_broker_stops(candle, ctx)
         open_positions = self.position_manager.get_open_positions(
             underlying=symbol, strategy=self.strategy.name
         )
         for position in open_positions:
             exit_signal = self.strategy.should_exit(position, candle, ctx)
-            print(">>exit_signal", exit_signal)
             if exit_signal:
                 exit_intents = (
                     self.strategy.on_position_exit(position, candle, ctx) or []

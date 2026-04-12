@@ -33,7 +33,7 @@ from core.strategies.deltaMktMixins import DeltaMktMixins
 from core.strategies.base import BaseStrategy
 
 
-VALID_TIME_1730 = {time(15, 25)}  # 1hr candle close time (IST)
+VALID_TIME_1730 = {time(21, 57)}  # 1hr candle close time (IST)
 
 # Strike/premium selection (kept conservative and similar to `MagicalLines`)
 STRIKE_STEP = 500
@@ -330,10 +330,10 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         # Above line => PE short, below => CE short: reverse when leaving that zone.
         # Short PE (above): reverse to CE when spot crosses below magical line.
         if opt_side == "PE":
-            return prev_close >= magical_line and curr_close < magical_line
+            return curr_close < magical_line #prev_close >= magical_line and 
         # Short CE (below): reverse to PE when spot crosses above magical line.
         if opt_side == "CE":
-            return prev_close <= magical_line and curr_close > magical_line
+            return curr_close > magical_line #prev_close <= magical_line and 
         return False
 
     # ==================================================

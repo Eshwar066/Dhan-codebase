@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Any, Dict
 
 from core.data.data_router import DataRouter
 from core.utils.lag_diag import print_data_check
@@ -73,4 +74,43 @@ class BaseEngine:
             universe_service=getattr(self, "universe_service", None),
             recent_candles=recent_candles,
             intent_store=intent_store,
+        )
+
+    def evaluate_sim_broker_stops(self, candle: Dict[str, Any], ctx: Any) -> None:
+        """SimulatedBroker: fire resting MAIN_SL when option LTP crosses trigger (backtest/paper)."""
+        router = getattr(self, "order_router", None)
+        if router is None:
+            return
+        br = getattr(router, "broker", None)
+        if br is None or not hasattr(br, "evaluate_pending_stops"):
+            return
+        price_map: Dict[str, float] = {}
+        for sym, pos in self.position_manager.positions.items():
+            if pos.net_qty == 0:
+                continue
+            if getattr(pos, "tag", None) != "MAIN":
+                continue
+            if getattr(pos, "strategy", None) != self.strategy.name:
+                continue
+            inst = pos.instrument
+            ts = getattr(inst, "trading_symbol", None)
+            if not ts:
+                continue
+            px = self.strategy.get_option_price_at_candle(
+                candle,
+                ctx,
+                inst.strike,
+                inst.option_type,
+                inst.expiry,
+                trading_symbol=ts,
+            )
+            if px is None:
+                px = float(candle.get("close", 0) or 0)
+            price_map[ts] = float(px)
+        if not price_map:
+            return
+        br.evaluate_pending_stops(
+            router,
+            price_map,
+            candle.get("timestamp"),
         )
