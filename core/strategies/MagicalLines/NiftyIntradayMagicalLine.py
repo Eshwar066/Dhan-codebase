@@ -27,7 +27,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, time
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 
@@ -38,7 +38,7 @@ from core.utils.expiry_resolver import ExpiryResolver
 
 
 # Session (IST)
-ENTRY_CANDLE_TIME = time(9, 30)  # close of 9:15–9:30 15m bar (formation window 9:15–9:30)
+ENTRY_CANDLE_TIME = time(9, 15)  # close of 9:15–9:30 15m bar (formation window 9:15–9:30)
 EOD_EXIT_TIME = time(15, 15)
 
 # 1h bar closes (IST) per Dhan / TradingView alignment — use 15m candles whose close time matches.
@@ -92,6 +92,8 @@ class NiftyIntradayMagicalLine(IndiaMktMixins, BaseStrategy):
     api = "DHAN"
     expiryType = "MONTHLY"
     valid_times = {ENTRY_CANDLE_TIME}
+    delta_abs_min = DELTA_ABS_MIN
+    delta_abs_max = DELTA_ABS_MAX
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -107,59 +109,21 @@ class NiftyIntradayMagicalLine(IndiaMktMixins, BaseStrategy):
     def should_evaluate(self, candle) -> bool:
         return True
 
-    # ------------------------------------------------------------------
-    # Expiry: after 15th → next month
-    # ------------------------------------------------------------------
-    def _expiry_date_for_trade(self, ctx) -> Any:
-        trade_date = pd.to_datetime(ctx.timestamp).date()
-        if trade_date.day > 15:
-            return ExpiryResolver.next_month_expiry(trade_date)
-        return ExpiryResolver.current_month_expiry(trade_date)
-
-    def fetch_option_chain(self, candle, ctx, option_type):
-        ocs = ctx.option_chain_service
-        if self.api == "NSE":
-            ctx.expiry_list = ocs.get_expiries(api=self.api, ctx=ctx, instrument="FUTIDX")
-
-        expiry_date = self._expiry_date_for_trade(ctx)
-        if expiry_date is None or not ctx.expiry_list:
+    def _calendar_expiry_for_symbol(self, ctx) -> Optional[Union[date, str]]:
+        """
+        DHAN keeps ``ctx.selected_expiry`` as chain index (0/1) for rolling option data; map to a
+        calendar expiry for symbol strings and instrument store. NSE paths already store a date.
+        """
+        e = ctx.selected_expiry
+        if e is None:
             return None
+        if isinstance(e, int):
+            td = pd.Timestamp(ctx.timestamp).date()
+            return ExpiryResolver.dhan_expiry_index_to_date(td, e)
+        return e
 
-        expiry_dates = [pd.to_datetime(e).date() for e in ctx.expiry_list]
-        matches = [e for e in expiry_dates if e == expiry_date]
-        if not matches:
-            matches = sorted(expiry_dates)
-            for e in matches:
-                if e >= expiry_date:
-                    expiry_date = e
-                    break
-            else:
-                expiry_date = matches[-1] if matches else expiry_date
-
-        idx = next(
-            (i for i, e in enumerate(expiry_dates) if pd.to_datetime(e).date() == expiry_date),
-            0,
-        )
-        ctx.selected_expiry = ctx.expiry_list[idx] if idx < len(ctx.expiry_list) else ctx.expiry_list[0]
-
-        spot = float(candle["close"])
-        step = STRIKE_STEP
-        atm = round(spot / step) * step
-        strikes = [atm + (i * step) for i in range(-15, 16)]
-        ctx.otm_strikes = [int(s) for s in strikes]
-        return ctx.otm_strikes
-
-    @staticmethod
-    def _delta_column(df: pd.DataFrame, option_type: str) -> Optional[str]:
-        opt = "CE" if option_type.upper() in ("CE", "CALL") else "PE"
-        for c in df.columns:
-            cu = str(c).upper()
-            if "DELTA" in cu and opt in cu:
-                return c
-        for c in df.columns:
-            if "DELTA" in str(c).upper():
-                return c
-        return None
+    # Option chain / strikes: inherited from ``IndiaMktMixins.fetch_option_chain``
+    # (ExpiryResolver + OTM strikes for ``api`` / ``expiryType``).
 
     @staticmethod
     def _direction_from_candle(candle: dict) -> str:
@@ -174,97 +138,6 @@ class NiftyIntradayMagicalLine(IndiaMktMixins, BaseStrategy):
         if spot > anchor:
             return "SHORT_PE"
         return "SHORT_CE"
-
-    def find_strike_niml(
-        self, candle: dict, ctx: Any, option_type: str
-    ) -> Optional[Tuple[Any, float, Any]]:
-        otm = self.fetch_option_chain(candle, ctx, option_type)
-        if not otm:
-            return None
-
-        candle_time = candle["timestamp"]
-        if hasattr(candle_time, "replace"):
-            candle_time = candle_time.replace(tzinfo=None)
-
-        params = {
-            "exchange": ctx.exchange,
-            "interval": self.timeframe,
-            "expiry_code": ctx.selected_expiry,
-            "strike": [str(int(s)) for s in ctx.otm_strikes],
-            "option_type": option_type,
-            "instrument": "OPTIDX",
-            "exchangeSegment": "NSE_FNO",
-            "expiry_flag": "MONTH",
-            "securityId": "13",
-        }
-
-        chain = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
-        if not chain:
-            return None
-
-        if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
-            if chain is None or (isinstance(chain, pd.DataFrame) and chain.empty):
-                return None
-            if not isinstance(chain, pd.DataFrame):
-                return None
-            row = chain[chain["datetime"] == candle_time]
-            if row is None or row.empty:
-                return None
-            r0 = row.iloc[0]
-            strike = int(float(r0.get("strike", r0.get("Strike Price", 0))))
-            opt_u = option_type.upper()
-            prem = None
-            for k in r0.index:
-                ku = str(k).upper()
-                if opt_u in ku and "LTP" in ku:
-                    prem = float(r0[k] or 0)
-                    break
-            if prem is None or prem <= 0:
-                return None
-            return strike, prem, r0
-
-        df = chain.get("chain")
-        if df is None or df.empty:
-            return None
-
-        opt_u = option_type.upper()
-        prem_col = None
-        for col in df.columns:
-            if opt_u in col.upper() and "LTP" in col.upper():
-                prem_col = col
-                break
-        if prem_col is None:
-            return None
-
-        strike_col = "Strike Price" if "Strike Price" in df.columns else df.columns[0]
-        dcol = self._delta_column(df, option_type)
-
-        candidates = df[pd.to_numeric(df[prem_col], errors="coerce").fillna(0) > 0]
-        if candidates.empty:
-            candidates = df
-
-        if dcol and dcol in candidates.columns:
-            def _ok_delta(row) -> bool:
-                try:
-                    d = float(row[dcol] or 0)
-                except (TypeError, ValueError):
-                    return False
-                ad = abs(d)
-                return DELTA_ABS_MIN <= ad <= DELTA_ABS_MAX
-
-            delta_ok = candidates[candidates.apply(_ok_delta, axis=1)]
-            if not delta_ok.empty:
-                candidates = delta_ok
-
-        row = candidates.iloc[0]
-        try:
-            strike = int(float(row[strike_col]))
-        except (TypeError, ValueError, KeyError):
-            return None
-        premium = float(row[prem_col])
-        if strike % STRIKE_STEP != 0:
-            return None
-        return strike, premium, row
 
     def _strategy_meta(self, meta: _NimlMeta) -> dict:
         return {
@@ -326,12 +199,27 @@ class NiftyIntradayMagicalLine(IndiaMktMixins, BaseStrategy):
         ):
             return None
 
-        result = self.find_strike_niml(candle, ctx, option_type)
+        result = self.find_strike_in_premium_range(
+            candle,
+            ctx,
+            option_type,
+            delta_min=DELTA_ABS_MIN,
+            delta_max=DELTA_ABS_MAX,
+        )
+
         if result is None:
             return None
 
         strike, premium, row = result
-        expiry = ctx.selected_expiry
+        try:
+            strike = int(float(strike))
+        except (TypeError, ValueError):
+            return None
+        if strike % STRIKE_STEP != 0:
+            return None
+        expiry = self._calendar_expiry_for_symbol(ctx)
+        if expiry is None:
+            return None
         trading_symbol = ExpiryResolver.build_option_symbol(
             self, candle["symbol"], expiry, strike, option_type
         )
@@ -371,7 +259,7 @@ class NiftyIntradayMagicalLine(IndiaMktMixins, BaseStrategy):
         symbol = candle["symbol"]
         trade_dt = pd.to_datetime(candle["timestamp"]).date()
         ct = pd.Timestamp(candle["timestamp"])
-
+        
         # Stale re-entry wait from prior day
         for sym in list(self._reentry_wait.keys()):
             w = self._reentry_wait[sym]
@@ -639,13 +527,27 @@ class NiftyIntradayMagicalLine(IndiaMktMixins, BaseStrategy):
         ):
             return [exit_intent]
 
-        result = self.find_strike_niml(candle, ctx, reverse_option_type)
+        result = self.find_strike_in_premium_range(
+            candle,
+            ctx,
+            reverse_option_type,
+            delta_min=DELTA_ABS_MIN,
+            delta_max=DELTA_ABS_MAX,
+        )
         if not result:
             return [exit_intent]
         strike, premium, row = result
+        try:
+            strike = int(float(strike))
+        except (TypeError, ValueError):
+            return [exit_intent]
+        if strike % STRIKE_STEP != 0:
+            return [exit_intent]
 
         spot = float(candle["close"])
-        expiry = ctx.selected_expiry
+        expiry = self._calendar_expiry_for_symbol(ctx)
+        if expiry is None:
+            return [exit_intent]
         trading_symbol = ExpiryResolver.build_option_symbol(
             self, meta.symbol, expiry, strike, reverse_option_type
         )

@@ -1,6 +1,7 @@
 from dhanhq import DhanContext, dhanhq, FullDepth
 import mibian
 import datetime
+import math
 import numpy as np
 import pandas as pd
 import traceback
@@ -26,6 +27,90 @@ import pdb
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 print("Codebase Version 3.1.2")
+
+
+# --- Black–Scholes delta (no scipy; matches N(d1) for calls, N(d1)-1 for puts) ---
+
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def bs_option_delta(
+    S: float,
+    K: float,
+    T: float,
+    r: float,
+    sigma: float,
+    option_type: str = "call",
+) -> float:
+    """
+    Black-Scholes delta. ``sigma`` is annualized volatility as decimal (e.g. 0.18 for 18%).
+    ``T`` is time to expiry in years. ``r`` is annual risk-free rate (e.g. 0.065 for ~6.5%).
+    """
+    if S <= 0 or K <= 0:
+        return float("nan")
+    if sigma <= 0 or math.isnan(sigma):
+        return float("nan")
+    if T <= 0:
+        T = 1e-10
+    sqrt_t = math.sqrt(T)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrt_t)
+    opt = option_type.lower()
+    if opt in ("call", "ce"):
+        return _norm_cdf(d1)
+    if opt in ("put", "pe"):
+        return _norm_cdf(d1) - 1.0
+    raise ValueError(f"option_type must be call/ce or put/pe, got {option_type!r}")
+
+
+def _last_thursday_month(year: int, month: int) -> datetime.date:
+    """Last Thursday of (year, month) — NIFTY-style monthly expiry."""
+    first = datetime.date(year, month, 1)
+    if month == 12:
+        last_cal = datetime.date(year + 1, 1, 1) - datetime.timedelta(days=1)
+    else:
+        last_cal = datetime.date(year, month + 1, 1) - datetime.timedelta(days=1)
+    offset = (last_cal.weekday() - 3) % 7
+    return last_cal - datetime.timedelta(days=offset)
+
+
+def _expiry_date_for_series(trade_date: datetime.date, expiry_code: int) -> datetime.date:
+    """
+    Map Dhan ``expiry_code`` (0 = front month, 1 = next) to an expiry calendar date.
+    Aligns with ``ExpiryResolver._derive_monthly_series`` intent.
+    """
+    ec = int(expiry_code)
+    if ec == 0:
+        return _last_thursday_month(trade_date.year, trade_date.month)
+    if trade_date.month == 12:
+        return _last_thursday_month(trade_date.year + 1, 1)
+    return _last_thursday_month(trade_date.year, trade_date.month + 1)
+
+
+def _iv_to_sigma(iv) -> float:
+    """API often sends IV as percent (e.g. 18); convert to decimal vol."""
+    if iv is None:
+        return float("nan")
+    try:
+        v = float(iv)
+    except (TypeError, ValueError):
+        return float("nan")
+    if math.isnan(v):
+        return float("nan")
+    return v / 100.0 if v > 1.0 else max(v, 1e-8)
+
+
+def _years_to_expiry(expiry_date: datetime.date, bar_time) -> float:
+    """Rough year fraction from bar timestamp to expiry (calendar)."""
+    if hasattr(bar_time, "date"):
+        bd = bar_time.date()
+    else:
+        bd = bar_time
+    days = (expiry_date - bd).days
+    if days < 0:
+        return 1e-10
+    return max(days / 365.25, 1e-10)
 
 
 class Tradehull:
@@ -3642,6 +3727,58 @@ class Tradehull:
         except:
             return pd.DataFrame()
 
+    def _enrich_df_bs_delta(
+        self,
+        df: pd.DataFrame,
+        option_type: str,
+        from_date_str: str,
+        expiry_code: int,
+        risk_free_rate: float = 0.065,
+    ) -> pd.DataFrame:
+        """
+        Add ``delta`` column via Black-Scholes using ``spot``, ``strike``, ``iv``, bar ``datetime``.
+        IV from API: if value > 1, treated as percent and divided by 100.
+        """
+        if df is None or df.empty:
+            return df
+        if "spot" not in df.columns or "strike" not in df.columns or "iv" not in df.columns:
+            return df
+        try:
+            trade_date = datetime.datetime.strptime(
+                str(from_date_str)[:10], "%Y-%m-%d"
+            ).date()
+        except (ValueError, TypeError):
+            return df
+        exp_date = _expiry_date_for_series(trade_date, expiry_code)
+        opt = str(option_type).lower()
+        if opt in ("put", "pe"):
+            kind = "put"
+        else:
+            kind = "call"
+        out = df.copy()
+        deltas = []
+        time_col = "datetime" if "datetime" in out.columns else None
+        for _, row in out.iterrows():
+            try:
+                S = float(row["spot"])
+                K = float(row["strike"])
+            except (TypeError, ValueError):
+                deltas.append(float("nan"))
+                continue
+            sigma = _iv_to_sigma(row.get("iv"))
+            if math.isnan(sigma):
+                deltas.append(float("nan"))
+                continue
+            bar_t = row[time_col] if time_col else trade_date
+            T = _years_to_expiry(exp_date, bar_t)
+            try:
+                d = bs_option_delta(S, K, T, risk_free_rate, sigma, kind)
+            except (ValueError, ZeroDivisionError):
+                d = float("nan")
+            deltas.append(d)
+        out["delta"] = deltas
+        return out
+
     def get_expired_option_data(
         self,
         exchangeSegment: str,
@@ -3680,9 +3817,9 @@ class Tradehull:
                 "securityId": int(securityId),
                 "instrument": instrument,
                 "expiryFlag": expiry_flag,
-                "expiryCode": int(expiry_code),
+                "expiryCode":  1 if int(expiry_code)==0 else int(expiry_code),
                 "strike": strike,
-                "drvOptionType": option_type,
+                "drvOptionType": 'PUT' if option_type =='PE' or option_type =='PUT' else 'CALL',
                 "requiredData": required_data,
                 "fromDate": fromDate,
                 "toDate": toDate,
@@ -3690,6 +3827,24 @@ class Tradehull:
             # pdb.set_trace()
             response = dhan_http.post("/charts/rollingoption", payload)
             df = self.convert_to_df(response)
+            ec = int(expiry_code)
+            if isinstance(df, dict):
+                if "CE" in df and isinstance(df["CE"], pd.DataFrame) and not df["CE"].empty:
+                    df["CE"] = self._enrich_df_bs_delta(
+                        df["CE"], "call", fromDate, ec
+                    )
+                if "PE" in df and isinstance(df["PE"], pd.DataFrame) and not df["PE"].empty:
+                    df["PE"] = self._enrich_df_bs_delta(
+                        df["PE"], "put", fromDate, ec
+                    )
+                return df
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                ot = (
+                    "put"
+                    if str(option_type).upper() in ("PUT", "PE")
+                    else "call"
+                )
+                return self._enrich_df_bs_delta(df, ot, fromDate, ec)
             return df
 
             # script_exchange = {

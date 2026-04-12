@@ -1,6 +1,7 @@
 from .base import BaseAdapter
 
 from core.models.strategy_context import StrategyContext
+from core.utils.expiry_resolver import ExpiryResolver
 
 
 class DhanAdapter(BaseAdapter):
@@ -31,15 +32,22 @@ class DhanAdapter(BaseAdapter):
         )
 
     def get_historical_option_chain(self, ctx: StrategyContext, params: dict):
-        expiry_index = ctx.selected_expiry
-        if not isinstance(expiry_index, int):
-            raise ValueError("DHAN selected_expiry must be expiry index")
+        # Prefer params (strike selection / SL pricing pass instrument calendar expiry); else ctx.
+        raw = params.get("expiry_code", ctx.selected_expiry)
+        expiry_index = ExpiryResolver.coerce_to_dhan_expiry_index(ctx.timestamp, raw)
 
         spot_price = ctx.spot_price
-        target_strike = params["strike"]
+        raw = params["strike"]
+        # Strategies pass either one strike or a list of candidate strikes (e.g. OTM ladder from mixins).
+        if isinstance(raw, (list, tuple)):
+            if not raw:
+                raise ValueError("params['strike'] list is empty")
+            target_strike = raw[0]
+        else:
+            target_strike = raw
         strike_step = 50
         atm_strike = round(spot_price / strike_step) * strike_step
-        diff = int(target_strike) - int(atm_strike)
+        diff = int(float(target_strike)) - int(atm_strike)
         n = int(diff / strike_step)
         MAX_N = 10
 
