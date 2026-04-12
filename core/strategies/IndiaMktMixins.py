@@ -20,7 +20,6 @@ from typing import Any, List, Optional, Tuple, Union
 
 # India Standard Time (UTC+5:30) for strategy time-of-day filters.
 IST = timezone(timedelta(hours=5, minutes=30))
-
 from run.config import RUN_MODE, RunMode
 from core.utils.expiry_resolver import ExpiryResolver
 from core.models.order_intent import OrderIntent
@@ -577,6 +576,56 @@ class IndiaMktMixins:
 
         return None
 
+    def _ltp_from_strike_row_backtest(self, strike_row, option_type: str) -> float:
+        """
+        Premium for backtest fills. NSE wide tables use ``CE LTP`` / ``PE LTP``; DHAN rolling
+        rows are often a Series with ``open``/``high``/``low``/``close`` (premium) only.
+        """
+        option_type_label = "PUT" if option_type == "PE" else "CALL"
+        opt_u = str(option_type).upper()
+        keys = (
+            f"{option_type_label} LTP",
+            f"{opt_u} LTP",
+            "PE LTP",
+            "CE LTP",
+            "PUT LTP",
+            "CALL LTP",
+        )
+        for k in keys:
+            try:
+                if isinstance(strike_row, pd.Series):
+                    if k not in strike_row.index:
+                        continue
+                    lv = strike_row[k]
+                elif isinstance(strike_row, dict):
+                    if k not in strike_row:
+                        continue
+                    lv = strike_row[k]
+                else:
+                    continue
+                if lv is None or (isinstance(lv, float) and pd.isna(lv)):
+                    continue
+                v = float(lv.iloc[0] if isinstance(lv, pd.Series) else lv)
+                if v > 0:
+                    return v
+            except (KeyError, TypeError, ValueError):
+                continue
+        if isinstance(strike_row, pd.DataFrame):
+            df = strike_row.iloc[[0]] if len(strike_row) else strike_row
+        elif isinstance(strike_row, pd.Series):
+            df = strike_row.to_frame().T
+        else:
+            df = pd.DataFrame([strike_row])
+        if df is None or df.empty:
+            return 0.0
+        pc = self._option_chain_premium_column(df, opt_u)
+        if pc and pc in df.columns:
+            try:
+                return float(df.iloc[0][pc])
+            except (TypeError, ValueError):
+                pass
+        return 0.0
+
     def map_instrument_to_intent(
         self,
         inst,
@@ -598,13 +647,7 @@ class IndiaMktMixins:
         if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
             ltp = ltp_from_strike_row_live(strike_row)
         else:
-            option_type_label = "PUT" if option_type == "PE" else "CALL"
-            ltp_value = strike_row.get(f"{option_type_label} LTP", 0)
-            ltp = (
-                float(ltp_value.iloc[0])
-                if isinstance(ltp_value, pd.Series)
-                else float(ltp_value)
-            )
+            ltp = self._ltp_from_strike_row_backtest(strike_row, option_type)
 
         assert inst.trading_symbol
         assert inst.custom_symbol

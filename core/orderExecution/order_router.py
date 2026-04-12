@@ -269,6 +269,7 @@ class OrderRouter:
             else None
         )
         exec_price = None
+        
         if price_map and sym is not None:
             exec_price = price_map.get(sym)
         if exec_price is None:
@@ -1247,6 +1248,7 @@ class OrderRouter:
                         f"Skipping duplicate MAIN ENTRY fill callback structure_id={stid_pf}",
                     )
                 return
+        
         position_closed, realized_pnl = self.position_manager.on_fill(
             instrument=instrument,
             side=side,

@@ -63,7 +63,7 @@ class BacktestEngine(BaseEngine):
                 trading_symbol=sym,
             )
             if px is None:
-                px = float(candle.get("close", 0) or 0)
+                px = float(intent.price)
             price_map = {sym: float(px)}
             self.order_router.process_intent(intent, price_map)
 
@@ -81,7 +81,7 @@ class BacktestEngine(BaseEngine):
                 continue
             price_map = {
                 intent.instrument.trading_symbol: float(
-                    candle.get("close", 0) or 0
+                    intent.price
                 )
             }
             self.order_router.process_intent(intent, price_map)
@@ -179,7 +179,7 @@ class BacktestEngine(BaseEngine):
                 exit_intents = self.strategy.on_position_exit(pos, candle, ctx) or []
                 for intent in exit_intents:
                     # dot notation since intent is now an object
-                    price_map = {intent.instrument.trading_symbol: candle["close"]}
+                    price_map = {intent.instrument.trading_symbol: intent.price}
                     self.order_router.process_intent(intent, price_map)
 
         # ---------- HEDGE ROLLOVER ----------
@@ -193,7 +193,7 @@ class BacktestEngine(BaseEngine):
         )
 
         for intent in rollover_intents:
-            price_map = {intent.instrument.trading_symbol: candle["close"]}
+            price_map = {intent.instrument.trading_symbol: intent.price}
             self.order_router.process_intent(intent, price_map)
 
     # ==========================================================
@@ -209,7 +209,7 @@ class BacktestEngine(BaseEngine):
 
         for intent in entry_intent:
             # dot notation since intent is an object
-            price_map = {intent.instrument.trading_symbol: candle["close"]}
+            price_map = {intent.instrument.trading_symbol: intent.price}
             self.order_router.process_intent(intent, price_map)
 
     # ==========================================================
