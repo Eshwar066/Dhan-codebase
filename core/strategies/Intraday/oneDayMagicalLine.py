@@ -64,6 +64,12 @@ class _PendingReversal:
     candle: dict
 
 
+@dataclass(frozen=True)
+class _PendingSLReentry:
+    meta: _PosMeta
+    exit_candle_ts: Any
+
+
 class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     """
     One-Day Magical Line strategy for intraday BTCUSD option selling.
@@ -91,6 +97,8 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         self._pending_spot_close_by_symbol: Dict[str, float] = {}
         self._candle_cache: Dict[Any, Any] = {}
         self._pending_reversal_by_exit_structure_id: Dict[str, _PendingReversal] = {}
+        self._pending_sl_reentry_by_exit_structure_id: Dict[str, _PendingSLReentry] = {}
+        self._pending_sl_reentry_by_symbol: Dict[str, _PendingSLReentry] = {}
 
     def get_warmup_period(self):
         return 0
@@ -357,6 +365,98 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             return "REVERSAL"
         return None
 
+    def _build_sl_reentry_on_next_candle(
+        self,
+        pending: _PendingSLReentry,
+        candle: dict,
+        ctx: Any,
+        curr_spot_close: float,
+    ) -> Optional[Any]:
+        """
+        After SL exit, re-enter on the next candle only:
+        close > magical_line => short PE, close < magical_line => short CE.
+        """
+        if candle["timestamp"] == pending.exit_candle_ts:
+            return None
+
+        meta = pending.meta
+        if curr_spot_close > meta.magical_line:
+            option_type = "PE"
+        else:
+            option_type = "CE"
+
+        next_level = (
+            self._reversal_level_counter.get((meta.symbol, meta.entry_date), meta.level)
+            + 1
+        )
+        if next_level > MAX_REVERSALS:
+            return None
+
+        structure_id_new = self._build_structure_id(
+            meta.symbol, meta.entry_date, next_level
+        )
+        if ctx.position_store.has_open_structure(
+            strategy=self.name, structure_id=structure_id_new, tag="MAIN"
+        ):
+            return None
+        if getattr(ctx, "intent_store", None) and ctx.intent_store.has_pending_intent(
+            strategy=self.name,
+            structure_id=structure_id_new,
+            tags=["MAIN"],
+            actions=["ENTRY"],
+        ):
+            return None
+
+        result = self._get_cached_strike_in_premium_range(
+            candle, ctx, meta.symbol, option_type
+        )
+        if not result:
+            return None
+        strike, premium, row = result
+        if not strike:
+            return None
+
+        expiry = ctx.selected_expiry
+        trading_symbol = self.delta_option_trading_symbol(
+            row,
+            float(strike),
+            option_type,
+            str(expiry),
+        )
+        inst = ctx.instrument_store.intent_creation_details(
+            trading_symbol,
+            ctx.exchange,
+            expiry,
+            option_type,
+            strike,
+        )
+        if inst is None:
+            return None
+
+        self._reversal_level_counter[(meta.symbol, meta.entry_date)] = next_level
+        new_meta = _PosMeta(
+            symbol=meta.symbol,
+            entry_date=meta.entry_date,
+            magical_line=meta.magical_line,
+            entry_premium=float(premium),
+            level=next_level,
+        )
+        entry_intent = self.map_instrument_to_intent(
+            inst=inst,
+            strike_row=row,
+            strategy=self.name,
+            side="SELL",
+            structure_id=structure_id_new,
+            candle_ts=candle["timestamp"],
+            tag="MAIN",
+            symbol=meta.symbol,
+            action="ENTRY",
+            metadata_extras=self._strategy_meta_dict(new_meta),
+        )
+        self._meta_by_structure_id[structure_id_new] = new_meta
+        self._exit_reason_by_structure_id.pop(structure_id_new, None)
+        return entry_intent
+
     # ==================================================
     # ENTRY
     # ==================================================
@@ -399,6 +499,20 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
 
             # Always stage current close for the next candle's cross detection.
             self._pending_spot_close_by_symbol[symbol] = curr_spot_close
+
+            # SL re-entry flow: after SL MAIN_EXIT fill, wait for next candle and
+            # choose side by close vs magical line (above=>short PE, below=>short CE).
+            pending_sl = self._pending_sl_reentry_by_symbol.get(symbol)
+            if pending_sl is not None:
+                reentry_intent = self._build_sl_reentry_on_next_candle(
+                    pending_sl=pending_sl,
+                    candle=candle,
+                    ctx=ctx,
+                    curr_spot_close=float(curr_spot_close),
+                )
+                if reentry_intent is not None:
+                    self._pending_sl_reentry_by_symbol.pop(symbol, None)
+                    return [reentry_intent]
 
             # --------------------------------------------------
             # Initial entry: only at 17:30 (reversal ENTRY is handled in
@@ -559,6 +673,11 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         structure_id = kwargs.get("structure_id")
         if not structure_id:
             return []
+        sl_pending = self._pending_sl_reentry_by_exit_structure_id.pop(
+            str(structure_id), None
+        )
+        if sl_pending is not None:
+            self._pending_sl_reentry_by_symbol[sl_pending.meta.symbol] = sl_pending
         pending = self._pending_reversal_by_exit_structure_id.pop(
             str(structure_id), None
         )
@@ -597,6 +716,11 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
 
         meta = self._meta_by_structure_id.get(structure_id)
         reason = self._exit_reason_by_structure_id.get(structure_id)
+
+        if reason == "SL" and meta is not None:
+            self._pending_sl_reentry_by_exit_structure_id[structure_id] = (
+                _PendingSLReentry(meta=meta, exit_candle_ts=candle["timestamp"])
+            )
 
         if reason != "REVERSAL" or meta is None:
             return [exit_intent]
@@ -699,6 +823,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         super().on_structure_exit(structure_id=structure_id, **kwargs)
         self._pending_exit_structure_ids.discard(structure_id)
         self._exit_reason_by_structure_id.pop(structure_id, None)
+        self._pending_sl_reentry_by_exit_structure_id.pop(str(structure_id), None)
         self._meta_by_structure_id.pop(structure_id, None)
 
     def on_forced_exit(self, **kwargs):
@@ -707,6 +832,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         if not structure_id:
             return
         self._pending_reversal_by_exit_structure_id.pop(str(structure_id), None)
+        self._pending_sl_reentry_by_exit_structure_id.pop(str(structure_id), None)
         position_closed = bool(kwargs.get("position_closed"))
         reason = str(
             kwargs.get("exit_reason") or kwargs.get("execution_source") or "FORCED"
