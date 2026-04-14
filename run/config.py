@@ -10,6 +10,9 @@ class RunMode(str, Enum):
 # 🔁 Default run mode when a job does not specify "run_mode".
 RUN_MODE = RunMode.BACKTEST
 
+# Global fallback: entry quantity in lots (used when a job does not override).
+ORDER_QTY_LOTS = 1
+
 # Default venue when job does not specify "venue". Used for single-venue runs.
 DEFAULT_VENUE = "DHAN"  # "DHAN" | "DELTA"
 
@@ -58,14 +61,15 @@ STRATEGY_JOBS = [
         "name": "NiftyIntradayMagicalLine",
         "venue": "DHAN",
         "enabled": True,
+        "ORDER_QTY_LOTS": 1,
         # "run_mode": "PAPER",  # or "LIVE"; omit to use RUN_MODE default
         "capital": 200000,
         "symbols": ["NIFTY"],
         "instrument": "OPTION",
         "live": {"exchange": "INDEX", "sector": "YES"},
         "backtest": {
-            "start_date": "2025-01-02",
-            "end_date": "2025-01-10",
+            "start_date": "2025-01-01",
+            "end_date": "2025-06-30",
             "timeframe": "15",
             "exchange": "INDEX",
             "sector": "YES",

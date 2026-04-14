@@ -207,7 +207,7 @@ class NiftyIntradayMagicalLine(IndiaMktMixins, BaseStrategy):
             delta_min=DELTA_ABS_MIN,
             delta_max=DELTA_ABS_MAX,
         )
-        pdb.set_trace()
+        # pdb.set_trace()
         if result is None:
             return None
 
@@ -297,11 +297,12 @@ class NiftyIntradayMagicalLine(IndiaMktMixins, BaseStrategy):
         if meta is None:
             return []
         sl_trigger = float(meta.entry_premium * (1.0 + SL_PCT))
+        fill_qty = _.get("qty")
         ref = SimpleNamespace(
             instrument=instrument,
             structure_id=structure_id,
             intent_id=intent_id,
-            qty=int(getattr(instrument, "lot_size", 0) or 0),
+            qty=self._normalize_order_qty(instrument, fill_qty),
         )
         return [self._build_main_sl_intent(ref, sl_trigger, candle_ts, meta.symbol)]
 
@@ -344,7 +345,7 @@ class NiftyIntradayMagicalLine(IndiaMktMixins, BaseStrategy):
             if tag in {"MAIN", "MAIN_EXIT"} or action in {"ENTRY", "EXIT"}:
                 return True
         return False
-        
+
     def on_candle(self, candle: dict, ctx: Any):
         symbol = candle["symbol"]
         trade_dt = pd.to_datetime(candle["timestamp"]).date()
@@ -397,6 +398,7 @@ class NiftyIntradayMagicalLine(IndiaMktMixins, BaseStrategy):
         return self._emit_entry(candle, ctx, trade_dt=trade_dt, level=1)
 
     def _is_eod(self, candle: dict) -> bool:
+        # pdb.set_trace()
         return self._ist_time(candle) >= EOD_EXIT_TIME
 
     def _resolved_option_type_ce_pe(self, inst: Any) -> str:

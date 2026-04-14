@@ -56,6 +56,7 @@ def job_to_engine_config(job: dict) -> EngineConfig:
         max_open_positions=job.get("max_open_positions"),
         max_portfolio_exposure=job.get("max_portfolio_exposure"),
         cooldown_seconds=job.get("cooldown_seconds"),
+        order_qty_lots=job.get("ORDER_QTY_LOTS"),
         check_short_option_margin_enabled=job.get("check_short_option_margin_enabled"),
         feed_stale_seconds=job.get("feed_stale_seconds"),
         backtest=backtest,

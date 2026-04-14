@@ -372,6 +372,7 @@ class PositionManager:
                         "exit_price": price,
                         "qty": qty,
                         "pnl": pos.realized_pnl,
+                        "collected_points": (pos.entry_price - price),
                         "symbol": sym,
                         "strategy": strategy or "GLOBAL",
                         "exit_reason": getattr(pos, "exit_reason", None) or "",
@@ -902,27 +903,35 @@ class PositionManager:
             if underlying:
                 # Match by trading_symbol (position key) so backtest symbol matches; fallback to custom_symbol
                 inst = pos.instrument
-                by_trading = (inst.trading_symbol or "").strip() == (
-                    underlying or ""
-                ).strip()
+                underlying_norm = (underlying or "").strip().upper()
+                trading_symbol = (inst.trading_symbol or "").strip()
+                custom_symbol = (getattr(inst, "custom_symbol", None) or "").strip()
+                trading_upper = trading_symbol.upper()
+                custom_upper = custom_symbol.upper()
+
+                # Exact match (existing behavior)
+                by_trading = trading_upper == underlying_norm
                 by_custom = False
-                if getattr(inst, "custom_symbol", None):
-                    symbol = (inst.custom_symbol or "").strip()
 
-                    # Handle option format: C-BTC-78000-270326 / P-BTC-...
-                    if "-" in symbol:
-                        parts = symbol.split("-")
-                        if len(parts) >= 2:
-                            underlying_from_symbol = parts[1]  # BTC
+                # Prefix match for India-style symbols:
+                # e.g. "NIFTY 30 JAN 24000 CALL" should match underlying "NIFTY".
+                by_prefix = trading_upper.startswith(f"{underlying_norm} ") or custom_upper.startswith(
+                    f"{underlying_norm} "
+                )
 
-                            # Compare with passed underlying (BTCUSD → BTC)
-                            base_underlying = (
-                                (underlying or "").replace("USD", "").strip()
-                            )
+                # Handle option format: C-BTC-78000-270326 / P-BTC-...
+                if "-" in custom_symbol:
+                    parts = custom_symbol.split("-")
+                    if len(parts) >= 2:
+                        underlying_from_symbol = parts[1].strip().upper()  # BTC
 
-                            by_custom = underlying_from_symbol == base_underlying
+                        # Compare with passed underlying (BTCUSD → BTC)
+                        base_underlying = underlying_norm.replace("USD", "").strip()
+                        by_custom = underlying_from_symbol == base_underlying
+
                 if not (by_trading or by_custom):
-                    continue
+                    if not by_prefix:
+                        continue
 
             positions.append(pos)
 

@@ -87,6 +87,8 @@ class EngineFactory:
             )
 
         strategy = cfg["strategy"]()
+        if getattr(config, "order_qty_lots", None) is not None:
+            setattr(strategy, "order_qty_lots", int(config.order_qty_lots))
 
         # ---------- Data (venue-specific) ----------
         if config.broker_name == "DELTA":
@@ -161,6 +163,8 @@ class EngineFactory:
             )
 
         strategy = cfg["strategy"]()
+        if getattr(config, "order_qty_lots", None) is not None:
+            setattr(strategy, "order_qty_lots", int(config.order_qty_lots))
 
         # ---------- Data (venue-specific) ----------
         if config.broker_name == "DELTA":

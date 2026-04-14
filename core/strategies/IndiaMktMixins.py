@@ -20,7 +20,7 @@ from typing import Any, List, Optional, Tuple, Union
 
 # India Standard Time (UTC+5:30) for strategy time-of-day filters.
 IST = timezone(timedelta(hours=5, minutes=30))
-from run.config import RUN_MODE, RunMode
+from run.config import RUN_MODE, RunMode, ORDER_QTY_LOTS
 from core.utils.expiry_resolver import ExpiryResolver
 from core.models.order_intent import OrderIntent
 from core.strategies.deltaMktMixins import (
@@ -55,6 +55,20 @@ class IndiaMktMixins:
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.rolled_hedges = set()
+
+    def _entry_order_qty(self, inst) -> int:
+        lot = int(getattr(inst, "lot_size", 0) or 0)
+        lots = int(getattr(self, "order_qty_lots", ORDER_QTY_LOTS) or 1)
+        return max(1, lot * max(1, lots))
+
+    def _normalize_order_qty(self, inst, qty) -> int:
+        if qty is None:
+            return self._entry_order_qty(inst)
+        try:
+            q = int(qty)
+        except (TypeError, ValueError):
+            return self._entry_order_qty(inst)
+        return q if q > 0 else self._entry_order_qty(inst)
 
     # ==================================================
     # DHAN EXPIRED OPTION CSV (BACKTEST) — same layout as dhan expired option chain download scripts
@@ -174,11 +188,12 @@ class IndiaMktMixins:
         metadata_extras=None,
         trigger_price=None,
     ):
+        resolved_qty = self._normalize_order_qty(inst, qty)
         return OrderIntent(
             intent_id=uuid.uuid4().hex,
             instrument=inst,
             side=side,
-            qty=int(inst.lot_size),
+            qty=resolved_qty,
             price=price,
             order_type=order_type,
             strategy=strategy,
@@ -696,7 +711,7 @@ class IndiaMktMixins:
             intent_id=uuid.uuid4().hex,
             instrument=inst,
             side=side,
-            qty=int(inst.lot_size),
+            qty=self._entry_order_qty(inst),
             price=ltp,
             order_type=order_type,
             strategy=strategy,
@@ -740,7 +755,7 @@ class IndiaMktMixins:
             intent_id=uuid.uuid4().hex,
             instrument=inst,
             side=side,
-            qty=int(inst.lot_size),
+            qty=self._entry_order_qty(inst),
             price=ltp,
             order_type="LIMIT",
             strategy=strategy,

@@ -12,6 +12,7 @@ TRADE_LOG_COLUMNS = [
     "exit_price",
     "qty",
     "pnl",
+    "collected_points",
     "symbol",
     "strategy",
     "exit_reason",

@@ -546,11 +546,12 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         if meta is None:
             return []
         sl_trigger = float(meta.entry_premium * (1.0 + SL_PCT))
+        fill_qty = _.get("qty")
         ref = SimpleNamespace(
             instrument=instrument,
             structure_id=structure_id,
             intent_id=intent_id,
-            qty=int(getattr(instrument, "lot_size", 0) or 0),
+            qty=self._normalize_order_qty(instrument, fill_qty),
         )
         return [self._build_main_sl_intent(ref, sl_trigger, candle_ts, meta.symbol)]
 
