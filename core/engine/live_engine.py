@@ -506,6 +506,35 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             stale_seconds=float(self._exit_refresh_interval_seconds),
         )
 
+    def _log_startup_balance_snapshot(self) -> None:
+        """
+        One-time startup balance check/log for observability before live loop.
+        """
+        broker = getattr(self.order_router, "broker", None)
+        if not broker or not hasattr(broker, "get_balance_snapshot"):
+            return
+        try:
+            snapshot = broker.get_balance_snapshot()
+        except Exception as e:
+            if self.engine_logger:
+                self.engine_logger.log("risk_block", f"Startup balance check failed: {e}")
+            else:
+                logger.warning("Startup balance check failed: %s", e)
+            return
+        if not snapshot:
+            return
+        msg = (
+            "Startup balance snapshot: "
+            f"selected={snapshot.get('selected_available')} "
+            f"usd={snapshot.get('usd_available')} "
+            f"inr={snapshot.get('inr_available')}"
+        )
+        if self.engine_logger:
+            self.engine_logger.log("oms", msg)
+        else:
+            logger.info(msg)
+        self._telegram_plain(f"ℹ️ {msg}")
+
     # this not getting logged properly
     def _export_eod(self, date_str: str) -> None:
         """Export open positions, realized pnl to reports/{engine_id}_{date}.csv."""
@@ -597,6 +626,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self._telegram_plain(
             f"Engine started: {self.engine_id} | venue={self.venue} | mode={_rm}"
         )
+        self._log_startup_balance_snapshot()
 
         self._do_order_state_check()
         tf = getattr(self.strategy, "timeframe", None)

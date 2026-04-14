@@ -90,6 +90,53 @@ class DeltaBroker(BaseBroker):
         super().__init__(position_manager=position_manager, intent_store=intent_store)
         self.api = api
 
+    @staticmethod
+    def _wallet_available(wallet: Optional[Dict[str, Any]]) -> Optional[float]:
+        if not isinstance(wallet, dict):
+            return None
+        for key in (
+            "available_balance",
+            "availableBalance",
+            "balance",
+            "withdrawable_balance",
+        ):
+            v = wallet.get(key)
+            if v is None:
+                continue
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def get_balance_snapshot(self) -> Optional[Dict[str, Any]]:
+        """
+        Fetch wallet balances used by Delta funds checks and return a log-friendly snapshot.
+        """
+        source = getattr(self.api, "_source", None)
+        if source is None or not getattr(source, "get_balances", None):
+            return None
+        try:
+            usd_wallet = source.get_balances(3)  # USD
+            inr_wallet = source.get_balances(17)  # INR
+            usd_available = self._wallet_available(usd_wallet)
+            inr_available = self._wallet_available(inr_wallet)
+            selected_available = (
+                usd_available
+                if usd_available is not None
+                else inr_available
+            )
+            return {
+                "usd_available": usd_available,
+                "inr_available": inr_available,
+                "selected_available": selected_available,
+                "usd_wallet_present": isinstance(usd_wallet, dict),
+                "inr_wallet_present": isinstance(inr_wallet, dict),
+            }
+        except Exception as e:
+            logger.warning("Delta balance snapshot failed: %s", e)
+            return None
+
     def check_funds_before_order(
         self,
         intent: Any,
@@ -106,28 +153,27 @@ class DeltaBroker(BaseBroker):
             logger.warning("Delta funds check: failed to compute required notional: %s", e)
             return None
 
-        source = getattr(self.api, "_source", None)
-        if source is None or not getattr(source, "get_balances", None):
+        snapshot = self.get_balance_snapshot()
+        if not isinstance(snapshot, dict):
             return None
 
         try:
-            # Prefer USD wallet (asset_id = 3)
-            wallet = source.get_balances(3)
-
-            # If USD wallet unavailable, fallback to INR wallet (asset_id = 17)
-            if not wallet:
-                wallet = source.get_balances(17)
-
-            if not isinstance(wallet, dict):
+            available = snapshot.get("selected_available")
+            if available is None:
                 return None
+            available = float(available)
 
-            available = float(
-                wallet.get("available_balance")
-                or wallet.get("availableBalance")
-                or wallet.get("balance")
-                or wallet.get("withdrawable_balance")
-                or 0
-            )
+            # Guard against false negatives from stale/mismatched wallet fields.
+            # If available is zero/negative, let broker-side validation decide.
+            if available <= 0:
+                logger.warning(
+                    "Delta funds check advisory-only: selected_available=%s (usd=%s, inr=%s). "
+                    "Skipping local block and letting broker validate.",
+                    available,
+                    snapshot.get("usd_available"),
+                    snapshot.get("inr_available"),
+                )
+                return None
 
             if available < required:
                 shortfall = required - available
