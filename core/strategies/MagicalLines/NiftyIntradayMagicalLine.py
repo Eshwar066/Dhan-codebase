@@ -138,12 +138,7 @@ class NiftyIntradayMagicalLine(IndiaMktMixins, BaseStrategy):
         c = float(candle["close"])
         return "SHORT_PE" if c > o else "SHORT_CE"
 
-    @staticmethod
-    def _direction_from_spot_vs_anchor(spot: float, anchor: float) -> str:
-        """Above anchor → short PE; below or equal → short CE."""
-        if spot > anchor:
-            return "SHORT_PE"
-        return "SHORT_CE"
+   
 
     def _strategy_meta(self, meta: _NimlMeta) -> dict:
         return {
@@ -260,7 +255,96 @@ class NiftyIntradayMagicalLine(IndiaMktMixins, BaseStrategy):
         self._meta_by_structure_id[structure_id] = meta
         self._exit_reason_by_structure_id.pop(structure_id, None)
         return [intent]
+    
+    def _build_main_sl_intent(
+        self,
+        entry_ref: Any,
+        trigger_price: float,
+        candle_ts: Any,
+        symbol: str,
+    ) -> Any:
+        return self.create_order_intent(
+            inst=entry_ref.instrument,
+            side="BUY",
+            qty=entry_ref.qty,
+            price=float(trigger_price),
+            order_type="SL-M",
+            strategy=self.name,
+            candle_ts=candle_ts,
+            structure_id=entry_ref.structure_id,
+            tag="MAIN_SL",
+            symbol=symbol,
+            action="FORCE_EXIT",
+            parent_intent_id=entry_ref.intent_id,
+            trigger_price=float(trigger_price),
+        )
+    def on_main_entry_filled(
+        self,
+        *,
+        ctx: Any,
+        instrument: Any,
+        structure_id: Optional[str],
+        intent_id: Optional[str],
+        candle_ts: Any,
+        metadata_extras: Any = None,
+        **_: Any,
+    ) -> List[Any]:
+        """After MAIN entry fill, arm broker SL (resting stop in SimulatedBroker)."""
+        del ctx, metadata_extras
+        if not structure_id or not intent_id:
+            return []
+        meta = self._meta_by_structure_id.get(structure_id)
+        if meta is None:
+            return []
+        sl_trigger = float(meta.entry_premium * (1.0 + SL_PCT))
+        ref = SimpleNamespace(
+            instrument=instrument,
+            structure_id=structure_id,
+            intent_id=intent_id,
+            qty=int(getattr(instrument, "lot_size", 0) or 0),
+        )
+        return [self._build_main_sl_intent(ref, sl_trigger, candle_ts, meta.symbol)]
 
+    def _has_pending_main_intent(self, ctx: Any, symbol: str) -> bool:
+        intent_store = getattr(ctx, "intent_store", None)
+        if intent_store is None:
+            return False
+        terminal_statuses = {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"}
+        intents = getattr(intent_store, "intents", {}) or {}
+        for rec in intents.values():
+            status = rec.get("status")
+            status_value = getattr(status, "value", status)
+            if str(status_value) in terminal_statuses:
+                continue
+            payload = rec.get("payload") or {}
+            if payload.get("strategy_id") != self.name:
+                continue
+            rec_underlyings = set()
+            strategy_meta = payload.get("strategy_meta") or {}
+            niml_meta = None
+            if isinstance(strategy_meta, dict):
+                niml_meta = strategy_meta.get("nifty_intraday_magical_line")
+            if isinstance(niml_meta, dict) and niml_meta.get("symbol"):
+                rec_underlyings.add(str(niml_meta.get("symbol")))
+            structure_id = str(
+                payload.get("structure_id") or rec.get("structure_id") or ""
+            )
+            parts = structure_id.split(":")
+            if len(parts) >= 3 and parts[0] == self.name:
+                rec_underlyings.add(parts[1])
+            if rec_underlyings:
+                if symbol not in rec_underlyings:
+                    continue
+            elif payload.get("symbol") != symbol:
+                continue
+            tag = str(payload.get("tag") or rec.get("tag") or "").upper()
+            action = str(payload.get("action") or rec.get("action") or "").upper()
+            if tag == "MAIN_SL":
+                continue
+            if tag in {"MAIN", "MAIN_EXIT"} or action in {"ENTRY", "EXIT"}:
+                return True
+        return False
+        
     def on_candle(self, candle: dict, ctx: Any):
         symbol = candle["symbol"]
         trade_dt = pd.to_datetime(candle["timestamp"]).date()
@@ -323,6 +407,13 @@ class NiftyIntradayMagicalLine(IndiaMktMixins, BaseStrategy):
             return "CE"
         return str(ot or "")
 
+    @staticmethod
+    def _direction_from_spot_vs_anchor(spot: float, anchor: float) -> str:
+        """Above anchor → short PE; below or equal → short CE."""
+        if spot > anchor:
+            return "SHORT_PE"
+        return "SHORT_CE"
+
     def _is_reversal_cross(
         self, position: Any, candle: dict, magical_line: float
     ) -> bool:
@@ -362,95 +453,8 @@ class NiftyIntradayMagicalLine(IndiaMktMixins, BaseStrategy):
             return True
         return False
 
-    def _has_pending_main_intent(self, ctx: Any, symbol: str) -> bool:
-        intent_store = getattr(ctx, "intent_store", None)
-        if intent_store is None:
-            return False
-        terminal_statuses = {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"}
-        intents = getattr(intent_store, "intents", {}) or {}
-        for rec in intents.values():
-            status = rec.get("status")
-            status_value = getattr(status, "value", status)
-            if str(status_value) in terminal_statuses:
-                continue
-            payload = rec.get("payload") or {}
-            if payload.get("strategy_id") != self.name:
-                continue
-            rec_underlyings = set()
-            strategy_meta = payload.get("strategy_meta") or {}
-            niml_meta = None
-            if isinstance(strategy_meta, dict):
-                niml_meta = strategy_meta.get("nifty_intraday_magical_line")
-            if isinstance(niml_meta, dict) and niml_meta.get("symbol"):
-                rec_underlyings.add(str(niml_meta.get("symbol")))
-            structure_id = str(
-                payload.get("structure_id") or rec.get("structure_id") or ""
-            )
-            parts = structure_id.split(":")
-            if len(parts) >= 3 and parts[0] == self.name:
-                rec_underlyings.add(parts[1])
-            if rec_underlyings:
-                if symbol not in rec_underlyings:
-                    continue
-            elif payload.get("symbol") != symbol:
-                continue
-            tag = str(payload.get("tag") or rec.get("tag") or "").upper()
-            action = str(payload.get("action") or rec.get("action") or "").upper()
-            if tag == "MAIN_SL":
-                continue
-            if tag in {"MAIN", "MAIN_EXIT"} or action in {"ENTRY", "EXIT"}:
-                return True
-        return False
-
-    def _build_main_sl_intent(
-        self,
-        entry_ref: Any,
-        trigger_price: float,
-        candle_ts: Any,
-        symbol: str,
-    ) -> Any:
-        return self.create_order_intent(
-            inst=entry_ref.instrument,
-            side="BUY",
-            qty=entry_ref.qty,
-            price=float(trigger_price),
-            order_type="SL-M",
-            strategy=self.name,
-            candle_ts=candle_ts,
-            structure_id=entry_ref.structure_id,
-            tag="MAIN_SL",
-            symbol=symbol,
-            action="FORCE_EXIT",
-            parent_intent_id=entry_ref.intent_id,
-            trigger_price=float(trigger_price),
-        )
-
-    def on_main_entry_filled(
-        self,
-        *,
-        ctx: Any,
-        instrument: Any,
-        structure_id: Optional[str],
-        intent_id: Optional[str],
-        candle_ts: Any,
-        metadata_extras: Any = None,
-        **_: Any,
-    ) -> List[Any]:
-        """After MAIN entry fill, arm broker SL (resting stop in SimulatedBroker)."""
-        del ctx, metadata_extras
-        if not structure_id or not intent_id:
-            return []
-        meta = self._meta_by_structure_id.get(structure_id)
-        if meta is None:
-            return []
-        sl_trigger = float(meta.entry_premium * (1.0 + SL_PCT))
-        ref = SimpleNamespace(
-            instrument=instrument,
-            structure_id=structure_id,
-            intent_id=intent_id,
-            qty=int(getattr(instrument, "lot_size", 0) or 0),
-        )
-        return [self._build_main_sl_intent(ref, sl_trigger, candle_ts, meta.symbol)]
+    
+    
 
     def on_main_exit_filled(self, **kwargs: Any) -> List[Tuple[Any, dict]]:
         structure_id = kwargs.get("structure_id")
