@@ -9,6 +9,7 @@ import logging
 import os
 import sys
 import pandas as pd
+import pdb
 
 logger = logging.getLogger(__name__)
 from datetime import date, datetime, timedelta
@@ -31,6 +32,11 @@ from core.data.sources.dhan_historical_cache import (
     cache_key_intraday,
     load_df,
     save_df,
+)
+from core.utils.expiry_resolver import ExpiryResolver
+from core.utils.dhan_expired_option_chain_files import (
+    default_expired_option_chain_root,
+    load_expired_option_chain_from_files,
 )
 
 load_dotenv()
@@ -486,25 +492,88 @@ class DhanSource:
         securityId,
         instrument,
         exchangeSegment,
+        symbol=None,
+        spot_price=None,
     ):
-        """Expired option data for backtest. Maps to Tradehull get_expired_option_data."""
-        return self.tsl.get_expired_option_data(
-            exchangeSegment=exchangeSegment,
-            instrument=instrument,
-            fromDate=from_date,
-            toDate=to_date,
-            exchange=exchange,
-            interval=(
-                int(interval)
-                if isinstance(interval, str) and interval.isdigit()
-                else interval
-            ),
-            securityId=securityId,
-            expiry_flag=expiry_flag,
-            expiry_code=int(expiry_code),
-            strike=strike,
-            option_type=option_type,
+        """
+        Backtest option OHLC: prefer CSVs under ``DHAN_EXPIRED_OPTION_CHAIN_ROOT``
+        (or ``dhan expired option chain/Monthly Options data *``). Same layout as
+        ``dhan expired option chain/Expired options data.py``.
+        """
+        trade_dt = self._to_date(from_date)
+        if trade_dt is None:
+            return None
+
+        ec = ExpiryResolver.coerce_to_dhan_expiry_index(
+            pd.Timestamp(from_date), expiry_code
         )
+        cal_exp = ExpiryResolver.dhan_expiry_index_to_date(trade_dt, ec)
+        sym = (symbol or "NIFTY").upper()
+        sp = float(spot_price or 0.0)
+        strikes = strike if isinstance(strike, (list, tuple)) else [strike]
+
+        root = default_expired_option_chain_root()
+        df = load_expired_option_chain_from_files(
+            symbol=sym,
+            calendar_expiry=cal_exp,
+            strikes=strikes,
+            option_type=option_type,
+            spot_price=sp,
+            from_date=from_date,
+            to_date=to_date,
+            root=root,
+            strike_step=50,
+        )
+        
+        if df is not None and not df.empty:
+            print(">> returned data from expired dhan options files")
+            return df
+        
+        try:
+            first = strikes[0] if strikes else "ATM"
+            strike_arg = first
+            if isinstance(first, str) and str(first).upper().startswith("ATM"):
+                strike_arg = first
+            elif isinstance(first, (int, float)) or (
+                isinstance(first, str)
+                and str(first).replace(".", "", 1).replace("-", "", 1).isdigit()
+            ):
+                fs = float(first)
+                atm_strike = round(sp / 50.0) * 50.0
+                n = int((fs - atm_strike) / 50.0)
+                mx = 10
+                if n == 0:
+                    strike_arg = "ATM"
+                elif 0 < n <= mx:
+                    strike_arg = f"ATM+{n}"
+                elif -mx <= n < 0:
+                    strike_arg = f"ATM{n}"
+                elif n > mx:
+                    strike_arg = f"ATM+{mx}"
+                else:
+                    strike_arg = f"ATM-{mx}"
+
+            print(">> returned data from api")
+            return self.tsl.get_expired_option_data(
+                exchangeSegment=exchangeSegment,
+                instrument=instrument,
+                fromDate=from_date,
+                toDate=to_date,
+                exchange=exchange,
+                interval=(
+                    int(interval)
+                    if isinstance(interval, str) and interval.isdigit()
+                    else interval
+                ),
+                securityId=securityId,
+                expiry_flag=expiry_flag,
+                expiry_code=int(ec),
+                strike=strike_arg,
+                option_type=option_type,
+            )
+        except Exception as e:
+            logger.warning("Dhan expired option chain API fallback failed: %s", e)
+            return None
 
     # -------------------------------------------------------------------------
     # Data: Strike helpers (for strategy building)

@@ -19,6 +19,11 @@ Rules (spec)
 
 Use a **15**-minute feed so the 9:15–9:30 close (9:30) exists; SL/EOD still align to **:15**
 hourly closes (10:15 … 15:15) on those 15m candles.
+
+**Backtest:** option marks come from locally downloaded Dhan expired option CSVs
+(``ATM Wise data/{SYMBOL}/{expiry}/{ATM±n}/…``). Set ``DHAN_EXPIRED_OPTION_CHAIN_ROOT`` to the
+folder that contains ``ATM Wise data``, or place data under ``dhan expired option chain/Monthly Options data *``.
+The **interval** of downloaded bars should match strategy ``timeframe`` (e.g. 15 vs 60 minutes).
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
+import pdb
 
 from run.config import RUN_MODE, RunMode
 from core.strategies.base import BaseStrategy
@@ -206,7 +212,7 @@ class NiftyIntradayMagicalLine(IndiaMktMixins, BaseStrategy):
             delta_min=DELTA_ABS_MIN,
             delta_max=DELTA_ABS_MAX,
         )
-
+        pdb.set_trace()
         if result is None:
             return None
 

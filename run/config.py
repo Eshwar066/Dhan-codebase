@@ -64,8 +64,8 @@ STRATEGY_JOBS = [
         "instrument": "OPTION",
         "live": {"exchange": "INDEX", "sector": "YES"},
         "backtest": {
-            "start_date": "2026-03-25",
-            "end_date": "2026-04-02",
+            "start_date": "2025-01-02",
+            "end_date": "2025-01-10",
             "timeframe": "15",
             "exchange": "INDEX",
             "sector": "YES",

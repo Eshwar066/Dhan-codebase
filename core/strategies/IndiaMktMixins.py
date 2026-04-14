@@ -2,7 +2,7 @@
 India market mixins: shared logic for India options/LEAPS strategies.
 
 Use in any strategy that needs:
-- Option chain fetch, strike selection, option pricing
+- Option chain fetch, strike selection, option pricing (Dhan backtests: local expired-option CSVs via ``IndiaMktMixins.load_dhan_expired_option_chain_dataframe`` / ``DhanSource.get_expired_optionchain``)
 - Order intent creation and instrument-to-intent mapping
 - Hedge entry/exit and rollover
 
@@ -28,6 +28,10 @@ from core.strategies.deltaMktMixins import (
     delta_option_trading_symbol,
     ltp_from_strike_row_live,
 )
+from core.utils.dhan_expired_option_chain_files import (
+    atm_label_from_spot_strike,
+    load_expired_option_chain_from_files,
+)
 
 
 class IndiaMktMixins:
@@ -51,6 +55,42 @@ class IndiaMktMixins:
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.rolled_hedges = set()
+
+    # ==================================================
+    # DHAN EXPIRED OPTION CSV (BACKTEST) — same layout as dhan expired option chain download scripts
+    # ==================================================
+    @staticmethod
+    def dhan_expired_option_atm_folder_label(
+        spot: float, strike: float, strike_step: int = 50
+    ) -> str:
+        """ATM folder name (``ATM``, ``ATM+2``, ``ATM-3``, …) for on-disk Dhan CSVs."""
+        return atm_label_from_spot_strike(spot, strike, strike_step=strike_step)
+
+    @staticmethod
+    def load_dhan_expired_option_chain_dataframe(
+        *,
+        symbol: str,
+        calendar_expiry: Any,
+        strikes: Any,
+        option_type: str,
+        spot_price: float,
+        from_date: str,
+        to_date: str,
+        root: Any = None,
+        strike_step: int = 50,
+    ):
+        """Load merged CALL or PUT history from local expired-option CSVs (optional custom ``root``)."""
+        return load_expired_option_chain_from_files(
+            symbol=symbol,
+            calendar_expiry=calendar_expiry,
+            strikes=strikes,
+            option_type=option_type,
+            spot_price=spot_price,
+            from_date=from_date,
+            to_date=to_date,
+            root=root,
+            strike_step=strike_step,
+        )
 
     # ==================================================
     # TIME FILTER (override valid_times in strategy)
