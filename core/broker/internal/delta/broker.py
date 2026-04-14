@@ -117,8 +117,8 @@ class DeltaBroker(BaseBroker):
         if source is None or not getattr(source, "get_balances", None):
             return None
         try:
-            usd_wallet = source.get_balances(3)  # USD
-            inr_wallet = source.get_balances(17)  # INR
+            usd_wallet = source.get_balances(14)  # USD
+            inr_wallet = source.get_balances(204)  # INR
             usd_available = self._wallet_available(usd_wallet)
             inr_available = self._wallet_available(inr_wallet)
             selected_available = (
