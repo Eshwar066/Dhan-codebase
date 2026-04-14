@@ -45,6 +45,7 @@ DELTA_RANGE = (0.2, 0.4)
 
 # Risk
 SL_PCT = 0.15  # 15% rise in short option premium triggers exit
+NEXT_DAY_ML_GAP_PCT = 0.03  # Next-day 17:30 MAIN entry only if spot is outside +/-3% of previous ML
 MAX_REVERSALS = 5  # max reversal levels per ML1 day (L1 initial + reversals)
 _CANDLE_CACHE_MAX = 1000
 
@@ -99,6 +100,8 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         self._pending_reversal_by_exit_structure_id: Dict[str, _PendingReversal] = {}
         self._pending_sl_reentry_by_exit_structure_id: Dict[str, _PendingSLReentry] = {}
         self._pending_sl_reentry_by_symbol: Dict[str, _PendingSLReentry] = {}
+        # Last daily ML used for 17:30 MAIN entry gating on following days.
+        self._last_daily_ml_by_symbol: Dict[str, Tuple[date, float]] = {}
 
     def get_warmup_period(self):
         return 0
@@ -365,6 +368,51 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             return "REVERSAL"
         return None
 
+    def _reference_ml_from_position_store(self, symbol: str, ctx: Any) -> Optional[float]:
+        position_store = getattr(ctx, "position_store", None)
+        if position_store is None or not hasattr(position_store, "get_position_metadata"):
+            return None
+        try:
+            bucket = position_store.get_position_metadata(symbol) or {}
+        except Exception:
+            return None
+        sm = bucket.get("strategy_meta") if isinstance(bucket, dict) else None
+        if not isinstance(sm, dict):
+            return None
+        raw = sm.get("one_day_magical_line") or sm.get("one_day_ml1")
+        if not isinstance(raw, dict):
+            return None
+        ml = raw.get("magicalLine", raw.get("ml1"))
+        if ml is None:
+            return None
+        try:
+            return float(ml)
+        except (TypeError, ValueError):
+            return None
+
+    def _passes_next_day_ml_gap_filter(
+        self, symbol: str, trade_dt: date, spot_close: float, ctx: Any
+    ) -> bool:
+        """
+        For fresh 17:30 MAIN entries on a new day, require spot to move at least
+        +/-3% from the previous day's stored magical line for that symbol.
+        """
+        prev_ml = self._reference_ml_from_position_store(symbol=symbol, ctx=ctx)
+        prev = self._last_daily_ml_by_symbol.get(symbol)
+        if prev is None and prev_ml is None:
+            return True
+        if prev is not None:
+            prev_dt, prev_ml_mem = prev
+            if trade_dt <= prev_dt:
+                return True
+            if prev_ml is None:
+                prev_ml = prev_ml_mem
+        if prev_ml <= 0:
+            return False
+        lo = prev_ml * (1.0 - NEXT_DAY_ML_GAP_PCT)
+        hi = prev_ml * (1.0 + NEXT_DAY_ML_GAP_PCT)
+        return spot_close <= lo or spot_close >= hi
+
     def _build_sl_reentry_on_next_candle(
         self,
         pending: _PendingSLReentry,
@@ -434,10 +482,11 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             return None
 
         self._reversal_level_counter[(meta.symbol, meta.entry_date)] = next_level
+        entry_ml = float(curr_spot_close)
         new_meta = _PosMeta(
             symbol=meta.symbol,
             entry_date=meta.entry_date,
-            magical_line=meta.magical_line,
+            magical_line=entry_ml,
             entry_premium=float(premium),
             level=next_level,
         )
@@ -455,6 +504,10 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         )
         self._meta_by_structure_id[structure_id_new] = new_meta
         self._exit_reason_by_structure_id.pop(structure_id_new, None)
+        self._last_daily_ml_by_symbol[meta.symbol] = (
+            pd.to_datetime(candle["timestamp"]).date(),
+            entry_ml,
+        )
         return entry_intent
 
     # ==================================================
@@ -522,6 +575,13 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 return None
 
             trade_dt = pd.to_datetime(candle["timestamp"]).date()
+            if not self._passes_next_day_ml_gap_filter(
+                symbol=symbol,
+                trade_dt=trade_dt,
+                spot_close=float(curr_spot_close),
+                ctx=ctx,
+            ):
+                return None
             open_positions = ctx.position_store.get_open_positions(
                 underlying=symbol, strategy=self.name
             )
@@ -610,6 +670,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             print(">>entry_intent", entry_intent)
             self._meta_by_structure_id[structure_id] = meta
             self._exit_reason_by_structure_id.pop(structure_id, None)
+            self._last_daily_ml_by_symbol[symbol] = (trade_dt, magical_line)
 
             return [entry_intent]
         finally:
@@ -780,11 +841,12 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             return [exit_intent]
 
         self._reversal_level_counter[(meta.symbol, meta.entry_date)] = next_level
+        entry_ml = float(candle.get("close", meta.magical_line) or meta.magical_line)
 
         new_meta = _PosMeta(
             symbol=meta.symbol,
             entry_date=meta.entry_date,
-            magical_line=meta.magical_line,
+            magical_line=entry_ml,
             entry_premium=float(premium),
             level=next_level,
         )
@@ -802,6 +864,10 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         )
         self._meta_by_structure_id[structure_id_new] = new_meta
         self._exit_reason_by_structure_id.pop(structure_id_new, None)
+        self._last_daily_ml_by_symbol[meta.symbol] = (
+            pd.to_datetime(candle["timestamp"]).date(),
+            entry_ml,
+        )
 
         self._pending_reversal_by_exit_structure_id[structure_id] = _PendingReversal(
             entry_intent=entry_intent,
