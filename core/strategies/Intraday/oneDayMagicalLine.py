@@ -33,7 +33,7 @@ from core.strategies.deltaMktMixins import DeltaMktMixins
 from core.strategies.base import BaseStrategy
 
 
-VALID_TIME_1730 = {time(15, 25)}  # 1hr candle close time (IST)
+VALID_TIME_1730 = {time(17, 30)}  # 1hr candle close time (IST)
 
 # Strike/premium selection (kept conservative and similar to `MagicalLines`)
 STRIKE_STEP = 500
@@ -70,7 +70,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     """
 
     name = "OneDayMagicalLine"
-    timeframe = "1"  # change to 60min later
+    timeframe = "60"  # change to 60min later
     required_context = ["option_chain"]
     api = "DELTA"
     expiryType = "Weekly"

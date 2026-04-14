@@ -92,6 +92,7 @@ class DeltaWebSocket:
         api_secret: str,
         testnet: bool = False,
         india: bool = True,
+        on_open: Optional[Callable[[], None]] = None,
         on_message: Optional[Callable[[Dict], None]] = None,
         on_auth: Optional[Callable[[bool, Dict], None]] = None,
         on_subscriptions: Optional[Callable[[Dict], None]] = None,
@@ -107,6 +108,7 @@ class DeltaWebSocket:
 
         self.ws_url = DELTA_WS_INDIA_TEST if testnet else DELTA_WS_INDIA_PROD
         logger.info("Delta WebSocket URL: %s", self.ws_url)
+        self.on_open_cb = on_open
         self.on_message = on_message
         self.on_auth = on_auth
         self.on_subscriptions = on_subscriptions
@@ -432,6 +434,11 @@ class DeltaWebSocket:
         with self._lock:
             self._connect_generation += 1
         logger.info("Delta WebSocket connected to %s", self.ws_url)
+        if self.on_open_cb:
+            try:
+                self.on_open_cb()
+            except Exception as e:
+                logger.debug("Delta WS on_open callback error: %s", e)
         self._enable_heartbeat()
         timestamp, signature = _ws_signature(self.api_secret)
         self._send(
@@ -504,20 +511,33 @@ class DeltaWebSocket:
 
     def _reconnect(self) -> None:
         """Replace WebSocket app and let the same thread run run_forever again (no second thread)."""
+        if self._reconnecting:
+            return
+        self._reconnecting = True
         if self._heartbeat_timer:
             self._heartbeat_timer.cancel()
             self._heartbeat_timer = None
-        if self._ws:
-            try:
-                self._ws.close()
-            except Exception as e:
-                logger.debug("Delta WS close during reconnect: %s", e)
-            self._ws = None
-        logger.debug("Delta WebSocket: reconnecting in 2s...")
-        time.sleep(2)
+        try:
+            if self._ws:
+                try:
+                    self._ws.close()
+                except Exception as e:
+                    logger.debug("Delta WS close during reconnect: %s", e)
+                self._ws = None
+            logger.debug("Delta WebSocket: reconnecting in 2s...")
+            time.sleep(2)
+            if self._stop.is_set() or self._gave_up:
+                return
+            self._ws = self._make_ws_app()
+        finally:
+            self._reconnecting = False
+
+    def request_reconnect(self, reason: str = "manual") -> None:
+        """Public reconnect trigger used by feed watchdog/recovery logic."""
         if self._stop.is_set() or self._gave_up:
             return
-        self._ws = self._make_ws_app()
+        logger.info("Delta WebSocket reconnect requested: %s", reason)
+        self._reconnect()
 
     def _run_forever(self) -> None:
         while not self._stop.is_set() and self._ws and not self._gave_up:

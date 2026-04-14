@@ -119,7 +119,7 @@ STRATEGY_JOBS = [
         "symbols": ["BTCUSD"],
         "instrument": "OPTION",
         "delta_india": True,
-        "delta_testnet": True,
+        "delta_testnet": False,
         "delta_leverage": 10,
         "max_open_positions": 5,
         "check_short_option_margin_enabled": True,
