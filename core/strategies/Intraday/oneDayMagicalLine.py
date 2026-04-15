@@ -8,13 +8,14 @@ Rules (per user spec)
    - Currently short `PE` => reverse to short `CE` when spot crosses **below** ML1
    - Currently short `CE` => reverse to short `PE` when spot crosses **above** ML1
 5. From short premium use 15% as SL:
-   - If option premium rises by >= 15% from entry premium => exit (no reversal).
+   - If option premium rises by >= 15% from entry premium => exit.
 
 Implementation notes
 - Uses `IndiaMktMixins` for option strike/premium selection and option LTP fetching.
 - Delta product symbols via `DeltaMktMixins.delta_option_trading_symbol` (see `deltaMktMixins.py`).
 - Broker SL (`MAIN_SL`) is placed only after the MAIN sell fills (avoids Delta `no_open_position`).
 - On reversal: emit `MAIN_EXIT` first; when that exit fills, emit reversal ENTRY; SL again after the new MAIN fills.
+- If broker/forced exit closes a MAIN leg at SL, queue next-candle SL re-entry as well.
 - The magical line (spot at entry) is stored per opened position via `structure_id` for reversal + SL.
 """
 
@@ -897,12 +898,27 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         structure_id = kwargs.get("structure_id")
         if not structure_id:
             return
+        structure_id = str(structure_id)
+        meta = self._meta_by_structure_id.get(structure_id)
+        reason = str(
+            kwargs.get("exit_reason")
+            or kwargs.get("execution_source")
+            or kwargs.get("tag")
+            or "FORCED"
+        ).upper()
+        candle_ts = kwargs.get("candle_ts") or kwargs.get("timestamp")
+
+        # Broker-side SL/forced exits may bypass on_position_exit/on_main_exit_filled.
+        # Queue next-candle SL re-entry so behavior stays consistent.
+        is_sl_forced_exit = reason in {"SL", "MAIN_SL", "FORCE_EXIT"}
+        if meta is not None and is_sl_forced_exit:
+            self._pending_sl_reentry_by_symbol[meta.symbol] = _PendingSLReentry(
+                meta=meta, exit_candle_ts=candle_ts
+            )
+
         self._pending_reversal_by_exit_structure_id.pop(str(structure_id), None)
         self._pending_sl_reentry_by_exit_structure_id.pop(str(structure_id), None)
         position_closed = bool(kwargs.get("position_closed"))
-        reason = str(
-            kwargs.get("exit_reason") or kwargs.get("execution_source") or "FORCED"
-        )
         if position_closed:
             self.on_structure_exit(structure_id=structure_id)
         else:
