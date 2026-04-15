@@ -418,9 +418,9 @@ class PositionManager:
                         "metadata_extras": metadata_extras,
                     }
             if prev_qty != 0 and new_qty == 0:
-                if str(tag or "").upper() == "MAIN_EXIT" and str(
+                if str(tag or "").upper() in ["MAIN_EXIT", "MAIN_SL"] and str(
                     action or ""
-                ).upper() == "EXIT":
+                ).upper() in ["EXIT", "FORCE_EXIT"]:
                     hook_main_exit = {
                         "instrument": instrument,
                         "side": side,
