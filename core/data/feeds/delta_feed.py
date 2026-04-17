@@ -71,6 +71,7 @@ class DeltaWebSocketFeed(RealtimeFeed):
         self._tick_queue: Optional[Any] = None
         self._public_sub_gen_applied: int = -1
         self._stall_reconnect_triggered: bool = False
+        self._user_trade_callback: Optional[Any] = None
 
     def set_tick_queue(self, queue: Any) -> None:
         """Push normalized ticks to queue for CandleAggregator. Set before start()."""
@@ -169,6 +170,7 @@ class DeltaWebSocketFeed(RealtimeFeed):
                 if (self._engine_logger or self._telegram_alert)
                 else None
             ),
+            on_user_trade=self._forward_user_trade,
         )
         self._ws.connect()
         # Public subscriptions happen from _on_open (including reconnects).
@@ -178,6 +180,19 @@ class DeltaWebSocketFeed(RealtimeFeed):
         self._auth_done = success
         if success:
             self._do_subscribe_private()
+
+    def set_user_trade_callback(self, callback: Any) -> None:
+        """Set event-driven callback for private user-trade events."""
+        self._user_trade_callback = callback
+
+    def _forward_user_trade(self, trade: Dict[str, Any]) -> None:
+        cb = self._user_trade_callback
+        if not cb:
+            return
+        try:
+            cb(trade)
+        except Exception as e:
+            logger.debug("Delta feed: user trade callback failed: %s", e)
 
     def _do_subscribe_public(self) -> None:
         if not self._ws or not self._ws.is_connected():
@@ -244,6 +259,7 @@ class DeltaWebSocketFeed(RealtimeFeed):
             [
                 {"name": "orders", "symbols": ["all"]},
                 {"name": "positions", "symbols": ["all"]},
+                {"name": "v2/user_trades", "symbols": ["all"]},
             ]
         )
 
@@ -374,3 +390,9 @@ class DeltaWebSocketFeed(RealtimeFeed):
         if not self._ws:
             return {}
         return self._ws.get_positions()
+
+    def get_recent_user_trades(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """Drain recent private user-trade events from WebSocket buffer."""
+        if not self._ws:
+            return []
+        return self._ws.pop_user_trades(limit=limit)

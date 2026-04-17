@@ -101,6 +101,7 @@ class DeltaWebSocket:
         on_tick: Optional[Callable[[str, float, float, float], None]] = None,
         on_feed_stall: Optional[Callable[[float], None]] = None,
         on_feed_recovered: Optional[Callable[[], None]] = None,
+        on_user_trade: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -116,6 +117,7 @@ class DeltaWebSocket:
         self.on_close_cb = on_close
         self.on_feed_stall = on_feed_stall
         self.on_feed_recovered = on_feed_recovered
+        self.on_user_trade = on_user_trade
 
         self._ws: Optional[websocket.WebSocketApp] = None
         self._thread: Optional[threading.Thread] = None
@@ -140,6 +142,7 @@ class DeltaWebSocket:
         self._last_orderbook_l2: Dict[str, Dict] = {}
         self._orders: Dict[str, List[Dict]] = {}
         self._positions: Dict[str, Dict] = {}
+        self._user_trades: List[Dict] = []
         self._ws_msg_sample_count = 0
         # Incremented on each successful WebSocket open (incl. reconnect); feeds use to re-apply L2 subs.
         self._connect_generation = 0
@@ -422,6 +425,30 @@ class DeltaWebSocket:
             "portfolio_margins",
             "mmp_trigger",
         ):
+            if msg_type in ("v2/user_trades", "user_trades"):
+                result = msg.get("result")
+                entries: List[Dict[str, Any]] = []
+                if isinstance(result, list):
+                    entries = [e for e in result if isinstance(e, dict)]
+                elif isinstance(result, dict):
+                    entries = [result]
+                elif isinstance(msg, dict):
+                    # Some payloads may arrive as a flat trade event.
+                    entries = [msg]
+                if entries:
+                    with self._lock:
+                        for e in entries:
+                            rec = dict(e)
+                            rec.setdefault("_ws_msg_type", msg_type)
+                            rec.setdefault("_ws_action", msg.get("action"))
+                            self._user_trades.append(rec)
+                            if self.on_user_trade:
+                                try:
+                                    self.on_user_trade(rec)
+                                except Exception as cb_err:
+                                    logger.debug("Delta WS on_user_trade callback error: %s", cb_err)
+                        if len(self._user_trades) > 2000:
+                            self._user_trades = self._user_trades[-2000:]
             if self.on_message:
                 self.on_message(msg)
             return
@@ -627,6 +654,18 @@ class DeltaWebSocket:
     def get_positions(self) -> Dict[str, Dict]:
         with self._lock:
             return dict(self._positions)
+
+    def pop_user_trades(self, limit: int = 200) -> List[Dict]:
+        """Drain up to ``limit`` recent private user-trade events."""
+        if limit <= 0:
+            return []
+        with self._lock:
+            n = min(int(limit), len(self._user_trades))
+            if n <= 0:
+                return []
+            out = self._user_trades[:n]
+            self._user_trades = self._user_trades[n:]
+            return out
 
     def is_connected(self) -> bool:
         return (
