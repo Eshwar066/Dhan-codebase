@@ -34,7 +34,7 @@ from core.strategies.deltaMktMixins import DeltaMktMixins
 from core.strategies.base import BaseStrategy
 
 
-VALID_TIME_1730 = {time(17, 30)}  # 1hr candle close time (IST)
+VALID_TIME_1730 = {time(22, 30)}  # 1hr candle close time (IST)
 
 # Strike/premium selection (kept conservative and similar to `MagicalLines`)
 STRIKE_STEP = 500
@@ -117,6 +117,33 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             }
         }
 
+    def _try_merge_odml_meta_from_raw(self, structure_id: str, raw: dict) -> bool:
+        """
+        Parse persisted ``one_day_magical_line`` payload into ``_meta_by_structure_id``.
+        Returns True if ``structure_id`` is present after the call.
+        """
+        if structure_id in self._meta_by_structure_id:
+            return True
+        try:
+            ml_val = raw.get("magicalLine", raw.get("ml1"))
+            if ml_val is None:
+                return False
+            meta = _PosMeta(
+                symbol=str(raw["symbol"]),
+                entry_date=date.fromisoformat(str(raw["entry_date"])),
+                magical_line=float(ml_val),
+                entry_premium=float(raw["entry_premium"]),
+                level=int(raw["level"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+        self._meta_by_structure_id[structure_id] = meta
+        k = (meta.symbol, meta.entry_date)
+        self._reversal_level_counter[k] = max(
+            self._reversal_level_counter.get(k, 0), meta.level
+        )
+        return True
+
     def _restore_odml_meta_from_position(self, pos: Any, position_store: Any) -> None:
         if not pos or not getattr(pos, "structure_id", None):
             return
@@ -128,26 +155,53 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             return
         sm = bucket.get("strategy_meta") or {}
         raw = sm.get("one_day_magical_line") or sm.get("one_day_ml1")
-        if not raw:
+        if not isinstance(raw, dict):
             return
-        try:
-            ml_val = raw.get("magicalLine", raw.get("ml1"))
-            if ml_val is None:
-                return
-            meta = _PosMeta(
-                symbol=str(raw["symbol"]),
-                entry_date=date.fromisoformat(str(raw["entry_date"])),
-                magical_line=float(ml_val),
-                entry_premium=float(raw["entry_premium"]),
-                level=int(raw["level"]),
+        self._try_merge_odml_meta_from_raw(str(pos.structure_id), raw)
+
+    def _ensure_odml_meta_for_main_fill(
+        self,
+        structure_id: str,
+        instrument: Any,
+        ctx: Any,
+        intent_id: Optional[str],
+        metadata_extras: Any,
+    ) -> None:
+        """
+        Repopulate in-memory ODML meta when the MAIN entry fill runs after restart or
+        whenever ``_meta_by_structure_id`` was cleared (``on_main_entry_filled`` needs it for SL).
+        """
+        if structure_id in self._meta_by_structure_id:
+            return
+        if isinstance(metadata_extras, dict):
+            raw = metadata_extras.get("one_day_magical_line") or metadata_extras.get(
+                "one_day_ml1"
             )
-        except (KeyError, TypeError, ValueError):
+            if isinstance(raw, dict):
+                self._try_merge_odml_meta_from_raw(structure_id, raw)
+        if structure_id in self._meta_by_structure_id:
             return
-        self._meta_by_structure_id[pos.structure_id] = meta
-        k = (meta.symbol, meta.entry_date)
-        self._reversal_level_counter[k] = max(
-            self._reversal_level_counter.get(k, 0), meta.level
-        )
+        ps = getattr(ctx, "position_store", None)
+        sym = getattr(instrument, "trading_symbol", None) if instrument else None
+        if ps is not None and sym and callable(getattr(ps, "get_position_metadata", None)):
+            bucket = ps.get_position_metadata(sym)
+            if bucket:
+                sm = bucket.get("strategy_meta") or {}
+                raw = sm.get("one_day_magical_line") or sm.get("one_day_ml1")
+                if isinstance(raw, dict):
+                    self._try_merge_odml_meta_from_raw(structure_id, raw)
+        if structure_id in self._meta_by_structure_id:
+            return
+        ist = getattr(ctx, "intent_store", None)
+        if ist is not None and intent_id and callable(getattr(ist, "get", None)):
+            rec = ist.get(intent_id)
+            if rec:
+                payload = rec.get("payload") or {}
+                sm = payload.get("strategy_meta")
+                if isinstance(sm, dict):
+                    raw = sm.get("one_day_magical_line") or sm.get("one_day_ml1")
+                    if isinstance(raw, dict):
+                        self._try_merge_odml_meta_from_raw(structure_id, raw)
 
     def _build_structure_id(self, symbol: str, trade_dt: date, level: int) -> str:
         return f"{self.name}:{symbol}:ML1:{trade_dt}:L{level}:{uuid.uuid4().hex[:6]}"
@@ -262,6 +316,19 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             parent_intent_id=entry_intent.intent_id,
             trigger_price=float(trigger_price),
         )
+
+    def _normalize_order_qty(self, instrument: Any, fill_qty: Any) -> int:
+        """Integer qty for SL intent ref; align with fill size and instrument lot_size."""
+        lot = int(getattr(instrument, "lot_size", None) or 1) or 1
+        if fill_qty is None:
+            return lot
+        try:
+            q = int(round(float(fill_qty)))
+        except (TypeError, ValueError):
+            return lot
+        if q <= 0:
+            return lot
+        return q
 
     # Strike selection: backtest = Delta tick CSV; live/paper = products + tickers (``deltaMktMixins``).
     # Branch uses ``run.config.RUN_MODE`` — for live engines set global ``RUN_MODE`` or ensure it matches the job.
@@ -850,17 +917,26 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         intent_id: Optional[str],
         candle_ts: Any,
         metadata_extras: Any = None,
-        **_: Any,
+        **kw: Any,
     ) -> List[Any]:
         """Engine calls after MAIN ENTRY fill; place broker SL when position exists."""
-        del ctx, metadata_extras
         if not structure_id or not intent_id:
             return []
-        meta = self._meta_by_structure_id.get(structure_id)
+        sid = str(structure_id)
+        self._ensure_odml_meta_for_main_fill(
+            sid, instrument, ctx, intent_id, metadata_extras
+        )
+        meta = self._meta_by_structure_id.get(sid)
         if meta is None:
+            self._log_skip(
+                stage="main_entry_fill",
+                reason="no ODML meta after restore; broker SL skipped",
+                structure_id=sid,
+                intent_id=intent_id,
+            )
             return []
         sl_trigger = float(meta.entry_premium * (1.0 + SL_PCT))
-        fill_qty = _.get("qty")
+        fill_qty = kw.get("qty")
         ref = SimpleNamespace(
             instrument=instrument,
             structure_id=structure_id,
