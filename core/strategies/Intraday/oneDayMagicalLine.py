@@ -81,7 +81,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     timeframe = "60"  # change to 60min later
     required_context = ["option_chain"]
     api = "DELTA"
-    expiryType = "Weekly"
+    expiryType = "Monthly"
     valid_times = VALID_TIME_1730
     delta = TARGET_DELTA
     delta_range = DELTA_RANGE
@@ -282,7 +282,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             min_prem=min_prem,
             max_prem=max_prem,
             lookback_sec=lookback_sec,
-            expiry="Weekly",
+            expiry=self.expiryType,
             side="SELL",
             target_delta=self.delta,
             delta_min=self.delta_range[0],
@@ -409,10 +409,39 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             if prev_ml is None:
                 prev_ml = prev_ml_mem
         if prev_ml <= 0:
+            self._log_skip(
+                stage="entry_ml_gap",
+                reason="previous magical line is non-positive",
+                symbol=symbol,
+                trade_dt=trade_dt,
+                prev_ml=prev_ml,
+                spot_close=spot_close,
+            )
             return False
         lo = prev_ml * (1.0 - NEXT_DAY_ML_GAP_PCT)
         hi = prev_ml * (1.0 + NEXT_DAY_ML_GAP_PCT)
-        return spot_close <= lo or spot_close >= hi
+        passes = spot_close <= lo or spot_close >= hi
+        if not passes:
+            self._log_skip(
+                stage="entry_ml_gap",
+                reason="spot close within previous ML +/- gap band",
+                symbol=symbol,
+                trade_dt=trade_dt,
+                prev_ml=prev_ml,
+                spot_close=spot_close,
+                lower_band=lo,
+                upper_band=hi,
+            )
+        return passes
+
+    def _log_skip(self, stage: str, reason: str, **details: Any) -> None:
+        parts = []
+        for key, value in details.items():
+            if value is None:
+                continue
+            parts.append(f"{key}={value}")
+        suffix = f" | {', '.join(parts)}" if parts else ""
+        print(f"[{self.name}][SKIP:{stage}] {reason}{suffix}")
 
     def _build_sl_reentry_on_next_candle(
         self,
@@ -426,6 +455,13 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         close > magical_line => short PE, close < magical_line => short CE.
         """
         if candle["timestamp"] == pending.exit_candle_ts:
+            self._log_skip(
+                stage="sl_reentry",
+                reason="waiting for next candle after SL exit",
+                symbol=pending.meta.symbol,
+                exit_candle_ts=pending.exit_candle_ts,
+                candle_ts=candle["timestamp"],
+            )
             return None
 
         meta = pending.meta
@@ -439,6 +475,14 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             + 1
         )
         if next_level > MAX_REVERSALS:
+            self._log_skip(
+                stage="sl_reentry",
+                reason="max reversals reached",
+                symbol=meta.symbol,
+                entry_date=meta.entry_date,
+                next_level=next_level,
+                max_reversals=MAX_REVERSALS,
+            )
             return None
 
         structure_id_new = self._build_structure_id(
@@ -447,6 +491,12 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         if ctx.position_store.has_open_structure(
             strategy=self.name, structure_id=structure_id_new, tag="MAIN"
         ):
+            self._log_skip(
+                stage="sl_reentry",
+                reason="target structure already open",
+                symbol=meta.symbol,
+                structure_id=structure_id_new,
+            )
             return None
         if getattr(ctx, "intent_store", None) and ctx.intent_store.has_pending_intent(
             strategy=self.name,
@@ -454,15 +504,35 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             tags=["MAIN"],
             actions=["ENTRY"],
         ):
+            self._log_skip(
+                stage="sl_reentry",
+                reason="pending MAIN ENTRY already exists",
+                symbol=meta.symbol,
+                structure_id=structure_id_new,
+            )
             return None
 
         result = self._get_cached_strike_in_premium_range(
             candle, ctx, meta.symbol, option_type
         )
         if not result:
+            self._log_skip(
+                stage="sl_reentry",
+                reason="no strike found in premium range",
+                symbol=meta.symbol,
+                option_type=option_type,
+                premium_min=TARGET_PREMIUM_MIN,
+                premium_max=TARGET_PREMIUM_MAX,
+            )
             return None
         strike, premium, row = result
         if not strike:
+            self._log_skip(
+                stage="sl_reentry",
+                reason="resolved strike is empty",
+                symbol=meta.symbol,
+                option_type=option_type,
+            )
             return None
 
         expiry = ctx.selected_expiry
@@ -480,6 +550,14 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             strike,
         )
         if inst is None:
+            self._log_skip(
+                stage="sl_reentry",
+                reason="instrument details unavailable for resolved strike",
+                symbol=meta.symbol,
+                trading_symbol=trading_symbol,
+                option_type=option_type,
+                strike=strike,
+            )
             return None
 
         self._reversal_level_counter[(meta.symbol, meta.entry_date)] = next_level
@@ -549,6 +627,12 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             # Entry lock: block new entries while current lifecycle is still in flight.
             if self._has_pending_main_intent(ctx, symbol):
                 self._pending_spot_close_by_symbol[symbol] = curr_spot_close
+                self._log_skip(
+                    stage="entry",
+                    reason="pending MAIN lifecycle intent exists",
+                    symbol=symbol,
+                    candle_ts=candle["timestamp"],
+                )
                 return None
 
             # Always stage current close for the next candle's cross detection.
@@ -573,6 +657,13 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             # on_position_exit after MAIN exit).
             # --------------------------------------------------
             if not self.should_enter(candle):
+                self._log_skip(
+                    stage="entry",
+                    reason="candle time is not in valid entry window",
+                    symbol=symbol,
+                    candle_ts=candle["timestamp"],
+                    valid_times=self.valid_times,
+                )
                 return None
 
             trade_dt = pd.to_datetime(candle["timestamp"]).date()
@@ -582,6 +673,13 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 spot_close=float(curr_spot_close),
                 ctx=ctx,
             ):
+                self._log_skip(
+                    stage="entry",
+                    reason="next-day magical line gap filter blocked entry",
+                    symbol=symbol,
+                    trade_dt=trade_dt,
+                    spot_close=float(curr_spot_close),
+                )
                 return None
             open_positions = ctx.position_store.get_open_positions(
                 underlying=symbol, strategy=self.name
@@ -596,6 +694,13 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             ]
 
             if len(open_main_positions) >= max_positions:
+                self._log_skip(
+                    stage="entry",
+                    reason="max open MAIN positions reached",
+                    symbol=symbol,
+                    open_main_positions=len(open_main_positions),
+                    max_positions=max_positions,
+                )
                 return None
 
             direction = self._direction_at_1730(candle)
@@ -611,6 +716,12 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             if ctx.position_store.has_open_structure(
                 strategy=self.name, structure_id=structure_id, tag="MAIN"
             ):
+                self._log_skip(
+                    stage="entry",
+                    reason="structure already open",
+                    symbol=symbol,
+                    structure_id=structure_id,
+                )
                 return None
 
             has_pending = (
@@ -622,6 +733,12 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 else False
             )
             if has_pending:
+                self._log_skip(
+                    stage="entry",
+                    reason="pending intent exists for structure",
+                    symbol=symbol,
+                    structure_id=structure_id,
+                )
                 return None
 
             result = self._get_cached_strike_in_premium_range(
@@ -629,10 +746,24 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             )
 
             if result is None:
+                self._log_skip(
+                    stage="entry",
+                    reason="no strike found in premium range",
+                    symbol=symbol,
+                    option_type=option_type,
+                    premium_min=TARGET_PREMIUM_MIN,
+                    premium_max=TARGET_PREMIUM_MAX,
+                )
                 return None
 
             strike, premium, row = result
             if not strike:
+                self._log_skip(
+                    stage="entry",
+                    reason="resolved strike is empty",
+                    symbol=symbol,
+                    option_type=option_type,
+                )
                 return None
 
             expiry = ctx.selected_expiry
@@ -647,6 +778,14 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 trading_symbol, ctx.exchange, expiry, option_type, strike
             )
             if inst is None:
+                self._log_skip(
+                    stage="entry",
+                    reason="instrument details unavailable for resolved strike",
+                    symbol=symbol,
+                    trading_symbol=trading_symbol,
+                    option_type=option_type,
+                    strike=strike,
+                )
                 return None
 
             meta = _PosMeta(
