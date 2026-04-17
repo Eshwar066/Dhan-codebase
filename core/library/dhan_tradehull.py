@@ -767,8 +767,12 @@ class Tradehull:
         bo_profit_value=None,
         bo_stop_loss_Value=None,
         tag=None,
+        correlation_id=None,
     ) -> str:
-
+        """
+        correlation_id: same value sent as REST ``correlationId`` (dhanhq maps ``tag`` → correlationId).
+        If set, overrides ``tag`` for that payload field.
+        """
         try:
             tradingsymbol = tradingsymbol
             exchange = exchange.upper()
@@ -831,7 +835,8 @@ class Tradehull:
             if security_check.empty:
                 raise Exception("Check the Tradingsymbol")
             security_id = security_check.iloc[-1]["SEM_SMST_SECURITY_ID"]
-            # pdb.set_trace()
+            corr = correlation_id if correlation_id is not None and str(correlation_id).strip() != "" else tag
+            # dhanhq: tag → JSON correlationId (see dhanhq._order.place_order)
             order = self.Dhan.place_order(
                 security_id=str(security_id),
                 exchange_segment=exchangeSegment,
@@ -847,7 +852,7 @@ class Tradehull:
                 amo_time=amo_time,
                 bo_profit_value=bo_profit_value,
                 bo_stop_loss_Value=bo_stop_loss_Value,
-                tag=tag,
+                tag=corr,
             )
 
             if order["status"] == "failure":

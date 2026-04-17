@@ -15,6 +15,8 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+from core.utils.global_rate_limiter import DHAN_QUOTE_API, GlobalRateLimiter
+
 
 DHAN_MARKETFEED_BASE = "https://api.dhan.co/v2"
 
@@ -37,7 +39,6 @@ class DhanMarketFeedClient:
         self.access_token = access_token
         self.base_url = base_url.rstrip("/")
         self.rate_limit_seconds = rate_limit_seconds
-        self._last_request_time: float = 0.0
 
     def _headers(self) -> Dict[str, str]:
         return {
@@ -59,10 +60,7 @@ class DhanMarketFeedClient:
     def _throttle(self) -> None:
         if self.rate_limit_seconds <= 0:
             return
-        elapsed = time.monotonic() - self._last_request_time
-        if elapsed < self.rate_limit_seconds:
-            time.sleep(self.rate_limit_seconds - elapsed)
-        self._last_request_time = time.monotonic()
+        GlobalRateLimiter.instance().acquire(DHAN_QUOTE_API, self.rate_limit_seconds)
 
     def _post(self, path: str, instruments: Dict[str, List[Any]]) -> Dict[str, Any]:
         self._throttle()

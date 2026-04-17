@@ -26,6 +26,7 @@ class DhanBrokerApi:
         bo_profit_value: Optional[float] = None,
         bo_stop_loss_value: Optional[float] = None,
         tag: Optional[str] = None,
+        correlation_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         return self._source.place_order(
             tradingsymbol=tradingsymbol,
@@ -43,6 +44,7 @@ class DhanBrokerApi:
             bo_profit_value=bo_profit_value,
             bo_stop_loss_value=bo_stop_loss_value,
             tag=tag,
+            correlation_id=correlation_id,
         )
 
     def get_positions(self, debug: str = "NO") -> Any:

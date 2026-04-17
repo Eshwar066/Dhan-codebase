@@ -775,12 +775,16 @@ class DhanSource:
         bo_profit_value=None,
         bo_stop_loss_value=None,
         tag=None,
+        correlation_id=None,
     ):
         """
         Place order via Tradehull. Used only by broker layer (DhanBrokerApi).
+        Dhan REST maps the same string to JSON ``correlationId`` (via dhanhq ``tag``).
+        Pass intent_id as both tag and correlation_id for WS order_alert CorrelationId parity.
         Returns dict with "status" ("success" | "error") and "order_id".
         """
         try:
+            cid = correlation_id if correlation_id is not None else tag
             result = self.tsl.order_placement(
                 tradingsymbol=tradingsymbol,
                 exchange=exchange.upper(),
@@ -797,6 +801,7 @@ class DhanSource:
                 bo_profit_value=bo_profit_value,
                 bo_stop_loss_Value=bo_stop_loss_value,
                 tag=tag or "",
+                correlation_id=cid,
             )
             if result is not None and isinstance(result, str):
                 return {"status": "success", "order_id": result}

@@ -534,7 +534,11 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
     def _normalize_dhan_ws_synthetic_trade(
         self, payload: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
-        """Map incremental order-update fill to OrderRouter.process_trade shape."""
+        """
+        Map incremental order-update fill to OrderRouter.process_trade shape.
+        Primary intent match: WS Data.CorrelationId (same string as REST correlationId / tag at place).
+        Fallback: OrderNo → intent via broker_order_id on IntentStore.
+        """
         if not isinstance(payload, dict):
             return None
         order_no = str(payload.get("order_no") or "").strip()
