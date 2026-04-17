@@ -99,7 +99,6 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         self._pending_spot_close_by_symbol: Dict[str, float] = {}
         self._candle_cache: Dict[Any, Any] = {}
         self._pending_reversal_by_exit_structure_id: Dict[str, _PendingReversal] = {}
-        self._pending_sl_reentry_by_exit_structure_id: Dict[str, _PendingSLReentry] = {}
         self._pending_sl_reentry_by_symbol: Dict[str, _PendingSLReentry] = {}
         # Last daily ML used for 17:30 MAIN entry gating on following days.
         self._last_daily_ml_by_symbol: Dict[str, Tuple[date, float]] = {}
@@ -861,11 +860,12 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         if meta is None:
             return []
         sl_trigger = float(meta.entry_premium * (1.0 + SL_PCT))
+        fill_qty = _.get("qty")
         ref = SimpleNamespace(
             instrument=instrument,
             structure_id=structure_id,
             intent_id=intent_id,
-            qty=int(getattr(instrument, "lot_size", 0) or 0),
+            qty=self._normalize_order_qty(instrument, fill_qty),
         )
         return [self._build_main_sl_intent(ref, sl_trigger, candle_ts, meta.symbol)]
 
@@ -874,13 +874,23 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         structure_id = kwargs.get("structure_id")
         if not structure_id:
             return []
-        sl_pending = self._pending_sl_reentry_by_exit_structure_id.pop(
-            str(structure_id), None
+        structure_id = str(structure_id)
+        meta = self._meta_by_structure_id.get(structure_id)
+        reason_u = str(kwargs.get("exit_reason") or "").upper()
+        tag_u = str(kwargs.get("tag") or "").upper()
+        action_u = str(kwargs.get("action") or "").upper()
+        is_sl_exit = (
+            tag_u == "MAIN_SL"
+            or action_u == "FORCE_EXIT"
+            or reason_u == "SL"
         )
-        if sl_pending is not None:
-            self._pending_sl_reentry_by_symbol[sl_pending.meta.symbol] = sl_pending
+        if meta is not None and is_sl_exit:
+            self._pending_sl_reentry_by_symbol[meta.symbol] = _PendingSLReentry(
+                meta=meta,
+                exit_candle_ts=kwargs.get("candle_ts"),
+            )
         pending = self._pending_reversal_by_exit_structure_id.pop(
-            str(structure_id), None
+            structure_id, None
         )
         if pending is None:
             return []
@@ -917,11 +927,6 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
 
         meta = self._meta_by_structure_id.get(structure_id)
         reason = self._exit_reason_by_structure_id.get(structure_id)
-
-        if reason == "SL" and meta is not None:
-            self._pending_sl_reentry_by_exit_structure_id[structure_id] = (
-                _PendingSLReentry(meta=meta, exit_candle_ts=candle["timestamp"])
-            )
 
         if reason != "REVERSAL" or meta is None:
             return [exit_intent]
@@ -1029,7 +1034,6 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         super().on_structure_exit(structure_id=structure_id, **kwargs)
         self._pending_exit_structure_ids.discard(structure_id)
         self._exit_reason_by_structure_id.pop(structure_id, None)
-        self._pending_sl_reentry_by_exit_structure_id.pop(str(structure_id), None)
         self._meta_by_structure_id.pop(structure_id, None)
 
     def on_forced_exit(self, **kwargs):
@@ -1046,17 +1050,22 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             or "FORCED"
         ).upper()
         candle_ts = kwargs.get("candle_ts") or kwargs.get("timestamp")
+        tag_u = str(kwargs.get("tag") or "").upper()
+        action_u = str(kwargs.get("action") or "").upper()
 
         # Broker-side SL/forced exits may bypass on_position_exit/on_main_exit_filled.
         # Queue next-candle SL re-entry so behavior stays consistent.
-        is_sl_forced_exit = reason in {"SL", "MAIN_SL", "FORCE_EXIT"}
+        is_sl_forced_exit = (
+            reason in {"SL", "MAIN_SL", "FORCE_EXIT"}
+            or tag_u == "MAIN_SL"
+            or action_u == "FORCE_EXIT"
+        )
         if meta is not None and is_sl_forced_exit:
             self._pending_sl_reentry_by_symbol[meta.symbol] = _PendingSLReentry(
                 meta=meta, exit_candle_ts=candle_ts
             )
 
         self._pending_reversal_by_exit_structure_id.pop(str(structure_id), None)
-        self._pending_sl_reentry_by_exit_structure_id.pop(str(structure_id), None)
         position_closed = bool(kwargs.get("position_closed"))
         if position_closed:
             self.on_structure_exit(structure_id=structure_id)
