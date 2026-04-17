@@ -33,6 +33,7 @@ from core.data.datalayer import DhanDataProvider, DeltaDataProvider
 from core.data.candle_service import CandleService
 from core.data.candle_aggregator import CandleAggregator
 from core.data.feeds import DeltaWebSocketFeed, DhanWebSocketFeed
+from core.data.feeds.dhan_order_update_feed import DhanOrderUpdateFeed
 from core.broker import (
     DhanBroker,
     DhanBrokerApi,
@@ -299,6 +300,7 @@ class EngineFactory:
 
         # ---------- Realtime feed ----------
         realtime_feed = None
+        dhan_order_update_feed = None
         tick_queue = None
         candle_aggregator = None
         if config.broker_name == "DELTA":
@@ -352,6 +354,11 @@ class EngineFactory:
                         candle_aggregator = CandleAggregator()
                         realtime_feed.set_tick_queue(tick_queue)
                     realtime_feed.start()
+            if access_token and client_id:
+                dhan_order_update_feed = DhanOrderUpdateFeed(
+                    access_token=access_token,
+                    client_id=client_id,
+                )
 
         return LiveEngine(
             strategy=strategy,
@@ -380,6 +387,7 @@ class EngineFactory:
             universe_service=universe_service,
             run_mode=config.run_mode,
             open_positions_logger=open_positions_logger,
+            dhan_order_update_feed=dhan_order_update_feed,
         )
 
     @staticmethod

@@ -92,6 +92,24 @@ class DhanWebSocketFeed(RealtimeFeed):
     def is_connected(self) -> bool:
         return self._ws is not None and self._ws.is_connected()
 
+    def replace_instruments(self, instruments: List[Dict[str, str]]) -> None:
+        """Update subscription list thread-safely; next reconnect uses this list."""
+        self.instruments = list(instruments)
+        if self._ws:
+            self._ws.replace_instruments(self.instruments)
+
+    @property
+    def connect_generation(self) -> int:
+        return int(self._ws.connect_generation) if self._ws else 0
+
+    @property
+    def subscribe_generation(self) -> int:
+        return int(self._ws.subscribe_generation) if self._ws else 0
+
+    @property
+    def is_warm(self) -> bool:
+        return bool(self._ws and self._ws.is_warm)
+
     def get_last_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
         if not self._ws:
             return None

@@ -1562,6 +1562,20 @@ class OrderRouter:
             pass
         return out
 
+    def resolve_intent_id_by_broker_order_id(self, broker_order_id: str) -> Optional[str]:
+        """Map Dhan OrderNo / broker order id to intent_id when CorrelationId is empty."""
+        bid = str(broker_order_id or "").strip()
+        if not bid or not self.intent_store:
+            return None
+        try:
+            for rec in self.intent_store.intents.values():
+                if str(rec.get("broker_order_id") or "").strip() == bid:
+                    iid = rec.get("intent_id")
+                    return str(iid) if iid else None
+        except Exception:
+            pass
+        return None
+
     def _external_close_confidence_score(
         self, f: Dict[str, Any], known_order_ids: Set[str]
     ) -> Tuple[int, Optional[Any]]:
@@ -1970,19 +1984,31 @@ class OrderRouter:
                 or broker_order_id_to_intent.get(str(f.get("order_id") or f.get("id") or ""))
             )
             if intent_id and self.intent_store and self.intent_store.get(intent_id):
-                trade = {
-                    "trade_id": f.get("id"),
-                    "id": f.get("id"),
-                    "order_id": str(f.get("order_id") or f.get("id", "")),
+                oid = str(f.get("order_id") or f.get("id") or "")
+                sz = float(f.get("size") or 0)
+                pr = float(f.get("price") or 0)
+                is_dhan = type(self.broker).__name__ == "DhanBroker"
+                # Canonical REST reconciliation id for Dhan (distinct from DHAN_WS:* incremental keys).
+                if is_dhan:
+                    trade_id = f"DHAN_REST:{oid}:{int(sz)}:{pr}"
+                else:
+                    tid = f.get("id") or f.get("trade_id")
+                    trade_id = str(tid) if tid else f"{oid}_{int(sz)}_{pr}"
+                trade: Dict[str, Any] = {
+                    "trade_id": trade_id,
+                    "id": trade_id,
+                    "order_id": oid or str(f.get("id", "")),
                     "intent_id": intent_id,
                     "client_order_id": intent_id,
                     "tag": intent_id,
-                    "price": float(f.get("price") or 0),
-                    "size": float(f.get("size") or 0),
+                    "price": pr,
+                    "size": sz,
                     "side": (f.get("side") or "").upper(),
                     "created_at": f.get("created_at"),
                     "execution_source": "REST_FILLS",
                 }
+                if is_dhan:
+                    trade["fill_confidence"] = "CONFIRMED"
                 self.process_trade(trade)
                 continue
 

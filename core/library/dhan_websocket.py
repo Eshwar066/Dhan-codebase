@@ -6,6 +6,8 @@ Dhan Live Market Feed WebSocket client.
 - Responses: binary Little Endian. Header 8 bytes (response_code, msg_len, exchange_segment, security_id); payload by code.
 - Keep alive: server pings every 10s; client pong (handled by library). No response 40s -> server closes.
 - Disconnect: JSON {"RequestCode": 12}
+- Reconnect: on drop, background loop recreates the socket with the same URL and calls
+  subscribe again from on_open (same pattern as Delta WS recovery).
 """
 
 import json
@@ -17,6 +19,8 @@ import urllib.parse
 from typing import Any, Callable, Dict, List, Optional
 
 import websocket
+
+from core.library.dhan_ws_common import StallWatchdog, reconnect_sleep_with_jitter
 
 logger = logging.getLogger(__name__)
 
@@ -209,10 +213,12 @@ class DhanWebSocket:
         on_ticker: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         on_quote: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         on_disconnect: Optional[Callable[[int], None]] = None,
+        stall_timeout_seconds: float = 35.0,
     ):
         """
         instruments: list of {"ExchangeSegment": "NSE_EQ", "SecurityId": "11536", "symbol": "RELIANCE"}.
         SecurityId as string; symbol used for get_last_ticker(symbol).
+        stall_timeout_seconds: if >0, force-close socket when no inbound packets for this long (zombie detection).
         """
         self.access_token = access_token
         self.client_id = str(client_id)
@@ -220,6 +226,7 @@ class DhanWebSocket:
         self.on_ticker = on_ticker
         self.on_quote = on_quote
         self.on_disconnect = on_disconnect
+        self._stall_timeout_seconds = float(stall_timeout_seconds)
 
         self._ws: Optional[websocket.WebSocketApp] = None
         self._thread: Optional[threading.Thread] = None
@@ -227,6 +234,25 @@ class DhanWebSocket:
         self._lock = threading.Lock()
         # security_id (int) -> symbol (str) for mapping parsed packets to symbol
         self._security_to_symbol: Dict[int, str] = {}
+        self._rebuild_security_map_locked()
+
+        self._last_ticker: Dict[str, Dict[str, Any]] = {}
+        self._last_quote: Dict[str, Dict[str, Any]] = {}
+        self._connect_generation = 0
+        self._subscribe_generation = 0
+        self._reconnect_backoff_sec = 2.0
+        self._last_activity_ts = time.time()
+        self._is_warm = False
+        self._stall = StallWatchdog(
+            name="DhanMarketWS",
+            stall_sec=self._stall_timeout_seconds,
+            get_last_activity_ts=lambda: self._last_activity_ts,
+            get_ws=lambda: self._ws,
+            should_run=lambda: not self._stop.is_set(),
+        )
+
+    def _rebuild_security_map_locked(self) -> None:
+        self._security_to_symbol = {}
         for inv in self.instruments:
             sid = inv.get("SecurityId")
             sym = inv.get("symbol") or inv.get("SecurityId")
@@ -236,8 +262,14 @@ class DhanWebSocket:
                 except (TypeError, ValueError):
                     self._security_to_symbol[int(sid)] = str(sid)
 
-        self._last_ticker: Dict[str, Dict[str, Any]] = {}
-        self._last_quote: Dict[str, Dict[str, Any]] = {}
+    def replace_instruments(self, instruments: List[Dict[str, str]]) -> None:
+        """Thread-safe: update subscription list; applied on next reconnect or call connect after disconnect."""
+        with self._lock:
+            self.instruments = list(instruments)
+            self._rebuild_security_map_locked()
+
+    def _touch_activity(self) -> None:
+        self._last_activity_ts = time.time()
 
     def _build_url(self) -> str:
         q = urllib.parse.urlencode({
@@ -264,13 +296,33 @@ class DhanWebSocket:
         self._send_json(msg)
         logger.debug("Dhan WS subscribe batch size %s", len(batch))
 
+    def _make_ws_app(self) -> websocket.WebSocketApp:
+        return websocket.WebSocketApp(
+            self._build_url(),
+            on_open=self._on_open,
+            on_message=self._on_message,
+            on_error=self._on_error,
+            on_close=self._on_close,
+        )
+
     def _subscribe_all(self) -> None:
-        for i in range(0, len(self.instruments), MAX_INSTRUMENTS_PER_MESSAGE):
-            batch = self.instruments[i : i + MAX_INSTRUMENTS_PER_MESSAGE]
+        with self._lock:
+            inst = list(self.instruments)
+            self._subscribe_generation += 1
+            sub_gen = self._subscribe_generation
+        for i in range(0, len(inst), MAX_INSTRUMENTS_PER_MESSAGE):
+            batch = inst[i : i + MAX_INSTRUMENTS_PER_MESSAGE]
             self._subscribe_batch(batch)
             time.sleep(0.2)
+        logger.info(
+            "Dhan market WS subscribed (subscribe_generation=%s, instruments=%s)",
+            sub_gen,
+            len(inst),
+        )
 
     def _on_binary(self, ws: websocket.WebSocketApp, data: bytes) -> None:
+        self._touch_activity()
+        self._is_warm = True
         if len(data) < 8:
             return
         code, msg_len, _seg, security_id = _parse_header(data)
@@ -323,7 +375,16 @@ class DhanWebSocket:
         # else text (e.g. JSON) – ignore or log
 
     def _on_open(self, ws: websocket.WebSocketApp) -> None:
-        logger.info("Dhan WebSocket connected")
+        with self._lock:
+            self._connect_generation += 1
+            gen = self._connect_generation
+        self._reconnect_backoff_sec = 2.0
+        self._is_warm = False
+        self._touch_activity()
+        logger.info(
+            "Dhan market WebSocket connected (generation=%s); subscribing instruments",
+            gen,
+        )
         time.sleep(0.5)
         self._subscribe_all()
 
@@ -331,39 +392,72 @@ class DhanWebSocket:
         logger.warning("Dhan WebSocket error: %s", error)
 
     def _on_close(self, ws: websocket.WebSocketApp, close_status_code: Optional[int], close_msg: Optional[str]) -> None:
-        logger.info("Dhan WebSocket closed: %s %s", close_status_code, close_msg)
+        logger.info(
+            "Dhan market WebSocket closed: code=%s msg=%s",
+            close_status_code,
+            close_msg,
+        )
 
     def connect(self) -> None:
-        url = self._build_url()
-        self._ws = websocket.WebSocketApp(
-            url,
-            on_open=self._on_open,
-            on_message=self._on_message,
-            on_error=self._on_error,
-            on_close=self._on_close,
-        )
+        """Start background thread; reconnects with fresh socket and re-subscribes after each drop."""
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run_forever, daemon=True)
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._thread_main, daemon=True)
         self._thread.start()
-        # allow connection to establish
-        time.sleep(2)
+        self._stall.start()
+        time.sleep(0.5)
+
+    def _thread_main(self) -> None:
+        try:
+            self._run_forever()
+        finally:
+            with self._lock:
+                self._thread = None
 
     def _run_forever(self) -> None:
-        if self._ws:
+        while not self._stop.is_set():
+            self._ws = self._make_ws_app()
             try:
                 self._ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as e:
-                logger.warning("Dhan WebSocket run_forever: %s", e)
+                if not self._stop.is_set():
+                    logger.warning("Dhan market WebSocket run_forever: %s", e)
+            if self._stop.is_set():
+                break
+            logger.info("Dhan market WebSocket scheduling reconnect (jittered backoff)")
+            self._reconnect_backoff_sec = reconnect_sleep_with_jitter(self._reconnect_backoff_sec)
 
     def disconnect(self) -> None:
         self._stop.set()
-        self._send_json({"RequestCode": REQUEST_DISCONNECT})
+        self._stall.stop()
+        try:
+            self._send_json({"RequestCode": REQUEST_DISCONNECT})
+        except Exception:
+            pass
         if self._ws:
-            self._ws.close()
+            try:
+                self._ws.close()
+            except Exception:
+                pass
             self._ws = None
 
     def is_connected(self) -> bool:
         return self._ws is not None and self._ws.sock is not None and self._ws.sock.connected
+
+    @property
+    def connect_generation(self) -> int:
+        with self._lock:
+            return int(self._connect_generation)
+
+    @property
+    def subscribe_generation(self) -> int:
+        with self._lock:
+            return int(self._subscribe_generation)
+
+    @property
+    def is_warm(self) -> bool:
+        return bool(self._is_warm)
 
     def get_last_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
         with self._lock:

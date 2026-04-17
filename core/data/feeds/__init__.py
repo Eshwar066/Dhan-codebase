@@ -11,5 +11,12 @@ from core.data.feeds.base_feed import RealtimeFeed
 from core.data.feeds.delta_feed import DeltaWebSocketFeed
 from core.data.feeds.dhan_feed import DhanWebSocketFeed
 from core.data.feeds.dhan_depth_feed import DhanDepthFeed
+from core.data.feeds.dhan_order_update_feed import DhanOrderUpdateFeed
 
-__all__ = ["RealtimeFeed", "DeltaWebSocketFeed", "DhanWebSocketFeed", "DhanDepthFeed"]
+__all__ = [
+    "RealtimeFeed",
+    "DeltaWebSocketFeed",
+    "DhanWebSocketFeed",
+    "DhanDepthFeed",
+    "DhanOrderUpdateFeed",
+]

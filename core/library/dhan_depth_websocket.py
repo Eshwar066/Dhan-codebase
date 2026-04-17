@@ -7,6 +7,7 @@ Dhan Full Market Depth WebSocket client.
 - Response: binary. Header 12 bytes (msg_len, response_code, segment, security_id, sequence); then N×16 bytes
   (float64 price, uint32 quantity, uint32 num_orders). Response code 41 = Bid, 51 = Ask.
 - Keep alive: server pings every 10s; no response 40s -> server closes. Disconnect: JSON {"RequestCode": 12}.
+- Reconnect: background loop recreates socket; on_open re-subscribes (same pattern as Dhan market WS).
 """
 
 import json
@@ -18,6 +19,8 @@ import urllib.parse
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import websocket
+
+from core.library.dhan_ws_common import StallWatchdog, reconnect_sleep_with_jitter
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +92,7 @@ class DhanDepthWebSocket:
         level: int = 20,
         on_depth: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         on_disconnect: Optional[Callable[[int], None]] = None,
+        stall_timeout_seconds: float = 40.0,
     ):
         """
         instruments: list of {"ExchangeSegment": "NSE_EQ", "SecurityId": "11536", "symbol": "RELIANCE"}.
@@ -102,12 +106,33 @@ class DhanDepthWebSocket:
         self.instruments = list(instruments) if level == 20 else (list(instruments)[:1] if instruments else [])
         self.on_depth = on_depth
         self.on_disconnect = on_disconnect
+        self._stall_timeout_seconds = float(stall_timeout_seconds)
 
         self._ws: Optional[websocket.WebSocketApp] = None
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._security_to_symbol: Dict[int, str] = {}
+        self._rebuild_security_map_locked()
+
+        # symbol -> {"bids": [...], "asks": [...], "exchange_segment", "security_id"}
+        self._last_depth: Dict[str, Dict[str, Any]] = {}
+        self._packet_size = HEADER_BYTES + (self.level * DEPTH_ROW_BYTES)
+        self._connect_generation = 0
+        self._subscribe_generation = 0
+        self._reconnect_backoff_sec = 2.0
+        self._last_activity_ts = time.time()
+        self._is_warm = False
+        self._stall = StallWatchdog(
+            name="DhanDepthWS",
+            stall_sec=self._stall_timeout_seconds,
+            get_last_activity_ts=lambda: self._last_activity_ts,
+            get_ws=lambda: self._ws,
+            should_run=lambda: not self._stop.is_set(),
+        )
+
+    def _rebuild_security_map_locked(self) -> None:
+        self._security_to_symbol = {}
         for inv in self.instruments:
             sid = inv.get("SecurityId")
             sym = inv.get("symbol") or inv.get("SecurityId")
@@ -117,9 +142,17 @@ class DhanDepthWebSocket:
                 except (TypeError, ValueError):
                     self._security_to_symbol[int(sid)] = str(sid)
 
-        # symbol -> {"bids": [...], "asks": [...], "exchange_segment", "security_id"}
-        self._last_depth: Dict[str, Dict[str, Any]] = {}
-        self._packet_size = HEADER_BYTES + (self.level * DEPTH_ROW_BYTES)
+    def replace_instruments(self, instruments: List[Dict[str, str]]) -> None:
+        """Thread-safe: update instruments; applied on next reconnect."""
+        with self._lock:
+            if self.level == 20:
+                self.instruments = list(instruments)
+            else:
+                self.instruments = list(instruments)[:1] if instruments else []
+            self._rebuild_security_map_locked()
+
+    def _touch_activity(self) -> None:
+        self._last_activity_ts = time.time()
 
     def _build_url(self) -> str:
         q = urllib.parse.urlencode({
@@ -135,8 +168,12 @@ class DhanDepthWebSocket:
             self._ws.send(json.dumps(payload))
 
     def _subscribe_20(self) -> None:
-        for i in range(0, len(self.instruments), MAX_INSTRUMENTS_20_LEVEL):
-            batch = self.instruments[i : i + MAX_INSTRUMENTS_20_LEVEL]
+        with self._lock:
+            inst = list(self.instruments)
+            self._subscribe_generation += 1
+            sgen = self._subscribe_generation
+        for i in range(0, len(inst), MAX_INSTRUMENTS_20_LEVEL):
+            batch = inst[i : i + MAX_INSTRUMENTS_20_LEVEL]
             msg = {
                 "RequestCode": REQUEST_DEPTH_SUBSCRIBE,
                 "InstrumentCount": len(batch),
@@ -148,18 +185,29 @@ class DhanDepthWebSocket:
             self._send_json(msg)
             logger.debug("Dhan Depth WS subscribe 20-level batch size %s", len(batch))
             time.sleep(0.2)
+        logger.info(
+            "Dhan Depth WS 20-level subscribed (subscribe_generation=%s, n=%s)",
+            sgen,
+            len(inst),
+        )
 
     def _subscribe_200(self) -> None:
-        if not self.instruments:
-            return
-        item = self.instruments[0]
+        with self._lock:
+            if not self.instruments:
+                return
+            self._subscribe_generation += 1
+            sgen = self._subscribe_generation
+            item = self.instruments[0]
         msg = {
             "RequestCode": REQUEST_DEPTH_SUBSCRIBE,
             "ExchangeSegment": item["ExchangeSegment"],
             "SecurityId": str(item["SecurityId"]),
         }
         self._send_json(msg)
-        logger.debug("Dhan Depth WS subscribe 200-level single instrument")
+        logger.info(
+            "Dhan Depth WS 200-level subscribed (subscribe_generation=%s)",
+            sgen,
+        )
 
     def _subscribe_all(self) -> None:
         if self.level == 20:
@@ -168,6 +216,8 @@ class DhanDepthWebSocket:
             self._subscribe_200()
 
     def _on_binary(self, ws: websocket.WebSocketApp, data: bytes) -> None:
+        self._touch_activity()
+        self._is_warm = True
         offset = 0
         while offset + self._packet_size <= len(data):
             msg_len, response_code, _seg, security_id, _seq = _parse_depth_header(data, offset)
@@ -215,8 +265,27 @@ class DhanDepthWebSocket:
         if isinstance(message, bytes):
             self._on_binary(ws, message)
 
+    def _make_ws_app(self) -> websocket.WebSocketApp:
+        return websocket.WebSocketApp(
+            self._build_url(),
+            on_open=self._on_open,
+            on_message=self._on_message,
+            on_error=self._on_error,
+            on_close=self._on_close,
+        )
+
     def _on_open(self, ws: websocket.WebSocketApp) -> None:
-        logger.info("Dhan Depth WebSocket connected (level=%s)", self.level)
+        with self._lock:
+            self._connect_generation += 1
+            gen = self._connect_generation
+        self._reconnect_backoff_sec = 2.0
+        self._is_warm = False
+        self._touch_activity()
+        logger.info(
+            "Dhan Depth WebSocket connected (level=%s, generation=%s)",
+            self.level,
+            gen,
+        )
         time.sleep(0.5)
         self._subscribe_all()
 
@@ -227,35 +296,64 @@ class DhanDepthWebSocket:
         logger.info("Dhan Depth WebSocket closed: %s %s", close_status_code, close_msg)
 
     def connect(self) -> None:
-        url = self._build_url()
-        self._ws = websocket.WebSocketApp(
-            url,
-            on_open=self._on_open,
-            on_message=self._on_message,
-            on_error=self._on_error,
-            on_close=self._on_close,
-        )
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run_forever, daemon=True)
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._thread_main, daemon=True)
         self._thread.start()
-        time.sleep(2)
+        self._stall.start()
+        time.sleep(0.5)
+
+    def _thread_main(self) -> None:
+        try:
+            self._run_forever()
+        finally:
+            with self._lock:
+                self._thread = None
 
     def _run_forever(self) -> None:
-        if self._ws:
+        while not self._stop.is_set():
+            self._ws = self._make_ws_app()
             try:
                 self._ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as e:
-                logger.warning("Dhan Depth WebSocket run_forever: %s", e)
+                if not self._stop.is_set():
+                    logger.warning("Dhan Depth WebSocket run_forever: %s", e)
+            if self._stop.is_set():
+                break
+            logger.info("Dhan Depth WebSocket scheduling reconnect (jittered backoff)")
+            self._reconnect_backoff_sec = reconnect_sleep_with_jitter(self._reconnect_backoff_sec)
 
     def disconnect(self) -> None:
         self._stop.set()
-        self._send_json({"RequestCode": REQUEST_DISCONNECT})
+        self._stall.stop()
+        try:
+            self._send_json({"RequestCode": REQUEST_DISCONNECT})
+        except Exception:
+            pass
         if self._ws:
-            self._ws.close()
+            try:
+                self._ws.close()
+            except Exception:
+                pass
             self._ws = None
 
     def is_connected(self) -> bool:
         return self._ws is not None and self._ws.sock is not None and self._ws.sock.connected
+
+    @property
+    def connect_generation(self) -> int:
+        with self._lock:
+            return int(self._connect_generation)
+
+    @property
+    def subscribe_generation(self) -> int:
+        with self._lock:
+            return int(self._subscribe_generation)
+
+    @property
+    def is_warm(self) -> bool:
+        return bool(self._is_warm)
 
     def get_depth(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Return latest depth for symbol: {bids: [{price, quantity, num_orders}, ...], asks: [...]}."""

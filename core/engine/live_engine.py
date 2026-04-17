@@ -67,6 +67,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         universe_service: Optional[Any] = None,
         run_mode: Optional[RunMode] = None,
         open_positions_logger: Optional[Any] = None,
+        dhan_order_update_feed: Optional[Any] = None,
     ):
         super().__init__(
             strategy,
@@ -135,6 +136,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self._last_evaluated_candle_ts: Dict[str, Any] = {}
         self._max_ticks_per_cycle = 10000
         self._ws_trade_event_bound = False
+        self.dhan_order_update_feed = dhan_order_update_feed
+        self._dhan_order_ws_bound = False
+        # OrderNo -> buffered synthetic payloads when intent_id not yet resolvable (race with place_order ack)
+        self._dhan_pending_fills: Dict[str, List[Dict[str, Any]]] = {}
         # Tick size cache (populated at startup to avoid lookup latency in hot path)
         self._tick_cache: Dict[str, float] = {}
         if self.instrument_store and hasattr(self.instrument_store, "get_tick_size"):
@@ -526,6 +531,129 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         except Exception:
             return
 
+    def _normalize_dhan_ws_synthetic_trade(
+        self, payload: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Map incremental order-update fill to OrderRouter.process_trade shape."""
+        if not isinstance(payload, dict):
+            return None
+        order_no = str(payload.get("order_no") or "").strip()
+        if not order_no:
+            return None
+        correlation_id = str(payload.get("correlation_id") or "").strip()
+        intent_id = correlation_id or None
+        if not intent_id and hasattr(self.order_router, "resolve_intent_id_by_broker_order_id"):
+            try:
+                intent_id = self.order_router.resolve_intent_id_by_broker_order_id(order_no)
+            except Exception:
+                intent_id = None
+        if not intent_id:
+            return None
+        try:
+            delta = int(payload.get("delta_qty") or 0)
+        except (TypeError, ValueError):
+            delta = 0
+        try:
+            price = float(payload.get("slice_price") or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        side = str(payload.get("side") or "").upper()
+        if delta <= 0 or price <= 0 or side not in ("BUY", "SELL"):
+            return None
+        try:
+            cum = int(payload.get("cumulative_tq") or 0)
+        except (TypeError, ValueError):
+            cum = 0
+        lu = str(payload.get("last_updated") or "").strip()
+        lu_key = lu.replace(" ", "_").replace(":", "-") if lu else ""
+        if lu_key:
+            trade_id = f"DHAN_WS:{order_no}:{cum}:{lu_key}"
+        else:
+            trade_id = f"DHAN_WS:{order_no}:{cum}:{int(time.time() * 1000)}"
+        out = {
+            "trade_id": trade_id,
+            "id": trade_id,
+            "order_id": order_no,
+            "intent_id": intent_id,
+            "client_order_id": intent_id,
+            "tag": intent_id,
+            "price": price,
+            "size": float(delta),
+            "side": side,
+            "created_at": payload.get("last_updated"),
+            "execution_source": "DHAN_WS_ORDER_UPDATE",
+            "fill_confidence": "HIGH",
+        }
+        ws_ts = payload.get("ws_received_at")
+        if isinstance(ws_ts, (int, float)) and self.engine_logger:
+            try:
+                lag_ms = (time.time() - float(ws_ts)) * 1000.0
+                if lag_ms >= 500:
+                    self.engine_logger.log(
+                        "oms",
+                        f"Dhan order WS dispatch lag {lag_ms:.0f}ms OrderNo={order_no}",
+                    )
+            except (TypeError, ValueError):
+                pass
+        return out
+
+    def _enqueue_dhan_pending_fill(
+        self, order_no: str, payload: Dict[str, Any]
+    ) -> None:
+        if not order_no:
+            return
+        q = self._dhan_pending_fills.setdefault(order_no, [])
+        q.append(payload)
+        max_per = 30
+        if len(q) > max_per:
+            del q[0 : len(q) - max_per]
+
+    def _retry_dhan_pending_fills(self) -> None:
+        """Replay fills that arrived before broker_order_id / CorrelationId was visible."""
+        if str(self.venue or "").upper() != "DHAN" or not self._dhan_pending_fills:
+            return
+        for order_no in list(self._dhan_pending_fills.keys()):
+            batch = self._dhan_pending_fills.get(order_no) or []
+            if not batch:
+                del self._dhan_pending_fills[order_no]
+                continue
+            remaining: List[Dict[str, Any]] = []
+            for payload in batch:
+                trade = self._normalize_dhan_ws_synthetic_trade(payload)
+                if trade:
+                    try:
+                        self.order_router.process_trade(trade)
+                    except Exception:
+                        remaining.append(payload)
+                else:
+                    remaining.append(payload)
+            if remaining:
+                self._dhan_pending_fills[order_no] = remaining[-30:]
+            else:
+                del self._dhan_pending_fills[order_no]
+
+    def _on_dhan_ws_synthetic_trade(self, payload: Dict[str, Any]) -> None:
+        order_no = str(payload.get("order_no") or "").strip()
+        trade = self._normalize_dhan_ws_synthetic_trade(payload)
+        if trade:
+            try:
+                self.order_router.process_trade(trade)
+            except Exception:
+                self._enqueue_dhan_pending_fill(order_no, payload)
+            return
+        if order_no:
+            self._enqueue_dhan_pending_fill(order_no, payload)
+            if self.engine_logger:
+                self.engine_logger.log(
+                    "oms",
+                    f"Dhan order WS: buffered unmapped fill OrderNo={order_no} (await intent/CorrelationId)",
+                )
+            else:
+                logger.info(
+                    "Dhan order WS: buffered unmapped fill OrderNo=%s (await intent/CorrelationId)",
+                    order_no,
+                )
+
     def _check_memory(self) -> None:
         if self.memory_threshold_percent is None or self.memory_threshold_percent <= 0:
             return
@@ -710,6 +838,19 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 self._ws_trade_event_bound = True
             except Exception:
                 self._ws_trade_event_bound = False
+        if (
+            str(self.venue or "").upper() == "DHAN"
+            and self.dhan_order_update_feed
+            and not self._dhan_order_ws_bound
+        ):
+            try:
+                self.dhan_order_update_feed.set_synthetic_trade_callback(
+                    self._on_dhan_ws_synthetic_trade
+                )
+                self.dhan_order_update_feed.start()
+                self._dhan_order_ws_bound = True
+            except Exception:
+                self._dhan_order_ws_bound = False
         tf = getattr(self.strategy, "timeframe", None)
         use_feed = self.realtime_feed and self.realtime_feed.is_connected()
         risk_manager = getattr(self.order_router, "risk", None)
@@ -731,6 +872,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             self.check_feed_health()
             self._do_order_state_check()
             self._sync_delta_ws_trades()
+            self._retry_dhan_pending_fills()
             self._do_exit_order_refresh()
 
             # Export eod report funtion
@@ -967,6 +1109,11 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             self.engine_logger.graceful_shutdown(
                 "================================================"
             )
+        if getattr(self, "dhan_order_update_feed", None):
+            try:
+                self.dhan_order_update_feed.stop()
+            except Exception:
+                pass
         broker = getattr(self.order_router, "broker", None)
         if broker and hasattr(broker, "close"):
             try:
