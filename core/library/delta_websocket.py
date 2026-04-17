@@ -278,7 +278,7 @@ class DeltaWebSocket:
                 )
             else:
                 now = self._last_tick_time
-                if now - self._last_feed_log_time >= 30:
+                if now - self._last_feed_log_time >= 1800:
                     self._last_feed_log_time = now
                     logger.info("Delta WebSocket feed: receiving data.")
             sym = msg.get("symbol")
@@ -323,7 +323,7 @@ class DeltaWebSocket:
                 )
             else:
                 now = self._last_tick_time
-                if now - self._last_feed_log_time >= 30:
+                if now - self._last_feed_log_time >= 1800:
                     self._last_feed_log_time = now
                     logger.info("Delta WebSocket feed: receiving data.")
             sym = msg.get("symbol")
