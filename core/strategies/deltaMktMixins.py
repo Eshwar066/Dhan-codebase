@@ -279,13 +279,29 @@ class DeltaMktMixins:
         return ctx.selected_expiry
 
     def monthlyExpiry(self, candle: dict, ctx: Any):
-        """Monthly expiry label ``DDMMYY`` (last Thursday month roll); aligns with ``ExpiryResolver`` NSE-style month."""
+        """Monthly expiry label ``DDMMYY`` using last Friday month expiry."""
         ts = pd.to_datetime(candle["timestamp"]).tz_localize(None)
         trade_date = ts.date()
+
+        def _last_friday(year: int, month: int):
+            import datetime as _dt
+            import calendar as _cal
+
+            last_day = _cal.monthrange(year, month)[1]
+            d = _dt.date(year, month, last_day)
+            # Monday=0 ... Friday=4
+            offset = (d.weekday() - 4) % 7
+            return d - _dt.timedelta(days=offset)
+
         if trade_date.day > 15:
-            expiry_date = ExpiryResolver.next_month_expiry(trade_date)
+            if trade_date.month == 12:
+                y, m = trade_date.year + 1, 1
+            else:
+                y, m = trade_date.year, trade_date.month + 1
+            expiry_date = _last_friday(y, m)
         else:
-            expiry_date = ExpiryResolver.current_month_expiry(trade_date)
+            expiry_date = _last_friday(trade_date.year, trade_date.month)
+
         s = expiry_date.strftime("%d%m%y")
         ctx.selected_expiry = s
         return s
@@ -435,32 +451,126 @@ class DeltaMktMixins:
 
         products = source.get_products(use_cache=True) or []
         spot = float(candle["close"])
+        trade_date = pd.to_datetime(candle["timestamp"]).tz_localize(None).date()
+        prefix = f"{opt_letter}-{und}-"
 
-        scored: list[tuple[float, float, str, Any]] = []
+        def _parse_expiry(code: str):
+            try:
+                return datetime.strptime(str(code), "%d%m%y").date()
+            except Exception:
+                return None
+
+        def _expiry_key(code: str):
+            d = _parse_expiry(code)
+            if d is None:
+                return datetime.max.date()
+            return d
+
+        expiry_products: dict[str, list[dict[str, Any]]] = {}
         for p in products:
             sym = (p.get("symbol") or "").upper()
-            if not sym.startswith(f"{opt_letter}-{und}-"):
+            if not sym.startswith(prefix):
                 continue
             parts = sym.split("-")
-            if len(parts) < 4 or parts[-1] != selected_expiry:
+            if len(parts) < 4:
                 continue
-            strike = p.get("strike_price")
-            if strike is None:
-                try:
-                    strike = float(parts[2])
-                except (ValueError, TypeError):
-                    continue
-            else:
-                strike = float(strike)
+            exp_code = str(parts[-1]).strip()
+            expiry_products.setdefault(exp_code, []).append(p)
 
-            if opt_letter == "C":
-                if strike < spot:
-                    continue
-            else:
-                if strike > spot:
-                    continue
+        available_expiries = sorted(expiry_products.keys(), key=_expiry_key)
+        if not available_expiries:
+            logger.warning(
+                "%s: no option products for underlying=%s opt=%s",
+                log_prefix,
+                und,
+                opt_letter,
+            )
+            return None
 
-            scored.append((abs(strike - spot), strike, sym, p))
+        logger.info(
+            "%s: available expiries sample=%s total=%s",
+            log_prefix,
+            available_expiries[:10],
+            len(available_expiries),
+        )
+
+        target_expiry = str(selected_expiry)
+        selected_date = _parse_expiry(target_expiry)
+        if target_expiry not in expiry_products:
+            # Fallback to exchange-listed expiries instead of calendar assumption.
+            fallback = None
+            if expiry == "Monthly" and selected_date is not None:
+                same_month = [
+                    e
+                    for e in available_expiries
+                    if (_parse_expiry(e) is not None)
+                    and _parse_expiry(e).year == selected_date.year
+                    and _parse_expiry(e).month == selected_date.month
+                ]
+                if same_month:
+                    fallback = same_month[-1]
+            if fallback is None:
+                future = [
+                    e
+                    for e in available_expiries
+                    if (_parse_expiry(e) is not None) and (_parse_expiry(e) >= trade_date)
+                ]
+                fallback = future[0] if future else available_expiries[-1]
+            logger.warning(
+                "%s: selected expiry %s not listed, fallback -> %s",
+                log_prefix,
+                target_expiry,
+                fallback,
+            )
+            target_expiry = str(fallback)
+            selected_expiry = target_expiry
+            ctx.selected_expiry = target_expiry
+
+        def _score_for_expiry(exp_code: str) -> list[tuple[float, float, str, Any]]:
+            rows: list[tuple[float, float, str, Any]] = []
+            for p in expiry_products.get(exp_code, []):
+                sym = (p.get("symbol") or "").upper()
+                parts = sym.split("-")
+                strike = p.get("strike_price")
+                if strike is None:
+                    try:
+                        strike = float(parts[2])
+                    except (ValueError, TypeError, IndexError):
+                        continue
+                else:
+                    strike = float(strike)
+                if opt_letter == "C":
+                    if strike < spot:
+                        continue
+                else:
+                    if strike > spot:
+                        continue
+                rows.append((abs(strike - spot), strike, sym, p))
+            return rows
+
+        scored: list[tuple[float, float, str, Any]] = _score_for_expiry(target_expiry)
+        if not scored:
+            future_chain = [
+                e
+                for e in available_expiries
+                if (_parse_expiry(e) is not None) and (_parse_expiry(e) >= trade_date)
+            ]
+            for alt in future_chain:
+                if alt == target_expiry:
+                    continue
+                alt_scored = _score_for_expiry(alt)
+                if alt_scored:
+                    logger.warning(
+                        "%s: no ATM/OTM for expiry=%s; fallback to next listed expiry=%s",
+                        log_prefix,
+                        target_expiry,
+                        alt,
+                    )
+                    target_expiry = alt
+                    selected_expiry = alt
+                    ctx.selected_expiry = alt
+                    scored = alt_scored
+                    break
 
         if not scored:
             logger.warning(
@@ -471,6 +581,8 @@ class DeltaMktMixins:
                 opt_letter,
             )
             return None
+
+        logger.info("%s: selected expiry=%s", log_prefix, selected_expiry)
         scored.sort(key=lambda x: x[0])
         scored = scored[:max_quotes]
 

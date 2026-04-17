@@ -1434,6 +1434,7 @@ class OrderRouter:
                 self.position_manager.note_trade_led_fill(sym)
                 return True
 
+            execution_source = trade.get("execution_source") or "INTENT"
             position_closed, realized_pnl = self.position_manager.on_fill(
                 instrument=instrument,
                 side=side,
@@ -1455,7 +1456,7 @@ class OrderRouter:
                 candle_ts=intent.get("candle_ts") or trade.get("candle_ts"),
                 action=intent.get("action") or payload.get("action") or trade.get("action"),
                 metadata_extras=payload.get("strategy_meta"),
-                execution_source="INTENT",
+                execution_source=execution_source,
             )
             if position_closed and realized_pnl is not None:
                 self.risk.record_realized_pnl(realized_pnl)
@@ -1468,7 +1469,7 @@ class OrderRouter:
             intent_id,
             OrderState.FILLED,
             action="process_trade",
-            message="Position updated from trade (fills API)",
+            message=f"Position updated from trade ({trade.get('execution_source') or 'INTENT'})",
         )
         self.intent_store.update(
             intent_id,
@@ -1980,6 +1981,7 @@ class OrderRouter:
                     "size": float(f.get("size") or 0),
                     "side": (f.get("side") or "").upper(),
                     "created_at": f.get("created_at"),
+                    "execution_source": "REST_FILLS",
                 }
                 self.process_trade(trade)
                 continue

@@ -3,6 +3,15 @@
 A production-grade, modular trading system that supports **India markets (Dhan)** and **crypto (Delta Exchange)** with fully isolated engines, config-driven setup, and file-based logging. One engine = one broker = one OMS; no shared state across venues.
 
 ---
+# Commands:
+    python -m run.main --venue DHAN
+    python -m run.main --venue DELTA
+    python -m core.analytics.performance
+    python -m run.run_quarterly_report 
+
+    python "Expired options data.py"
+    python "Quarterly expired options data.py"
+    streamlit run "option_chain_ui.py"
 
 ## Table of contents
 

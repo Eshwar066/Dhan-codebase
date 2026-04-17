@@ -130,9 +130,11 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             }
         # Graceful shutdown
         self._shutdown_requested = False
+        self._shutdown_signal: Optional[int] = None
         # Candle aggregator: last evaluated closed-candle timestamp per symbol (avoid re-eval same bar)
         self._last_evaluated_candle_ts: Dict[str, Any] = {}
         self._max_ticks_per_cycle = 10000
+        self._ws_trade_event_bound = False
         # Tick size cache (populated at startup to avoid lookup latency in hot path)
         self._tick_cache: Dict[str, float] = {}
         if self.instrument_store and hasattr(self.instrument_store, "get_tick_size"):
@@ -293,6 +295,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
     def _graceful_shutdown_handler(self, signum: int, frame: Any) -> None:
         """Per-engine: set flag so main loop exits; snapshot and flush in loop or on exit."""
         self._shutdown_requested = True
+        self._shutdown_signal = int(signum)
         if self.engine_logger:
             self.engine_logger.graceful_shutdown(f"Signal {signum} received")
 
@@ -458,6 +461,71 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         else:
             self._entries_paused_order_mismatch = False
 
+    def _normalize_delta_ws_trade(self, raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Normalize Delta user-trade websocket payload to OrderRouter.process_trade shape."""
+        if not isinstance(raw, dict):
+            return None
+        order_id = raw.get("order_id") or raw.get("id")
+        client_order_id = raw.get("client_order_id") or raw.get("tag")
+        side = str(raw.get("side") or "").upper()
+        if side not in ("BUY", "SELL"):
+            return None
+        try:
+            price = float(raw.get("price") or raw.get("average_fill_price") or 0)
+            size = float(raw.get("size") or raw.get("qty") or raw.get("filled_size") or 0)
+        except (TypeError, ValueError):
+            return None
+        if price <= 0 or size <= 0:
+            return None
+        trade_id = raw.get("id") or raw.get("trade_id")
+        if trade_id is None:
+            # Stable fallback key for idempotency when exchange omits trade id.
+            trade_id = f"{order_id}:{client_order_id}:{price}:{size}:{raw.get('created_at') or raw.get('timestamp')}"
+        return {
+            "trade_id": trade_id,
+            "id": trade_id,
+            "order_id": str(order_id or ""),
+            "intent_id": client_order_id,
+            "client_order_id": client_order_id,
+            "tag": client_order_id,
+            "price": price,
+            "size": size,
+            "side": side,
+            "created_at": raw.get("created_at") or raw.get("timestamp"),
+            "execution_source": "WS_USER_TRADES",
+        }
+
+    def _sync_delta_ws_trades(self) -> None:
+        """Apply websocket user-trades to OMS immediately (faster than periodic fills API sync)."""
+        if str(self.venue or "").upper() != "DELTA":
+            return
+        if not self.realtime_feed or not hasattr(self.realtime_feed, "get_recent_user_trades"):
+            return
+        try:
+            ws_trades = self.realtime_feed.get_recent_user_trades(limit=200) or []
+        except Exception:
+            return
+        if not ws_trades:
+            return
+        for raw in ws_trades:
+            trade = self._normalize_delta_ws_trade(raw)
+            if not trade:
+                continue
+            try:
+                self.order_router.process_trade(trade)
+            except Exception:
+                continue
+
+    def on_ws_trade(self, raw_trade: Dict[str, Any]) -> None:
+        """Event-driven websocket trade callback: apply fills immediately."""
+        trade = self._normalize_delta_ws_trade(raw_trade)
+        if not trade:
+            return
+        try:
+            self.order_router.process_trade(trade)
+        except Exception:
+            return
+
     def _check_memory(self) -> None:
         if self.memory_threshold_percent is None or self.memory_threshold_percent <= 0:
             return
@@ -507,6 +575,35 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             get_bid_ask=self._get_bid_ask,
             stale_seconds=float(self._exit_refresh_interval_seconds),
         )
+
+    def _log_startup_balance_snapshot(self) -> None:
+        """
+        One-time startup balance check/log for observability before live loop.
+        """
+        broker = getattr(self.order_router, "broker", None)
+        if not broker or not hasattr(broker, "get_balance_snapshot"):
+            return
+        try:
+            snapshot = broker.get_balance_snapshot()
+        except Exception as e:
+            if self.engine_logger:
+                self.engine_logger.log("risk_block", f"Startup balance check failed: {e}")
+            else:
+                logger.warning("Startup balance check failed: %s", e)
+            return
+        if not snapshot:
+            return
+        msg = (
+            "Startup balance snapshot: "
+            f"selected={snapshot.get('selected_available')} "
+            f"usd={snapshot.get('usd_available')} "
+            f"inr={snapshot.get('inr_available')}"
+        )
+        if self.engine_logger:
+            self.engine_logger.log("oms", msg)
+        else:
+            logger.info(msg)
+        self._telegram_plain(f"ℹ️ {msg}")
 
     # this not getting logged properly
     def _export_eod(self, date_str: str) -> None:
@@ -595,7 +692,24 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             self.engine_logger.log("critical", "Startup reconciliation failed")
             return
 
+        _rm = getattr(self.run_mode, "value", None) or str(self.run_mode or "")
+        self._telegram_plain(
+            f"Engine started: {self.engine_id} | venue={self.venue} | mode={_rm}"
+        )
+        self._log_startup_balance_snapshot()
+
         self._do_order_state_check()
+        if (
+            str(self.venue or "").upper() == "DELTA"
+            and self.realtime_feed
+            and hasattr(self.realtime_feed, "set_user_trade_callback")
+            and not self._ws_trade_event_bound
+        ):
+            try:
+                self.realtime_feed.set_user_trade_callback(self.on_ws_trade)
+                self._ws_trade_event_bound = True
+            except Exception:
+                self._ws_trade_event_bound = False
         tf = getattr(self.strategy, "timeframe", None)
         use_feed = self.realtime_feed and self.realtime_feed.is_connected()
         risk_manager = getattr(self.order_router, "risk", None)
@@ -616,6 +730,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             self._check_memory()
             self.check_feed_health()
             self._do_order_state_check()
+            self._sync_delta_ws_trades()
             self._do_exit_order_refresh()
 
             # Export eod report funtion
@@ -811,6 +926,16 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 time.sleep(1)
 
         # Graceful shutdown: save position snapshot, flush logger, close broker
+        _rm = getattr(self.run_mode, "value", None) or str(self.run_mode or "")
+        _why = (
+            f"signal {self._shutdown_signal}"
+            if self._shutdown_signal is not None
+            else "shutdown"
+        )
+        self._telegram_plain(
+            f"Engine stopped: {self.engine_id} | venue={self.venue} | mode={_rm} | {_why}"
+        )
+
         snapshot_path = None
         try:
             os.makedirs(REPORTS_DIR, exist_ok=True)

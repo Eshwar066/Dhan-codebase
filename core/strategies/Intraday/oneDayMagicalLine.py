@@ -8,13 +8,14 @@ Rules (per user spec)
    - Currently short `PE` => reverse to short `CE` when spot crosses **below** ML1
    - Currently short `CE` => reverse to short `PE` when spot crosses **above** ML1
 5. From short premium use 15% as SL:
-   - If option premium rises by >= 15% from entry premium => exit (no reversal).
+   - If option premium rises by >= 15% from entry premium => exit.
 
 Implementation notes
 - Uses `IndiaMktMixins` for option strike/premium selection and option LTP fetching.
 - Delta product symbols via `DeltaMktMixins.delta_option_trading_symbol` (see `deltaMktMixins.py`).
 - Broker SL (`MAIN_SL`) is placed only after the MAIN sell fills (avoids Delta `no_open_position`).
 - On reversal: emit `MAIN_EXIT` first; when that exit fills, emit reversal ENTRY; SL again after the new MAIN fills.
+- If broker/forced exit closes a MAIN leg at SL, queue next-candle SL re-entry as well.
 - The magical line (spot at entry) is stored per opened position via `structure_id` for reversal + SL.
 """
 
@@ -33,7 +34,7 @@ from core.strategies.deltaMktMixins import DeltaMktMixins
 from core.strategies.base import BaseStrategy
 
 
-VALID_TIME_1730 = {time(21, 57)}  # 1hr candle close time (IST)
+VALID_TIME_1730 = {time(17, 30)}  # 1hr candle close time (IST)
 
 # Strike/premium selection (kept conservative and similar to `MagicalLines`)
 STRIKE_STEP = 500
@@ -45,6 +46,7 @@ DELTA_RANGE = (0.2, 0.4)
 
 # Risk
 SL_PCT = 0.15  # 15% rise in short option premium triggers exit
+NEXT_DAY_ML_GAP_PCT = 0.03  # Next-day 17:30 MAIN entry only if spot is outside +/-3% of previous ML
 MAX_REVERSALS = 5  # max reversal levels per ML1 day (L1 initial + reversals)
 _CANDLE_CACHE_MAX = 1000
 
@@ -64,16 +66,22 @@ class _PendingReversal:
     candle: dict
 
 
+@dataclass(frozen=True)
+class _PendingSLReentry:
+    meta: _PosMeta
+    exit_candle_ts: Any
+
+
 class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     """
     One-Day Magical Line strategy for intraday BTCUSD option selling.
     """
 
     name = "OneDayMagicalLine"
-    timeframe = "1"  # change to 60min later
+    timeframe = "60"  # change to 60min later
     required_context = ["option_chain"]
     api = "DELTA"
-    expiryType = "Weekly"
+    expiryType = "Monthly"
     valid_times = VALID_TIME_1730
     delta = TARGET_DELTA
     delta_range = DELTA_RANGE
@@ -91,6 +99,9 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         self._pending_spot_close_by_symbol: Dict[str, float] = {}
         self._candle_cache: Dict[Any, Any] = {}
         self._pending_reversal_by_exit_structure_id: Dict[str, _PendingReversal] = {}
+        self._pending_sl_reentry_by_symbol: Dict[str, _PendingSLReentry] = {}
+        # Last daily ML used for 17:30 MAIN entry gating on following days.
+        self._last_daily_ml_by_symbol: Dict[str, Tuple[date, float]] = {}
 
     def get_warmup_period(self):
         return 0
@@ -270,7 +281,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             min_prem=min_prem,
             max_prem=max_prem,
             lookback_sec=lookback_sec,
-            expiry="Weekly",
+            expiry=self.expiryType,
             side="SELL",
             target_delta=self.delta,
             delta_min=self.delta_range[0],
@@ -357,6 +368,226 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             return "REVERSAL"
         return None
 
+    def _reference_ml_from_position_store(self, symbol: str, ctx: Any) -> Optional[float]:
+        position_store = getattr(ctx, "position_store", None)
+        if position_store is None or not hasattr(position_store, "get_position_metadata"):
+            return None
+        try:
+            bucket = position_store.get_position_metadata(symbol) or {}
+        except Exception:
+            return None
+        sm = bucket.get("strategy_meta") if isinstance(bucket, dict) else None
+        if not isinstance(sm, dict):
+            return None
+        raw = sm.get("one_day_magical_line") or sm.get("one_day_ml1")
+        if not isinstance(raw, dict):
+            return None
+        ml = raw.get("magicalLine", raw.get("ml1"))
+        if ml is None:
+            return None
+        try:
+            return float(ml)
+        except (TypeError, ValueError):
+            return None
+
+    def _passes_next_day_ml_gap_filter(
+        self, symbol: str, trade_dt: date, spot_close: float, ctx: Any
+    ) -> bool:
+        """
+        For fresh 17:30 MAIN entries on a new day, require spot to move at least
+        +/-3% from the previous day's stored magical line for that symbol.
+        """
+        prev_ml = self._reference_ml_from_position_store(symbol=symbol, ctx=ctx)
+        prev = self._last_daily_ml_by_symbol.get(symbol)
+        if prev is None and prev_ml is None:
+            return True
+        if prev is not None:
+            prev_dt, prev_ml_mem = prev
+            if trade_dt <= prev_dt:
+                return True
+            if prev_ml is None:
+                prev_ml = prev_ml_mem
+        if prev_ml <= 0:
+            self._log_skip(
+                stage="entry_ml_gap",
+                reason="previous magical line is non-positive",
+                symbol=symbol,
+                trade_dt=trade_dt,
+                prev_ml=prev_ml,
+                spot_close=spot_close,
+            )
+            return False
+        lo = prev_ml * (1.0 - NEXT_DAY_ML_GAP_PCT)
+        hi = prev_ml * (1.0 + NEXT_DAY_ML_GAP_PCT)
+        passes = spot_close <= lo or spot_close >= hi
+        if not passes:
+            self._log_skip(
+                stage="entry_ml_gap",
+                reason="spot close within previous ML +/- gap band",
+                symbol=symbol,
+                trade_dt=trade_dt,
+                prev_ml=prev_ml,
+                spot_close=spot_close,
+                lower_band=lo,
+                upper_band=hi,
+            )
+        return passes
+
+    def _log_skip(self, stage: str, reason: str, **details: Any) -> None:
+        parts = []
+        for key, value in details.items():
+            if value is None:
+                continue
+            parts.append(f"{key}={value}")
+        suffix = f" | {', '.join(parts)}" if parts else ""
+        print(f"[{self.name}][SKIP:{stage}] {reason}{suffix}")
+
+    def _build_sl_reentry_on_next_candle(
+        self,
+        pending: _PendingSLReentry,
+        candle: dict,
+        ctx: Any,
+        curr_spot_close: float,
+    ) -> Optional[Any]:
+        """
+        After SL exit, re-enter on the next candle only:
+        close > magical_line => short PE, close < magical_line => short CE.
+        """
+        if candle["timestamp"] == pending.exit_candle_ts:
+            self._log_skip(
+                stage="sl_reentry",
+                reason="waiting for next candle after SL exit",
+                symbol=pending.meta.symbol,
+                exit_candle_ts=pending.exit_candle_ts,
+                candle_ts=candle["timestamp"],
+            )
+            return None
+
+        meta = pending.meta
+        if curr_spot_close > meta.magical_line:
+            option_type = "PE"
+        else:
+            option_type = "CE"
+
+        next_level = (
+            self._reversal_level_counter.get((meta.symbol, meta.entry_date), meta.level)
+            + 1
+        )
+        if next_level > MAX_REVERSALS:
+            self._log_skip(
+                stage="sl_reentry",
+                reason="max reversals reached",
+                symbol=meta.symbol,
+                entry_date=meta.entry_date,
+                next_level=next_level,
+                max_reversals=MAX_REVERSALS,
+            )
+            return None
+
+        structure_id_new = self._build_structure_id(
+            meta.symbol, meta.entry_date, next_level
+        )
+        if ctx.position_store.has_open_structure(
+            strategy=self.name, structure_id=structure_id_new, tag="MAIN"
+        ):
+            self._log_skip(
+                stage="sl_reentry",
+                reason="target structure already open",
+                symbol=meta.symbol,
+                structure_id=structure_id_new,
+            )
+            return None
+        if getattr(ctx, "intent_store", None) and ctx.intent_store.has_pending_intent(
+            strategy=self.name,
+            structure_id=structure_id_new,
+            tags=["MAIN"],
+            actions=["ENTRY"],
+        ):
+            self._log_skip(
+                stage="sl_reentry",
+                reason="pending MAIN ENTRY already exists",
+                symbol=meta.symbol,
+                structure_id=structure_id_new,
+            )
+            return None
+
+        result = self._get_cached_strike_in_premium_range(
+            candle, ctx, meta.symbol, option_type
+        )
+        if not result:
+            self._log_skip(
+                stage="sl_reentry",
+                reason="no strike found in premium range",
+                symbol=meta.symbol,
+                option_type=option_type,
+                premium_min=TARGET_PREMIUM_MIN,
+                premium_max=TARGET_PREMIUM_MAX,
+            )
+            return None
+        strike, premium, row = result
+        if not strike:
+            self._log_skip(
+                stage="sl_reentry",
+                reason="resolved strike is empty",
+                symbol=meta.symbol,
+                option_type=option_type,
+            )
+            return None
+
+        expiry = ctx.selected_expiry
+        trading_symbol = self.delta_option_trading_symbol(
+            row,
+            float(strike),
+            option_type,
+            str(expiry),
+        )
+        inst = ctx.instrument_store.intent_creation_details(
+            trading_symbol,
+            ctx.exchange,
+            expiry,
+            option_type,
+            strike,
+        )
+        if inst is None:
+            self._log_skip(
+                stage="sl_reentry",
+                reason="instrument details unavailable for resolved strike",
+                symbol=meta.symbol,
+                trading_symbol=trading_symbol,
+                option_type=option_type,
+                strike=strike,
+            )
+            return None
+
+        self._reversal_level_counter[(meta.symbol, meta.entry_date)] = next_level
+        entry_ml = float(curr_spot_close)
+        new_meta = _PosMeta(
+            symbol=meta.symbol,
+            entry_date=meta.entry_date,
+            magical_line=entry_ml,
+            entry_premium=float(premium),
+            level=next_level,
+        )
+        entry_intent = self.map_instrument_to_intent(
+            inst=inst,
+            strike_row=row,
+            strategy=self.name,
+            side="SELL",
+            structure_id=structure_id_new,
+            candle_ts=candle["timestamp"],
+            tag="MAIN",
+            symbol=meta.symbol,
+            action="ENTRY",
+            metadata_extras=self._strategy_meta_dict(new_meta),
+        )
+        self._meta_by_structure_id[structure_id_new] = new_meta
+        self._exit_reason_by_structure_id.pop(structure_id_new, None)
+        self._last_daily_ml_by_symbol[meta.symbol] = (
+            pd.to_datetime(candle["timestamp"]).date(),
+            entry_ml,
+        )
+        return entry_intent
+
     # ==================================================
     # ENTRY
     # ==================================================
@@ -395,19 +626,60 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             # Entry lock: block new entries while current lifecycle is still in flight.
             if self._has_pending_main_intent(ctx, symbol):
                 self._pending_spot_close_by_symbol[symbol] = curr_spot_close
+                self._log_skip(
+                    stage="entry",
+                    reason="pending MAIN lifecycle intent exists",
+                    symbol=symbol,
+                    candle_ts=candle["timestamp"],
+                )
                 return None
 
             # Always stage current close for the next candle's cross detection.
             self._pending_spot_close_by_symbol[symbol] = curr_spot_close
+
+            # SL re-entry flow: after SL MAIN_EXIT fill, wait for next candle and
+            # choose side by close vs magical line (above=>short PE, below=>short CE).
+            pending_sl = self._pending_sl_reentry_by_symbol.get(symbol)
+            if pending_sl is not None:
+                reentry_intent = self._build_sl_reentry_on_next_candle(
+                    pending_sl=pending_sl,
+                    candle=candle,
+                    ctx=ctx,
+                    curr_spot_close=float(curr_spot_close),
+                )
+                if reentry_intent is not None:
+                    self._pending_sl_reentry_by_symbol.pop(symbol, None)
+                    return [reentry_intent]
 
             # --------------------------------------------------
             # Initial entry: only at 17:30 (reversal ENTRY is handled in
             # on_position_exit after MAIN exit).
             # --------------------------------------------------
             if not self.should_enter(candle):
+                self._log_skip(
+                    stage="entry",
+                    reason="candle time is not in valid entry window",
+                    symbol=symbol,
+                    candle_ts=candle["timestamp"],
+                    valid_times=self.valid_times,
+                )
                 return None
 
             trade_dt = pd.to_datetime(candle["timestamp"]).date()
+            if not self._passes_next_day_ml_gap_filter(
+                symbol=symbol,
+                trade_dt=trade_dt,
+                spot_close=float(curr_spot_close),
+                ctx=ctx,
+            ):
+                self._log_skip(
+                    stage="entry",
+                    reason="next-day magical line gap filter blocked entry",
+                    symbol=symbol,
+                    trade_dt=trade_dt,
+                    spot_close=float(curr_spot_close),
+                )
+                return None
             open_positions = ctx.position_store.get_open_positions(
                 underlying=symbol, strategy=self.name
             )
@@ -421,6 +693,13 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             ]
 
             if len(open_main_positions) >= max_positions:
+                self._log_skip(
+                    stage="entry",
+                    reason="max open MAIN positions reached",
+                    symbol=symbol,
+                    open_main_positions=len(open_main_positions),
+                    max_positions=max_positions,
+                )
                 return None
 
             direction = self._direction_at_1730(candle)
@@ -436,6 +715,12 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             if ctx.position_store.has_open_structure(
                 strategy=self.name, structure_id=structure_id, tag="MAIN"
             ):
+                self._log_skip(
+                    stage="entry",
+                    reason="structure already open",
+                    symbol=symbol,
+                    structure_id=structure_id,
+                )
                 return None
 
             has_pending = (
@@ -447,6 +732,12 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 else False
             )
             if has_pending:
+                self._log_skip(
+                    stage="entry",
+                    reason="pending intent exists for structure",
+                    symbol=symbol,
+                    structure_id=structure_id,
+                )
                 return None
 
             result = self._get_cached_strike_in_premium_range(
@@ -454,10 +745,24 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             )
 
             if result is None:
+                self._log_skip(
+                    stage="entry",
+                    reason="no strike found in premium range",
+                    symbol=symbol,
+                    option_type=option_type,
+                    premium_min=TARGET_PREMIUM_MIN,
+                    premium_max=TARGET_PREMIUM_MAX,
+                )
                 return None
 
             strike, premium, row = result
             if not strike:
+                self._log_skip(
+                    stage="entry",
+                    reason="resolved strike is empty",
+                    symbol=symbol,
+                    option_type=option_type,
+                )
                 return None
 
             expiry = ctx.selected_expiry
@@ -472,6 +777,14 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 trading_symbol, ctx.exchange, expiry, option_type, strike
             )
             if inst is None:
+                self._log_skip(
+                    stage="entry",
+                    reason="instrument details unavailable for resolved strike",
+                    symbol=symbol,
+                    trading_symbol=trading_symbol,
+                    option_type=option_type,
+                    strike=strike,
+                )
                 return None
 
             meta = _PosMeta(
@@ -496,6 +809,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             print(">>entry_intent", entry_intent)
             self._meta_by_structure_id[structure_id] = meta
             self._exit_reason_by_structure_id.pop(structure_id, None)
+            self._last_daily_ml_by_symbol[symbol] = (trade_dt, magical_line)
 
             return [entry_intent]
         finally:
@@ -560,8 +874,23 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         structure_id = kwargs.get("structure_id")
         if not structure_id:
             return []
+        structure_id = str(structure_id)
+        meta = self._meta_by_structure_id.get(structure_id)
+        reason_u = str(kwargs.get("exit_reason") or "").upper()
+        tag_u = str(kwargs.get("tag") or "").upper()
+        action_u = str(kwargs.get("action") or "").upper()
+        is_sl_exit = (
+            tag_u == "MAIN_SL"
+            or action_u == "FORCE_EXIT"
+            or reason_u == "SL"
+        )
+        if meta is not None and is_sl_exit:
+            self._pending_sl_reentry_by_symbol[meta.symbol] = _PendingSLReentry(
+                meta=meta,
+                exit_candle_ts=kwargs.get("candle_ts"),
+            )
         pending = self._pending_reversal_by_exit_structure_id.pop(
-            str(structure_id), None
+            structure_id, None
         )
         if pending is None:
             return []
@@ -657,11 +986,12 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             return [exit_intent]
 
         self._reversal_level_counter[(meta.symbol, meta.entry_date)] = next_level
+        entry_ml = float(candle.get("close", meta.magical_line) or meta.magical_line)
 
         new_meta = _PosMeta(
             symbol=meta.symbol,
             entry_date=meta.entry_date,
-            magical_line=meta.magical_line,
+            magical_line=entry_ml,
             entry_premium=float(premium),
             level=next_level,
         )
@@ -679,6 +1009,10 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         )
         self._meta_by_structure_id[structure_id_new] = new_meta
         self._exit_reason_by_structure_id.pop(structure_id_new, None)
+        self._last_daily_ml_by_symbol[meta.symbol] = (
+            pd.to_datetime(candle["timestamp"]).date(),
+            entry_ml,
+        )
 
         self._pending_reversal_by_exit_structure_id[structure_id] = _PendingReversal(
             entry_intent=entry_intent,
@@ -707,11 +1041,32 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         structure_id = kwargs.get("structure_id")
         if not structure_id:
             return
+        structure_id = str(structure_id)
+        meta = self._meta_by_structure_id.get(structure_id)
+        reason = str(
+            kwargs.get("exit_reason")
+            or kwargs.get("execution_source")
+            or kwargs.get("tag")
+            or "FORCED"
+        ).upper()
+        candle_ts = kwargs.get("candle_ts") or kwargs.get("timestamp")
+        tag_u = str(kwargs.get("tag") or "").upper()
+        action_u = str(kwargs.get("action") or "").upper()
+
+        # Broker-side SL/forced exits may bypass on_position_exit/on_main_exit_filled.
+        # Queue next-candle SL re-entry so behavior stays consistent.
+        is_sl_forced_exit = (
+            reason in {"SL", "MAIN_SL", "FORCE_EXIT"}
+            or tag_u == "MAIN_SL"
+            or action_u == "FORCE_EXIT"
+        )
+        if meta is not None and is_sl_forced_exit:
+            self._pending_sl_reentry_by_symbol[meta.symbol] = _PendingSLReentry(
+                meta=meta, exit_candle_ts=candle_ts
+            )
+
         self._pending_reversal_by_exit_structure_id.pop(str(structure_id), None)
         position_closed = bool(kwargs.get("position_closed"))
-        reason = str(
-            kwargs.get("exit_reason") or kwargs.get("execution_source") or "FORCED"
-        )
         if position_closed:
             self.on_structure_exit(structure_id=structure_id)
         else:

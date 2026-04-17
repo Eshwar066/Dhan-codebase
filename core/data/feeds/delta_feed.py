@@ -69,6 +69,9 @@ class DeltaWebSocketFeed(RealtimeFeed):
         self._ws: Optional[DeltaWebSocket] = None
         self._auth_done = False
         self._tick_queue: Optional[Any] = None
+        self._public_sub_gen_applied: int = -1
+        self._stall_reconnect_triggered: bool = False
+        self._user_trade_callback: Optional[Any] = None
 
     def set_tick_queue(self, queue: Any) -> None:
         """Push normalized ticks to queue for CandleAggregator. Set before start()."""
@@ -109,6 +112,14 @@ class DeltaWebSocketFeed(RealtimeFeed):
                     self._telegram_alert(f"⚠️ {msg}")
                 except Exception as e:
                     logger.debug("Delta feed: telegram stall alert failed: %s", e)
+            # Watchdog: force reconnect once per stall window.
+            if (
+                self._ws
+                and stall_sec >= 10
+                and not self._stall_reconnect_triggered
+            ):
+                self._stall_reconnect_triggered = True
+                self._ws.request_reconnect(reason=f"feed_stall_{int(stall_sec)}s")
 
         def _on_feed_recovered() -> None:
             msg = "Delta feed recovered: ticks resumed after stall (feed healthy)"
@@ -119,13 +130,35 @@ class DeltaWebSocketFeed(RealtimeFeed):
                     self._telegram_alert(f"✅ {msg}")
                 except Exception as e:
                     logger.debug("Delta feed: telegram recovered alert failed: %s", e)
+            self._stall_reconnect_triggered = False
+
+        def _on_open() -> None:
+            # Re-subscribe on every websocket open (initial connect + reconnect).
+            def _subscribe_after_ready() -> None:
+                import time
+
+                for _ in range(20):
+                    if self._ws and self._ws.is_connected():
+                        break
+                    time.sleep(0.25)
+                self._do_subscribe_public()
+                if self._auth_done:
+                    self._do_subscribe_private()
+
+            threading.Thread(target=_subscribe_after_ready, daemon=True).start()
+
+        def _on_subscriptions(msg: Dict[str, Any]) -> None:
+            channels = msg.get("channels", []) if isinstance(msg, dict) else []
+            logger.info("Delta feed subscription ack: channels=%s", channels)
 
         self._ws = DeltaWebSocket(
             api_key=self.api_key,
             api_secret=self.api_secret,
             testnet=self.testnet,
             india=self.india,
+            on_open=_on_open,
             on_auth=self._on_auth,
+            on_subscriptions=_on_subscriptions,
             on_tick=on_tick,
             on_feed_stall=(
                 _on_feed_stall
@@ -137,38 +170,54 @@ class DeltaWebSocketFeed(RealtimeFeed):
                 if (self._engine_logger or self._telegram_alert)
                 else None
             ),
+            on_user_trade=self._forward_user_trade,
         )
         self._ws.connect()
-        # Subscribe to public channels after socket is ready; private after auth success.
-        import threading
-        import time
-
-        def subscribe_public_after_delay():
-            time.sleep(1.5)
-            self._do_subscribe_public()
-
-        t = threading.Thread(target=subscribe_public_after_delay, daemon=True)
-        t.start()
+        # Public subscriptions happen from _on_open (including reconnects).
+        # Private subscriptions happen from _on_auth after successful key-auth.
 
     def _on_auth(self, success: bool, msg: Dict) -> None:
         self._auth_done = success
         if success:
             self._do_subscribe_private()
 
+    def set_user_trade_callback(self, callback: Any) -> None:
+        """Set event-driven callback for private user-trade events."""
+        self._user_trade_callback = callback
+
+    def _forward_user_trade(self, trade: Dict[str, Any]) -> None:
+        cb = self._user_trade_callback
+        if not cb:
+            return
+        try:
+            cb(trade)
+        except Exception as e:
+            logger.debug("Delta feed: user trade callback failed: %s", e)
+
     def _do_subscribe_public(self) -> None:
         if not self._ws or not self._ws.is_connected():
             return
-        if not self.symbols:
+        symbols = list(self.symbols) if self.symbols else []
+        if not symbols:
+            return
+        gen = self._ws.connect_generation
+        if self._public_sub_gen_applied == gen:
             return
         channels = [
-            {"name": "v2/ticker", "symbols": self.symbols},
-            {"name": self._channel_candlestick(), "symbols": self.symbols},
-            {"name": "l2_orderbook", "symbols": self.symbols},
+            {"name": "v2/ticker", "symbols": symbols},
+            {"name": self._channel_candlestick(), "symbols": symbols},
+            {"name": "l2_orderbook", "symbols": symbols},
         ]
         self._ws.subscribe(channels)
+        self._public_sub_gen_applied = gen
+        logger.info(
+            "Delta feed: re-subscribed public channels after reconnect (gen=%s)",
+            gen,
+        )
+        logger.info("Delta feed: subscribed symbols=%s", symbols)
         with self._l2_sub_lock:
-            self._subscribed_l2_symbols = {str(s).strip().upper() for s in self.symbols}
-            self._l2_gen_applied = self._ws.connect_generation
+            self._subscribed_l2_symbols = {str(s).strip().upper() for s in symbols}
+            self._l2_gen_applied = gen
 
     def ensure_l2_orderbook_subscription(self, symbol: str) -> None:
         """
@@ -210,6 +259,7 @@ class DeltaWebSocketFeed(RealtimeFeed):
             [
                 {"name": "orders", "symbols": ["all"]},
                 {"name": "positions", "symbols": ["all"]},
+                {"name": "v2/user_trades", "symbols": ["all"]},
             ]
         )
 
@@ -218,6 +268,8 @@ class DeltaWebSocketFeed(RealtimeFeed):
             self._ws.disconnect()
             self._ws = None
         self._auth_done = False
+        self._public_sub_gen_applied = -1
+        self._stall_reconnect_triggered = False
 
     def is_connected(self) -> bool:
         return self._ws is not None and self._ws.is_connected()
@@ -338,3 +390,9 @@ class DeltaWebSocketFeed(RealtimeFeed):
         if not self._ws:
             return {}
         return self._ws.get_positions()
+
+    def get_recent_user_trades(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """Drain recent private user-trade events from WebSocket buffer."""
+        if not self._ws:
+            return []
+        return self._ws.pop_user_trades(limit=limit)

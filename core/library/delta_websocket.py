@@ -92,6 +92,7 @@ class DeltaWebSocket:
         api_secret: str,
         testnet: bool = False,
         india: bool = True,
+        on_open: Optional[Callable[[], None]] = None,
         on_message: Optional[Callable[[Dict], None]] = None,
         on_auth: Optional[Callable[[bool, Dict], None]] = None,
         on_subscriptions: Optional[Callable[[Dict], None]] = None,
@@ -100,6 +101,7 @@ class DeltaWebSocket:
         on_tick: Optional[Callable[[str, float, float, float], None]] = None,
         on_feed_stall: Optional[Callable[[float], None]] = None,
         on_feed_recovered: Optional[Callable[[], None]] = None,
+        on_user_trade: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -107,6 +109,7 @@ class DeltaWebSocket:
 
         self.ws_url = DELTA_WS_INDIA_TEST if testnet else DELTA_WS_INDIA_PROD
         logger.info("Delta WebSocket URL: %s", self.ws_url)
+        self.on_open_cb = on_open
         self.on_message = on_message
         self.on_auth = on_auth
         self.on_subscriptions = on_subscriptions
@@ -114,6 +117,7 @@ class DeltaWebSocket:
         self.on_close_cb = on_close
         self.on_feed_stall = on_feed_stall
         self.on_feed_recovered = on_feed_recovered
+        self.on_user_trade = on_user_trade
 
         self._ws: Optional[websocket.WebSocketApp] = None
         self._thread: Optional[threading.Thread] = None
@@ -138,6 +142,7 @@ class DeltaWebSocket:
         self._last_orderbook_l2: Dict[str, Dict] = {}
         self._orders: Dict[str, List[Dict]] = {}
         self._positions: Dict[str, Dict] = {}
+        self._user_trades: List[Dict] = []
         self._ws_msg_sample_count = 0
         # Incremented on each successful WebSocket open (incl. reconnect); feeds use to re-apply L2 subs.
         self._connect_generation = 0
@@ -273,7 +278,7 @@ class DeltaWebSocket:
                 )
             else:
                 now = self._last_tick_time
-                if now - self._last_feed_log_time >= 30:
+                if now - self._last_feed_log_time >= 1800:
                     self._last_feed_log_time = now
                     logger.info("Delta WebSocket feed: receiving data.")
             sym = msg.get("symbol")
@@ -318,7 +323,7 @@ class DeltaWebSocket:
                 )
             else:
                 now = self._last_tick_time
-                if now - self._last_feed_log_time >= 30:
+                if now - self._last_feed_log_time >= 1800:
                     self._last_feed_log_time = now
                     logger.info("Delta WebSocket feed: receiving data.")
             sym = msg.get("symbol")
@@ -420,6 +425,30 @@ class DeltaWebSocket:
             "portfolio_margins",
             "mmp_trigger",
         ):
+            if msg_type in ("v2/user_trades", "user_trades"):
+                result = msg.get("result")
+                entries: List[Dict[str, Any]] = []
+                if isinstance(result, list):
+                    entries = [e for e in result if isinstance(e, dict)]
+                elif isinstance(result, dict):
+                    entries = [result]
+                elif isinstance(msg, dict):
+                    # Some payloads may arrive as a flat trade event.
+                    entries = [msg]
+                if entries:
+                    with self._lock:
+                        for e in entries:
+                            rec = dict(e)
+                            rec.setdefault("_ws_msg_type", msg_type)
+                            rec.setdefault("_ws_action", msg.get("action"))
+                            self._user_trades.append(rec)
+                            if self.on_user_trade:
+                                try:
+                                    self.on_user_trade(rec)
+                                except Exception as cb_err:
+                                    logger.debug("Delta WS on_user_trade callback error: %s", cb_err)
+                        if len(self._user_trades) > 2000:
+                            self._user_trades = self._user_trades[-2000:]
             if self.on_message:
                 self.on_message(msg)
             return
@@ -432,6 +461,11 @@ class DeltaWebSocket:
         with self._lock:
             self._connect_generation += 1
         logger.info("Delta WebSocket connected to %s", self.ws_url)
+        if self.on_open_cb:
+            try:
+                self.on_open_cb()
+            except Exception as e:
+                logger.debug("Delta WS on_open callback error: %s", e)
         self._enable_heartbeat()
         timestamp, signature = _ws_signature(self.api_secret)
         self._send(
@@ -504,20 +538,33 @@ class DeltaWebSocket:
 
     def _reconnect(self) -> None:
         """Replace WebSocket app and let the same thread run run_forever again (no second thread)."""
+        if self._reconnecting:
+            return
+        self._reconnecting = True
         if self._heartbeat_timer:
             self._heartbeat_timer.cancel()
             self._heartbeat_timer = None
-        if self._ws:
-            try:
-                self._ws.close()
-            except Exception as e:
-                logger.debug("Delta WS close during reconnect: %s", e)
-            self._ws = None
-        logger.debug("Delta WebSocket: reconnecting in 2s...")
-        time.sleep(2)
+        try:
+            if self._ws:
+                try:
+                    self._ws.close()
+                except Exception as e:
+                    logger.debug("Delta WS close during reconnect: %s", e)
+                self._ws = None
+            logger.debug("Delta WebSocket: reconnecting in 2s...")
+            time.sleep(2)
+            if self._stop.is_set() or self._gave_up:
+                return
+            self._ws = self._make_ws_app()
+        finally:
+            self._reconnecting = False
+
+    def request_reconnect(self, reason: str = "manual") -> None:
+        """Public reconnect trigger used by feed watchdog/recovery logic."""
         if self._stop.is_set() or self._gave_up:
             return
-        self._ws = self._make_ws_app()
+        logger.info("Delta WebSocket reconnect requested: %s", reason)
+        self._reconnect()
 
     def _run_forever(self) -> None:
         while not self._stop.is_set() and self._ws and not self._gave_up:
@@ -607,6 +654,18 @@ class DeltaWebSocket:
     def get_positions(self) -> Dict[str, Dict]:
         with self._lock:
             return dict(self._positions)
+
+    def pop_user_trades(self, limit: int = 200) -> List[Dict]:
+        """Drain up to ``limit`` recent private user-trade events."""
+        if limit <= 0:
+            return []
+        with self._lock:
+            n = min(int(limit), len(self._user_trades))
+            if n <= 0:
+                return []
+            out = self._user_trades[:n]
+            self._user_trades = self._user_trades[n:]
+            return out
 
     def is_connected(self) -> bool:
         return (
