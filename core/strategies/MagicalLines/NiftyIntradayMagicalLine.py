@@ -54,7 +54,7 @@ HOURLY_MONITOR_HOUR_END = 15  # … through 15:15 (EOD)
 STRIKE_STEP = 100
 
 DELTA_ABS_MIN = 0.20
-DELTA_ABS_MAX = 0.40
+DELTA_ABS_MAX = 0.30
 
 SL_PCT = 0.15
 ANCHOR_SPOT_TOLERANCE = 0.001  # 0.1% around prior entry spot for re-entry
