@@ -3,12 +3,27 @@ import os
 import threading
 import time
 from collections import defaultdict
+from typing import Any, Optional
+
+import pandas as pd
 from logs.logger.trade_logger import TradeLogger
 from datetime import datetime
 import uuid
 from core.utils.instruments.instrument_store import Instrument
 
 logger = logging.getLogger(__name__)
+
+
+def _fill_clock_for_trade_log(fill_ts: Any) -> Optional[datetime]:
+    """
+    Normalize bar/fill time for trade_log CSV (backtest = candle close instant, not wall clock).
+    """
+    if fill_ts is None:
+        return None
+    ts = pd.Timestamp(fill_ts)
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert("Asia/Kolkata").tz_localize(None)
+    return ts.to_pydatetime()
 
 # use
 # How to Run Auto-Reconciliation
@@ -56,6 +71,8 @@ class Position:
         self.trade_id = None
         self.entry_price = None
         self.entry_time = None
+        # Backtest / bar clock for trade_log (when set, overrides wall-clock entry_time in CSV)
+        self.entry_clock: Optional[datetime] = None
 
         self.mae = 0.0
         self.mfe = 0.0
@@ -78,14 +95,19 @@ class Position:
         )
         return f"<Position symbol={sym} qty={self.net_qty} avg={self.avg_price}>"
 
-    def update_fill(self, side, qty, price):
+    def update_fill(self, side, qty, price, fill_ts=None):
         signed_qty = qty if side == "BUY" else -qty
 
         # -------- ENTRY --------
         if self.net_qty == 0:
             self.trade_id = f"T-{uuid.uuid4().hex[:10]}"
             self.entry_price = price
-            self.entry_time = time.time()
+            if fill_ts is not None:
+                self.entry_clock = _fill_clock_for_trade_log(fill_ts)
+                self.entry_time = float(pd.Timestamp(fill_ts).timestamp())
+            else:
+                self.entry_clock = None
+                self.entry_time = time.time()
             self.mae = 0.0
             self.mfe = 0.0
 
@@ -223,7 +245,7 @@ class PositionManager:
                 self.positions[sym] = Position(instrument=instrument)
 
             pos = self.positions[sym]
-            pos.update_fill(side, qty, price)
+            pos.update_fill(side, qty, price, fill_ts=candle_ts)
 
             new_qty = pos.net_qty
             if prev_qty == 0 and new_qty != 0:
@@ -349,13 +371,14 @@ class PositionManager:
                         row["execution_source"] = execution_source
 
                     # Log complete trade for performance analytics (trade log)
-                    entry_time_str = (
-                        datetime.fromtimestamp(pos.entry_time).strftime(
+                    if getattr(pos, "entry_clock", None) is not None:
+                        entry_time_str = pos.entry_clock.strftime("%Y-%m-%d %H:%M:%S")
+                    elif pos.entry_time is not None:
+                        entry_time_str = datetime.fromtimestamp(pos.entry_time).strftime(
                             "%Y-%m-%d %H:%M:%S"
                         )
-                        if pos.entry_time is not None
-                        else ""
-                    )
+                    else:
+                        entry_time_str = ""
                     exit_time_str = (
                         candle_ts.strftime("%Y-%m-%d %H:%M:%S")
                         if candle_ts is not None and isinstance(candle_ts, datetime)
