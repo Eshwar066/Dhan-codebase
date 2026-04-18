@@ -5,7 +5,9 @@ Load Dhan expired option OHLC from locally downloaded CSVs (same layout as
     {root}/ATM Wise data/{SYMBOL}/{YYYY-MM-DD}/{ATM±n}/{SYMBOL}_{YYYY-MM-DD}_CALL.csv
     {root}/ATM Wise data/{SYMBOL}/{YYYY-MM-DD}/{ATM±n}/{SYMBOL}_{YYYY-MM-DD}_PUT.csv
 
-``root`` is typically ``.../Monthly Options data 15 mins`` or ``.../60 mins``.
+``root`` is the folder that contains ``ATM Wise data`` — e.g.
+``dhan expired option chain/dhan/Two month Options data 15 mins`` or
+``.../Monthly Options data 15 mins``.
 """
 
 from __future__ import annotations
@@ -27,7 +29,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 def default_expired_option_chain_root() -> Optional[Path]:
     """
     If ``DHAN_EXPIRED_OPTION_CHAIN_ROOT`` is unset, look under
-    ``<repo>/dhan expired option chain/`` for a ``Monthly Options data *`` folder.
+    ``<repo>/dhan expired option chain/`` for a data folder that contains
+    ``ATM Wise data`` (see candidates below).
     """
     env = (os.getenv("DHAN_EXPIRED_OPTION_CHAIN_ROOT") or "").strip()
     if env:
@@ -36,11 +39,14 @@ def default_expired_option_chain_root() -> Optional[Path]:
     base = _PROJECT_ROOT / "dhan expired option chain"
     if not base.is_dir():
         return None
-    for name in (
-        "Monthly Options data 15 mins",
-        "Monthly Options data 60 mins",
-    ):
-        cand = base / name
+    # Prefer: dhan/Two month Options data 15 mins (then top-level fallbacks)
+    candidates: List[Path] = [
+        base / "dhan" / "Two month Options data 15 mins",
+        # base / "Two month Options data 15 mins",
+        # base / "Monthly Options data 15 mins",
+        # base / "Monthly Options data 60 mins",
+    ]
+    for cand in candidates:
         if cand.is_dir():
             return cand
     return None
@@ -181,7 +187,8 @@ def load_expired_option_chain_from_files(
     if atm_wise is None:
         logger.debug(
             "Dhan expired option files: no root (set DHAN_EXPIRED_OPTION_CHAIN_ROOT "
-            "or add Monthly Options data under dhan expired option chain/)"
+            "or add e.g. dhan expired option chain/dhan/Two month Options data 15 mins "
+            "with ATM Wise data inside)"
         )
         return None
 
