@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+DHAN_INSTRUMENT_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 from run.config import RUN_MODE, RunMode
 
 from .base import BaseInstrumentStore, Instrument
@@ -23,8 +25,31 @@ class DhanInstrumentProvider:
 
     def load(self) -> pd.DataFrame:
         if not self.csv_path.exists():
+            self._fetch_master_csv()
+        if not self.csv_path.exists():
             raise FileNotFoundError(f"Dhan instrument file not found: {self.csv_path}")
         return pd.read_csv(self.csv_path, low_memory=False)
+
+    def _fetch_master_csv(self) -> None:
+        """Download public Dhan scrip master (same source as Tradehull) if file is missing."""
+        try:
+            self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+            logger.info(
+                "Fetching Dhan instrument master from %s -> %s",
+                DHAN_INSTRUMENT_MASTER_URL,
+                self.csv_path,
+            )
+            df = pd.read_csv(DHAN_INSTRUMENT_MASTER_URL, low_memory=False)
+            if "SEM_CUSTOM_SYMBOL" in df.columns:
+                df["SEM_CUSTOM_SYMBOL"] = (
+                    df["SEM_CUSTOM_SYMBOL"]
+                    .astype(str)
+                    .str.strip()
+                    .str.replace(r"\s+", " ", regex=True)
+                )
+            df.to_csv(self.csv_path, index=False)
+        except Exception as e:
+            logger.warning("Could not auto-download Dhan instrument master: %s", e)
 
 
 class DhanInstrumentStore(BaseInstrumentStore):

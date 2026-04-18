@@ -1,4 +1,4 @@
-from dhanhq import dhanhq
+from dhanhq import dhanhq, DhanContext, FullDepth
 import mibian
 import datetime
 import math
@@ -111,6 +111,21 @@ def _years_to_expiry(expiry_date: datetime.date, bar_time) -> float:
     if days < 0:
         return 1e-10
     return max(days / 365.25, 1e-10)
+
+
+def _dhan_invalid_auth_hint(payload) -> str:
+    """Actionable suffix when Dhan returns DH-901 Invalid Authentication."""
+    if not isinstance(payload, dict):
+        return ""
+    remarks = payload.get("remarks") or {}
+    code = str(remarks.get("error_code") or "")
+    et = str(remarks.get("error_type") or "")
+    if code == "DH-901" or "Invalid_Authentication" in et:
+        return (
+            " — Fix: Regenerate your API access token in the Dhan developer dashboard and set "
+            "DHAN_ACCESS_TOKEN in .env (token expires; client id must be DHAN_CLIENT_CODE)."
+        )
+    return ""
 
 
 class Tradehull:
@@ -503,7 +518,6 @@ class Tradehull:
         except Exception as e:
             print(e)
             self.logger.exception(f"got exception in get_login as {e} ")
-            print(self.response)
             traceback.print_exc()
 
     def get_instrument_file(self):
@@ -3430,7 +3444,10 @@ class Tradehull:
                 else:
                     raise Exception("No DAY data found in test range.")
             else:
-                raise Exception(f"Failed to retrieve DAY timeframe data: {day_data}")
+                raise Exception(
+                    f"Failed to retrieve DAY timeframe data: {day_data}"
+                    f"{_dhan_invalid_auth_hint(day_data)}"
+                )
 
             if timeframe in ["1", "5", "15", "25", "60"]:
                 interval = int(timeframe)
@@ -3488,7 +3505,10 @@ class Tradehull:
                                 f"{tradingsymbol} [{from_str} to {to_str}] {len(df)} rows"
                             )
                 else:
-                    print(f"Failed: {from_str} to {to_str}: {response}")
+                    print(
+                        f"Failed: {from_str} to {to_str}: {response}"
+                        f"{_dhan_invalid_auth_hint(response)}"
+                    )
 
                 current_from = current_to + datetime.timedelta(days=1)
             return (
