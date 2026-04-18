@@ -14,9 +14,13 @@ Example:
 
 import uuid
 import calendar
+import logging
+import math
 import pandas as pd
 from datetime import date, timedelta, datetime, timezone
 from typing import Any, List, Optional, Tuple, Union
+
+logger = logging.getLogger(__name__)
 
 # India Standard Time (UTC+5:30) for strategy time-of-day filters.
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -424,6 +428,136 @@ class IndiaMktMixins:
         except (TypeError, ValueError, KeyError):
             return False
 
+    @staticmethod
+    def _backtest_can_compute_bs_delta(chain: pd.DataFrame) -> bool:
+        """Expired Dhan CSV rows often have iv + strike but no DELTA column — BS delta can be used."""
+        if chain is None or chain.empty:
+            return False
+        cols = {str(c).lower() for c in chain.columns}
+        return "strike" in cols and "iv" in cols
+
+    @staticmethod
+    def _ts_to_utc_naive(ts: Any) -> pd.Timestamp:
+        """Align timestamps for subtraction: tz-aware → UTC, then strip tz (naive UTC wall time)."""
+        t = pd.Timestamp(ts)
+        if t.tzinfo is not None:
+            t = t.tz_convert("UTC").tz_localize(None)
+        return t
+
+    @staticmethod
+    def _expiry_calendar_to_utc_naive_close(exp_cal: Union[date, datetime, Any]) -> pd.Timestamp:
+        """
+        Option expiry instant: same **calendar** day at **15:30 IST** (NIFTY cash close convention),
+        converted to naive UTC for consistent ``T`` vs bar timestamps.
+        """
+        if isinstance(exp_cal, datetime):
+            d = exp_cal.date()
+        elif isinstance(exp_cal, date):
+            d = exp_cal
+        else:
+            d = pd.Timestamp(exp_cal).date()
+        t = pd.Timestamp(datetime(d.year, d.month, d.day, 15, 30, 0))
+        t = t.tz_localize("Asia/Kolkata").tz_convert("UTC").tz_localize(None)
+        return t
+
+    @staticmethod
+    def _years_to_expiry_bs(bar_ts_utc_naive: pd.Timestamp, exp_cal_date: Union[date, datetime]) -> float:
+        """
+        Year fraction for Black–Scholes: (expiry @ 15:30 IST in UTC) − (bar time in UTC naive).
+        """
+        exp_ts = IndiaMktMixins._expiry_calendar_to_utc_naive_close(exp_cal_date)
+        dt_sec = (exp_ts - bar_ts_utc_naive).total_seconds()
+        if dt_sec <= 0:
+            dt_sec = 60.0
+        return max(dt_sec / (365.0 * 24 * 3600.0), 1e-10)
+
+    def _append_computed_delta_to_chain_df(
+        self,
+        chain: pd.DataFrame,
+        option_type: str,
+        candle: dict,
+        ctx: Any,
+    ) -> pd.DataFrame:
+        """
+        Append BS ``DELTA_CE`` / ``DELTA_PE`` (signed) and ``abs_delta`` when the chain has
+        ``strike`` + ``iv`` but no column matching ``_option_chain_delta_column`` — typical for
+        expired Dhan CSV backtests.
+        """
+        if chain is None or chain.empty:
+            return chain
+        if self._option_chain_delta_column(chain, option_type) is not None:
+            return chain
+        if not self._backtest_can_compute_bs_delta(chain):
+            return chain
+
+        from core.library.dhan_tradehull import _iv_to_sigma, bs_option_delta
+
+        opt_u = str(option_type).upper()
+        kind = "pe" if opt_u in ("PE", "PUT") else "ce"
+        leg_col = f"DELTA_{'PE' if kind == 'pe' else 'CE'}"
+        r_annual = 0.065
+        ts = candle.get("timestamp")
+        td = self._ts_to_utc_naive(ts)
+        trade_d = td.date()
+        exp = getattr(ctx, "selected_expiry", None)
+        if isinstance(exp, int):
+            exp_d = ExpiryResolver.dhan_expiry_index_to_date(trade_d, exp)
+        elif exp is not None and hasattr(exp, "year"):
+            exp_d = pd.Timestamp(exp).date()
+        else:
+            exp_d = ExpiryResolver.dhan_expiry_index_to_date(trade_d, 0)
+
+        _sf = candle.get("spot", candle.get("underlying_price"))
+        spot_fallback = float(_sf) if _sf is not None and _sf != "" else 0.0
+        if spot_fallback <= 0:
+            spot_fallback = float(candle.get("close", 0) or 0)
+
+        ts_col = "datetime" if "datetime" in chain.columns else None
+
+        out = chain.copy()
+        d_signed: List[float] = []
+        d_abs: List[float] = []
+        for _, r in out.iterrows():
+            try:
+                spot = (
+                    float(r["spot"])
+                    if "spot" in out.columns and pd.notna(r.get("spot"))
+                    else spot_fallback
+                )
+                if pd.isna(r.get("strike")) or pd.isna(r.get("iv")) or spot <= 0:
+                    d_signed.append(float("nan"))
+                    d_abs.append(float("nan"))
+                    continue
+                K = float(r["strike"])
+                sigma = _iv_to_sigma(r["iv"])
+                if sigma <= 0 or (isinstance(sigma, float) and math.isnan(sigma)):
+                    d_signed.append(float("nan"))
+                    d_abs.append(float("nan"))
+                    continue
+                bar_ts = pd.Timestamp(r[ts_col]) if ts_col else td
+                bar_ts = self._ts_to_utc_naive(bar_ts)
+                T = self._years_to_expiry_bs(bar_ts, exp_d)
+                d = bs_option_delta(spot, K, T, r_annual, sigma, kind)
+                fv = float(d)
+                d_signed.append(fv)
+                d_abs.append(abs(fv))
+            except (TypeError, ValueError):
+                d_signed.append(float("nan"))
+                d_abs.append(float("nan"))
+
+        if len(d_signed) > 5:
+            vals = [x for x in d_signed if not math.isnan(x)]
+            if vals and (max(vals) - min(vals)) < 0.05:
+                logger.warning(
+                    "Delta nearly flat across strikes (range < 0.05) — check T / expiry vs bar "
+                    "time (timezone or expiry calendar mismatch). exp_d=%s",
+                    exp_d,
+                )
+
+        out[leg_col] = d_signed
+        out["abs_delta"] = d_abs
+        return out
+
     def fetch_option_chain(self, candle, ctx, option_type):
         ocs = ctx.option_chain_service
 
@@ -432,16 +566,19 @@ class IndiaMktMixins:
                 api=self.api, ctx=ctx, instrument="FUTIDX"
             )
 
+        rollover = getattr(self, "dhan_monthly_rollover_after_calendar_day", None)
         expiry_code = ExpiryResolver.resolve(
             expiry_list=ctx.get_expiry_list(),
             trade_date=ctx.timestamp,
             api=self.api,
             expiry_pref=self.expiryType,
+            dhan_calendar_rollover_day=rollover,
         )
         spot = candle["close"]
-        step = 500
+        step = getattr(self, "otm_strike_step", 500)
+        count = int(getattr(self, "otm_strike_count", 4))
         otm_strikes = ExpiryResolver.get_otm_strikes(
-            self, spot=spot, option_type=option_type, step=step, count=4
+            self, spot=spot, option_type=option_type, step=step, count=count
         )
         ctx.selected_expiry = expiry_code
         ctx.otm_strikes = otm_strikes
@@ -568,6 +705,9 @@ class IndiaMktMixins:
                 elif len(chain) > 1:
                     return None
 
+            # BS delta columns (DELTA_CE/DELTA_PE, abs_delta) when iv+strike present and no broker delta.
+            chain = self._append_computed_delta_to_chain_df(chain, option_type, candle, ctx)
+
             option_type_upper = option_type.upper()
             premium_col = self._option_chain_premium_column(chain, option_type_upper)
 
@@ -591,6 +731,18 @@ class IndiaMktMixins:
                 ]
                 if delta_ok.empty:
                     return None
+
+                if len(delta_ok) > 1:
+                    target_mid = (float(d_min) + float(d_max)) / 2.0
+                    ad_series = delta_ok.apply(
+                        lambda r: abs(float(r[dcol_bt])) if pd.notna(r.get(dcol_bt)) else float("nan"),
+                        axis=1,
+                    )
+                    delta_ok = (
+                        delta_ok.assign(_dd=(ad_series - target_mid).abs())
+                        .sort_values("_dd")
+                        .drop(columns=["_dd"])
+                    )
                 row = delta_ok
                 skip_premium_check = True
             else:

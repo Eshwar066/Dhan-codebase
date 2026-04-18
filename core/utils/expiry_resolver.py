@@ -15,7 +15,14 @@ class ExpiryResolver:
     # PUBLIC API
     # ============================
     @staticmethod
-    def resolve(expiry_list, trade_date, api="NSE", expiry_pref="MONTHLY"):
+    def resolve(
+        expiry_list,
+        trade_date,
+        api="NSE",
+        expiry_pref="MONTHLY",
+        *,
+        dhan_calendar_rollover_day=None,
+    ):
         # NSE will check later-->Pending
 
         if isinstance(trade_date, str):
@@ -32,7 +39,9 @@ class ExpiryResolver:
         # ---------- DHAN path ----------
         if api.upper() == "DHAN":
             if expiry_pref == "MONTHLY":
-                return ExpiryResolver._derive_monthly_series(trade_date)
+                return ExpiryResolver._derive_monthly_series(
+                    trade_date, calendar_rollover_day=dhan_calendar_rollover_day
+                )
             elif expiry_pref == "QUARTERLY":
                 return ExpiryResolver._derive_quarterly_series(trade_date)
 
@@ -139,15 +148,24 @@ class ExpiryResolver:
         return matches[-1]
 
     @staticmethod
-    def _derive_monthly_series(trade_date):
+    def _derive_monthly_series(trade_date, calendar_rollover_day=None):
         """
         Dhan / Tradehull monthly option chain index for backtest (``expiry_code`` is int).
 
-        ``0`` = current month's series; ``1`` = next series after this month's expiry Thursday
-        has passed (see ``get_expired_optionchain`` / ``DhanAdapter.get_historical_option_chain``).
+        ``0`` = current month's series; ``1`` = next month's series when:
+
+        - this month's expiry Thursday has already passed, **or**
+        - ``calendar_rollover_day`` is set (e.g. 15) and ``trade_date.day`` is **greater than**
+          that day (intraday monthly rollover — next series from folder / chain).
         """
         this_exp = ExpiryResolver.current_month_expiry(trade_date)
         if trade_date > this_exp:
+            return 1
+        if (
+            calendar_rollover_day is not None
+            and int(calendar_rollover_day) >= 1
+            and trade_date.day > int(calendar_rollover_day)
+        ):
             return 1
         return 0
 

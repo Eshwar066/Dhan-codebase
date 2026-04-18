@@ -54,7 +54,7 @@ HOURLY_MONITOR_HOUR_END = 15  # … through 15:15 (EOD)
 STRIKE_STEP = 100
 
 DELTA_ABS_MIN = 0.20
-DELTA_ABS_MAX = 0.30
+DELTA_ABS_MAX = 0.40
 
 SL_PCT = 0.15
 ANCHOR_SPOT_TOLERANCE = 0.001  # 0.1% around prior entry spot for re-entry
@@ -100,6 +100,11 @@ class NiftyIntradayMagicalLine(IndiaMktMixins, BaseStrategy):
     valid_times = {ENTRY_CANDLE_TIME}
     delta_abs_min = DELTA_ABS_MIN
     delta_abs_max = DELTA_ABS_MAX
+    # NIFTY OPTIDX: 50-point strikes; enough legs for |delta| band on expired CSVs.
+    otm_strike_step = 50
+    otm_strike_count = 10
+    # After this calendar day, DHAN uses next month's series (expiry_code 1).
+    dhan_monthly_rollover_after_calendar_day = 15
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -347,6 +352,7 @@ class NiftyIntradayMagicalLine(IndiaMktMixins, BaseStrategy):
         return False
 
     def on_candle(self, candle: dict, ctx: Any):
+        # pdb.set_trace()
         symbol = candle["symbol"]
         trade_dt = pd.to_datetime(candle["timestamp"]).date()
         ct = pd.Timestamp(candle["timestamp"])
