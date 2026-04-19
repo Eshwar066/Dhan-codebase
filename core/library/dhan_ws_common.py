@@ -22,6 +22,7 @@ class StallWatchdog:
     """
     Background thread: if connected but no application traffic for stall_sec, close the socket.
     get_ws() should return current WebSocketApp or None; on_stall() should close it.
+    Optional stall_only_when: if provided, close only when it returns True (e.g. market open).
     """
 
     def __init__(
@@ -31,12 +32,14 @@ class StallWatchdog:
         get_last_activity_ts: Callable[[], float],
         get_ws: Callable[[], Any],
         should_run: Callable[[], bool],
+        stall_only_when: Optional[Callable[[], bool]] = None,
     ):
         self._name = name
         self._stall_sec = float(stall_sec)
         self._get_ts = get_last_activity_ts
         self._get_ws = get_ws
         self._should_run = should_run
+        self._stall_only_when = stall_only_when if stall_only_when is not None else (lambda: True)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -77,6 +80,8 @@ class StallWatchdog:
                 continue
             idle = time.time() - self._get_ts()
             if idle > self._stall_sec:
+                if not self._stall_only_when():
+                    continue
                 logger.warning(
                     "%s: stall watchdog closing socket (no traffic %.1fs > %.1fs)",
                     self._name,

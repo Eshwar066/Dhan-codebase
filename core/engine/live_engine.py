@@ -725,12 +725,14 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             return
         if not snapshot:
             return
-        msg = (
-            "Startup balance snapshot: "
-            f"selected={snapshot.get('selected_available')} "
-            f"usd={snapshot.get('usd_available')} "
-            f"inr={snapshot.get('inr_available')}"
-        )
+        sel = snapshot.get("selected_available")
+        usd = snapshot.get("usd_available")
+        inr = snapshot.get("inr_available")
+        parts = [f"selected={sel}"]
+        if usd is not None:
+            parts.append(f"usd={usd}")
+        parts.append(f"inr={inr}")
+        msg = "Startup balance snapshot: " + " ".join(parts)
         if self.engine_logger:
             self.engine_logger.log("oms", msg)
         else:
@@ -919,12 +921,41 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             ts = candle.get("timestamp")
                             if isinstance(ts, (int, float)):
                                 self._last_candle_timestamp[symbol] = time.time()
+
                     #  check this flow by commenting ws feed
-                    if candle is None and self.candle_service:
-                        candle = self.candle_service.get_latest_closed(
-                            symbol, tf, exchange, sector, rsi
-                        )
+                    # if candle is None and self.candle_service:
+                        # candle = self.candle_service.get_latest_closed(
+                        #     symbol, tf, exchange, sector, rsi
+                        # )
+
+                    #========Dummy candle for after mkt hours test ===========================
+                    # if candle is None:
+                    #     from zoneinfo import ZoneInfo
+                    #     ist = ZoneInfo("Asia/Kolkata")
+                    #     bar = dt.datetime.now(ist).replace(
+                    #             hour=9, minute=15, second=0, microsecond=0
+                    #     )
+                    #     bucket = bar.timestamp()
+                    #     if self._last_evaluated_candle_ts.get(symbol) == bucket:
+                    #         continue
+                    #     px = 25000.0
+                    #     candle = {
+                    #             "timestamp": bar.astimezone(dt.timezone.utc).replace(
+                    #                 tzinfo=None
+                    #             ),
+                    #             "open": px,
+                    #             "high": px,
+                    #             "low": px,
+                    #             "close": px,
+                    #             "volume": 1,
+                    #             "bucket_ts": bucket,
+                    #     }
+                    #         # pdb.set_trace()
+                    # else:
+                    #     print(">>candle is None")
+                    #     continue
                     if candle is None:
+                        print(">>candle is None")
                         continue
                     if isinstance(candle.get("timestamp"), (int, float)):
                         ts = candle["timestamp"]
@@ -949,6 +980,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         continue
 
                     if use_aggregator:
+                        # check the time of the entry candle at mkt time
                         if self._live_bar_is_stale_or_replay(symbol, candle, tf):
                             continue
                         bt_ok = candle.get("bucket_ts")

@@ -24,6 +24,17 @@ from core.library.dhan_ws_common import StallWatchdog, reconnect_sleep_with_jitt
 
 logger = logging.getLogger(__name__)
 
+
+def _dhan_market_stall_should_close() -> bool:
+    """Reconnect on stall only during NSE index session; after hours a quiet socket is normal."""
+    try:
+        from core.utils.session.session_manager import SessionManager
+
+        return SessionManager.is_market_open("INDEX")
+    except Exception:
+        return True
+
+
 DHAN_FEED_WS_URL = "wss://api-feed.dhan.co"
 
 # Response codes (Annexure)
@@ -213,7 +224,7 @@ class DhanWebSocket:
         on_ticker: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         on_quote: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         on_disconnect: Optional[Callable[[int], None]] = None,
-        stall_timeout_seconds: float = 35.0,
+        stall_timeout_seconds: float = 60,
     ):
         """
         instruments: list of {"ExchangeSegment": "NSE_EQ", "SecurityId": "11536", "symbol": "RELIANCE"}.
@@ -249,6 +260,7 @@ class DhanWebSocket:
             get_last_activity_ts=lambda: self._last_activity_ts,
             get_ws=lambda: self._ws,
             should_run=lambda: not self._stop.is_set(),
+            stall_only_when=_dhan_market_stall_should_close,
         )
 
     def _rebuild_security_map_locked(self) -> None:
