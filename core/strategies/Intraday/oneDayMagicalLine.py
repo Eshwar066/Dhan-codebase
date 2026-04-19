@@ -17,10 +17,15 @@ Implementation notes
 - On reversal: emit `MAIN_EXIT` first; when that exit fills, emit reversal ENTRY; SL again after the new MAIN fills.
 - If broker/forced exit closes a MAIN leg at SL, queue next-candle SL re-entry as well.
 - The magical line (spot at entry) is stored per opened position via `structure_id` for reversal + SL.
+
+
+Pending:
+    1. 1 week before the expiry exit the trades.--> to be implemented in the strategy.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date, time
 from types import SimpleNamespace
@@ -33,8 +38,9 @@ from core.strategies.IndiaMktMixins import IndiaMktMixins
 from core.strategies.deltaMktMixins import DeltaMktMixins
 from core.strategies.base import BaseStrategy
 
+logger = logging.getLogger(__name__)
 
-VALID_TIME_1730 = {time(22, 30)}  # 1hr candle close time (IST)
+VALID_TIME_1730 = {time(18, 30)}  # 1hr candle close time (IST)
 
 # Strike/premium selection (kept conservative and similar to `MagicalLines`)
 STRIKE_STEP = 500
@@ -457,24 +463,70 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         except (TypeError, ValueError):
             return None
 
+    def _log_main_entry_ml_gap(self, **fields: Any) -> None:
+        """Structured log for ±3% next-day MAIN entry rule (grep: MAIN_ENTRY:ML_GAP)."""
+        parts = []
+        for key, value in fields.items():
+            if value is None:
+                continue
+            parts.append(f"{key}={value}")
+        msg = f"[{self.name}][MAIN_ENTRY:ML_GAP] " + " | ".join(parts)
+        print(msg)
+        logger.info(msg)
+
     def _passes_next_day_ml_gap_filter(
         self, symbol: str, trade_dt: date, spot_close: float, ctx: Any
     ) -> bool:
         """
-        For fresh 17:30 MAIN entries on a new day, require spot to move at least
+        For fresh 18:30 MAIN entries on a new day, require spot to move at least
         +/-3% from the previous day's stored magical line for that symbol.
         """
-        prev_ml = self._reference_ml_from_position_store(symbol=symbol, ctx=ctx)
+        pct = NEXT_DAY_ML_GAP_PCT
+        prev_ml_store = self._reference_ml_from_position_store(symbol=symbol, ctx=ctx)
         prev = self._last_daily_ml_by_symbol.get(symbol)
+        prev_ml = prev_ml_store
+
         if prev is None and prev_ml is None:
+            self._log_main_entry_ml_gap(
+                outcome="NOT_EVALUATED",
+                applied=False,
+                rule=f"spot must be outside prior ML ±{pct:.2%}",
+                reason="no prior ML: _last_daily_ml_by_symbol empty and position_store has no ML for this underlying",
+                symbol=symbol,
+                trade_dt=trade_dt,
+                spot_close=spot_close,
+            )
             return True
+
         if prev is not None:
             prev_dt, prev_ml_mem = prev
             if trade_dt <= prev_dt:
+                self._log_main_entry_ml_gap(
+                    outcome="NOT_EVALUATED",
+                    applied=False,
+                    rule=f"spot must be outside prior ML ±{pct:.2%}",
+                    reason="calendar day <= last_daily_ml_date (intra-day repeat; ±3% gate is for a later day vs that date)",
+                    symbol=symbol,
+                    trade_dt=trade_dt,
+                    last_ml_date=prev_dt,
+                    last_ml_value=prev_ml_mem,
+                    spot_close=spot_close,
+                )
                 return True
             if prev_ml is None:
                 prev_ml = prev_ml_mem
-        if prev_ml <= 0:
+
+        if prev_ml is None or prev_ml <= 0:
+            self._log_main_entry_ml_gap(
+                outcome="FAIL",
+                applied=True,
+                rule=f"spot must be outside prior ML ±{pct:.2%}",
+                reason="previous magical line missing or non-positive after resolve",
+                symbol=symbol,
+                trade_dt=trade_dt,
+                prev_ml_effective=prev_ml,
+                spot_close=spot_close,
+            )
             self._log_skip(
                 stage="entry_ml_gap",
                 reason="previous magical line is non-positive",
@@ -484,10 +536,41 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 spot_close=spot_close,
             )
             return False
+
         lo = prev_ml * (1.0 - NEXT_DAY_ML_GAP_PCT)
         hi = prev_ml * (1.0 + NEXT_DAY_ML_GAP_PCT)
         passes = spot_close <= lo or spot_close >= hi
-        if not passes:
+        prev_source = (
+            "position_store"
+            if prev_ml_store is not None
+            else "last_daily_ml_memory"
+        )
+        if passes:
+            self._log_main_entry_ml_gap(
+                outcome="PASS",
+                applied=True,
+                rule=f"spot outside prior ML ±{pct:.2%}",
+                symbol=symbol,
+                trade_dt=trade_dt,
+                prev_ml=prev_ml,
+                prev_ml_source=prev_source,
+                spot_close=spot_close,
+                band_low=lo,
+                band_high=hi,
+            )
+        else:
+            self._log_main_entry_ml_gap(
+                outcome="FAIL",
+                applied=True,
+                rule=f"spot inside prior ML ±{pct:.2%} band (no entry)",
+                symbol=symbol,
+                trade_dt=trade_dt,
+                prev_ml=prev_ml,
+                prev_ml_source=prev_source,
+                spot_close=spot_close,
+                band_low=lo,
+                band_high=hi,
+            )
             self._log_skip(
                 stage="entry_ml_gap",
                 reason="spot close within previous ML +/- gap band",
@@ -507,7 +590,9 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 continue
             parts.append(f"{key}={value}")
         suffix = f" | {', '.join(parts)}" if parts else ""
-        print(f"[{self.name}][SKIP:{stage}] {reason}{suffix}")
+        msg = f"[{self.name}][SKIP:{stage}] {reason}{suffix}"
+        print(msg)
+        logger.info(msg)
 
     def _build_sl_reentry_on_next_candle(
         self,
@@ -739,13 +824,7 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 spot_close=float(curr_spot_close),
                 ctx=ctx,
             ):
-                self._log_skip(
-                    stage="entry",
-                    reason="next-day magical line gap filter blocked entry",
-                    symbol=symbol,
-                    trade_dt=trade_dt,
-                    spot_close=float(curr_spot_close),
-                )
+                # Failure already logged inside _passes_next_day_ml_gap_filter (entry_ml_gap).
                 return None
             open_positions = ctx.position_store.get_open_positions(
                 underlying=symbol, strategy=self.name
@@ -874,6 +953,14 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 metadata_extras=self._strategy_meta_dict(meta),
             )
             print(">>entry_intent", entry_intent)
+            main_ent = (
+                f"[{self.name}][MAIN_ENTRY] emit L1 ENTRY | symbol={symbol} "
+                f"trade_dt={trade_dt} magical_line_spot={magical_line} "
+                f"option_type={option_type} trading_symbol={trading_symbol} "
+                f"structure_id={structure_id}"
+            )
+            print(main_ent)
+            logger.info(main_ent)
             self._meta_by_structure_id[structure_id] = meta
             self._exit_reason_by_structure_id.pop(structure_id, None)
             self._last_daily_ml_by_symbol[symbol] = (trade_dt, magical_line)
