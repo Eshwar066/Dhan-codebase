@@ -36,6 +36,7 @@ from core.utils.dhan_expired_option_chain_files import (
     atm_label_from_spot_strike,
     load_expired_option_chain_from_files,
 )
+from core.utils.option_chain_snapshot_log import log_option_chain_snapshot
 
 
 class IndiaMktMixins:
@@ -634,7 +635,16 @@ class IndiaMktMixins:
         }
 
         chain = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
-       
+        try:
+            log_option_chain_snapshot(
+                chain,
+                ctx=ctx,
+                strategy_name=getattr(self, "name", "") or "",
+                api=self.api,
+                params=params,
+            )
+        except Exception:
+            pass
         if chain is None:
             print(">>no option chain data", ctx, params)
             return None

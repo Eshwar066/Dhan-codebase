@@ -28,7 +28,7 @@ class DhanAdapter(BaseAdapter):
             symbol=ctx.symbol,
             exchange=ctx.exchange or "",
             expiry_index=expiry_index,
-            strikes_around_atm=params.get("strikes", 10),
+            strikes_around_atm=params.get("strikes", 30),
             expiry_flag=params.get("expiry_flag", "MONTH"),
         )
 
