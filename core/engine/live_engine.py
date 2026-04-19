@@ -679,6 +679,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
 
     def check_feed_health(self) -> None:
         """Warn if no tick/candle received for feed_stale_seconds; optionally pause entries."""
+        if not self._is_market_open_for_feed_health():
+            self._entries_paused_feed_stale = False
+            return
         if not self.realtime_feed or not self.realtime_feed.is_connected():
             return
         now = time.time()
