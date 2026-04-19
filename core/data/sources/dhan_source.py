@@ -20,6 +20,7 @@ import json
 
 # Use in-project Dhan Tradehull library and v2 Market Quote API
 from core.library.dhan_tradehull import Tradehull
+from datetime import datetime
 from core.library.dhan_marketfeed import (
     DhanMarketFeedClient,
     parse_ltp_response,
@@ -439,12 +440,31 @@ class DhanSource:
     # -------------------------------------------------------------------------
     # Data: Option chain (live)
     # -------------------------------------------------------------------------
-    def get_live_option_chain(self, symbol, exchange, expiry_index, strikes_around_atm):
+    def filter_monthly_expiries(self,expiries):
+        monthly = {}
+
+        for e in expiries:
+            d = datetime.strptime(e, "%Y-%m-%d")
+            key = (d.year, d.month)
+
+            # Always keep the latest date in that month
+            if key not in monthly or e > monthly[key]:
+                monthly[key] = e
+
+        return sorted(monthly.values())
+
+    def get_live_option_chain(self, symbol, exchange, expiry_index, strikes_around_atm,expiry_flag):
         """
         Engine-friendly option chain. expiry_index indexes into get_live_expiry() list.
         Returns { "symbol", "exchange", "chain": DataFrame } or None.
         """
         expiries = self.tsl.get_expiry_list(Underlying=symbol, exchange=exchange)
+        if(expiry_flag == "MONTH"):
+            expiries = self.filter_monthly_expiries(expiries)
+
+        # Optional: sort just in case
+        expiries = sorted(expiries)
+
         if not expiries or expiry_index >= len(expiries):
             return None
         expiry = expiries[expiry_index]

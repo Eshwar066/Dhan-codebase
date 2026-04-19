@@ -55,6 +55,7 @@ class IDataProvider(ABC):
         exchange: str,
         expiry_index: int,
         strikes_around_atm: int,
+        expiry_flag: str,
     ) -> Optional[dict]:
         """Live option chain (e.g. Dhan format)."""
         raise NotImplementedError

@@ -56,6 +56,7 @@ class DeltaDataProvider(IDataProvider):
         exchange: str,
         expiry_index: int,
         strikes_around_atm: int,
+        expiry_flag: str,
     ) -> Optional[dict]:
         return self._source.get_live_option_chain(
             symbol=symbol,

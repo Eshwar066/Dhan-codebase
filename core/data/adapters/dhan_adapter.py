@@ -29,6 +29,7 @@ class DhanAdapter(BaseAdapter):
             exchange=ctx.exchange or "",
             expiry_index=expiry_index,
             strikes_around_atm=params.get("strikes", 10),
+            expiry_flag=params.get("expiry_flag", "MONTH"),
         )
 
     def get_historical_option_chain(self, ctx: StrategyContext, params: dict):
