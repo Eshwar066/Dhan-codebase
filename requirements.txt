@@ -1,6 +1,8 @@
+python-dotenv
 requests
 pandas
 numpy
+TA-Lib
 websocket-client
 websockets
 python-dateutil

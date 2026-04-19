@@ -1,4 +1,7 @@
-from dhanhq import dhanhq, DhanContext, FullDepth
+try:
+    from dhanhq import dhanhq, DhanContext, FullDepth
+except ImportError:
+    from core.library.dhanhq_tradehull_compat import dhanhq, DhanContext, FullDepth
 import mibian
 import datetime
 import math

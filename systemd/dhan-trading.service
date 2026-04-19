@@ -1,0 +1,19 @@
+[Unit]
+Description=Dhan trading engine (python -m run.main --venue DHAN)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/Dhan-codebase
+EnvironmentFile=-/root/Dhan-codebase/.env
+ExecStart=/root/Dhan-codebase/.venv/bin/python -m run.main --venue DHAN
+Restart=always
+RestartSec=10
+TimeoutStopSec=120
+StandardOutput=append:/root/dhan.log
+StandardError=append:/root/dhan.err.log
+
+[Install]
+WantedBy=multi-user.target
