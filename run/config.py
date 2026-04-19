@@ -8,7 +8,7 @@ class RunMode(str, Enum):
 
 
 # 🔁 Default run mode when a job does not specify "run_mode".
-RUN_MODE = RunMode.BACKTEST
+RUN_MODE = RunMode.LIVE
 
 # Global fallback: entry quantity in lots (used when a job does not override).
 ORDER_QTY_LOTS = 1
@@ -62,13 +62,17 @@ STRATEGY_JOBS = [
         "venue": "DHAN",
         "enabled": True,
         "ORDER_QTY_LOTS": 1,
-        # "run_mode": "PAPER",  # or "LIVE"; omit to use RUN_MODE default
+        "run_mode": "LIVE",  # or "LIVE"; omit to use RUN_MODE default
         "capital": 200000,
         "symbols": ["NIFTY"],
         "instrument": "OPTION",
+         "telegram": {
+            "bot_token": "8663481671:AAHY-OnE8OiaJmkOfXbwqoe4InosJVblAtM",
+            "chat_id": "1021479950",
+        },
         "live": {"exchange": "INDEX", "sector": "YES"},
         "backtest": {
-            "start_date": "2025-01-01",
+            "start_date": "2025-01-1",
             "end_date": "2025-06-30",
             "timeframe": "15",
             "exchange": "INDEX",

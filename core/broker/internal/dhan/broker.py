@@ -88,6 +88,28 @@ class DhanBroker(BaseBroker):
             "correlation_id": intent.get("intent_id"),
         }
 
+    def get_balance_snapshot(self) -> Optional[Dict[str, Any]]:
+        """
+        INR available margin/cash from Dhan fund limits — same keys as DeltaBroker
+        so LiveEngine._log_startup_balance_snapshot can log/Telegram one shape.
+        """
+        source = getattr(self.api, "_source", None)
+        if source is None or not getattr(source, "get_balance", None):
+            return None
+        try:
+            available = float(source.get_balance())
+        except (TypeError, ValueError) as e:
+            logger.warning("Dhan balance snapshot: invalid balance: %s", e)
+            return None
+        except Exception as e:
+            logger.warning("Dhan balance snapshot failed: %s", e)
+            return None
+        return {
+            "selected_available": available,
+            "inr_available": available,
+            "usd_available": None,
+        }
+
     def check_funds_before_order(
         self,
         intent: Any,
