@@ -2847,7 +2847,7 @@ class Tradehull:
     ):
         try:
 
-            tradingsymbol = tradingsymbol.upper()
+            ts_key = str(tradingsymbol).strip().upper()
             exchange = exchange.upper()
             instrument_df = self.instrument_df.copy()
             script_exchange = {
@@ -2881,11 +2881,22 @@ class Tradehull:
             product_Type = product[trade_type.upper()]
             order_side = transactiontype[transaction_type.upper()]
 
+            sym_u = (
+                instrument_df["SEM_TRADING_SYMBOL"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.upper()
+            )
+            cust_u = (
+                instrument_df["SEM_CUSTOM_SYMBOL"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.upper()
+            )
             security_check = instrument_df[
-                (
-                    (instrument_df["SEM_TRADING_SYMBOL"] == tradingsymbol)
-                    | (instrument_df["SEM_CUSTOM_SYMBOL"] == tradingsymbol)
-                )
+                ((sym_u == ts_key) | (cust_u == ts_key))
                 & (instrument_df["SEM_EXM_EXCH_ID"] == instrument_exchange[exchange])
             ]
             if security_check.empty:

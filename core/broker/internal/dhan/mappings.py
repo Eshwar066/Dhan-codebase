@@ -25,7 +25,8 @@ INTERNAL_SEGMENT_TO_EXCHANGE_ARG: Dict[str, str] = {
     "BFO": "BFO",
     "CUR": "CUR",
     "BSE": "BSE",
-    "D": "NSE",
+    # Dhan scrip master uses SEM_SEGMENT "D" for derivatives (OPTIDX/FNO on NSE); order/margin need NFO segment, not NSE EQ.
+    "D": "NFO",
     "CRYPTO": "CRYPTO",
 }
 

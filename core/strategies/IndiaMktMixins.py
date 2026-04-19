@@ -398,6 +398,14 @@ class IndiaMktMixins:
         return None
 
     @staticmethod
+    def _strike_on_hundred_point_grid(val) -> bool:
+        """OPTIDX live/paper: only 100-point strikes (exclude 50-step e.g. 25250, 25350)."""
+        try:
+            return int(round(float(val))) % 100 == 0
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
     def _option_chain_delta_column(df: pd.DataFrame, option_type: str) -> Optional[str]:
         """Column name for option delta (|delta| used for short-option strike band)."""
         opt = "CE" if option_type.upper() in ("CE", "CALL") else "PE"
@@ -672,6 +680,12 @@ class IndiaMktMixins:
             premium_col = self._option_chain_premium_column(live_df, option_type_upper)
             strike_col = self._option_chain_strike_column(live_df)
             if premium_col is None or strike_col is None:
+                return None
+
+            live_df = live_df[
+                live_df[strike_col].apply(self._strike_on_hundred_point_grid)
+            ]
+            if live_df.empty:
                 return None
 
             dcol_live = (

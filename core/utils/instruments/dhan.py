@@ -4,6 +4,7 @@ SEM_* schema, NSE/NFO/BSE exchange mapping, backtest dummy rows.
 """
 
 import logging
+from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -56,6 +57,8 @@ class DhanInstrumentStore(BaseInstrumentStore):
     """Instrument store for Dhan: SEM_* columns, NSE/NFO/BSE mapping, backtest dummies."""
 
     INSTRUMENT_EXCHANGE = {
+        # Strategy/config uses INDEX for Nifty/BankNifty spot feed; scrip master rows use NSE for F&O.
+        "INDEX": "NSE",
         "NSE": "NSE",
         "BSE": "BSE",
         "NFO": "NSE",
@@ -128,7 +131,7 @@ class DhanInstrumentStore(BaseInstrumentStore):
             strike=row.get("SEM_STRIKE_PRICE"),
             option_type=row.get("SEM_OPTION_TYPE"),
             lot_size=int(lot) if lot is not None else 1,
-            instrument_id=row.get("INSTRUMENT_ID"),
+            instrument_id=row.get("INSTRUMENT_ID") or row.get("SEM_SMST_SECURITY_ID"),
             series=row.get("SEM_SERIES"),
         )
 
@@ -156,6 +159,108 @@ class DhanInstrumentStore(BaseInstrumentStore):
         row = df.iloc[0]
         return self.map_row_to_instrument(row)
 
+    @staticmethod
+    def _option_type_to_ce_pe(option_type: Any) -> str:
+        u = str(option_type or "").strip().upper()
+        if u in ("CE", "CALL"):
+            return "CE"
+        if u in ("PE", "PUT"):
+            return "PE"
+        return u[:2] if len(u) >= 2 else u
+
+    @staticmethod
+    def _underlying_root_from_option_trading_symbol(trading_symbol: str) -> str:
+        ts = (trading_symbol or "").strip().upper()
+        if not ts:
+            return ""
+        if " " in ts:
+            return ts.split()[0]
+        if "-" in ts:
+            return ts.split("-")[0]
+        return ts
+
+    @staticmethod
+    def _sem_expiry_to_date(val: Any) -> Optional[date]:
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return None
+        try:
+            t = pd.Timestamp(val)
+            if pd.isna(t):
+                return None
+            return t.date()
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _resolve_option_row_fallback(
+        self,
+        ex: str,
+        trading_symbol: str,
+        expiry: Any,
+        option_type: Any,
+        strike: Any,
+    ) -> pd.DataFrame:
+        """
+        When SEM_TRADING_SYMBOL / SEM_CUSTOM_SYMBOL do not match ``build_option_symbol`` output
+        (e.g. last-Thursday vs NSE monthly Tuesday, or compact ``NIFTY-May2026-25400-CE`` vs
+        ``NIFTY 28 MAY 25400 CALL``), match by exchange + strike + CE/PE + underlying + expiry month.
+        Prefers SEM_EXPIRY_FLAG == M (monthly) when multiple rows share month/year.
+        """
+        opt = self._option_type_to_ce_pe(option_type)
+        if opt not in ("CE", "PE"):
+            return pd.DataFrame()
+        try:
+            strike_f = float(strike)
+        except (TypeError, ValueError):
+            return pd.DataFrame()
+        root = self._underlying_root_from_option_trading_symbol(trading_symbol)
+        if not root:
+            return pd.DataFrame()
+
+        exp_dt = self._sem_expiry_to_date(expiry)
+        df = self.df
+        sp = pd.to_numeric(df["SEM_STRIKE_PRICE"], errors="coerce")
+        ot = df["SEM_OPTION_TYPE"].astype(str).str.upper().str.strip()
+        base = (
+            (df["SEM_EXM_EXCH_ID"] == ex)
+            & (sp == strike_f)
+            & (ot == opt)
+            & (df["SEM_EXCH_INSTRUMENT_TYPE"].astype(str).str.upper().str.strip() == "OP")
+        )
+        # Underlying: SM_SYMBOL_NAME when set; else first token of SEM_CUSTOM_SYMBOL
+        cust = df["SEM_CUSTOM_SYMBOL"].fillna("").astype(str).str.upper()
+        first_tok = cust.str.split().str[0]
+        if "SM_SYMBOL_NAME" in df.columns:
+            sm = df["SM_SYMBOL_NAME"].fillna("").astype(str).str.strip().str.upper()
+            base = base & (((sm != "") & (sm == root)) | ((sm == "") & first_tok.eq(root)))
+        else:
+            base = base & first_tok.eq(root)
+
+        cand = df[base]
+        if cand.empty or exp_dt is None:
+            return cand
+
+        def _same_month_year(row) -> bool:
+            d = self._sem_expiry_to_date(row.get("SEM_EXPIRY_DATE"))
+            return bool(d and d.month == exp_dt.month and d.year == exp_dt.year)
+
+        month_ok = cand[cand.apply(_same_month_year, axis=1)]
+        if month_ok.empty:
+            return month_ok
+
+        out = month_ok
+        if "SEM_EXPIRY_FLAG" in out.columns:
+            m_only = out[out["SEM_EXPIRY_FLAG"].astype(str).str.upper().str.strip() == "M"]
+            if not m_only.empty:
+                out = m_only
+        if len(out) > 1:
+            out = out.assign(
+                _dd=out["SEM_EXPIRY_DATE"].apply(
+                    lambda v: abs((self._sem_expiry_to_date(v) or exp_dt) - exp_dt).days
+                )
+            ).sort_values("_dd", ascending=True)
+            out = out.drop(columns=["_dd"], errors="ignore")
+        return out.head(1)
+
     def intent_creation_details(
         self, trading_symbol, exchange, expiry, option_type, strike
     ) -> Optional[Instrument]:
@@ -169,6 +274,10 @@ class DhanInstrumentStore(BaseInstrumentStore):
                 )
                 & (self.df["SEM_EXM_EXCH_ID"] == ex)
             ]
+            if df.empty:
+                df = self._resolve_option_row_fallback(
+                    ex, trading_symbol, expiry, option_type, strike
+                )
             if df.empty:
                 logger.warning("No instrument found for %s on %s", trading_symbol, exchange)
                 return None
