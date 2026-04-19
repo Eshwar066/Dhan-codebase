@@ -661,24 +661,29 @@ class IndiaMktMixins:
             return None
 
         skip_premium_check = False
-
         if RUN_MODE == RunMode.LIVE or RUN_MODE == RunMode.PAPER:
-            if not isinstance(chain, pd.DataFrame) or chain.empty:
+            # DHAN live: get_chain returns {"symbol", "exchange", "chain": DataFrame, "atm_strike", "expiry"}.
+            # Snapshot has CE/PE LTP + Strike Price (+ greeks); no datetime / close / strike columns.
+            live_df = chain.get("chain") if isinstance(chain, dict) else chain
+            if not isinstance(live_df, pd.DataFrame) or live_df.empty:
+                return None
+
+            option_type_upper = option_type.upper()
+            premium_col = self._option_chain_premium_column(live_df, option_type_upper)
+            strike_col = self._option_chain_strike_column(live_df)
+            if premium_col is None or strike_col is None:
                 return None
 
             dcol_live = (
-                self._option_chain_delta_column(chain, option_type)
-                if use_delta and isinstance(chain, pd.DataFrame)
+                self._option_chain_delta_column(live_df, option_type)
+                if use_delta
                 else None
             )
             delta_in_chain_live = (
-                dcol_live is not None and dcol_live in chain.columns
+                dcol_live is not None and dcol_live in live_df.columns
             )
 
-            row = chain[chain["datetime"] == candle_time]
-            if row.empty:
-                return None
-
+            row = live_df
             if use_delta and delta_in_chain_live and dcol_live in row.columns:
                 mask = row.apply(
                     lambda r: self._abs_delta_in_band(r, dcol_live, d_min, d_max),
@@ -687,11 +692,35 @@ class IndiaMktMixins:
                 filt = row[mask]
                 if filt.empty:
                     return None
+                if len(filt) > 1:
+                    target_mid = (float(d_min) + float(d_max)) / 2.0
+                    ad_series = filt.apply(
+                        lambda r: abs(float(r[dcol_live]))
+                        if pd.notna(r.get(dcol_live))
+                        else float("nan"),
+                        axis=1,
+                    )
+                    filt = (
+                        filt.assign(_dd=(ad_series - target_mid).abs())
+                        .sort_values("_dd")
+                        .drop(columns=["_dd"])
+                    )
                 row = filt
                 skip_premium_check = True
+            else:
+                prem_num = pd.to_numeric(live_df[premium_col], errors="coerce").fillna(0)
+                row = live_df[prem_num.between(float(min_prem), float(max_prem), inclusive="both")]
+                if row.empty:
+                    row = live_df[prem_num > 0]
+                if row.empty:
+                    row = live_df
 
-            premium = float(row.iloc[0]["close"])
-            selected_strike = row.iloc[0]["strike"]
+            if row.empty:
+                return None
+
+            r0 = row.iloc[0]
+            premium = float(pd.to_numeric(r0[premium_col], errors="coerce") or 0.0)
+            selected_strike = r0[strike_col]
         else:
             # NSE backtest often returns {"chain": df}; DHAN / Tradehull may return a bare DataFrame.
             if isinstance(chain, dict):
