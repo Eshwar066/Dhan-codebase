@@ -55,6 +55,7 @@ class IDataProvider(ABC):
         exchange: str,
         expiry_index: int,
         strikes_around_atm: int,
+        expiry_flag: str,
     ) -> Optional[dict]:
         """Live option chain (e.g. Dhan format)."""
         raise NotImplementedError
@@ -73,6 +74,8 @@ class IDataProvider(ABC):
         securityId: str,
         instrument: str,
         exchangeSegment: str,
+        symbol: Optional[str] = None,
+        spot_price: Optional[float] = None,
     ) -> Any:
         """Expired option data for backtest (e.g. Dhan)."""
         raise NotImplementedError

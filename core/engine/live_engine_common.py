@@ -296,6 +296,25 @@ class LiveEngineHelpersMixin:
         now = dt.datetime.utcnow()
         return _within_trading_hours_utc(now, self.allowed_trading_hours)
 
+    def _is_market_open_for_feed_health(self) -> bool:
+        """
+        When False, skip feed staleness checks (no ticks overnight is expected).
+        If allowed_trading_hours is set, use that; else DHAN→NSE index session, DELTA→DELTA calendar.
+        """
+        if self.allowed_trading_hours:
+            return self._within_trading_hours()
+        v = str(getattr(self, "venue", None) or "").upper()
+        try:
+            from core.utils.session.session_manager import SessionManager
+
+            if v == "DHAN":
+                return SessionManager.is_market_open("INDEX")
+            if v == "DELTA":
+                return SessionManager.is_market_open("DELTA")
+        except Exception:
+            return True
+        return True
+
     # ---------- Candle enrichment ----------
 
     def _enrich_candle_depth(self, symbol: str, candle: Dict[str, Any]) -> None:

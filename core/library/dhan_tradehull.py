@@ -1,6 +1,7 @@
-from dhanhq import dhanhq
+from dhanhq import dhanhq, DhanContext, FullDepth
 import mibian
 import datetime
+import math
 import numpy as np
 import pandas as pd
 import traceback
@@ -26,6 +27,105 @@ import pdb
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 print("Codebase Version 3.1.2")
+
+
+# --- Black–Scholes delta (no scipy; matches N(d1) for calls, N(d1)-1 for puts) ---
+
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def bs_option_delta(
+    S: float,
+    K: float,
+    T: float,
+    r: float,
+    sigma: float,
+    option_type: str = "call",
+) -> float:
+    """
+    Black-Scholes delta. ``sigma`` is annualized volatility as decimal (e.g. 0.18 for 18%).
+    ``T`` is time to expiry in years. ``r`` is annual risk-free rate (e.g. 0.065 for ~6.5%).
+    """
+    if S <= 0 or K <= 0:
+        return float("nan")
+    if sigma <= 0 or math.isnan(sigma):
+        return float("nan")
+    if T <= 0:
+        T = 1e-10
+    sqrt_t = math.sqrt(T)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrt_t)
+    opt = option_type.lower()
+    if opt in ("call", "ce"):
+        return _norm_cdf(d1)
+    if opt in ("put", "pe"):
+        return _norm_cdf(d1) - 1.0
+    raise ValueError(f"option_type must be call/ce or put/pe, got {option_type!r}")
+
+
+def _last_thursday_month(year: int, month: int) -> datetime.date:
+    """Last Thursday of (year, month) — NIFTY-style monthly expiry."""
+    first = datetime.date(year, month, 1)
+    if month == 12:
+        last_cal = datetime.date(year + 1, 1, 1) - datetime.timedelta(days=1)
+    else:
+        last_cal = datetime.date(year, month + 1, 1) - datetime.timedelta(days=1)
+    offset = (last_cal.weekday() - 3) % 7
+    return last_cal - datetime.timedelta(days=offset)
+
+
+def _expiry_date_for_series(trade_date: datetime.date, expiry_code: int) -> datetime.date:
+    """
+    Map Dhan ``expiry_code`` (0 = front month, 1 = next) to an expiry calendar date.
+    Aligns with ``ExpiryResolver._derive_monthly_series`` intent.
+    """
+    ec = int(expiry_code)
+    if ec == 0:
+        return _last_thursday_month(trade_date.year, trade_date.month)
+    if trade_date.month == 12:
+        return _last_thursday_month(trade_date.year + 1, 1)
+    return _last_thursday_month(trade_date.year, trade_date.month + 1)
+
+
+def _iv_to_sigma(iv) -> float:
+    """API often sends IV as percent (e.g. 18); convert to decimal vol."""
+    if iv is None:
+        return float("nan")
+    try:
+        v = float(iv)
+    except (TypeError, ValueError):
+        return float("nan")
+    if math.isnan(v):
+        return float("nan")
+    return v / 100.0 if v > 1.0 else max(v, 1e-8)
+
+
+def _years_to_expiry(expiry_date: datetime.date, bar_time) -> float:
+    """Rough year fraction from bar timestamp to expiry (calendar)."""
+    if hasattr(bar_time, "date"):
+        bd = bar_time.date()
+    else:
+        bd = bar_time
+    days = (expiry_date - bd).days
+    if days < 0:
+        return 1e-10
+    return max(days / 365.25, 1e-10)
+
+
+def _dhan_invalid_auth_hint(payload) -> str:
+    """Actionable suffix when Dhan returns DH-901 Invalid Authentication."""
+    if not isinstance(payload, dict):
+        return ""
+    remarks = payload.get("remarks") or {}
+    code = str(remarks.get("error_code") or "")
+    et = str(remarks.get("error_type") or "")
+    if code == "DH-901" or "Invalid_Authentication" in et:
+        return (
+            " — Fix: Regenerate your API access token in the Dhan developer dashboard and set "
+            "DHAN_ACCESS_TOKEN in .env (token expires; client id must be DHAN_CLIENT_CODE)."
+        )
+    return ""
 
 
 class Tradehull:
@@ -418,7 +518,6 @@ class Tradehull:
         except Exception as e:
             print(e)
             self.logger.exception(f"got exception in get_login as {e} ")
-            print(self.response)
             traceback.print_exc()
 
     def get_instrument_file(self):
@@ -682,8 +781,12 @@ class Tradehull:
         bo_profit_value=None,
         bo_stop_loss_Value=None,
         tag=None,
+        correlation_id=None,
     ) -> str:
-
+        """
+        correlation_id: same value sent as REST ``correlationId`` (dhanhq maps ``tag`` → correlationId).
+        If set, overrides ``tag`` for that payload field.
+        """
         try:
             tradingsymbol = tradingsymbol
             exchange = exchange.upper()
@@ -746,7 +849,8 @@ class Tradehull:
             if security_check.empty:
                 raise Exception("Check the Tradingsymbol")
             security_id = security_check.iloc[-1]["SEM_SMST_SECURITY_ID"]
-            # pdb.set_trace()
+            corr = correlation_id if correlation_id is not None and str(correlation_id).strip() != "" else tag
+            # dhanhq: tag → JSON correlationId (see dhanhq._order.place_order)
             order = self.Dhan.place_order(
                 security_id=str(security_id),
                 exchange_segment=exchangeSegment,
@@ -762,7 +866,7 @@ class Tradehull:
                 amo_time=amo_time,
                 bo_profit_value=bo_profit_value,
                 bo_stop_loss_Value=bo_stop_loss_Value,
-                tag=tag,
+                tag=corr,
             )
 
             if order["status"] == "failure":
@@ -2743,7 +2847,7 @@ class Tradehull:
     ):
         try:
 
-            tradingsymbol = tradingsymbol.upper()
+            ts_key = str(tradingsymbol).strip().upper()
             exchange = exchange.upper()
             instrument_df = self.instrument_df.copy()
             script_exchange = {
@@ -2777,11 +2881,22 @@ class Tradehull:
             product_Type = product[trade_type.upper()]
             order_side = transactiontype[transaction_type.upper()]
 
+            sym_u = (
+                instrument_df["SEM_TRADING_SYMBOL"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.upper()
+            )
+            cust_u = (
+                instrument_df["SEM_CUSTOM_SYMBOL"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.upper()
+            )
             security_check = instrument_df[
-                (
-                    (instrument_df["SEM_TRADING_SYMBOL"] == tradingsymbol)
-                    | (instrument_df["SEM_CUSTOM_SYMBOL"] == tradingsymbol)
-                )
+                ((sym_u == ts_key) | (cust_u == ts_key))
                 & (instrument_df["SEM_EXM_EXCH_ID"] == instrument_exchange[exchange])
             ]
             if security_check.empty:
@@ -3340,7 +3455,10 @@ class Tradehull:
                 else:
                     raise Exception("No DAY data found in test range.")
             else:
-                raise Exception(f"Failed to retrieve DAY timeframe data: {day_data}")
+                raise Exception(
+                    f"Failed to retrieve DAY timeframe data: {day_data}"
+                    f"{_dhan_invalid_auth_hint(day_data)}"
+                )
 
             if timeframe in ["1", "5", "15", "25", "60"]:
                 interval = int(timeframe)
@@ -3398,7 +3516,10 @@ class Tradehull:
                                 f"{tradingsymbol} [{from_str} to {to_str}] {len(df)} rows"
                             )
                 else:
-                    print(f"Failed: {from_str} to {to_str}: {response}")
+                    print(
+                        f"Failed: {from_str} to {to_str}: {response}"
+                        f"{_dhan_invalid_auth_hint(response)}"
+                    )
 
                 current_from = current_to + datetime.timedelta(days=1)
             return (
@@ -3642,6 +3763,58 @@ class Tradehull:
         except:
             return pd.DataFrame()
 
+    def _enrich_df_bs_delta(
+        self,
+        df: pd.DataFrame,
+        option_type: str,
+        from_date_str: str,
+        expiry_code: int,
+        risk_free_rate: float = 0.065,
+    ) -> pd.DataFrame:
+        """
+        Add ``delta`` column via Black-Scholes using ``spot``, ``strike``, ``iv``, bar ``datetime``.
+        IV from API: if value > 1, treated as percent and divided by 100.
+        """
+        if df is None or df.empty:
+            return df
+        if "spot" not in df.columns or "strike" not in df.columns or "iv" not in df.columns:
+            return df
+        try:
+            trade_date = datetime.datetime.strptime(
+                str(from_date_str)[:10], "%Y-%m-%d"
+            ).date()
+        except (ValueError, TypeError):
+            return df
+        exp_date = _expiry_date_for_series(trade_date, expiry_code)
+        opt = str(option_type).lower()
+        if opt in ("put", "pe"):
+            kind = "put"
+        else:
+            kind = "call"
+        out = df.copy()
+        deltas = []
+        time_col = "datetime" if "datetime" in out.columns else None
+        for _, row in out.iterrows():
+            try:
+                S = float(row["spot"])
+                K = float(row["strike"])
+            except (TypeError, ValueError):
+                deltas.append(float("nan"))
+                continue
+            sigma = _iv_to_sigma(row.get("iv"))
+            if math.isnan(sigma):
+                deltas.append(float("nan"))
+                continue
+            bar_t = row[time_col] if time_col else trade_date
+            T = _years_to_expiry(exp_date, bar_t)
+            try:
+                d = bs_option_delta(S, K, T, risk_free_rate, sigma, kind)
+            except (ValueError, ZeroDivisionError):
+                d = float("nan")
+            deltas.append(d)
+        out["delta"] = deltas
+        return out
+
     def get_expired_option_data(
         self,
         exchangeSegment: str,
@@ -3680,9 +3853,9 @@ class Tradehull:
                 "securityId": int(securityId),
                 "instrument": instrument,
                 "expiryFlag": expiry_flag,
-                "expiryCode": int(expiry_code),
+                "expiryCode":  1 if int(expiry_code)==0 else int(expiry_code),
                 "strike": strike,
-                "drvOptionType": option_type,
+                "drvOptionType": 'PUT' if option_type =='PE' or option_type =='PUT' else 'CALL',
                 "requiredData": required_data,
                 "fromDate": fromDate,
                 "toDate": toDate,
@@ -3690,6 +3863,24 @@ class Tradehull:
             # pdb.set_trace()
             response = dhan_http.post("/charts/rollingoption", payload)
             df = self.convert_to_df(response)
+            ec = int(expiry_code)
+            if isinstance(df, dict):
+                if "CE" in df and isinstance(df["CE"], pd.DataFrame) and not df["CE"].empty:
+                    df["CE"] = self._enrich_df_bs_delta(
+                        df["CE"], "call", fromDate, ec
+                    )
+                if "PE" in df and isinstance(df["PE"], pd.DataFrame) and not df["PE"].empty:
+                    df["PE"] = self._enrich_df_bs_delta(
+                        df["PE"], "put", fromDate, ec
+                    )
+                return df
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                ot = (
+                    "put"
+                    if str(option_type).upper() in ("PUT", "PE")
+                    else "call"
+                )
+                return self._enrich_df_bs_delta(df, ot, fromDate, ec)
             return df
 
             # script_exchange = {

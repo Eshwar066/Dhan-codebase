@@ -414,10 +414,10 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         # Above line => PE short, below => CE short: reverse when leaving that zone.
         # Short PE (above): reverse to CE when spot crosses below magical line.
         if opt_side == "PE":
-            return prev_close >= magical_line and curr_close < magical_line
+            return curr_close < magical_line #prev_close >= magical_line and 
         # Short CE (below): reverse to PE when spot crosses above magical line.
         if opt_side == "CE":
-            return prev_close <= magical_line and curr_close > magical_line
+            return curr_close > magical_line #prev_close <= magical_line and 
         return False
 
     # ==================================================

@@ -12,6 +12,7 @@ TRADE_LOG_COLUMNS = [
     "exit_price",
     "qty",
     "pnl",
+    "collected_points",
     "symbol",
     "strategy",
     "exit_reason",
@@ -58,13 +59,25 @@ class TradeLogger:
         Log a completed trade for performance analytics.
         trade_row must contain: trade_id, entry_time, exit_time, side,
         entry_price, exit_price, qty, pnl, and optionally symbol, strategy.
+        Writes to logs/{strategy}_trades.csv when strategy is present (e.g. NiftyIntradayMagicalLine_trades.csv),
+        and also appends to the aggregate trade_log.csv for cross-strategy views.
         """
-        file_path = self._get_trade_log_file()
-        with self._trade_log_lock:
+        row = {k: trade_row.get(k, "") for k in TRADE_LOG_COLUMNS}
+        strategy = trade_row.get("strategy") or "GLOBAL"
+        file_path = self._get_file(strategy)
+        lock = self._get_lock(strategy)
+        with lock:
             write_header = not os.path.exists(file_path)
-            row = {k: trade_row.get(k, "") for k in TRADE_LOG_COLUMNS}
             with open(file_path, "a", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=TRADE_LOG_COLUMNS)
                 if write_header:
+                    writer.writeheader()
+                writer.writerow(row)
+        agg_path = self._get_trade_log_file()
+        with self._trade_log_lock:
+            write_header_agg = not os.path.exists(agg_path)
+            with open(agg_path, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=TRADE_LOG_COLUMNS)
+                if write_header_agg:
                     writer.writeheader()
                 writer.writerow(row)

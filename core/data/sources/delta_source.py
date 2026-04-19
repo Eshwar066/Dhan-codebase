@@ -456,6 +456,7 @@ class DeltaSource:
         exchange: str,
         expiry_index: int,
         strikes_around_atm: int,
+        expiry_flag: str,
     ) -> Optional[Dict]:
         """Minimal option chain from products (Delta options)."""
         products = self.get_products(use_cache=True)

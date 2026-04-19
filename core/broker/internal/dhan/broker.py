@@ -8,17 +8,17 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 from core.broker.base import BaseBroker
+from core.broker.internal.dhan import mappings as dhan_mappings
+from core.utils.global_rate_limiter import DHAN_ORDER_API, GlobalRateLimiter
 
 
 def _order_intent_to_payload(intent, execution_price=None):
     """Convert OrderIntent to dict for Dhan payload."""
     inst = intent.instrument
-    segment_map = {
-        "EQ": "NSE", "FUT": "NSE", "OPT": "NSE", "MCX": "MCX",
-        "CRYPTO": "CRYPTO", "D": "NSE", "NSE": "NSE", "NFO": "NSE",
-    }
     segment = getattr(inst, "segment", "NFO")
-    exchange = segment_map.get(segment, "NSE")
+    exchange = dhan_mappings.internal_segment_to_exchange_arg(
+        str(segment) if segment is not None else "NFO"
+    )
     price = execution_price if execution_price is not None else (intent.price or 0)
     qty = getattr(intent, "qty", inst.lot_size)
     lot_size = int(getattr(inst, "lot_size", 1))
@@ -40,25 +40,26 @@ def _order_intent_to_payload(intent, execution_price=None):
         "bo_stop_loss_value": None,
         "tag": intent.intent_id,
         "intent_id": intent.intent_id,
+        "correlation_id": intent.intent_id,
     }
 
 
 class DhanBroker(BaseBroker):
     """Order placement via Dhan. Uses IBrokerApi (DhanBrokerApi)."""
 
+    # Dhan docs: max 25 modifications per order — switch to cancel + re-place before hard failure.
+    DHAN_MODIFY_WARN_THRESHOLD = 20
+
     def __init__(self, api, position_manager=None, intent_store=None):
         super().__init__(position_manager=position_manager, intent_store=intent_store)
         self.api = api
+        self._dhan_modify_counts: Dict[str, int] = {}
 
     def _build_payload(self, intent, execution_price=None):
         if hasattr(intent, "instrument"):
             return _order_intent_to_payload(intent, execution_price)
-        segment_map = {
-            "EQ": "NSE", "FUT": "NSE", "OPT": "NSE", "MCX": "MCX",
-            "CRYPTO": "CRYPTO", "D": "NSE", "NSE": "NSE", "NFO": "NSE",
-        }
         segment = intent.get("segment", "EQ")
-        exchange = segment_map.get(segment, "NSE")
+        exchange = dhan_mappings.internal_segment_to_exchange_arg(str(segment))
         required = ["trading_symbol", "side", "qty"]
         for r in required:
             if r not in intent or intent[r] is None:
@@ -84,6 +85,29 @@ class DhanBroker(BaseBroker):
             "bo_stop_loss_value": intent.get("bo_stop_loss_value", 0),
             "tag": intent.get("intent_id"),
             "intent_id": intent.get("intent_id"),
+            "correlation_id": intent.get("intent_id"),
+        }
+
+    def get_balance_snapshot(self) -> Optional[Dict[str, Any]]:
+        """
+        INR available margin/cash from Dhan fund limits — same keys as DeltaBroker
+        so LiveEngine._log_startup_balance_snapshot can log/Telegram one shape.
+        """
+        source = getattr(self.api, "_source", None)
+        if source is None or not getattr(source, "get_balance", None):
+            return None
+        try:
+            available = float(source.get_balance())
+        except (TypeError, ValueError) as e:
+            logger.warning("Dhan balance snapshot: invalid balance: %s", e)
+            return None
+        except Exception as e:
+            logger.warning("Dhan balance snapshot failed: %s", e)
+            return None
+        return {
+            "selected_available": available,
+            "inr_available": available,
+            "usd_available": None,
         }
 
     def check_funds_before_order(
@@ -178,6 +202,7 @@ class DhanBroker(BaseBroker):
         intent_id = order_payload["intent_id"]
         for attempt in range(retries + 1):
             try:
+                GlobalRateLimiter.instance().acquire(DHAN_ORDER_API, 0.11)
                 resp = self.api.place_order(
                     tradingsymbol=order_payload["tradingsymbol"],
                     exchange=order_payload["exchange"],
@@ -194,6 +219,7 @@ class DhanBroker(BaseBroker):
                     bo_profit_value=order_payload["bo_profit_value"],
                     bo_stop_loss_value=order_payload["bo_stop_loss_value"],
                     tag=order_payload["tag"],
+                    correlation_id=order_payload.get("correlation_id") or order_payload["tag"],
                 )
                 if not isinstance(resp, dict):
                     raise Exception(f"Invalid broker response: {resp}")
@@ -201,6 +227,8 @@ class DhanBroker(BaseBroker):
                     logger.warning("Dhan broker rejection: %s", resp)
                     return None
                 order_id = resp.get("order_id")
+                if order_id:
+                    self.clear_dhan_modify_count(str(order_id))
                 if self.intent_store:
                     self.intent_store.update(intent_id, "SENT")
                 return order_id
@@ -304,8 +332,9 @@ class DhanBroker(BaseBroker):
 
     def exit_position(self, trading_symbol, qty, side, segment="EQ", lot_size=1):
         exit_side = "SELL" if side == "BUY" else "BUY"
+        eid = f"exit_{uuid.uuid4().hex[:6]}"
         intent = {
-            "intent_id": f"exit_{uuid.uuid4().hex[:6]}",
+            "intent_id": eid,
             "trading_symbol": trading_symbol,
             "side": exit_side,
             "qty": int(qty),
@@ -313,6 +342,7 @@ class DhanBroker(BaseBroker):
             "lot_size": int(lot_size),
             "order_type": "MARKET",
             "trade_type": "MARGIN",
+            "correlation_id": eid,
         }
         return self.place_order(intent, execution_price=None)
 
@@ -334,3 +364,28 @@ class DhanBroker(BaseBroker):
                 "status": status or "open",
             })
         return out
+
+    def note_dhan_modify(self, broker_order_id: str) -> bool:
+        """
+        Call before each Dhan modify_order on the same broker order id.
+        Returns False when modify count would exceed DHAN_MODIFY_WARN_THRESHOLD (20):
+        caller should cancel + re-place instead (Dhan hard limit 25).
+        """
+        oid = str(broker_order_id)
+        next_c = self._dhan_modify_counts.get(oid, 0) + 1
+        if next_c > self.DHAN_MODIFY_WARN_THRESHOLD:
+            logger.warning(
+                "Dhan modify limit: order_id=%s would reach modify #%s — use cancel + re-place",
+                oid,
+                next_c,
+            )
+            return False
+        self._dhan_modify_counts[oid] = next_c
+        return True
+
+    def clear_dhan_modify_count(self, broker_order_id: Optional[str]) -> None:
+        if broker_order_id:
+            self._dhan_modify_counts.pop(str(broker_order_id), None)
+
+    def should_cancel_reorder_instead_of_modify(self, broker_order_id: str) -> bool:
+        return self._dhan_modify_counts.get(str(broker_order_id), 0) >= self.DHAN_MODIFY_WARN_THRESHOLD

@@ -3,12 +3,27 @@ import os
 import threading
 import time
 from collections import defaultdict
+from typing import Any, Optional
+
+import pandas as pd
 from logs.logger.trade_logger import TradeLogger
 from datetime import datetime
 import uuid
 from core.utils.instruments.instrument_store import Instrument
 
 logger = logging.getLogger(__name__)
+
+
+def _fill_clock_for_trade_log(fill_ts: Any) -> Optional[datetime]:
+    """
+    Normalize bar/fill time for trade_log CSV (backtest = candle close instant, not wall clock).
+    """
+    if fill_ts is None:
+        return None
+    ts = pd.Timestamp(fill_ts)
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert("Asia/Kolkata").tz_localize(None)
+    return ts.to_pydatetime()
 
 # use
 # How to Run Auto-Reconciliation
@@ -56,6 +71,8 @@ class Position:
         self.trade_id = None
         self.entry_price = None
         self.entry_time = None
+        # Backtest / bar clock for trade_log (when set, overrides wall-clock entry_time in CSV)
+        self.entry_clock: Optional[datetime] = None
 
         self.mae = 0.0
         self.mfe = 0.0
@@ -78,14 +95,19 @@ class Position:
         )
         return f"<Position symbol={sym} qty={self.net_qty} avg={self.avg_price}>"
 
-    def update_fill(self, side, qty, price):
+    def update_fill(self, side, qty, price, fill_ts=None):
         signed_qty = qty if side == "BUY" else -qty
 
         # -------- ENTRY --------
         if self.net_qty == 0:
             self.trade_id = f"T-{uuid.uuid4().hex[:10]}"
             self.entry_price = price
-            self.entry_time = time.time()
+            if fill_ts is not None:
+                self.entry_clock = _fill_clock_for_trade_log(fill_ts)
+                self.entry_time = float(pd.Timestamp(fill_ts).timestamp())
+            else:
+                self.entry_clock = None
+                self.entry_time = time.time()
             self.mae = 0.0
             self.mfe = 0.0
 
@@ -223,7 +245,7 @@ class PositionManager:
                 self.positions[sym] = Position(instrument=instrument)
 
             pos = self.positions[sym]
-            pos.update_fill(side, qty, price)
+            pos.update_fill(side, qty, price, fill_ts=candle_ts)
 
             new_qty = pos.net_qty
             if prev_qty == 0 and new_qty != 0:
@@ -239,6 +261,7 @@ class PositionManager:
                         structure_id=pos.structure_id,
                         instrument=instrument,
                         candle_ts=candle_ts,
+                        exit_reason=exit_reason,
                     )
 
             if strategy:
@@ -312,9 +335,10 @@ class PositionManager:
 
             # -------- LOG --------
             if self.logger:
-                # PnL only on EXIT; leave blank on ENTRY/SCALE_IN
-                pnl_val = pos.realized_pnl if trade_type == "EXIT" else ""
-                cumulative_val = pos.cumulative_pnl if trade_type == "EXIT" else ""
+                # PnL only on EXIT / broker FORCE_EXIT (SL); leave blank on ENTRY/SCALE_IN
+                _exit_like = trade_type in ("EXIT", "FORCE_EXIT")
+                pnl_val = pos.realized_pnl if _exit_like else ""
+                cumulative_val = pos.cumulative_pnl if _exit_like else ""
                 row = {
                     "candle_timestamp": (
                         candle_ts.strftime("%Y-%m-%d %H:%M")
@@ -338,7 +362,7 @@ class PositionManager:
                     # "strategy": strategy,
                 }
 
-                if trade_type == "EXIT":
+                if _exit_like:
                     row["mae"] = pos.mae
                     row["mfe"] = pos.mfe
                     if getattr(pos, "exit_reason", None):
@@ -347,13 +371,14 @@ class PositionManager:
                         row["execution_source"] = execution_source
 
                     # Log complete trade for performance analytics (trade log)
-                    entry_time_str = (
-                        datetime.fromtimestamp(pos.entry_time).strftime(
+                    if getattr(pos, "entry_clock", None) is not None:
+                        entry_time_str = pos.entry_clock.strftime("%Y-%m-%d %H:%M:%S")
+                    elif pos.entry_time is not None:
+                        entry_time_str = datetime.fromtimestamp(pos.entry_time).strftime(
                             "%Y-%m-%d %H:%M:%S"
                         )
-                        if pos.entry_time is not None
-                        else ""
-                    )
+                    else:
+                        entry_time_str = ""
                     exit_time_str = (
                         candle_ts.strftime("%Y-%m-%d %H:%M:%S")
                         if candle_ts is not None and isinstance(candle_ts, datetime)
@@ -370,6 +395,7 @@ class PositionManager:
                         "exit_price": price,
                         "qty": qty,
                         "pnl": pos.realized_pnl,
+                        "collected_points": (pos.entry_price - price),
                         "symbol": sym,
                         "strategy": strategy or "GLOBAL",
                         "exit_reason": getattr(pos, "exit_reason", None) or "",
@@ -900,27 +926,35 @@ class PositionManager:
             if underlying:
                 # Match by trading_symbol (position key) so backtest symbol matches; fallback to custom_symbol
                 inst = pos.instrument
-                by_trading = (inst.trading_symbol or "").strip() == (
-                    underlying or ""
-                ).strip()
+                underlying_norm = (underlying or "").strip().upper()
+                trading_symbol = (inst.trading_symbol or "").strip()
+                custom_symbol = (getattr(inst, "custom_symbol", None) or "").strip()
+                trading_upper = trading_symbol.upper()
+                custom_upper = custom_symbol.upper()
+
+                # Exact match (existing behavior)
+                by_trading = trading_upper == underlying_norm
                 by_custom = False
-                if getattr(inst, "custom_symbol", None):
-                    symbol = (inst.custom_symbol or "").strip()
 
-                    # Handle option format: C-BTC-78000-270326 / P-BTC-...
-                    if "-" in symbol:
-                        parts = symbol.split("-")
-                        if len(parts) >= 2:
-                            underlying_from_symbol = parts[1]  # BTC
+                # Prefix match for India-style symbols:
+                # e.g. "NIFTY 30 JAN 24000 CALL" should match underlying "NIFTY".
+                by_prefix = trading_upper.startswith(f"{underlying_norm} ") or custom_upper.startswith(
+                    f"{underlying_norm} "
+                )
 
-                            # Compare with passed underlying (BTCUSD → BTC)
-                            base_underlying = (
-                                (underlying or "").replace("USD", "").strip()
-                            )
+                # Handle option format: C-BTC-78000-270326 / P-BTC-...
+                if "-" in custom_symbol:
+                    parts = custom_symbol.split("-")
+                    if len(parts) >= 2:
+                        underlying_from_symbol = parts[1].strip().upper()  # BTC
 
-                            by_custom = underlying_from_symbol == base_underlying
+                        # Compare with passed underlying (BTCUSD → BTC)
+                        base_underlying = underlying_norm.replace("USD", "").strip()
+                        by_custom = underlying_from_symbol == base_underlying
+
                 if not (by_trading or by_custom):
-                    continue
+                    if not by_prefix:
+                        continue
 
             positions.append(pos)
 

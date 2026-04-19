@@ -269,6 +269,7 @@ class OrderRouter:
             else None
         )
         exec_price = None
+        
         if price_map and sym is not None:
             exec_price = price_map.get(sym)
         if exec_price is None:
@@ -487,6 +488,7 @@ class OrderRouter:
                 broker_order_id=order_id,
             )
 
+    # working
     def refresh_stale_exit_orders(
         self,
         get_bid_ask: Callable[[str], Tuple[float, float]],
@@ -1152,6 +1154,8 @@ class OrderRouter:
         tag=None,
         candle_ts=None,
         action=None,
+        exit_reason=None,
+        execution_source=None,
     ):
         """
         Single entry point for fill processing. Call from broker fill callback or LiveEngine.
@@ -1244,6 +1248,7 @@ class OrderRouter:
                         f"Skipping duplicate MAIN ENTRY fill callback structure_id={stid_pf}",
                     )
                 return
+        
         position_closed, realized_pnl = self.position_manager.on_fill(
             instrument=instrument,
             side=side,
@@ -1257,7 +1262,8 @@ class OrderRouter:
             candle_ts=candle_ts,
             action=action,
             metadata_extras=metadata_extras,
-            execution_source="INTENT",
+            exit_reason=exit_reason,
+            execution_source=execution_source or "INTENT",
         )
         if position_closed and realized_pnl is not None:
             self.risk.record_realized_pnl(realized_pnl)
@@ -1555,6 +1561,20 @@ class OrderRouter:
         except Exception:
             pass
         return out
+
+    def resolve_intent_id_by_broker_order_id(self, broker_order_id: str) -> Optional[str]:
+        """Map Dhan OrderNo / broker order id to intent_id when CorrelationId is empty."""
+        bid = str(broker_order_id or "").strip()
+        if not bid or not self.intent_store:
+            return None
+        try:
+            for rec in self.intent_store.intents.values():
+                if str(rec.get("broker_order_id") or "").strip() == bid:
+                    iid = rec.get("intent_id")
+                    return str(iid) if iid else None
+        except Exception:
+            pass
+        return None
 
     def _external_close_confidence_score(
         self, f: Dict[str, Any], known_order_ids: Set[str]
@@ -1964,19 +1984,31 @@ class OrderRouter:
                 or broker_order_id_to_intent.get(str(f.get("order_id") or f.get("id") or ""))
             )
             if intent_id and self.intent_store and self.intent_store.get(intent_id):
-                trade = {
-                    "trade_id": f.get("id"),
-                    "id": f.get("id"),
-                    "order_id": str(f.get("order_id") or f.get("id", "")),
+                oid = str(f.get("order_id") or f.get("id") or "")
+                sz = float(f.get("size") or 0)
+                pr = float(f.get("price") or 0)
+                is_dhan = type(self.broker).__name__ == "DhanBroker"
+                # Canonical REST reconciliation id for Dhan (distinct from DHAN_WS:* incremental keys).
+                if is_dhan:
+                    trade_id = f"DHAN_REST:{oid}:{int(sz)}:{pr}"
+                else:
+                    tid = f.get("id") or f.get("trade_id")
+                    trade_id = str(tid) if tid else f"{oid}_{int(sz)}_{pr}"
+                trade: Dict[str, Any] = {
+                    "trade_id": trade_id,
+                    "id": trade_id,
+                    "order_id": oid or str(f.get("id", "")),
                     "intent_id": intent_id,
                     "client_order_id": intent_id,
                     "tag": intent_id,
-                    "price": float(f.get("price") or 0),
-                    "size": float(f.get("size") or 0),
+                    "price": pr,
+                    "size": sz,
                     "side": (f.get("side") or "").upper(),
                     "created_at": f.get("created_at"),
                     "execution_source": "REST_FILLS",
                 }
+                if is_dhan:
+                    trade["fill_confidence"] = "CONFIRMED"
                 self.process_trade(trade)
                 continue
 

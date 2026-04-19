@@ -1,6 +1,7 @@
 from .base import BaseAdapter
 
 from core.models.strategy_context import StrategyContext
+from core.utils.expiry_resolver import ExpiryResolver
 
 
 class DhanAdapter(BaseAdapter):
@@ -27,32 +28,24 @@ class DhanAdapter(BaseAdapter):
             symbol=ctx.symbol,
             exchange=ctx.exchange or "",
             expiry_index=expiry_index,
-            strikes_around_atm=params.get("strikes", 10),
+            strikes_around_atm=params.get("strikes", 30),
+            expiry_flag=params.get("expiry_flag", "MONTH"),
         )
 
     def get_historical_option_chain(self, ctx: StrategyContext, params: dict):
-        expiry_index = ctx.selected_expiry
-        if not isinstance(expiry_index, int):
-            raise ValueError("DHAN selected_expiry must be expiry index")
+        # Prefer params (strike selection / SL pricing pass instrument calendar expiry); else ctx.
+        raw_exp = params.get("expiry_code", ctx.selected_expiry)
+        expiry_index = ExpiryResolver.coerce_to_dhan_expiry_index(ctx.timestamp, raw_exp)
 
-        spot_price = ctx.spot_price
-        target_strike = params["strike"]
-        strike_step = 50
-        atm_strike = round(spot_price / strike_step) * strike_step
-        diff = int(target_strike) - int(atm_strike)
-        n = int(diff / strike_step)
-        MAX_N = 10
-
-        if n == 0:
-            strike = "ATM"
-        elif 0 < n <= MAX_N:
-            strike = f"ATM+{n}"
-        elif -MAX_N <= n < 0:
-            strike = f"ATM{n}"
-        elif n > MAX_N:
-            strike = f"ATM+{MAX_N}"
+        spot_price = float(ctx.spot_price or 0.0)
+        raw = params["strike"]
+        # Strategies pass either one strike or a list of candidate strikes (e.g. OTM ladder from mixins).
+        if isinstance(raw, (list, tuple)):
+            if not raw:
+                raise ValueError("params['strike'] list is empty")
+            strikes = list(raw)
         else:
-            strike = f"ATM-{MAX_N}"
+            strikes = [raw]
 
         ts = ctx.timestamp
         date_str = ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]
@@ -63,10 +56,12 @@ class DhanAdapter(BaseAdapter):
             interval=params["interval"],
             expiry_flag=params["expiry_flag"],
             expiry_code=expiry_index,
-            strike=strike,
+            strike=strikes,
             option_type=params["option_type"],
             from_date=date_str,
             to_date=date_str,
             instrument=params["instrument"],
             exchangeSegment=params["exchangeSegment"],
+            symbol=ctx.symbol,
+            spot_price=spot_price,
         )

@@ -15,7 +15,14 @@ class ExpiryResolver:
     # PUBLIC API
     # ============================
     @staticmethod
-    def resolve(expiry_list, trade_date, api="NSE", expiry_pref="MONTHLY"):
+    def resolve(
+        expiry_list,
+        trade_date,
+        api="NSE",
+        expiry_pref="MONTHLY",
+        *,
+        dhan_calendar_rollover_day=None,
+    ):
         # NSE will check later-->Pending
 
         if isinstance(trade_date, str):
@@ -32,7 +39,9 @@ class ExpiryResolver:
         # ---------- DHAN path ----------
         if api.upper() == "DHAN":
             if expiry_pref == "MONTHLY":
-                return ExpiryResolver._derive_monthly_series(trade_date)
+                return ExpiryResolver._derive_monthly_series(
+                    trade_date, calendar_rollover_day=dhan_calendar_rollover_day
+                )
             elif expiry_pref == "QUARTERLY":
                 return ExpiryResolver._derive_quarterly_series(trade_date)
 
@@ -138,24 +147,82 @@ class ExpiryResolver:
         # Monthly expiry = LAST one
         return matches[-1]
 
-    # # ============================
-    # # DHAN EXPIRY SERIES
-    # # ============================
-    # @staticmethod
-    # def _derive_monthly_series(trade_date):
-    #     """
-    #     Decide MONTHLY vs MONTHLY_NEXT for Dhan option chain.
-    #     """
-    #     year = trade_date.year
-    #     month = trade_date.month
+    @staticmethod
+    def _derive_monthly_series(trade_date, calendar_rollover_day=None):
+        """
+        Dhan / Tradehull monthly option chain index for backtest (``expiry_code`` is int).
 
-    #     last_thursday = ExpiryResolver._last_thursday(year, month)
+        ``0`` = current month's series; ``1`` = next month's series when:
 
-    #     # After expiry → next monthly
-    #     if trade_date > last_thursday:
-    #         return "MONTHLY_NEXT"
+        - this month's expiry Thursday has already passed, **or**
+        - ``calendar_rollover_day`` is set (e.g. 15) and ``trade_date.day`` is **greater than**
+          that day (intraday monthly rollover — next series from folder / chain).
+        """
+        this_exp = ExpiryResolver.current_month_expiry(trade_date)
+        if trade_date > this_exp:
+            return 1
+        if (
+            calendar_rollover_day is not None
+            and int(calendar_rollover_day) >= 1
+            and trade_date.day > int(calendar_rollover_day)
+        ):
+            return 1
+        return 0
 
-    #     return "MONTHLY"
+    @staticmethod
+    def dhan_expiry_index_to_date(trade_date, expiry_index: int):
+        """
+        Map DHAN ``expiry_code`` (0 = front monthly, 1 = next monthly) to a calendar expiry date
+        (last Thursday of that month). Used for ``build_option_symbol`` / instrument store while
+        ``ctx.selected_expiry`` remains an int for the rolling-option API.
+        """
+        if isinstance(trade_date, dt.datetime):
+            trade_date = trade_date.date()
+        elif isinstance(trade_date, str):
+            trade_date = pd.to_datetime(trade_date).date()
+        idx = int(expiry_index)
+        if idx == 0:
+            return ExpiryResolver.current_month_expiry(trade_date)
+        return ExpiryResolver.next_month_expiry(trade_date)
+
+    @staticmethod
+    def dhan_calendar_expiry_to_index(trade_date, calendar_expiry) -> int:
+        """
+        Inverse of ``dhan_expiry_index_to_date``: map a calendar expiry to DHAN ``expiry_code``
+        (0/1) for the rolling option API. Used when only the instrument's expiry date is known
+        (e.g. stop checks) while ``ctx.selected_expiry`` may be unset.
+        """
+        td = pd.Timestamp(trade_date).date()
+        cal = pd.Timestamp(calendar_expiry).date()
+        z = ExpiryResolver.dhan_expiry_index_to_date(td, 0)
+        o = ExpiryResolver.dhan_expiry_index_to_date(td, 1)
+        if cal == z:
+            return 0
+        if cal == o:
+            return 1
+        return ExpiryResolver._derive_monthly_series(td)
+
+    @staticmethod
+    def coerce_to_dhan_expiry_index(trade_date, value) -> int:
+        """
+        Normalize values from ``params['expiry_code']`` / ``ctx.selected_expiry``: DHAN index,
+        numpy int, or calendar expiry (date/datetime/str).
+        """
+        td = pd.Timestamp(trade_date).date()
+        if value is None:
+            return ExpiryResolver._derive_monthly_series(td)
+        if isinstance(value, bool):
+            return ExpiryResolver._derive_monthly_series(td)
+        if isinstance(value, (int, float)):
+            return int(value)
+        try:
+            import numpy as np
+
+            if isinstance(value, np.integer):
+                return int(value)
+        except ImportError:
+            pass
+        return ExpiryResolver.dhan_calendar_expiry_to_index(td, value)
 
     @staticmethod
     def _last_thursday(year, month):

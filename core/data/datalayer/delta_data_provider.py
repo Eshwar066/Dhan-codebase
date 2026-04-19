@@ -56,6 +56,7 @@ class DeltaDataProvider(IDataProvider):
         exchange: str,
         expiry_index: int,
         strikes_around_atm: int,
+        expiry_flag: str,
     ) -> Optional[dict]:
         return self._source.get_live_option_chain(
             symbol=symbol,
@@ -77,6 +78,8 @@ class DeltaDataProvider(IDataProvider):
         securityId: str,
         instrument: str,
         exchangeSegment: str,
+        symbol: str | None = None,
+        spot_price: float | None = None,
     ) -> Any:
         return self._source.get_expired_optionchain(
             exchange=exchange,
@@ -90,6 +93,8 @@ class DeltaDataProvider(IDataProvider):
             securityId=securityId,
             instrument=instrument,
             exchangeSegment=exchangeSegment,
+            symbol=symbol,
+            spot_price=spot_price,
         )
 
     def get_nse_optionchain_historical(

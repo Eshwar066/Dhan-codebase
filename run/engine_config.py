@@ -78,6 +78,7 @@ class EngineConfig:
     max_open_positions: Optional[int] = None
     max_portfolio_exposure: Optional[float] = None
     cooldown_seconds: Optional[int] = None
+    order_qty_lots: Optional[int] = None
 
     # Option shorting: if False, do not use broker's check_short_option_margin (e.g. futures-only).
     check_short_option_margin_enabled: Optional[bool] = None

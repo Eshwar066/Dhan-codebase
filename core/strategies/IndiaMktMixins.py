@@ -2,7 +2,7 @@
 India market mixins: shared logic for India options/LEAPS strategies.
 
 Use in any strategy that needs:
-- Option chain fetch, strike selection, option pricing
+- Option chain fetch, strike selection, option pricing (Dhan backtests: local expired-option CSVs via ``IndiaMktMixins.load_dhan_expired_option_chain_dataframe`` / ``DhanSource.get_expired_optionchain``)
 - Order intent creation and instrument-to-intent mapping
 - Hedge entry/exit and rollover
 
@@ -14,14 +14,17 @@ Example:
 
 import uuid
 import calendar
+import logging
+import math
 import pandas as pd
 from datetime import date, timedelta, datetime, timezone
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
+
+logger = logging.getLogger(__name__)
 
 # India Standard Time (UTC+5:30) for strategy time-of-day filters.
 IST = timezone(timedelta(hours=5, minutes=30))
-
-from run.config import RUN_MODE, RunMode
+from run.config import RUN_MODE, RunMode, ORDER_QTY_LOTS
 from core.utils.expiry_resolver import ExpiryResolver
 from core.models.order_intent import OrderIntent
 from core.strategies.deltaMktMixins import (
@@ -29,6 +32,11 @@ from core.strategies.deltaMktMixins import (
     delta_option_trading_symbol,
     ltp_from_strike_row_live,
 )
+from core.utils.dhan_expired_option_chain_files import (
+    atm_label_from_spot_strike,
+    load_expired_option_chain_from_files,
+)
+from core.utils.option_chain_snapshot_log import log_option_chain_snapshot
 
 
 class IndiaMktMixins:
@@ -52,6 +60,56 @@ class IndiaMktMixins:
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.rolled_hedges = set()
+
+    def _entry_order_qty(self, inst) -> int:
+        lot = int(getattr(inst, "lot_size", 0) or 0)
+        lots = int(getattr(self, "order_qty_lots", ORDER_QTY_LOTS) or 1)
+        return max(1, lot * max(1, lots))
+
+    def _normalize_order_qty(self, inst, qty) -> int:
+        if qty is None:
+            return self._entry_order_qty(inst)
+        try:
+            q = int(qty)
+        except (TypeError, ValueError):
+            return self._entry_order_qty(inst)
+        return q if q > 0 else self._entry_order_qty(inst)
+
+    # ==================================================
+    # DHAN EXPIRED OPTION CSV (BACKTEST) — same layout as dhan expired option chain download scripts
+    # ==================================================
+    @staticmethod
+    def dhan_expired_option_atm_folder_label(
+        spot: float, strike: float, strike_step: int = 50
+    ) -> str:
+        """ATM folder name (``ATM``, ``ATM+2``, ``ATM-3``, …) for on-disk Dhan CSVs."""
+        return atm_label_from_spot_strike(spot, strike, strike_step=strike_step)
+
+    @staticmethod
+    def load_dhan_expired_option_chain_dataframe(
+        *,
+        symbol: str,
+        calendar_expiry: Any,
+        strikes: Any,
+        option_type: str,
+        spot_price: float,
+        from_date: str,
+        to_date: str,
+        root: Any = None,
+        strike_step: int = 50,
+    ):
+        """Load merged CALL or PUT history from local expired-option CSVs (optional custom ``root``)."""
+        return load_expired_option_chain_from_files(
+            symbol=symbol,
+            calendar_expiry=calendar_expiry,
+            strikes=strikes,
+            option_type=option_type,
+            spot_price=spot_price,
+            from_date=from_date,
+            to_date=to_date,
+            root=root,
+            strike_step=strike_step,
+        )
 
     # ==================================================
     # TIME FILTER (override valid_times in strategy)
@@ -135,11 +193,12 @@ class IndiaMktMixins:
         metadata_extras=None,
         trigger_price=None,
     ):
+        resolved_qty = self._normalize_order_qty(inst, qty)
         return OrderIntent(
             intent_id=uuid.uuid4().hex,
             instrument=inst,
             side=side,
-            qty=int(inst.lot_size),
+            qty=resolved_qty,
             price=price,
             order_type=order_type,
             strategy=strategy,
@@ -218,12 +277,32 @@ class IndiaMktMixins:
 
         chain = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
 
-        if not chain or "chain" not in chain:
+        df: Optional[pd.DataFrame] = None
+        if chain is None:
+            return None
+        if isinstance(chain, dict):
+            df = chain.get("chain")
+        elif isinstance(chain, pd.DataFrame):
+            df = chain
+        else:
+            return None
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
             return None
 
-        df = chain["chain"]
+        # DHAN rolling option bars: multiple timestamps — keep the current candle row only.
+        if "datetime" in df.columns and len(df) > 0:
+            candle_time = candle["timestamp"].replace(tzinfo=None)
+            ts = pd.to_datetime(df["datetime"])
+            wall = ts.dt.strftime("%Y-%m-%d %H:%M")
+            wall_c = pd.Timestamp(candle_time).strftime("%Y-%m-%d %H:%M")
+            filt = df[wall == wall_c]
+            if not filt.empty:
+                df = filt
+            elif len(df) > 1:
+                return None
 
-        if option_type.upper() in ("PUT", "PE"):
+        otp = option_type.upper()
+        if otp in ("PUT", "PE"):
             cols = ["PE LTP", "PUT LTP"]
         else:
             cols = ["CE LTP", "CALL LTP"]
@@ -231,6 +310,15 @@ class IndiaMktMixins:
         for col in cols:
             if col in df.columns:
                 return float(df[col].iloc[0])
+
+        prem_col = self._option_chain_premium_column(
+            df, "CE" if otp in ("CE", "CALL") else "PE"
+        )
+        if prem_col is not None and prem_col in df.columns:
+            try:
+                return float(df.iloc[0][prem_col])
+            except (TypeError, ValueError):
+                return None
 
         return None
 
@@ -282,6 +370,203 @@ class IndiaMktMixins:
 
         return expiry_date
 
+    
+
+    @staticmethod
+    def _option_chain_premium_column(
+        chain: pd.DataFrame, option_type_upper: str
+    ) -> Optional[str]:
+        """
+        Premium / LTP column for backtest chains.
+
+        - NSE-style wide tables: ``CE LTP`` / ``PE LTP`` style columns.
+        - DHAN rolling option bars: use ``close`` as option price (no separate LTP column).
+        """
+        for col in chain.columns:
+            if option_type_upper in col.upper() and "LTP" in col.upper():
+                return col
+        if "close" in chain.columns:
+            return "close"
+        return None
+
+    @staticmethod
+    def _option_chain_strike_column(chain: pd.DataFrame) -> Optional[str]:
+        if "Strike Price" in chain.columns:
+            return "Strike Price"
+        if "strike" in chain.columns:
+            return "strike"
+        return None
+
+    @staticmethod
+    def _strike_on_hundred_point_grid(val) -> bool:
+        """OPTIDX live/paper: only 100-point strikes (exclude 50-step e.g. 25250, 25350)."""
+        try:
+            return int(round(float(val))) % 100 == 0
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _option_chain_delta_column(df: pd.DataFrame, option_type: str) -> Optional[str]:
+        """Column name for option delta (|delta| used for short-option strike band)."""
+        opt = "CE" if option_type.upper() in ("CE", "CALL") else "PE"
+        for c in df.columns:
+            cu = str(c).upper()
+            if "DELTA" in cu and opt in cu:
+                return c
+        for c in df.columns:
+            if "DELTA" in str(c).upper():
+                return c
+        return None
+
+    @staticmethod
+    def _abs_delta_in_band(
+        row: Union[pd.Series, pd.DataFrame],
+        delta_col: str,
+        d_min: float,
+        d_max: float,
+    ) -> bool:
+        try:
+            if isinstance(row, pd.DataFrame):
+                if row.empty:
+                    return False
+                v = row.iloc[0][delta_col]
+            else:
+                v = row[delta_col]
+            ad = abs(float(v or 0))
+            return float(d_min) <= ad <= float(d_max)
+        except (TypeError, ValueError, KeyError):
+            return False
+
+    @staticmethod
+    def _backtest_can_compute_bs_delta(chain: pd.DataFrame) -> bool:
+        """Expired Dhan CSV rows often have iv + strike but no DELTA column — BS delta can be used."""
+        if chain is None or chain.empty:
+            return False
+        cols = {str(c).lower() for c in chain.columns}
+        return "strike" in cols and "iv" in cols
+
+    @staticmethod
+    def _ts_to_utc_naive(ts: Any) -> pd.Timestamp:
+        """Align timestamps for subtraction: tz-aware → UTC, then strip tz (naive UTC wall time)."""
+        t = pd.Timestamp(ts)
+        if t.tzinfo is not None:
+            t = t.tz_convert("UTC").tz_localize(None)
+        return t
+
+    @staticmethod
+    def _expiry_calendar_to_utc_naive_close(exp_cal: Union[date, datetime, Any]) -> pd.Timestamp:
+        """
+        Option expiry instant: same **calendar** day at **15:30 IST** (NIFTY cash close convention),
+        converted to naive UTC for consistent ``T`` vs bar timestamps.
+        """
+        if isinstance(exp_cal, datetime):
+            d = exp_cal.date()
+        elif isinstance(exp_cal, date):
+            d = exp_cal
+        else:
+            d = pd.Timestamp(exp_cal).date()
+        t = pd.Timestamp(datetime(d.year, d.month, d.day, 15, 30, 0))
+        t = t.tz_localize("Asia/Kolkata").tz_convert("UTC").tz_localize(None)
+        return t
+
+    @staticmethod
+    def _years_to_expiry_bs(bar_ts_utc_naive: pd.Timestamp, exp_cal_date: Union[date, datetime]) -> float:
+        """
+        Year fraction for Black–Scholes: (expiry @ 15:30 IST in UTC) − (bar time in UTC naive).
+        """
+        exp_ts = IndiaMktMixins._expiry_calendar_to_utc_naive_close(exp_cal_date)
+        dt_sec = (exp_ts - bar_ts_utc_naive).total_seconds()
+        if dt_sec <= 0:
+            dt_sec = 60.0
+        return max(dt_sec / (365.0 * 24 * 3600.0), 1e-10)
+
+    def _append_computed_delta_to_chain_df(
+        self,
+        chain: pd.DataFrame,
+        option_type: str,
+        candle: dict,
+        ctx: Any,
+    ) -> pd.DataFrame:
+        """
+        Append BS ``DELTA_CE`` / ``DELTA_PE`` (signed) and ``abs_delta`` when the chain has
+        ``strike`` + ``iv`` but no column matching ``_option_chain_delta_column`` — typical for
+        expired Dhan CSV backtests.
+        """
+        if chain is None or chain.empty:
+            return chain
+        if self._option_chain_delta_column(chain, option_type) is not None:
+            return chain
+        if not self._backtest_can_compute_bs_delta(chain):
+            return chain
+
+        from core.library.dhan_tradehull import _iv_to_sigma, bs_option_delta
+
+        opt_u = str(option_type).upper()
+        kind = "pe" if opt_u in ("PE", "PUT") else "ce"
+        leg_col = f"DELTA_{'PE' if kind == 'pe' else 'CE'}"
+        r_annual = 0.065
+        ts = candle.get("timestamp")
+        td = self._ts_to_utc_naive(ts)
+        trade_d = td.date()
+        exp = getattr(ctx, "selected_expiry", None)
+        if isinstance(exp, int):
+            exp_d = ExpiryResolver.dhan_expiry_index_to_date(trade_d, exp)
+        elif exp is not None and hasattr(exp, "year"):
+            exp_d = pd.Timestamp(exp).date()
+        else:
+            exp_d = ExpiryResolver.dhan_expiry_index_to_date(trade_d, 0)
+
+        _sf = candle.get("spot", candle.get("underlying_price"))
+        spot_fallback = float(_sf) if _sf is not None and _sf != "" else 0.0
+        if spot_fallback <= 0:
+            spot_fallback = float(candle.get("close", 0) or 0)
+
+        ts_col = "datetime" if "datetime" in chain.columns else None
+
+        out = chain.copy()
+        d_signed: List[float] = []
+        d_abs: List[float] = []
+        for _, r in out.iterrows():
+            try:
+                spot = (
+                    float(r["spot"])
+                    if "spot" in out.columns and pd.notna(r.get("spot"))
+                    else spot_fallback
+                )
+                if pd.isna(r.get("strike")) or pd.isna(r.get("iv")) or spot <= 0:
+                    d_signed.append(float("nan"))
+                    d_abs.append(float("nan"))
+                    continue
+                K = float(r["strike"])
+                sigma = _iv_to_sigma(r["iv"])
+                if sigma <= 0 or (isinstance(sigma, float) and math.isnan(sigma)):
+                    d_signed.append(float("nan"))
+                    d_abs.append(float("nan"))
+                    continue
+                bar_ts = pd.Timestamp(r[ts_col]) if ts_col else td
+                bar_ts = self._ts_to_utc_naive(bar_ts)
+                T = self._years_to_expiry_bs(bar_ts, exp_d)
+                d = bs_option_delta(spot, K, T, r_annual, sigma, kind)
+                fv = float(d)
+                d_signed.append(fv)
+                d_abs.append(abs(fv))
+            except (TypeError, ValueError):
+                d_signed.append(float("nan"))
+                d_abs.append(float("nan"))
+
+        if len(d_signed) > 5:
+            vals = [x for x in d_signed if not math.isnan(x)]
+            if vals and (max(vals) - min(vals)) < 0.05:
+                logger.warning(
+                    "Delta nearly flat across strikes (range < 0.05) — check T / expiry vs bar "
+                    "time (timezone or expiry calendar mismatch). exp_d=%s",
+                    exp_d,
+                )
+
+        out[leg_col] = d_signed
+        out["abs_delta"] = d_abs
+        return out
+
     def fetch_option_chain(self, candle, ctx, option_type):
         ocs = ctx.option_chain_service
 
@@ -290,17 +575,19 @@ class IndiaMktMixins:
                 api=self.api, ctx=ctx, instrument="FUTIDX"
             )
 
+        rollover = getattr(self, "dhan_monthly_rollover_after_calendar_day", None)
         expiry_code = ExpiryResolver.resolve(
             expiry_list=ctx.get_expiry_list(),
             trade_date=ctx.timestamp,
             api=self.api,
             expiry_pref=self.expiryType,
+            dhan_calendar_rollover_day=rollover,
         )
-
         spot = candle["close"]
-        step = 500
+        step = getattr(self, "otm_strike_step", 500)
+        count = int(getattr(self, "otm_strike_count", 4))
         otm_strikes = ExpiryResolver.get_otm_strikes(
-            self, spot=spot, option_type=option_type, step=step, count=4
+            self, spot=spot, option_type=option_type, step=step, count=count
         )
         ctx.selected_expiry = expiry_code
         ctx.otm_strikes = otm_strikes
@@ -308,17 +595,46 @@ class IndiaMktMixins:
         return otm_strikes
 
     def find_strike_in_premium_range(
-        self, candle, ctx, option_type, min_prem=200, max_prem=400
+        self,
+        candle,
+        ctx,
+        option_type,
+        min_prem=200,
+        max_prem=400,
+        delta_min=None,
+        delta_max=None,
     ):
         otm_strikes = self.fetch_option_chain(candle, ctx, option_type)
 
+        if not otm_strikes:
+            return None
+
+        d_min = (
+            delta_min
+            if delta_min is not None
+            else getattr(self, "delta_abs_min", None)
+        )
+        d_max = (
+            delta_max
+            if delta_max is not None
+            else getattr(self, "delta_abs_max", None)
+        )
+        use_delta = d_min is not None and d_max is not None
+
         candle_time = candle["timestamp"].replace(tzinfo=None)
+
+        # When delta bounds are set and the chain has a delta column, strike selection uses
+        # |delta| only — no min_prem/max_prem filtering or final premium check.
+
+        strike_param = otm_strikes
+        if strike_param and isinstance(strike_param[0], (int, float)):
+            strike_param = [str(int(s)) for s in otm_strikes]
 
         params = {
             "exchange": ctx.exchange,
             "interval": self.timeframe,
             "expiry_code": ctx.selected_expiry,
-            "strike": otm_strikes,
+            "strike": strike_param,
             "option_type": option_type,
             "instrument": "OPTIDX",
             "exchangeSegment": "NSE_FNO",
@@ -327,46 +643,248 @@ class IndiaMktMixins:
         }
 
         chain = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
-        if not chain:
+        try:
+            log_option_chain_snapshot(
+                chain,
+                ctx=ctx,
+                strategy_name=getattr(self, "name", "") or "",
+                api=self.api,
+                params=params,
+            )
+        except Exception:
+            pass
+        if chain is None:
+            print(">>no option chain data", ctx, params)
+            return None
+        if isinstance(chain, pd.DataFrame):
+            if chain.empty:
+                print(">>no option chain data", ctx, params)
+                return None
+        elif isinstance(chain, dict):
+            if not chain:
+                print(">>no option chain data", ctx, params)
+                return None
+        else:
             print(">>no option chain data", ctx, params)
             return None
 
+        skip_premium_check = False
         if RUN_MODE == RunMode.LIVE or RUN_MODE == RunMode.PAPER:
-            if chain is None or len(chain) == 0:
-                return None
-
-            row = chain[chain["datetime"] == candle_time]
-            if row.empty:
-                return None
-
-            premium = float(row.iloc[0]["close"])
-            selected_strike = row.iloc[0]["strike"]
-        else:
-            chain = chain["chain"]
-            if chain is None or len(chain) == 0:
+            # DHAN live: get_chain returns {"symbol", "exchange", "chain": DataFrame, "atm_strike", "expiry"}.
+            # Snapshot has CE/PE LTP + Strike Price (+ greeks); no datetime / close / strike columns.
+            live_df = chain.get("chain") if isinstance(chain, dict) else chain
+            if not isinstance(live_df, pd.DataFrame) or live_df.empty:
                 return None
 
             option_type_upper = option_type.upper()
-            premium_col = None
-            for col in chain.columns:
-                if option_type_upper in col.upper() and "LTP" in col.upper():
-                    premium_col = col
-                    break
+            premium_col = self._option_chain_premium_column(live_df, option_type_upper)
+            strike_col = self._option_chain_strike_column(live_df)
+            if premium_col is None or strike_col is None:
+                return None
+
+            live_df = live_df[
+                live_df[strike_col].apply(self._strike_on_hundred_point_grid)
+            ]
+            if live_df.empty:
+                return None
+
+            dcol_live = (
+                self._option_chain_delta_column(live_df, option_type)
+                if use_delta
+                else None
+            )
+            delta_in_chain_live = (
+                dcol_live is not None and dcol_live in live_df.columns
+            )
+
+            row = live_df
+            if use_delta and delta_in_chain_live and dcol_live in row.columns:
+                mask = row.apply(
+                    lambda r: self._abs_delta_in_band(r, dcol_live, d_min, d_max),
+                    axis=1,
+                )
+                filt = row[mask]
+                if filt.empty:
+                    return None
+                if len(filt) > 1:
+                    target_mid = (float(d_min) + float(d_max)) / 2.0
+                    ad_series = filt.apply(
+                        lambda r: abs(float(r[dcol_live]))
+                        if pd.notna(r.get(dcol_live))
+                        else float("nan"),
+                        axis=1,
+                    )
+                    filt = (
+                        filt.assign(_dd=(ad_series - target_mid).abs())
+                        .sort_values("_dd")
+                        .drop(columns=["_dd"])
+                    )
+                row = filt
+                skip_premium_check = True
+            else:
+                prem_num = pd.to_numeric(live_df[premium_col], errors="coerce").fillna(0)
+                row = live_df[prem_num.between(float(min_prem), float(max_prem), inclusive="both")]
+                if row.empty:
+                    row = live_df[prem_num > 0]
+                if row.empty:
+                    row = live_df
+
+            if row.empty:
+                return None
+
+            r0 = row.iloc[0]
+            premium = float(pd.to_numeric(r0[premium_col], errors="coerce") or 0.0)
+            selected_strike = r0[strike_col]
+        else:
+            # NSE backtest often returns {"chain": df}; DHAN / Tradehull may return a bare DataFrame.
+            if isinstance(chain, dict):
+                chain = chain.get("chain")
+            if chain is None:
+                return None
+            if isinstance(chain, pd.DataFrame):
+                if chain.empty:
+                    return None
+            else:
+                return None
+
+            # Rolling option history (e.g. DHAN): multiple bars — keep the current candle row only.
+            if "datetime" in chain.columns and len(chain) > 0:
+                ts = pd.to_datetime(chain["datetime"])
+                wall = ts.dt.strftime("%Y-%m-%d %H:%M")
+                wall_c = pd.Timestamp(candle_time).strftime("%Y-%m-%d %H:%M")
+                filt = chain[wall == wall_c]
+                if not filt.empty:
+                    chain = filt
+                elif len(chain) > 1:
+                    return None
+
+            # BS delta columns (DELTA_CE/DELTA_PE, abs_delta) when iv+strike present and no broker delta.
+            chain = self._append_computed_delta_to_chain_df(chain, option_type, candle, ctx)
+
+            option_type_upper = option_type.upper()
+            premium_col = self._option_chain_premium_column(chain, option_type_upper)
 
             if premium_col is None:
                 return None
 
-            row = chain[chain[premium_col].between(min_prem, max_prem)]
+            dcol_bt = self._option_chain_delta_column(chain, option_type)
+            delta_in_chain = dcol_bt is not None and dcol_bt in chain.columns
+
+            if use_delta and delta_in_chain:
+                row = chain[
+                    pd.to_numeric(chain[premium_col], errors="coerce").fillna(0) > 0
+                ]
+                if row.empty:
+                    row = chain
+                delta_ok = row[
+                    row.apply(
+                        lambda r: self._abs_delta_in_band(r, dcol_bt, d_min, d_max),
+                        axis=1,
+                    )
+                ]
+                if delta_ok.empty:
+                    return None
+
+                if len(delta_ok) > 1:
+                    target_mid = (float(d_min) + float(d_max)) / 2.0
+                    ad_series = delta_ok.apply(
+                        lambda r: abs(float(r[dcol_bt])) if pd.notna(r.get(dcol_bt)) else float("nan"),
+                        axis=1,
+                    )
+                    delta_ok = (
+                        delta_ok.assign(_dd=(ad_series - target_mid).abs())
+                        .sort_values("_dd")
+                        .drop(columns=["_dd"])
+                    )
+                row = delta_ok
+                skip_premium_check = True
+            else:
+                row = chain[chain[premium_col].between(min_prem, max_prem)]
+                if row.empty:
+                    row = chain[
+                        pd.to_numeric(chain[premium_col], errors="coerce").fillna(0) > 0
+                    ]
+                if row.empty:
+                    row = chain
+
+                if use_delta and dcol_bt and dcol_bt in row.columns:
+                    delta_ok = row[
+                        row.apply(
+                            lambda r: self._abs_delta_in_band(r, dcol_bt, d_min, d_max),
+                            axis=1,
+                        )
+                    ]
+                    if not delta_ok.empty:
+                        row = delta_ok
+
             if row.empty:
                 return None
 
-            selected_strike = row.iloc[0]["Strike Price"]
-            premium = float(row.iloc[0][premium_col])
+            strike_col = self._option_chain_strike_column(row)
+            if strike_col is None:
+                return None
+            r0 = row.iloc[0]
+            selected_strike = r0[strike_col]
+            premium = float(r0[premium_col])
 
-        if min_prem <= premium <= max_prem:
-            return selected_strike, premium, row
+        if skip_premium_check or (min_prem <= premium <= max_prem):
+            if isinstance(row, pd.DataFrame) and not row.empty:
+                out_row = row.iloc[0]
+            else:
+                out_row = row
+            return selected_strike, premium, out_row
 
         return None
+
+    def _ltp_from_strike_row_backtest(self, strike_row, option_type: str) -> float:
+        """
+        Premium for backtest fills. NSE wide tables use ``CE LTP`` / ``PE LTP``; DHAN rolling
+        rows are often a Series with ``open``/``high``/``low``/``close`` (premium) only.
+        """
+        option_type_label = "PUT" if option_type == "PE" else "CALL"
+        opt_u = str(option_type).upper()
+        keys = (
+            f"{option_type_label} LTP",
+            f"{opt_u} LTP",
+            "PE LTP",
+            "CE LTP",
+            "PUT LTP",
+            "CALL LTP",
+        )
+        for k in keys:
+            try:
+                if isinstance(strike_row, pd.Series):
+                    if k not in strike_row.index:
+                        continue
+                    lv = strike_row[k]
+                elif isinstance(strike_row, dict):
+                    if k not in strike_row:
+                        continue
+                    lv = strike_row[k]
+                else:
+                    continue
+                if lv is None or (isinstance(lv, float) and pd.isna(lv)):
+                    continue
+                v = float(lv.iloc[0] if isinstance(lv, pd.Series) else lv)
+                if v > 0:
+                    return v
+            except (KeyError, TypeError, ValueError):
+                continue
+        if isinstance(strike_row, pd.DataFrame):
+            df = strike_row.iloc[[0]] if len(strike_row) else strike_row
+        elif isinstance(strike_row, pd.Series):
+            df = strike_row.to_frame().T
+        else:
+            df = pd.DataFrame([strike_row])
+        if df is None or df.empty:
+            return 0.0
+        pc = self._option_chain_premium_column(df, opt_u)
+        if pc and pc in df.columns:
+            try:
+                return float(df.iloc[0][pc])
+            except (TypeError, ValueError):
+                pass
+        return 0.0
 
     def map_instrument_to_intent(
         self,
@@ -389,13 +907,7 @@ class IndiaMktMixins:
         if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
             ltp = ltp_from_strike_row_live(strike_row)
         else:
-            option_type_label = "PUT" if option_type == "PE" else "CALL"
-            ltp_value = strike_row.get(f"{option_type_label} LTP", 0)
-            ltp = (
-                float(ltp_value.iloc[0])
-                if isinstance(ltp_value, pd.Series)
-                else float(ltp_value)
-            )
+            ltp = self._ltp_from_strike_row_backtest(strike_row, option_type)
 
         assert inst.trading_symbol
         assert inst.custom_symbol
@@ -404,7 +916,7 @@ class IndiaMktMixins:
             intent_id=uuid.uuid4().hex,
             instrument=inst,
             side=side,
-            qty=int(inst.lot_size),
+            qty=self._entry_order_qty(inst),
             price=ltp,
             order_type=order_type,
             strategy=strategy,
@@ -448,7 +960,7 @@ class IndiaMktMixins:
             intent_id=uuid.uuid4().hex,
             instrument=inst,
             side=side,
-            qty=int(inst.lot_size),
+            qty=self._entry_order_qty(inst),
             price=ltp,
             order_type="LIMIT",
             strategy=strategy,
