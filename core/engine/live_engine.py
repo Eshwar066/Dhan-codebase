@@ -5,14 +5,13 @@ Includes: duplicate signal protection, time-of-day guard, memory guard, graceful
 symbol-level failure isolation, strategy timeout, latency alert levels, candle integrity.
 """
 
-import csv
 import dataclasses
 import logging
 import os
 import signal
 import time
-import psutil
 import datetime as dt
+import csv
 from typing import Any, Dict, List, Optional, Tuple
 import pdb
 
@@ -24,14 +23,11 @@ from core.engine.live_engine_common import (
     DEFAULT_FEED_STALE_SECONDS,
     LiveEngineHelpersMixin,
 )
-from core.data.candle_aggregator import _resolution_to_seconds
 
 try:
     from logs.engine_logger import REPORTS_DIR
 except ImportError:
     REPORTS_DIR = "reports"
-
-
 class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
     """
     Live/paper engine. Optional realtime_feed (WebSocket); falls back to
@@ -97,6 +93,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self._last_candle_timestamp: Dict[str, float] = {}
         self._last_eod_date: Optional[str] = None
         self._entries_paused_feed_stale = False
+        # Dhan feed lifecycle notification state (transition-based, no spam).
+        self._dhan_feed_was_connected: Optional[bool] = None
+        self._dhan_feed_last_connect_generation_alerted: int = 0
         # Duplicate signal protection
         self._last_signal_hash_per_symbol: Dict[str, int] = {}
         # Time-of-day guard
@@ -153,89 +152,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self._max_candle_bucket_unix: Dict[str, int] = {}
         # After at least one tick-built bar (bucket_ts set), drop REST rows without bucket_ts
         self._has_seen_aggregator_bucket: Dict[str, bool] = {}
-
-    @staticmethod
-    def _candle_bucket_start_unix(candle: Dict[str, Any]) -> Optional[int]:
-        bt = candle.get("bucket_ts")
-        if bt is not None:
-            try:
-                return int(bt)
-            except (TypeError, ValueError):
-                pass
-        ts = candle.get("timestamp")
-        if isinstance(ts, dt.datetime):
-            return int(ts.timestamp())
-        if isinstance(ts, (int, float)):
-            t = float(ts)
-            if t > 1e12:
-                return int(t / 1e6)
-            return int(t)
-        return None
-
-    def _live_bar_is_stale_or_replay(
-        self, symbol: str, candle: Dict[str, Any], tf: str
-    ) -> bool:
-        """
-        When ticks + CandleAggregator are active, reject:
-        - REST fallback rows without bucket_ts after we have seen real buckets
-        - bar bucket time going backwards (duplicate old bar after restart)
-        - \"last closed\" rows far behind wall clock (stale historical replay)
-        """
-        max_seen = self._max_candle_bucket_unix.get(symbol)
-        bt = candle.get("bucket_ts")
-        bs = self._candle_bucket_start_unix(candle)
-
-        if bt is None and self._has_seen_aggregator_bucket.get(symbol):
-            logger.debug(
-                "Skip %s: missing bucket_ts after live aggregated bars (REST replay)",
-                symbol,
-            )
-            return True
-
-        if bs is None:
-            return False
-
-        if max_seen is not None and bs < max_seen:
-            logger.debug(
-                "Skip %s: non-monotonic bucket %s < max_seen %s",
-                symbol,
-                bs,
-                max_seen,
-            )
-            return True
-
-        tf_sec = max(60, int(_resolution_to_seconds(tf)))
-        age_sec = time.time() - float(bs)
-        stale_sec = max(15 * 60, 5 * tf_sec)
-        if age_sec > stale_sec:
-            logger.debug(
-                "Skip %s: stale bar wall_age=%.0fs > %s (bucket=%s)",
-                symbol,
-                age_sec,
-                stale_sec,
-                bs,
-            )
-            return True
-
-        return False
-
-    def _should_log_closed_candle(
-        self, symbol: str, tf: Optional[str], candle: Dict[str, Any]
-    ) -> bool:
-        """
-        Log one candle per (symbol, timeframe, bucket).
-        Prevents writing the same closed candle every engine loop cycle.
-        """
-        bucket = self._candle_bucket_start_unix(candle)
-        if bucket is None:
-            return False
-        tf_key = str(tf or "NA")
-        key = f"{symbol}|{tf_key}"
-        prev = self._last_logged_candle_bucket.get(key)
-        if prev == bucket:
-            return False
-        self._last_logged_candle_bucket[key] = bucket
-        return True
 
     def build_context(self, candle, recent_candles=None):
         intent_store = getattr(self.order_router, "intent_store", None)
@@ -677,158 +593,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     "Dhan order WS: buffered unmapped fill OrderNo=%s (await intent/CorrelationId)",
                     order_no,
                 )
-
-    def _check_memory(self) -> None:
-        if self.memory_threshold_percent is None or self.memory_threshold_percent <= 0:
-            return
-        try:
-            proc = psutil.Process()
-            usage = proc.memory_percent()
-            # print(">>usage", usage)
-            if usage >= self.memory_threshold_percent:
-                self._entries_paused_memory = True
-                if self.engine_logger:
-                    self.engine_logger.memory_pressure_warning(
-                        f"Memory usage {usage:.1f}% >= {self.memory_threshold_percent}%",
-                        usage_percent=usage,
-                    )
-            else:
-                self._entries_paused_memory = False
-        except Exception as e:
-            logger.debug("Memory check failed: %s", e)
-
-    def check_feed_health(self) -> None:
-        """Warn if no tick/candle received for feed_stale_seconds; optionally pause entries."""
-        if not self._is_market_open_for_feed_health():
-            self._entries_paused_feed_stale = False
-            return
-        if not self.realtime_feed or not self.realtime_feed.is_connected():
-            return
-        now = time.time()
-        any_stale = False
-        for symbol in self.symbols:
-            last_tick = self._last_tick_timestamp.get(symbol, 0)
-            last_candle = self._last_candle_timestamp.get(symbol, 0)
-            stale = (now - max(last_tick, last_candle)) > self.feed_stale_seconds
-            if stale and (last_tick or last_candle):
-                any_stale = True
-                if self.engine_logger:
-                    self.engine_logger.feed_health_warning(
-                        f"No data for {symbol} in {self.feed_stale_seconds}s",
-                        symbol=symbol,
-                    )
-        self._entries_paused_feed_stale = any_stale
-
-    # working
-    def _do_exit_order_refresh(self) -> None:
-        """Every 1 min, re-quote open exit orders at near bid/ask until they fill."""
-        now = time.time()
-        if now - self._last_exit_refresh_time < self._exit_refresh_interval_seconds:
-            return
-        self._last_exit_refresh_time = now
-        self.order_router.refresh_stale_exit_orders(
-            get_bid_ask=self._get_bid_ask,
-            stale_seconds=float(self._exit_refresh_interval_seconds),
-        )
-
-    def _log_startup_balance_snapshot(self) -> None:
-        """
-        One-time startup balance check/log for observability before live loop.
-        """
-        broker = getattr(self.order_router, "broker", None)
-        if not broker or not hasattr(broker, "get_balance_snapshot"):
-            return
-        try:
-            snapshot = broker.get_balance_snapshot()
-        except Exception as e:
-            if self.engine_logger:
-                self.engine_logger.log("risk_block", f"Startup balance check failed: {e}")
-            else:
-                logger.warning("Startup balance check failed: %s", e)
-            return
-        if not snapshot:
-            return
-        sel = snapshot.get("selected_available")
-        usd = snapshot.get("usd_available")
-        inr = snapshot.get("inr_available")
-        parts = [f"selected={sel}"]
-        if usd is not None:
-            parts.append(f"usd={usd}")
-        parts.append(f"inr={inr}")
-        msg = "Startup balance snapshot: " + " ".join(parts)
-        if self.engine_logger:
-            self.engine_logger.log("oms", msg)
-        else:
-            logger.info(msg)
-        self._telegram_plain(f"ℹ️ {msg}")
-
-    # this not getting logged properly
-    def _export_eod(self, date_str: str) -> None:
-        """Export open positions, realized pnl to reports/{engine_id}_{date}.csv."""
-        reports_dir = REPORTS_DIR
-        os.makedirs(reports_dir, exist_ok=True)
-        path = os.path.join(reports_dir, f"{self.engine_id}_{date_str}.csv")
-        rows = []
-        for sym, pos in self.position_manager.positions.items():
-            if pos.net_qty == 0:
-                continue
-            rows.append(
-                {
-                    "symbol": sym,
-                    "qty": pos.net_qty,
-                    "avg_price": pos.avg_price,
-                    "realized_pnl": pos.realized_pnl,
-                    "unrealized_pnl": "",
-                }
-            )
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(
-                f,
-                fieldnames=[
-                    "symbol",
-                    "qty",
-                    "avg_price",
-                    "realized_pnl",
-                    "unrealized_pnl",
-                ],
-            )
-            w.writeheader()
-            w.writerows(rows)
-        if self.engine_logger:
-            self.engine_logger.eod_export(path)
-
-    def _drain_tick_queue(self) -> None:
-        """Drain tick queue into candle_aggregator (single state owner). Non-blocking; cap per cycle."""
-        if not self.tick_queue or not self.candle_aggregator:
-            return
-        if not hasattr(self, "_tick_debug_count"):
-            self._tick_debug_count = 0
-            self._tick_debug_last_log = time.time()
-        for _ in range(self._max_ticks_per_cycle):
-            try:
-                tick = self.tick_queue.get_nowait()
-            except Exception:
-                break
-            try:
-                s = tick.get("symbol")
-                p = tick.get("price")
-                v = tick.get("volume", 0)
-                ts = tick.get("timestamp")
-                if s is not None and p is not None and ts is not None:
-                    self.candle_aggregator.on_tick(s, p, v, ts)
-                    self._last_tick_timestamp[s] = time.time()
-                    self._tick_debug_count += 1
-                    now = time.time()
-                    if now - self._tick_debug_last_log >= 600:
-                        msg = f"Tick health: {self._tick_debug_count} ticks in last 5s"
-                        if self.engine_logger:
-                            self.engine_logger.log("tick_health", msg)
-                        else:
-                            logger.info(msg)
-                        self._tick_debug_count = 0
-                        self._tick_debug_last_log = now
-            except Exception as e:
-                logger.debug("Invalid tick or aggregator error: %s", e)
 
     def start(self, exchange, sector, rsi):
         if self.engine_logger:
