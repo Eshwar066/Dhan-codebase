@@ -134,6 +134,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self._shutdown_signal: Optional[int] = None
         # Candle aggregator: last evaluated closed-candle timestamp per symbol (avoid re-eval same bar)
         self._last_evaluated_candle_ts: Dict[str, Any] = {}
+        # Per symbol+timeframe last logged closed bucket (avoid candle log spam in fast loop)
+        self._last_logged_candle_bucket: Dict[str, int] = {}
         self._max_ticks_per_cycle = 10000
         self._ws_trade_event_bound = False
         self.dhan_order_update_feed = dhan_order_update_feed
@@ -216,6 +218,24 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             return True
 
         return False
+
+    def _should_log_closed_candle(
+        self, symbol: str, tf: Optional[str], candle: Dict[str, Any]
+    ) -> bool:
+        """
+        Log one candle per (symbol, timeframe, bucket).
+        Prevents writing the same closed candle every engine loop cycle.
+        """
+        bucket = self._candle_bucket_start_unix(candle)
+        if bucket is None:
+            return False
+        tf_key = str(tf or "NA")
+        key = f"{symbol}|{tf_key}"
+        prev = self._last_logged_candle_bucket.get(key)
+        if prev == bucket:
+            return False
+        self._last_logged_candle_bucket[key] = bucket
+        return True
 
     def build_context(self, candle, recent_candles=None):
         intent_store = getattr(self.order_router, "intent_store", None)
@@ -958,7 +978,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     #     print(">>candle is None")
                     #     continue
                     if candle is None:
-                        print(">>candle is None")
+                        # print(">>candle is None")
                         continue
                     if isinstance(candle.get("timestamp"), (int, float)):
                         ts = candle["timestamp"]
@@ -968,8 +988,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             candle["timestamp"] = dt.datetime.utcfromtimestamp(ts)
                     candle["symbol"] = symbol
                     candle["exchange"] = exchange
-                    if self.engine_logger:
-                        self.engine_logger.candle_created(candle, timeframe=tf)
 
                     if not self._validate_candle_integrity(candle, symbol):
                         continue
@@ -996,6 +1014,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                                 self._max_candle_bucket_unix.get(symbol, 0),
                                 bs_ok,
                             )
+                    if self.engine_logger and self._should_log_closed_candle(
+                        symbol, tf, candle
+                    ):
+                        self.engine_logger.candle_created(candle, timeframe=tf)
 
                     if not self.strategy.should_evaluate(candle):
                         continue
