@@ -860,20 +860,34 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             )
                         continue
 
+                    eval_bucket = self._candle_bucket_start_unix(candle)
+                    eval_key = candle.get("bucket_ts")
+                    if eval_key is None:
+                        eval_key = eval_bucket
+                    if (
+                        eval_key is not None
+                        and eval_key == self._last_evaluated_candle_ts.get(symbol)
+                    ):
+                        logger.debug(
+                            "Skip %s: already evaluated candle key=%s",
+                            symbol,
+                            eval_key,
+                        )
+                        continue
+
                     if use_aggregator:
                         # check the time of the entry candle at mkt time
                         if self._live_bar_is_stale_or_replay(symbol, candle, tf):
                             continue
-                        bt_ok = candle.get("bucket_ts")
-                        if bt_ok is not None:
-                            self._last_evaluated_candle_ts[symbol] = bt_ok
+                        if candle.get("bucket_ts") is not None:
                             self._has_seen_aggregator_bucket[symbol] = True
-                        bs_ok = self._candle_bucket_start_unix(candle)
-                        if bs_ok is not None:
+                        if eval_bucket is not None:
                             self._max_candle_bucket_unix[symbol] = max(
                                 self._max_candle_bucket_unix.get(symbol, 0),
-                                bs_ok,
+                                eval_bucket,
                             )
+                    if eval_key is not None:
+                        self._last_evaluated_candle_ts[symbol] = eval_key
                     if self.engine_logger and self._should_log_closed_candle(
                         symbol, tf, candle
                     ):

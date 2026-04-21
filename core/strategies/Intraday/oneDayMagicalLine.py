@@ -478,108 +478,121 @@ class OneDayMagicalLine(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         self, symbol: str, trade_dt: date, spot_close: float, ctx: Any
     ) -> bool:
         """
-        For fresh 18:30 MAIN entries on a new day, require spot to move at least
-        +/-3% from the previous day's stored magical line for that symbol.
+        MAIN-entry 3% gate based on currently open MAIN positions at signal time.
+
+        Rules:
+        - No open MAIN ML levels -> allow (first entry).
+        - Exactly one open MAIN ML level -> require spot outside that ML +/- 3%.
+        - Two or more open MAIN ML levels -> block entries while spot is between
+          the min/max open ML levels; allow only at/outside those outer levels.
         """
         pct = NEXT_DAY_ML_GAP_PCT
-        prev_ml_store = self._reference_ml_from_position_store(symbol=symbol, ctx=ctx)
-        prev = self._last_daily_ml_by_symbol.get(symbol)
-        prev_ml = prev_ml_store
+        open_positions = ctx.position_store.get_open_positions(
+            underlying=symbol, strategy=self.name
+        )
+        open_main_positions = [
+            p
+            for p in open_positions
+            if getattr(p, "tag", None) == "MAIN" and getattr(p, "net_qty", 0) != 0
+        ]
 
-        if prev is None and prev_ml is None:
+        open_ml_levels: List[float] = []
+        for p in open_main_positions:
+            self._restore_odml_meta_from_position(p, ctx.position_store)
+            sid = str(getattr(p, "structure_id", "") or "")
+            meta = self._meta_by_structure_id.get(sid) if sid else None
+            if meta and float(meta.magical_line) > 0:
+                open_ml_levels.append(float(meta.magical_line))
+        open_ml_levels = sorted(set(open_ml_levels))
+
+        if not open_ml_levels:
             self._log_main_entry_ml_gap(
                 outcome="NOT_EVALUATED",
                 applied=False,
-                rule=f"spot must be outside prior ML ±{pct:.2%}",
-                reason="no prior ML: _last_daily_ml_by_symbol empty and position_store has no ML for this underlying",
+                rule="open-main ML gate (3%)",
+                reason="no open MAIN magical-line levels; first entry allowed",
                 symbol=symbol,
                 trade_dt=trade_dt,
                 spot_close=spot_close,
             )
             return True
 
-        if prev is not None:
-            prev_dt, prev_ml_mem = prev
-            if trade_dt <= prev_dt:
+        if len(open_ml_levels) == 1:
+            ref_ml = float(open_ml_levels[0])
+            lo = ref_ml * (1.0 - pct)
+            hi = ref_ml * (1.0 + pct)
+            passes = spot_close <= lo or spot_close >= hi
+            if passes:
                 self._log_main_entry_ml_gap(
-                    outcome="NOT_EVALUATED",
-                    applied=False,
-                    rule=f"spot must be outside prior ML ±{pct:.2%}",
-                    reason="calendar day <= last_daily_ml_date (intra-day repeat; ±3% gate is for a later day vs that date)",
+                    outcome="PASS",
+                    applied=True,
+                    rule=f"spot outside single open ML ±{pct:.2%}",
                     symbol=symbol,
                     trade_dt=trade_dt,
-                    last_ml_date=prev_dt,
-                    last_ml_value=prev_ml_mem,
                     spot_close=spot_close,
+                    ref_ml=ref_ml,
+                    band_low=lo,
+                    band_high=hi,
                 )
-                return True
-            if prev_ml is None:
-                prev_ml = prev_ml_mem
+            else:
+                self._log_main_entry_ml_gap(
+                    outcome="FAIL",
+                    applied=True,
+                    rule=f"spot inside single open ML ±{pct:.2%}",
+                    symbol=symbol,
+                    trade_dt=trade_dt,
+                    spot_close=spot_close,
+                    ref_ml=ref_ml,
+                    band_low=lo,
+                    band_high=hi,
+                )
+                self._log_skip(
+                    stage="entry_ml_gap",
+                    reason="spot close within +/-3% band of open MAIN magical line",
+                    symbol=symbol,
+                    trade_dt=trade_dt,
+                    spot_close=spot_close,
+                    ref_ml=ref_ml,
+                    lower_band=lo,
+                    upper_band=hi,
+                )
+            return passes
 
-        if prev_ml is None or prev_ml <= 0:
-            self._log_main_entry_ml_gap(
-                outcome="FAIL",
-                applied=True,
-                rule=f"spot must be outside prior ML ±{pct:.2%}",
-                reason="previous magical line missing or non-positive after resolve",
-                symbol=symbol,
-                trade_dt=trade_dt,
-                prev_ml_effective=prev_ml,
-                spot_close=spot_close,
-            )
-            self._log_skip(
-                stage="entry_ml_gap",
-                reason="previous magical line is non-positive",
-                symbol=symbol,
-                trade_dt=trade_dt,
-                prev_ml=prev_ml,
-                spot_close=spot_close,
-            )
-            return False
-
-        lo = prev_ml * (1.0 - NEXT_DAY_ML_GAP_PCT)
-        hi = prev_ml * (1.0 + NEXT_DAY_ML_GAP_PCT)
-        passes = spot_close <= lo or spot_close >= hi
-        prev_source = (
-            "position_store"
-            if prev_ml_store is not None
-            else "last_daily_ml_memory"
-        )
+        lo_ml = float(open_ml_levels[0])
+        hi_ml = float(open_ml_levels[-1])
+        passes = spot_close <= lo_ml or spot_close >= hi_ml
         if passes:
             self._log_main_entry_ml_gap(
                 outcome="PASS",
                 applied=True,
-                rule=f"spot outside prior ML ±{pct:.2%}",
+                rule="spot at/outside outer open MAIN ML levels",
                 symbol=symbol,
                 trade_dt=trade_dt,
-                prev_ml=prev_ml,
-                prev_ml_source=prev_source,
                 spot_close=spot_close,
-                band_low=lo,
-                band_high=hi,
+                open_ml_min=lo_ml,
+                open_ml_max=hi_ml,
+                open_ml_levels=open_ml_levels,
             )
         else:
             self._log_main_entry_ml_gap(
                 outcome="FAIL",
                 applied=True,
-                rule=f"spot inside prior ML ±{pct:.2%} band (no entry)",
+                rule="spot between outer open MAIN ML levels (no entry)",
                 symbol=symbol,
                 trade_dt=trade_dt,
-                prev_ml=prev_ml,
-                prev_ml_source=prev_source,
                 spot_close=spot_close,
-                band_low=lo,
-                band_high=hi,
+                open_ml_min=lo_ml,
+                open_ml_max=hi_ml,
+                open_ml_levels=open_ml_levels,
             )
             self._log_skip(
                 stage="entry_ml_gap",
-                reason="spot close within previous ML +/- gap band",
+                reason="spot is between existing open MAIN magical-line levels",
                 symbol=symbol,
                 trade_dt=trade_dt,
-                prev_ml=prev_ml,
                 spot_close=spot_close,
-                lower_band=lo,
-                upper_band=hi,
+                open_ml_min=lo_ml,
+                open_ml_max=hi_ml,
             )
         return passes
 
