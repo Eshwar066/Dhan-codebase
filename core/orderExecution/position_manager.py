@@ -386,16 +386,29 @@ class PositionManager:
                     )
                     # Entry side: long position was entered with BUY, short with SELL
                     entry_side = "BUY" if prev_qty > 0 else "SELL"
+                    entry_price_for_log = pos.entry_price
+                    collected_points = ""
+                    if entry_price_for_log is not None:
+                        try:
+                            collected_points = float(entry_price_for_log) - float(price)
+                        except (TypeError, ValueError):
+                            collected_points = ""
+                    else:
+                        logger.warning(
+                            "Missing entry_price on exit fill; collected_points left blank for %s",
+                            sym,
+                        )
+
                     trade_row = {
                         "trade_id": pos.trade_id,
                         "entry_time": entry_time_str,
                         "exit_time": exit_time_str,
                         "side": entry_side,
-                        "entry_price": pos.entry_price,
+                        "entry_price": entry_price_for_log if entry_price_for_log is not None else "",
                         "exit_price": price,
                         "qty": qty,
                         "pnl": pos.realized_pnl,
-                        "collected_points": (pos.entry_price - price),
+                        "collected_points": collected_points,
                         "symbol": sym,
                         "strategy": strategy or "GLOBAL",
                         "exit_reason": getattr(pos, "exit_reason", None) or "",
