@@ -8,9 +8,14 @@ Timestamps are in India/Bangalore (IST, UTC+5:30).
 import json
 import os
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
+
+try:
+    from core.data.candle_aggregator import _resolution_to_seconds
+except ImportError:
+    _resolution_to_seconds = None  # type: ignore
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -76,6 +81,43 @@ class EngineLogger:
             with open(self._path, "a", encoding="utf-8") as f:
                 f.write(line)
 
+    @staticmethod
+    def _bar_timestamp_to_ist_iso(ts: Any) -> Optional[str]:
+        """
+        Same bar instant as ``bar_timestamp``, expressed in Asia/Kolkata (IST) for logs.
+        Naive datetimes are interpreted as UTC (same convention as LiveEngine candle timestamps).
+        """
+        if ts is None:
+            return None
+        try:
+            if isinstance(ts, datetime):
+                dt_ = ts
+                if dt_.tzinfo is None:
+                    dt_ = dt_.replace(tzinfo=timezone.utc)
+                return dt_.astimezone(IST).isoformat()
+            if isinstance(ts, (int, float)):
+                sec = float(ts)
+                if sec >= 1e15:
+                    sec /= 1e6
+                elif sec >= 1e12:
+                    sec /= 1000.0
+                return (
+                    datetime.fromtimestamp(sec, tz=timezone.utc)
+                    .astimezone(IST)
+                    .isoformat()
+                )
+            s = str(ts).strip()
+            if not s:
+                return None
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            parsed = datetime.fromisoformat(s)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(IST).isoformat()
+        except Exception:
+            return None
+
     def candle_created(
         self,
         candle: Dict[str, Any],
@@ -88,11 +130,19 @@ class EngineLogger:
             ts_out = ts.isoformat()
         else:
             ts_out = ts
+        bar_ts_ist = self._bar_timestamp_to_ist_iso(ts)
+        tf_sec = None
+        if _resolution_to_seconds is not None and timeframe is not None:
+            try:
+                tf_sec = int(_resolution_to_seconds(str(timeframe)))
+            except Exception:
+                tf_sec = None
         payload = self._payload(
             "candle_created",
             message="Closed candle",
             symbol=candle.get("symbol"),
             timeframe=timeframe,
+            tf_sec=tf_sec,
             source=source,
             open=candle.get("open"),
             high=candle.get("high"),
@@ -101,6 +151,7 @@ class EngineLogger:
             volume=candle.get("volume"),
             bucket_ts=candle.get("bucket_ts"),
             bar_timestamp=ts_out,
+            bar_timestamp_ist=bar_ts_ist,
             exchange=candle.get("exchange"),
         )
         line = json.dumps(payload, default=str) + "\n"
@@ -144,8 +195,9 @@ class EngineLogger:
     def feed_health_recovered(self, message: str, symbol: Optional[str] = None) -> None:
         self.log("feed_health_recovered", message=message, symbol=symbol)
 
-    def closed_candle_skip(self, symbol: str, reason: str) -> None:
-        self.log("closed_candle_skip", message=reason, symbol=symbol)
+    def closed_candle_skip(self, symbol: str, reason: str, **extra: Any) -> None:
+        """Log skip reason; pass ``diagnostics=`` or other fields for feed/timestamp debugging."""
+        self.log("closed_candle_skip", message=reason, symbol=symbol, **extra)
 
     def eod_export(self, path: str, message: str = "EOD export written") -> None:
         self.log("eod_export", message=message, export_path=path)

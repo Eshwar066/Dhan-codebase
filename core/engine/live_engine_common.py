@@ -3,11 +3,13 @@ Shared helpers and mixin for LiveEngine: pricing, depth, validation, candle chec
 Import LiveEngineHelpersMixin and use as: class LiveEngine(LiveEngineHelpersMixin, BaseEngine).
 """
 
+import calendar
 import csv
 import datetime as dt
 import logging
 import os
 import time
+from datetime import timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import psutil
@@ -262,47 +264,210 @@ class LiveEngineHelpersMixin:
             return False
         return True
 
+    @staticmethod
+    def _numeric_ts_to_utc_seconds(ts: float) -> float:
+        """
+        Normalize broker timestamps: unix seconds (~1e9), millis (~1e12), or micros (~1e15+).
+        """
+        t = float(ts)
+        if t >= 1e15:
+            return t / 1e6  # microseconds → seconds
+        if t >= 1e12:
+            return t / 1000.0  # milliseconds → seconds (common for WS / REST)
+        return t
+
+    @staticmethod
+    def _coerce_scalar_to_float(raw: Any) -> Optional[float]:
+        """Best-effort: Python int/float/numpy scalars → float; else None."""
+        if raw is None:
+            return None
+        if isinstance(raw, bool):
+            return None
+        if isinstance(raw, (int, float)):
+            return float(raw)
+        try:
+            if hasattr(raw, "item") and callable(raw.item):
+                return float(raw.item())
+        except Exception:
+            pass
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _dhan_repair_naive_as_ist_wallclock(self, naive: dt.datetime) -> dt.datetime:
+        """
+        Dhan WS ``last_trade_time`` / naive datetimes are often **IST wall components** but flow
+        through code paths that compare against ``utcnow()`` as if they were UTC — producing a
+        ~+19800s false \"forming\" bar. If naive is ~4.25–7.25h **ahead** of UTC now, interpret
+        components as Asia/Kolkata and convert to naive UTC.
+        """
+        if str(getattr(self, "venue", "") or "").upper() != "DHAN":
+            return naive
+        nowu = dt.datetime.utcnow()
+        dsec = (naive - nowu).total_seconds()
+        if 4.25 * 3600 <= dsec <= 7.25 * 3600:
+            try:
+                from zoneinfo import ZoneInfo
+
+                ist = ZoneInfo("Asia/Kolkata")
+                return naive.replace(tzinfo=ist).astimezone(timezone.utc).replace(tzinfo=None)
+            except Exception:
+                return naive - dt.timedelta(seconds=19800)
+        return naive
+
+    def _candle_timestamp_to_utc_naive(self, ts: Any) -> Optional[dt.datetime]:
+        """Parse any candle timestamp to naive UTC datetime for consistent comparisons."""
+        if ts is None:
+            return None
+        num = LiveEngineHelpersMixin._coerce_scalar_to_float(ts)
+        if num is not None:
+            sec = self._numeric_ts_to_utc_seconds(num)
+            naive = dt.datetime.fromtimestamp(sec, tz=dt.timezone.utc).replace(tzinfo=None)
+            return self._dhan_repair_naive_as_ist_wallclock(naive)
+        if isinstance(ts, dt.datetime):
+            if ts.tzinfo is not None:
+                return ts.astimezone(timezone.utc).replace(tzinfo=None)
+            return self._dhan_repair_naive_as_ist_wallclock(ts)
+        s = str(ts).strip()
+        try:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            parsed = dt.datetime.fromisoformat(s)
+        except ValueError:
+            return None
+        if parsed.tzinfo is not None:
+            return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return self._dhan_repair_naive_as_ist_wallclock(parsed)
+
+    def _normalize_candle_timestamp_utc_naive(self, candle: Dict[str, Any]) -> None:
+        """Rewrite candle['timestamp'] to normalized naive UTC (DHAN IST fix included)."""
+        raw = candle.get("timestamp")
+        out = self._candle_timestamp_to_utc_naive(raw)
+        if out is not None:
+            candle["timestamp"] = out
+
+    def _now_utc_naive(self, now: Optional[dt.datetime]) -> dt.datetime:
+        """Wall-clock 'now' as naive UTC (same basis as utcfromtimestamp outputs)."""
+        if now is None:
+            return dt.datetime.utcnow()
+        if now.tzinfo is not None:
+            return now.astimezone(timezone.utc).replace(tzinfo=None)
+        return now
+
     def _is_closed_candle(
         self, candle: Dict, timeframe: str, now: Optional[dt.datetime] = None
     ) -> bool:
         """
         True if candle timestamp is on timeframe boundary and not in the future.
-        Reject forming candles (timestamp > expected close time).
+
+        - **Aggregator path**: ``bucket_ts`` is an integer unix *start* aligned to TF seconds;
+          if present and divisible by the strategy TF (same seconds as ``CandleAggregator``),
+          treat as aligned (canonical closed bar).
+        - **Alignment**: unix second offset modulo ``tf_sec`` where ``tf_sec`` comes from
+          ``_resolution_to_seconds`` (same map as ``TIMEFRAME_SECONDS`` / aggregator). This
+          matches ``"15"``, ``"15m"``, ``"60"``, ``"1h"``, etc., unlike naive ``int(tf)``.
         """
-        ts = candle.get("timestamp")
-        if ts is None:
+        ts_raw = candle.get("timestamp")
+        ts_utc = self._candle_timestamp_to_utc_naive(ts_raw)
+        if ts_utc is None:
             return False
-        if isinstance(ts, (int, float)):
-            if ts > 1e12:
-                ts_dt = dt.datetime.utcfromtimestamp(ts / 1e6)
-            else:
-                ts_dt = dt.datetime.utcfromtimestamp(ts)
+        now_utc = self._now_utc_naive(now)
+        if ts_utc > now_utc:
+            return False
+
+        tf_sec = int(_resolution_to_seconds(timeframe))
+        if tf_sec <= 0:
+            tf_sec = 60
+
+        bt = candle.get("bucket_ts")
+        if bt is not None:
+            try:
+                b = int(float(bt))
+                # CandleAggregator buckets are unix seconds floored to TF; trust when consistent.
+                if b % tf_sec == 0:
+                    return True
+            except (TypeError, ValueError):
+                pass
+
+        epoch = dt.datetime(1970, 1, 1)
+        unix_s = int((ts_utc - epoch).total_seconds())
+        return (unix_s % tf_sec) == 0
+
+    def _closed_candle_diagnostics(
+        self,
+        candle: Dict,
+        timeframe: str,
+        now: Optional[dt.datetime],
+        *,
+        use_aggregator: bool,
+        candle_source: str,
+    ) -> Dict[str, Any]:
+        """
+        Structured fields for logs when ``_is_closed_candle`` fails (feed snapshot + math).
+        """
+        ts_raw = candle.get("timestamp")
+        ts_utc = self._candle_timestamp_to_utc_naive(ts_raw)
+        tf_sec = int(_resolution_to_seconds(timeframe))
+        if tf_sec <= 0:
+            tf_sec = 60
+        out: Dict[str, Any] = {
+            "use_aggregator": use_aggregator,
+            "candle_source": candle_source,
+            "timeframe": str(timeframe),
+            "tf_sec": tf_sec,
+            "ts_raw": repr(ts_raw)[:300],
+            "bucket_ts": candle.get("bucket_ts"),
+            "ohlc": {
+                "o": candle.get("open"),
+                "h": candle.get("high"),
+                "l": candle.get("low"),
+                "c": candle.get("close"),
+                "v": candle.get("volume"),
+            },
+        }
+        if ts_utc is None:
+            out["skip_reason"] = "missing_ts"
+            return out
+        now_utc = self._now_utc_naive(now)
+        out["ts_utc_naive"] = ts_utc.isoformat()
+        out["now_utc_naive"] = now_utc.isoformat()
+        out["forming"] = bool(ts_utc > now_utc)
+        try:
+            out["delta_ts_minus_now_sec"] = (ts_utc - now_utc).total_seconds()
+        except Exception:
+            pass
+        bt = candle.get("bucket_ts")
+        if bt is not None:
+            try:
+                b = int(float(bt))
+                out["bucket_mod_tf"] = b % tf_sec
+            except (TypeError, ValueError):
+                out["bucket_mod_tf"] = None
+        epoch = dt.datetime(1970, 1, 1)
+        unix_s = int((ts_utc - epoch).total_seconds())
+        out["unix_s_mod_tf"] = unix_s % tf_sec
+        if ts_utc > now_utc:
+            out["skip_reason"] = "forming"
+        elif bt is not None:
+            try:
+                b = int(float(bt))
+                if b % tf_sec == 0:
+                    out["skip_reason"] = "unexpected_should_pass"
+                else:
+                    out["skip_reason"] = "bucket_not_on_tf_grid"
+            except (TypeError, ValueError):
+                out["skip_reason"] = "misaligned"
         else:
-            ts_dt = (
-                ts
-                if isinstance(ts, dt.datetime)
-                else dt.datetime.fromisoformat(str(ts))
+            out["skip_reason"] = (
+                "misaligned" if (unix_s % tf_sec) != 0 else "unexpected_should_pass"
             )
-        now = now or dt.datetime.utcnow()
-        if ts_dt.tzinfo:
-            now = now.replace(tzinfo=ts_dt.tzinfo) if not now.tzinfo else now
-        if ts_dt > now:
-            return False
-        tf_min = self._tf_to_minutes(timeframe)
-        if tf_min <= 0:
-            return True
-        epoch = dt.datetime(1970, 1, 1, tzinfo=ts_dt.tzinfo if ts_dt.tzinfo else None)
-        mins = int((ts_dt - epoch).total_seconds() / 60)
-        return (mins % tf_min) == 0
+        return out
 
     def _tf_to_minutes(self, tf: str) -> int:
-        tf = str(tf).lower()
-        if tf.endswith("h"):
-            return int(tf[:-1]) * 60
-        try:
-            return int(tf)
-        except ValueError:
-            return 60
+        """Minutes per bar; consistent with ``CandleAggregator`` / ``_resolution_to_seconds``."""
+        sec = int(_resolution_to_seconds(tf))
+        return max(1, sec // 60)
 
     def _within_trading_hours(self) -> bool:
         if not self.allowed_trading_hours:
@@ -361,12 +526,18 @@ class LiveEngineHelpersMixin:
                 pass
         ts = candle.get("timestamp")
         if isinstance(ts, dt.datetime):
-            return int(ts.timestamp())
+            u = ts
+            if u.tzinfo is not None:
+                u = u.astimezone(timezone.utc).replace(tzinfo=None)
+            # Naive components are treated as UTC wall (same basis as utcfromtimestamp).
+            return int(calendar.timegm(u.timetuple()))
         if isinstance(ts, (int, float)):
-            t = float(ts)
-            if t > 1e12:
-                return int(t / 1e6)
-            return int(t)
+            sec = LiveEngineHelpersMixin._numeric_ts_to_utc_seconds(float(ts))
+            return int(sec)
+        num = LiveEngineHelpersMixin._coerce_scalar_to_float(ts)
+        if num is not None:
+            sec = LiveEngineHelpersMixin._numeric_ts_to_utc_seconds(num)
+            return int(sec)
         return None
 
     def _live_bar_is_stale_or_replay(
@@ -432,6 +603,27 @@ class LiveEngineHelpersMixin:
         if prev == bucket:
             return False
         self._last_logged_candle_bucket[key] = bucket
+        return True
+
+    def _should_log_closed_candle_skip(
+        self, symbol: str, tf: Optional[str], candle: Dict[str, Any]
+    ) -> bool:
+        """
+        Rate-limit ``closed_candle_skip`` JSON logs. Without this, a non-aligned or forming
+        bar in a tight engine loop can emit hundreds of identical lines per second.
+        """
+        bucket = self._candle_bucket_start_unix(candle)
+        ts_fb = str(candle.get("timestamp"))
+        key = f"{symbol}|{tf or 'NA'}|{bucket if bucket is not None else ts_fb}"
+        now = time.time()
+        d = getattr(self, "_last_closed_candle_skip_ts", None)
+        if d is None:
+            d = {}
+            self._last_closed_candle_skip_ts = d
+        last = d.get(key, 0.0)
+        if now - last < 5.0:
+            return False
+        d[key] = now
         return True
 
     def _check_memory(self) -> None:

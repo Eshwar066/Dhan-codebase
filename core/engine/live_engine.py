@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 from run.config import RunMode
 from core.engine.base_engine import BaseEngine
+from core.data.candle_aggregator import _resolution_to_seconds
 from core.engine.live_engine_common import (
     DEFAULT_FEED_STALE_SECONDS,
     LiveEngineHelpersMixin,
@@ -572,6 +573,35 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             else:
                 del self._dhan_pending_fills[order_no]
 
+    def _dhan_closed_row_to_candle(
+        self, symbol: str, row: Any, exchange: str, tf: str
+    ) -> Dict[str, Any]:
+        """
+        Build a live-engine candle dict from ``CandleService.get_latest_closed`` row (pandas Series).
+        Floors timestamp to TF bucket start and sets ``bucket_ts`` so ``_is_closed_candle`` matches
+        ``CandleAggregator`` semantics.
+        """
+        import pandas as pd
+
+        ts = row["timestamp"]
+        ts_pd = pd.Timestamp(ts)
+        sec = int(ts_pd.timestamp())
+        tf_sec = int(_resolution_to_seconds(tf))
+        if tf_sec <= 0:
+            tf_sec = 60
+        bucket = sec - (sec % tf_sec)
+        return {
+            "symbol": symbol,
+            "open": float(row["open"]),
+            "high": float(row["high"]),
+            "low": float(row["low"]),
+            "close": float(row["close"]),
+            "volume": float(row.get("volume", 0)),
+            "timestamp": bucket,
+            "bucket_ts": bucket,
+            "exchange": exchange,
+        }
+
     def _on_dhan_ws_synthetic_trade(self, payload: Dict[str, Any]) -> None:
         order_no = str(payload.get("order_no") or "").strip()
         trade = self._normalize_dhan_ws_synthetic_trade(payload)
@@ -593,6 +623,37 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     "Dhan order WS: buffered unmapped fill OrderNo=%s (await intent/CorrelationId)",
                     order_no,
                 )
+
+    def _get_last_closed_from_aggregator(
+        self, symbol: str, tf: Any
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """
+        Resolve ``CandleAggregator`` state by symbol. Tick callbacks may register a different
+        key casing/alias than ``config.symbols`` (e.g. index name vs ``NIFTY``).
+        Returns (candle_or_none, source_tag for diagnostics).
+        """
+        ca = self.candle_aggregator
+        if ca is None:
+            return None, "no_aggregator"
+        candidates: List[str] = []
+        for c in (symbol, str(symbol).strip(), str(symbol).upper(), str(symbol).lower()):
+            if c and c not in candidates:
+                candidates.append(c)
+        for c in candidates:
+            out = ca.get_last_closed_candle(c, tf)
+            if out is not None:
+                return out, f"aggregator:{c}"
+        try:
+            keys = ca.symbols_with_data()
+        except Exception:
+            keys = []
+        su = str(symbol).upper().strip()
+        for k in keys:
+            if str(k).upper().strip() == su:
+                out = ca.get_last_closed_candle(k, tf)
+                if out is not None:
+                    return out, f"aggregator_alias:{k}"
+        return None, "aggregator:empty"
 
     def start(self, exchange, sector, rsi):
         if self.engine_logger:
@@ -686,8 +747,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
 
                 for symbol in self.symbols:
                     candle = None
+                    candle_source = "none"
                     if use_aggregator:
-                        candle = self.candle_aggregator.get_last_closed_candle(
+                        candle, candle_source = self._get_last_closed_from_aggregator(
                             symbol, tf
                         )
 
@@ -702,9 +764,30 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                                 candle.get("bucket_ts"),
                             )
                             continue
-                    if candle is None and use_feed and not use_aggregator:
+                    # DHAN: REST closed OHLC when aggregator is cold, empty, or symbol key mismatched.
+                    if (
+                        candle is None
+                        and use_feed
+                        and str(self.venue or "").upper() == "DHAN"
+                        and self.candle_service
+                        and tf
+                    ):
+                        try:
+                            row = self.candle_service.get_latest_closed(
+                                symbol, str(tf), exchange, sector, rsi
+                            )
+                        except Exception:
+                            row = None
+                        if row is not None:
+                            candle = self._dhan_closed_row_to_candle(
+                                symbol, row, exchange, str(tf)
+                            )
+                            candle_source = "rest"
+                    # Quote/ticker pseudo-candle (last_trade_time — usually not TF-aligned).
+                    if candle is None and use_feed and self.realtime_feed:
                         candle = self.realtime_feed.get_last_candle(symbol, tf)
                         if candle:
+                            candle_source = "quote_feed"
                             ts = candle.get("timestamp")
                             if isinstance(ts, (int, float)):
                                 self._last_candle_timestamp[symbol] = time.time()
@@ -744,12 +827,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     if candle is None:
                         # print(">>candle is None")
                         continue
-                    if isinstance(candle.get("timestamp"), (int, float)):
-                        ts = candle["timestamp"]
-                        if ts > 1e12:
-                            candle["timestamp"] = dt.datetime.utcfromtimestamp(ts / 1e6)
-                        else:
-                            candle["timestamp"] = dt.datetime.utcfromtimestamp(ts)
+                    self._normalize_candle_timestamp_utc_naive(candle)
                     candle["symbol"] = symbol
                     candle["exchange"] = exchange
 
@@ -758,9 +836,27 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
 
                     # This code checks if the candle is fully closed; if not, it logs a warning and skips strategy evaluation to avoid trading on incomplete market data.
                     if not self._is_closed_candle(candle, tf, now=_now):
-                        if self.engine_logger:
+                        if self.engine_logger and self._should_log_closed_candle_skip(
+                            symbol, tf, candle
+                        ):
+                            diag = self._closed_candle_diagnostics(
+                                candle,
+                                str(tf),
+                                _now,
+                                use_aggregator=bool(use_aggregator),
+                                candle_source=candle_source,
+                            )
+                            try:
+                                if self.candle_aggregator:
+                                    diag["aggregator_symbol_keys"] = (
+                                        self.candle_aggregator.symbols_with_data()
+                                    )
+                            except Exception:
+                                pass
                             self.engine_logger.closed_candle_skip(
-                                symbol, "Forming or misaligned candle; skip evaluation"
+                                symbol,
+                                "Forming or misaligned candle; skip evaluation",
+                                diagnostics=diag,
                             )
                         continue
 
