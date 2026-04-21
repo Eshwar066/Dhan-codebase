@@ -3,6 +3,8 @@
 # ----------------------------
 log_files/
 *.log
+# Runtime OMS snapshots (regenerated per engine; do not commit)
+logs/order_state_delta_*.json
 
 # ----------------------------
 # Python cache

@@ -1149,7 +1149,7 @@ class Tradehull:
             return 0
 
     def convert_to_date_time(self, epoch):
-        return self.Dhan.convert_to_date_time(self.Dhan, epoch)
+        return self.Dhan.convert_to_date_time(epoch)
 
     def get_start_date(self):
         try:
