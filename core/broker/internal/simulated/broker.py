@@ -24,9 +24,9 @@ class SimulatedBroker(BaseBroker):
 
     @staticmethod
     def _sl_orders_log_path(strategy: str) -> str:
-        base = Path(__file__).resolve().parents[4] / "logs"
-        base.mkdir(parents=True, exist_ok=True)
         safe = (strategy or "GLOBAL").replace("/", "_").replace(" ", "_")
+        base = Path(__file__).resolve().parents[4] / "logs" / safe
+        base.mkdir(parents=True, exist_ok=True)
         return str(base / f"{safe}_sl_orders.csv")
 
     def _append_sl_order_event(self, strategy: str, row: Dict[str, Any]) -> None:

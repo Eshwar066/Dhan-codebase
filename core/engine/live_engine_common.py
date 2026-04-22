@@ -20,7 +20,7 @@ DEFAULT_FEED_STALE_SECONDS = 60
 logger = logging.getLogger(__name__)
 
 try:
-    from logs.engine_logger import REPORTS_DIR
+    from logger.engine_logger import REPORTS_DIR
 except ImportError:
     REPORTS_DIR = "reports"
 

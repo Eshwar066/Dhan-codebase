@@ -91,7 +91,10 @@ class OrderRouter:
         # EXTERNAL_CLOSE: additive confidence (see _external_close_confidence_score)
         self._orphan_close_score_threshold = 6
         self._orphan_close_suspect_floor = 5
-        _logs_dir = Path(__file__).resolve().parents[2] / "logs"
+        _strategy_dir = (
+            str(self.strategy_id or "GLOBAL").replace(" ", "_").replace("/", "_")
+        )
+        _logs_dir = Path(__file__).resolve().parents[2] / "logs" / _strategy_dir
         _logs_dir.mkdir(parents=True, exist_ok=True)
         _safe_id = (engine_id or "default").replace(" ", "_").replace("/", "_")
         self._order_state_file = _logs_dir / f"order_state_{_safe_id}.json"

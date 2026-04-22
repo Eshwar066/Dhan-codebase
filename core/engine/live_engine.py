@@ -26,7 +26,7 @@ from core.engine.live_engine_common import (
 )
 
 try:
-    from logs.engine_logger import REPORTS_DIR
+    from logger.engine_logger import REPORTS_DIR
 except ImportError:
     REPORTS_DIR = "reports"
 class LiveEngine(LiveEngineHelpersMixin, BaseEngine):

@@ -48,9 +48,9 @@ from core.orderExecution.position_manager import PositionManager
 from core.orderExecution.risk_manager import RiskManager, make_short_option_margin_check
 from core.utils.delta_env import get_delta_credentials
 from core.utils.instruments.instrument_store import InstrumentStore
-from logs.logger.trade_logger import TradeLogger
-from logs.logger.open_positions_logger import OpenPositionsLogger
-from logs.logger.engine_logger import EngineLogger
+from logger.trade_logger import TradeLogger
+from logger.open_positions_logger import OpenPositionsLogger
+from logger.engine_logger import EngineLogger
 
 try:
     from core.universe.equity_universe_service import EquityUniverseService
@@ -182,11 +182,15 @@ class EngineFactory:
         # ---------- OMS (isolated per engine) ----------
         logger = TradeLogger()
         _engine_id = config.engine_id or "live"
-        _open_positions_csv = os.path.join("logs", f"{_engine_id}_open_positions.csv")
+        _strategy_dir = str(config.strategy_name or "GLOBAL").replace("/", "_").replace("\\", "_").replace(" ", "_")
+        _open_positions_csv = os.path.join(
+            "logs", _strategy_dir, f"{_engine_id}_open_positions.csv"
+        )
         open_positions_logger = OpenPositionsLogger(
             engine_id=_engine_id,
             venue=config.broker_name or "",
             run_mode=config.run_mode,
+            strategy=config.strategy_name,
         )
         position_manager = PositionManager(
             logger=logger,

@@ -125,15 +125,20 @@ class OpenPositionsLogger:
         engine_id: str,
         venue: str,
         run_mode: Any,
+        strategy: Optional[str] = None,
         log_dir: str = "logs",
     ):
         self.engine_id = engine_id or "engine"
         self.venue = venue or ""
+        self.strategy = strategy or "GLOBAL"
         self.run_mode = run_mode
         self._run_mode_str = (
             getattr(run_mode, "value", None) or str(run_mode) or ""
         )
-        self._path = os.path.join(log_dir, f"{self.engine_id}_open_positions.csv")
+        safe_strategy = str(self.strategy).replace("/", "_").replace("\\", "_").replace(" ", "_")
+        strategy_dir = os.path.join(log_dir, safe_strategy)
+        os.makedirs(strategy_dir, exist_ok=True)
+        self._path = os.path.join(strategy_dir, f"{self.engine_id}_open_positions.csv")
         self._lock = threading.Lock()
         os.makedirs(log_dir, exist_ok=True)
         self._ensure_csv_schema()

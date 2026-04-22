@@ -23,6 +23,11 @@ LOGS_DIR = "logs"
 REPORTS_DIR = "reports"
 
 
+def _safe_dir_name(name: Optional[str]) -> str:
+    raw = str(name or "GLOBAL").strip() or "GLOBAL"
+    return raw.replace("/", "_").replace("\\", "_").replace(" ", "_")
+
+
 class EngineLogger:
     """
     Per-engine structured logger. Thread-safe. Writes JSON lines to logs/{engine_id}.log.
@@ -32,7 +37,8 @@ class EngineLogger:
         self.engine_id = engine_id
         self.venue = venue
         self.strategy = strategy
-        self._log_dir = (log_dir or LOGS_DIR)
+        self._strategy_dir = _safe_dir_name(strategy)
+        self._log_dir = os.path.join((log_dir or LOGS_DIR), self._strategy_dir)
         self._path = os.path.join(self._log_dir, f"{engine_id}.log")
         self._candles_path = os.path.join(self._log_dir, f"{engine_id}_candles.log")
         self._lock = threading.Lock()

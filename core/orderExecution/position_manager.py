@@ -6,7 +6,7 @@ from collections import defaultdict
 from typing import Any, Optional
 
 import pandas as pd
-from logs.logger.trade_logger import TradeLogger
+from logger.trade_logger import TradeLogger
 from datetime import datetime
 import uuid
 from core.utils.instruments.instrument_store import Instrument
@@ -691,7 +691,7 @@ class PositionManager:
         if not path or not os.path.isfile(path):
             return
         try:
-            from logs.logger.open_positions_logger import (
+            from logger.open_positions_logger import (
                 load_position_metadata_from_csv,
             )
         except ImportError:
@@ -760,7 +760,7 @@ class PositionManager:
             self.open_positions_csv_path
         ):
             try:
-                from logs.logger.open_positions_logger import (
+                from logger.open_positions_logger import (
                     load_position_metadata_from_csv,
                 )
 
