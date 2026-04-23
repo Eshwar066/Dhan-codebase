@@ -23,19 +23,49 @@ DEFAULT_LIBRARY_LOG_LEVEL = "WARNING"
 # Per-job run_mode: set "run_mode": "PAPER" or "run_mode": "LIVE" (or "BACKTEST") on each job.
 # If omitted, RUN_MODE above is used. You can run some strategies in paper and others in live in the same process.
 STRATEGY_JOBS = [
-    # leaps rsi 52 32 for dhan
+    # Primary DHAN engine (multi-strategy): LEAPS_RSI + NiftyIntradayMagicalLine
     {
         "name": "LEAPS_RSI",
         "venue": "DHAN",
-        "enabled": False,
-        # "run_mode": "PAPER",  # or "LIVE"; omit to use RUN_MODE default
+        "enabled": True,
+        "strategy_names": ["NiftyIntradayMagicalLine"],
+        "run_mode": "PAPER",  # or "LIVE"; omit to use RUN_MODE default
         "capital": 200000,
+        "ORDER_QTY_LOTS": 1,
         "symbols": ["NIFTY"],
+        "telegram": {
+            "bot_token": "8663481671:AAHY-OnE8OiaJmkOfXbwqoe4InosJVblAtM",
+            "chat_id": "1021479950",
+        },
         "live": {"exchange": "INDEX", "sector": "YES", "rsi": "YES"},
         "backtest": {
             "start_date": "2023-10-19",
             "end_date": "2026-02-20",
             "timeframe": "60",
+            "exchange": "INDEX",
+            "sector": "YES",
+        },
+    },
+     # Nifty intraday magical line: entry on 15m 9:15–9:30 (close 9:30); SL on 1h :15 closes (10:15…15:15); 15:15 square-off;
+    # monthly expiry (rollover after 15th), delta band + premium fallback. Dhan NIFTY OPTIDX — use exchange NSE (live + backtest).
+    {
+        "name": "NiftyIntradayMagicalLine",
+        "venue": "DHAN",
+        "enabled": False,  # included via LEAPS_RSI.strategy_names in the primary job above
+        "ORDER_QTY_LOTS": 1,
+        "run_mode": "PAPER",  # or "PAPER"; omit to use RUN_MODE default
+        "capital": 200000,
+        "symbols": ["NIFTY"],
+        "instrument": "OPTION",
+        "telegram": {
+            "bot_token": "8663481671:AAHY-OnE8OiaJmkOfXbwqoe4InosJVblAtM",
+            "chat_id": "1021479950",
+        },
+        "live": {"exchange": "INDEX", "sector": "YES"},
+        "backtest": {
+            "start_date": "2025-01-01",
+            "end_date": "2025-06-30",
+            "timeframe": "15",
             "exchange": "INDEX",
             "sector": "YES",
         },
@@ -51,30 +81,6 @@ STRATEGY_JOBS = [
             "start_date": "2026-01-01",
             "end_date": "2026-02-19",
             "timeframe": "DAY",
-            "exchange": "INDEX",
-            "sector": "YES",
-        },
-    },
-    # Nifty intraday magical line: entry on 15m 9:15–9:30 (close 9:30); SL on 1h :15 closes (10:15…15:15); 15:15 square-off;
-    # monthly expiry (rollover after 15th), delta band + premium fallback. Dhan NIFTY OPTIDX — use exchange NSE (live + backtest).
-    {
-        "name": "NiftyIntradayMagicalLine",
-        "venue": "DHAN",
-        "enabled": True,
-        "ORDER_QTY_LOTS": 1,
-        "run_mode": "PAPER",  # or "PAPER"; omit to use RUN_MODE default
-        "capital": 200000,
-        "symbols": ["NIFTY"],
-        "instrument": "OPTION",
-        "telegram": {
-            "bot_token": "8663481671:AAHY-OnE8OiaJmkOfXbwqoe4InosJVblAtM",
-            "chat_id": "1021479950",
-        },
-        "live": {"exchange": "INDEX", "sector": "YES"},
-        "backtest": {
-            "start_date": "2025-01-01",
-            "end_date": "2025-06-30",
-            "timeframe": "15",
             "exchange": "INDEX",
             "sector": "YES",
         },

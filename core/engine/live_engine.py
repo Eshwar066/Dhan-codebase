@@ -1192,6 +1192,13 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
     def start(self, exchange, sector, rsi):
         if self.engine_logger:
             self.engine_logger.engine_start("Live engine started")
+            for strategy_obj in self.strategies:
+                strategy_name = str(getattr(strategy_obj, "name", "unknown_strategy"))
+                self.engine_logger.log(
+                    "strategy_loaded",
+                    message=f"Strategy loaded: {strategy_name}",
+                    strategy=strategy_name,
+                )
         else:
             logger.info("Live engine started")
 
@@ -1406,6 +1413,17 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
 
                     self._enrich_candle_depth(symbol, candle)
                     for eval_result in self._evaluate_strategies_parallel(candle):
+                        eval_strategy = eval_result.get("strategy")
+                        eval_strategy_name = str(
+                            getattr(eval_strategy, "name", "unknown_strategy")
+                        )
+                        if self.engine_logger:
+                            self.engine_logger.log(
+                                "strategy_evaluated",
+                                message=f"Strategy evaluated: {eval_strategy_name}",
+                                strategy=eval_strategy_name,
+                                symbol=symbol,
+                            )
                         intent = eval_result["intent"]
                         if intent and self._entries_paused_feed_stale:
                             continue

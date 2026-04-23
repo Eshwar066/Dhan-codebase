@@ -47,6 +47,7 @@ def job_to_engine_config(job: dict) -> EngineConfig:
         broker_name=venue,
         run_mode=run_mode,
         strategy_name=job["name"],
+        strategy_names=job.get("strategy_names"),
         symbols=job["symbols"],
         enabled=job.get("enabled", True),
         engine_id=job.get("engine_id"),
@@ -87,6 +88,13 @@ def run_engine(config: EngineConfig) -> None:
         print(f"⚠️ {config.strategy_name} ({config.broker_name}) is disabled. Skipping.")
         return
 
+    loaded_strategies = [config.strategy_name] + list(config.strategy_names or [])
+    logger.info(
+        "Loaded strategies for %s (%s): %s",
+        config.engine_id or f"{config.broker_name.lower()}_{config.strategy_name.lower()}",
+        config.broker_name,
+        ", ".join(loaded_strategies),
+    )
     print(f"▶ Running {config.strategy_name} ({config.broker_name})...")
     engine = EngineFactory.create_engine(config)
 

@@ -26,6 +26,7 @@ STRATEGY_MAP = {
         "allowed_modes": [
             RunMode.BACKTEST,
             RunMode.LIVE,
+            RunMode.PAPER,
         ],
     },
     "MagicalLines": {

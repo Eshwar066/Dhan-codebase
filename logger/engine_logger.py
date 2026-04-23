@@ -37,8 +37,9 @@ class EngineLogger:
         self.engine_id = engine_id
         self.venue = venue
         self.strategy = strategy
+        self._base_log_root = log_dir or LOGS_DIR
         self._strategy_dir = _safe_dir_name(strategy)
-        self._log_dir = os.path.join((log_dir or LOGS_DIR), self._strategy_dir)
+        self._log_dir = os.path.join(self._base_log_root, self._strategy_dir)
         self._path = os.path.join(self._log_dir, f"{engine_id}.log")
         self._candles_path = os.path.join(self._log_dir, f"{engine_id}_candles.log")
         self._lock = threading.Lock()
@@ -48,6 +49,7 @@ class EngineLogger:
         self,
         event_type: str,
         message: str = "",
+        strategy: Optional[str] = None,
         symbol: Optional[str] = None,
         side: Optional[str] = None,
         qty: Optional[int] = None,
@@ -59,7 +61,7 @@ class EngineLogger:
         base = {
             "engine_id": self.engine_id,
             "venue": self.venue,
-            "strategy": self.strategy,
+            "strategy": strategy or self.strategy,
             "event_type": event_type,
             "timestamp": datetime.now(IST).isoformat(),
         }
@@ -87,6 +89,13 @@ class EngineLogger:
             os.makedirs(self._log_dir, exist_ok=True)
             with open(self._path, "a", encoding="utf-8") as f:
                 f.write(line)
+            payload_strategy = str(payload.get("strategy") or "").strip()
+            if payload_strategy and payload_strategy != self.strategy:
+                alt_dir = os.path.join(self._base_log_root, _safe_dir_name(payload_strategy))
+                os.makedirs(alt_dir, exist_ok=True)
+                alt_path = os.path.join(alt_dir, f"{self.engine_id}.log")
+                with open(alt_path, "a", encoding="utf-8") as f:
+                    f.write(line)
 
     @staticmethod
     def _bar_timestamp_to_ist_iso(ts: Any) -> Optional[str]:
