@@ -139,7 +139,7 @@ class EngineConfig:
     worker_watchdog_interval_seconds: float = 5.0
     max_active_account_symbol_keys: int = 200
     account_circuit_breaker_threshold: int = 5
-    feed_stall_seconds: float = 5.0
+    feed_stall_seconds: float = 60.0
 
     def __post_init__(self):
         if self.base_dir is None:

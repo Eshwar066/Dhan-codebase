@@ -429,7 +429,7 @@ class EngineFactory:
             account_circuit_breaker_threshold=getattr(
                 config, "account_circuit_breaker_threshold", 5
             ),
-            feed_stall_seconds=getattr(config, "feed_stall_seconds", 5.0),
+            feed_stall_seconds=getattr(config, "feed_stall_seconds", 60.0),
         )
 
     @staticmethod

@@ -82,7 +82,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         worker_watchdog_interval_seconds: float = 5.0,
         max_active_account_symbol_keys: int = 200,
         account_circuit_breaker_threshold: int = 5,
-        feed_stall_seconds: float = 5.0,
+        feed_stall_seconds: float = 60.0,
     ):
         super().__init__(
             strategy,
@@ -199,7 +199,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         )
         self._worker_restart_events: Dict[str, deque] = {}
         self._disabled_worker_ids: set[str] = set()
-        self._feed_stall_seconds = max(1.0, float(feed_stall_seconds or 5.0))
+        self._feed_stall_seconds = max(1.0, float(feed_stall_seconds or 60.0))
         self._intent_journal_path = os.path.join(
             "logs", f"{self.engine_id}_intent_pipeline.jsonl"
         )
