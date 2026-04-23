@@ -13,6 +13,12 @@ A production-grade, modular trading system that supports **India markets (Dhan)*
     python "Quarterly expired options data.py"
     streamlit run "option_chain_ui.py"
 
+    sudo systemctl daemon-reload
+    sudo systemctl restart dhan-trading.service
+    sudo systemctl enable dhan-trading.service
+    sudo systemctl status dhan-trading.service
+    journalctl -u dhan-trading.service -f
+
 ## Table of contents
 
 1. [What this project does](#what-this-project-does)

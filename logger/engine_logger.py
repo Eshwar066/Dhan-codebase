@@ -84,6 +84,7 @@ class EngineLogger:
         payload = self._payload(event_type, message=message, **kwargs)
         line = json.dumps(payload, default=str) + "\n"
         with self._lock:
+            os.makedirs(self._log_dir, exist_ok=True)
             with open(self._path, "a", encoding="utf-8") as f:
                 f.write(line)
 
@@ -162,6 +163,7 @@ class EngineLogger:
         )
         line = json.dumps(payload, default=str) + "\n"
         with self._lock:
+            os.makedirs(self._log_dir, exist_ok=True)
             with open(self._candles_path, "a", encoding="utf-8") as f:
                 f.write(line)
 
