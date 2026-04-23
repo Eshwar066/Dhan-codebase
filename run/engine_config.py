@@ -61,6 +61,7 @@ class EngineConfig:
     broker_name: BrokerName
     run_mode: RunMode
     strategy_name: str
+    strategy_names: Optional[List[str]] = None
     symbols: Optional[List[str]] = (
         None  # None = derive from universe (e.g. IPOBreakout)
     )
@@ -127,6 +128,18 @@ class EngineConfig:
     # Telegram alerts (e.g. for Delta): order placed, broker errors, slippage. Optional.
     telegram_bot_token: Optional[str] = None
     telegram_chat_id: Optional[str] = None
+    account_routing: Optional[Dict[str, Any]] = None
+    oms_rate_limit_per_sec: float = 5.0
+    intent_queue_maxsize: int = 1000
+    account_queue_maxsize: int = 500
+    queue_overflow_policy: str = "drop_newest"
+    oms_retry_max_attempts: int = 3
+    oms_retry_base_delay_seconds: float = 0.25
+    oms_token_bucket_capacity: int = 5
+    worker_watchdog_interval_seconds: float = 5.0
+    max_active_account_symbol_keys: int = 200
+    account_circuit_breaker_threshold: int = 5
+    feed_stall_seconds: float = 5.0
 
     def __post_init__(self):
         if self.base_dir is None:

@@ -42,6 +42,7 @@ from core.broker import (
     SimulatedBroker,
 )
 from core.orderExecution.order_router import OrderRouter
+from core.orderExecution.account_router import AccountRouter
 from core.orderExecution.intent_store import IntentStore
 from core.utils.telegram_alert import send_telegram_alert
 from core.orderExecution.position_manager import PositionManager
@@ -166,6 +167,22 @@ class EngineFactory:
         strategy = cfg["strategy"]()
         if getattr(config, "order_qty_lots", None) is not None:
             setattr(strategy, "order_qty_lots", int(config.order_qty_lots))
+        strategies = [strategy]
+        extra_names = list(getattr(config, "strategy_names", None) or [])
+        for strategy_name in extra_names:
+            if strategy_name == config.strategy_name:
+                continue
+            extra_cfg = STRATEGY_MAP.get(strategy_name)
+            if not extra_cfg:
+                raise ValueError(f"Unknown strategy in strategy_names: {strategy_name}")
+            if config.run_mode.value not in [m.value for m in extra_cfg["allowed_modes"]]:
+                raise ValueError(
+                    f"Strategy {strategy_name} not allowed in {config.run_mode}"
+                )
+            extra_strategy = extra_cfg["strategy"]()
+            if getattr(config, "order_qty_lots", None) is not None:
+                setattr(extra_strategy, "order_qty_lots", int(config.order_qty_lots))
+            strategies.append(extra_strategy)
 
         # ---------- Data (venue-specific) ----------
         if config.broker_name == "DELTA":
@@ -326,7 +343,7 @@ class EngineFactory:
                     engine_logger=engine_logger,
                     telegram_alert=telegram_alert,
                 )
-                if getattr(strategy, "timeframe", None):
+                if any(getattr(s, "timeframe", None) for s in strategies):
                     tick_queue = queue.Queue(maxsize=50000)
                     candle_aggregator = CandleAggregator()
                     realtime_feed.set_tick_queue(tick_queue)
@@ -353,7 +370,7 @@ class EngineFactory:
                         client_id=client_id,
                         instruments=instruments,
                     )
-                    if getattr(strategy, "timeframe", None):
+                    if any(getattr(s, "timeframe", None) for s in strategies):
                         tick_queue = queue.Queue(maxsize=50000)
                         candle_aggregator = CandleAggregator()
                         realtime_feed.set_tick_queue(tick_queue)
@@ -366,6 +383,7 @@ class EngineFactory:
 
         return LiveEngine(
             strategy=strategy,
+            strategies=strategies,
             data=data_provider,
             candle_service=candle_service,
             symbols=config.symbols or [],
@@ -392,6 +410,26 @@ class EngineFactory:
             run_mode=config.run_mode,
             open_positions_logger=open_positions_logger,
             dhan_order_update_feed=dhan_order_update_feed,
+            account_router=AccountRouter(getattr(config, "account_routing", None)),
+            oms_rate_limit_per_sec=getattr(config, "oms_rate_limit_per_sec", 5.0),
+            intent_queue_maxsize=getattr(config, "intent_queue_maxsize", 1000),
+            account_queue_maxsize=getattr(config, "account_queue_maxsize", 500),
+            queue_overflow_policy=getattr(config, "queue_overflow_policy", "drop_newest"),
+            oms_retry_max_attempts=getattr(config, "oms_retry_max_attempts", 3),
+            oms_retry_base_delay_seconds=getattr(
+                config, "oms_retry_base_delay_seconds", 0.25
+            ),
+            oms_token_bucket_capacity=getattr(config, "oms_token_bucket_capacity", 5),
+            worker_watchdog_interval_seconds=getattr(
+                config, "worker_watchdog_interval_seconds", 5.0
+            ),
+            max_active_account_symbol_keys=getattr(
+                config, "max_active_account_symbol_keys", 200
+            ),
+            account_circuit_breaker_threshold=getattr(
+                config, "account_circuit_breaker_threshold", 5
+            ),
+            feed_stall_seconds=getattr(config, "feed_stall_seconds", 5.0),
         )
 
     @staticmethod

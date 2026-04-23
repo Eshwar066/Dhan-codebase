@@ -8,10 +8,14 @@ symbol-level failure isolation, strategy timeout, latency alert levels, candle i
 import dataclasses
 import logging
 import os
+import queue
 import signal
 import time
 import datetime as dt
 import csv
+import threading
+import json
+from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
 import pdb
 
@@ -24,6 +28,7 @@ from core.engine.live_engine_common import (
     DEFAULT_FEED_STALE_SECONDS,
     LiveEngineHelpersMixin,
 )
+from core.orderExecution.account_router import AccountRouter
 
 try:
     from logger.engine_logger import REPORTS_DIR
@@ -31,8 +36,8 @@ except ImportError:
     REPORTS_DIR = "reports"
 class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
     """
-    Live/paper engine. Optional realtime_feed (WebSocket); falls back to
-    candle_service / data.get_latest_candles. Supports broker reconciliation,
+    Live/paper engine. Uses realtime_feed (WebSocket/aggregator) candle flow
+    in live loop. Supports broker reconciliation,
     risk kill switch, closed-candle validation, feed health, EOD export.
     Plus: duplicate signal protection, time-of-day guard, memory guard, graceful shutdown,
     symbol-level pause, strategy timeout, latency levels, candle integrity.
@@ -65,6 +70,19 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         run_mode: Optional[RunMode] = None,
         open_positions_logger: Optional[Any] = None,
         dhan_order_update_feed: Optional[Any] = None,
+        strategies=None,
+        account_router: Optional[AccountRouter] = None,
+        oms_rate_limit_per_sec: float = 5.0,
+        intent_queue_maxsize: int = 1000,
+        account_queue_maxsize: int = 500,
+        queue_overflow_policy: str = "drop_newest",
+        oms_retry_max_attempts: int = 3,
+        oms_retry_base_delay_seconds: float = 0.25,
+        oms_token_bucket_capacity: int = 5,
+        worker_watchdog_interval_seconds: float = 5.0,
+        max_active_account_symbol_keys: int = 200,
+        account_circuit_breaker_threshold: int = 5,
+        feed_stall_seconds: float = 5.0,
     ):
         super().__init__(
             strategy,
@@ -74,6 +92,11 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             universe_service=universe_service,
         )
         self.symbols = symbols
+        self.strategies = list(strategies or [strategy])
+        self._strategy_by_name = {
+            str(getattr(s, "name", f"strategy_{idx}")): s
+            for idx, s in enumerate(self.strategies)
+        }
         self.candle_service = candle_service
         self.order_router = order_router
         self.position_manager = position_manager
@@ -139,6 +162,49 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self._max_ticks_per_cycle = 10000
         self._ws_trade_event_bound = False
         self.dhan_order_update_feed = dhan_order_update_feed
+        self.account_router = account_router or AccountRouter()
+        self.intent_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue(
+            maxsize=max(1, int(intent_queue_maxsize or 1000))
+        )
+        self._account_symbol_queues: Dict[Tuple[str, str], "queue.Queue[Dict[str, Any]]"] = {}
+        self._account_symbol_workers: Dict[Tuple[str, str], threading.Thread] = {}
+        self._routing_worker: Optional[threading.Thread] = None
+        self._watchdog_worker: Optional[threading.Thread] = None
+        self._worker_watchdog_interval_seconds = max(
+            1.0, float(worker_watchdog_interval_seconds or 5.0)
+        )
+        self._routed_intent_ids: set[str] = set()
+        self._account_processed_intent_ids: Dict[Tuple[str, str], set[str]] = {}
+        self._queue_overflow_policy = str(queue_overflow_policy or "drop_newest").lower()
+        self._account_queue_maxsize = max(1, int(account_queue_maxsize or 500))
+        self._oms_retry_max_attempts = max(1, int(oms_retry_max_attempts or 3))
+        self._oms_retry_base_delay_seconds = max(
+            0.05, float(oms_retry_base_delay_seconds or 0.25)
+        )
+        self._oms_rate_limit_per_sec = max(0.1, float(oms_rate_limit_per_sec or 5.0))
+        self._oms_token_bucket_capacity = max(
+            1, int(oms_token_bucket_capacity or self._oms_rate_limit_per_sec)
+        )
+        self._account_token_buckets: Dict[str, Dict[str, float]] = {}
+        self._account_bucket_locks: Dict[str, threading.Lock] = {}
+        self._executed_intent_ids: set[str] = set()
+        self._max_active_account_symbol_keys = max(
+            1, int(max_active_account_symbol_keys or 200)
+        )
+        self._fallback_symbol_key = "__FALLBACK__"
+        self._account_failure_counts: Dict[str, int] = {}
+        self._paused_accounts: set[str] = set()
+        self._account_circuit_breaker_threshold = max(
+            1, int(account_circuit_breaker_threshold or 5)
+        )
+        self._worker_restart_events: Dict[str, deque] = {}
+        self._disabled_worker_ids: set[str] = set()
+        self._feed_stall_seconds = max(1.0, float(feed_stall_seconds or 5.0))
+        self._intent_journal_path = os.path.join(
+            "logs", f"{self.engine_id}_intent_pipeline.jsonl"
+        )
+        self._strategy_task_queues: Dict[str, "queue.Queue[Dict[str, Any]]"] = {}
+        self._strategy_workers: Dict[str, threading.Thread] = {}
         self._dhan_order_ws_bound = False
         # OrderNo -> buffered synthetic payloads when intent_id not yet resolvable (race with place_order ack)
         self._dhan_pending_fills: Dict[str, List[Dict[str, Any]]] = {}
@@ -203,6 +269,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         for intent in intents:
             self._process_entry_like_intent(
                 intent,
+                self.strategy,
                 sym,
                 candle,
                 None,
@@ -227,6 +294,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 continue
             self._process_entry_like_intent(
                 intent,
+                self.strategy,
                 sym,
                 candle,
                 None,
@@ -454,7 +522,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             if not trade:
                 continue
             try:
-                self.order_router.process_trade(trade)
+                if self.order_router.process_trade(trade):
+                    self._log_intent_filled(trade)
             except Exception:
                 continue
 
@@ -464,7 +533,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         if not trade:
             return
         try:
-            self.order_router.process_trade(trade)
+            if self.order_router.process_trade(trade):
+                self._log_intent_filled(trade)
         except Exception:
             return
 
@@ -563,7 +633,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 trade = self._normalize_dhan_ws_synthetic_trade(payload)
                 if trade:
                     try:
-                        self.order_router.process_trade(trade)
+                        if self.order_router.process_trade(trade):
+                            self._log_intent_filled(trade)
                     except Exception:
                         remaining.append(payload)
                 else:
@@ -607,7 +678,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         trade = self._normalize_dhan_ws_synthetic_trade(payload)
         if trade:
             try:
-                self.order_router.process_trade(trade)
+                if self.order_router.process_trade(trade):
+                    self._log_intent_filled(trade)
             except Exception:
                 self._enqueue_dhan_pending_fill(order_no, payload)
             return
@@ -654,6 +726,468 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 if out is not None:
                     return out, f"aggregator_alias:{k}"
         return None, "aggregator:empty"
+
+    def _enqueue_intent(
+        self,
+        *,
+        strategy,
+        intent,
+        price_map: Dict[str, float],
+        idempotency_key: Optional[str] = None,
+        strategy_time_ms: Optional[float] = None,
+    ) -> None:
+        payload = {
+            "intent": intent,
+            "strategy": strategy,
+            "strategy_id": getattr(strategy, "name", "unknown_strategy"),
+            "intent_id": getattr(intent, "intent_id", ""),
+            "created_at": time.time(),
+            "price_map": dict(price_map or {}),
+            "idempotency_key": idempotency_key,
+            "strategy_time_ms": float(strategy_time_ms or 0.0),
+            "symbol": getattr(intent, "symbol", None)
+            or getattr(getattr(intent, "instrument", None), "trading_symbol", None)
+            or "",
+        }
+        if not self._safe_queue_put(
+            self.intent_queue,
+            payload,
+            queue_name="intent_queue",
+            queue_key="global",
+        ):
+            return
+        if self.engine_logger:
+            self.engine_logger.log(
+                "intent",
+                f"CREATED intent_id={payload['intent_id']} strategy_id={payload['strategy_id']}",
+            )
+
+    def _safe_queue_put(
+        self, q: "queue.Queue[Dict[str, Any]]", item: Dict[str, Any], queue_name: str, queue_key: Any
+    ) -> bool:
+        try:
+            q.put_nowait(item)
+            return True
+        except queue.Full:
+            policy = self._queue_overflow_policy
+            if policy == "drop_oldest":
+                try:
+                    q.get_nowait()
+                    q.task_done()
+                    q.put_nowait(item)
+                    if self.engine_logger:
+                        self.engine_logger.log(
+                            "intent",
+                            f"{queue_name} overflow key={queue_key}; dropped oldest, accepted intent_id={item.get('intent_id')}",
+                        )
+                    return True
+                except (queue.Empty, queue.Full):
+                    pass
+            if self.engine_logger:
+                self.engine_logger.log(
+                    "intent",
+                    f"{queue_name} overflow key={queue_key}; dropped newest intent_id={item.get('intent_id')}",
+                )
+            if queue_name == "strategy_queue":
+                logger.warning(
+                    "Strategy lagging: dropped signal strategy_id=%s intent_id=%s",
+                    queue_key,
+                    item.get("intent_id"),
+                )
+            return False
+
+    def _worker_id(self, worker_type: str, key: Any) -> str:
+        return f"{worker_type}:{key}"
+
+    def _can_restart_worker(self, worker_type: str, key: Any) -> bool:
+        wid = self._worker_id(worker_type, key)
+        if wid in self._disabled_worker_ids:
+            return False
+        now = time.time()
+        events = self._worker_restart_events.setdefault(wid, deque())
+        while events and now - events[0] > 60:
+            events.popleft()
+        if len(events) >= 5:
+            self._disabled_worker_ids.add(wid)
+            if self.engine_logger:
+                self.engine_logger.log(
+                    "critical",
+                    f"Worker restart guard tripped worker_id={wid}; disabling worker and alerting",
+                )
+            return False
+        events.append(now)
+        return True
+
+    def _append_intent_journal(self, item: Dict[str, Any], status: str) -> None:
+        try:
+            os.makedirs(os.path.dirname(self._intent_journal_path), exist_ok=True)
+            line = {
+                "ts": time.time(),
+                "engine_id": self.engine_id,
+                "intent_id": item.get("intent_id"),
+                "account_id": item.get("account_id"),
+                "symbol": item.get("symbol"),
+                "status": status,
+                "execution_attempt_id": item.get("execution_attempt_id"),
+            }
+            with open(self._intent_journal_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(line) + "\n")
+        except Exception:
+            pass
+
+    def _token_bucket_wait(self, account_id: str) -> None:
+        lock = self._account_bucket_locks.setdefault(account_id, threading.Lock())
+        while not self._shutdown_requested:
+            with lock:
+                state = self._account_token_buckets.setdefault(
+                    account_id,
+                    {
+                        "tokens": float(self._oms_token_bucket_capacity),
+                        "last_refill": time.time(),
+                    },
+                )
+                now = time.time()
+                elapsed = max(0.0, now - float(state["last_refill"]))
+                refill = elapsed * self._oms_rate_limit_per_sec
+                state["tokens"] = min(
+                    float(self._oms_token_bucket_capacity),
+                    float(state["tokens"]) + refill,
+                )
+                state["last_refill"] = now
+                if state["tokens"] >= 1.0:
+                    state["tokens"] -= 1.0
+                    return
+            time.sleep(0.01)
+
+    @staticmethod
+    def _is_retryable_intent_error(exc: Exception) -> bool:
+        msg = str(exc or "").lower()
+        retry_markers = (
+            "timeout",
+            "temporarily",
+            "connection reset",
+            "connection aborted",
+            "connection error",
+            "503",
+            "502",
+            "504",
+            "rate limit",
+        )
+        return any(token in msg for token in retry_markers)
+
+    def _process_intent_with_retry(self, item: Dict[str, Any]) -> bool:
+        attempts = self._oms_retry_max_attempts
+        base_delay = self._oms_retry_base_delay_seconds
+        for attempt in range(attempts):
+            try:
+                item["execution_attempt_id"] = f"{item.get('intent_id')}-{attempt + 1}"
+                result = self.order_router.process_intent(
+                    item["intent"],
+                    item.get("price_map") or {},
+                    idempotency_key=item.get("idempotency_key"),
+                    raise_on_retryable_failure=True,
+                )
+                broker_sent_ts = (result or {}).get("broker_sent_ts") or time.time()
+                item["broker_sent_ts"] = broker_sent_ts
+                return bool((result or {}).get("ok", True))
+            except Exception as exc:
+                retryable = self._is_retryable_intent_error(exc)
+                if not retryable or attempt >= attempts - 1:
+                    if self.engine_logger:
+                        self.engine_logger.log(
+                            "intent",
+                            f"ORDER_FAILED intent_id={item.get('intent_id')} retryable={retryable} attempt={attempt + 1}/{attempts} error={exc}",
+                        )
+                    return False
+                backoff = base_delay * (2 ** attempt)
+                time.sleep(backoff)
+        return False
+
+    def _process_account_symbol_queue(self, key: Tuple[str, str]) -> None:
+        account_id, _symbol = key
+        q = self._account_symbol_queues[key]
+        while not self._shutdown_requested:
+            try:
+                item = q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            intent_id = item.get("intent_id")
+            if intent_id in self._executed_intent_ids:
+                q.task_done()
+                continue
+            if account_id in self._paused_accounts:
+                q.task_done()
+                continue
+            processed = self._account_processed_intent_ids.setdefault(key, set())
+            if intent_id in processed:
+                q.task_done()
+                continue
+            item["oms_start_ts"] = time.time()
+            self._token_bucket_wait(account_id)
+            try:
+                ok = self._process_intent_with_retry(item)
+                if ok:
+                    processed.add(intent_id)
+                    self._executed_intent_ids.add(intent_id)
+                    self._account_failure_counts[account_id] = 0
+                    self._append_intent_journal(item, status="SENT")
+                    total_latency_ms = (
+                        (item.get("broker_sent_ts") or time.time())
+                        - float(item.get("created_at") or time.time())
+                    ) * 1000.0
+                    if self.engine_logger:
+                        self.engine_logger.latency(
+                            strategy_time_ms=float(item.get("strategy_time_ms") or 0.0),
+                            broker_latency_ms=(
+                                (item.get("broker_sent_ts") or time.time())
+                                - float(item.get("oms_start_ts") or time.time())
+                            )
+                            * 1000.0,
+                            total_latency_ms=total_latency_ms,
+                        )
+                    if total_latency_ms > self.latency_critical_ms:
+                        self._entries_paused_latency = True
+                    if self.engine_logger:
+                        self.engine_logger.log(
+                            "intent",
+                            f"ORDER_PLACED intent_id={intent_id} strategy_id={item.get('strategy_id')} account_id={account_id} execution_attempt_id={item.get('execution_attempt_id')}",
+                        )
+                else:
+                    self._account_failure_counts[account_id] = (
+                        self._account_failure_counts.get(account_id, 0) + 1
+                    )
+                    if (
+                        self._account_failure_counts[account_id]
+                        >= self._account_circuit_breaker_threshold
+                    ):
+                        self._paused_accounts.add(account_id)
+                        if self.engine_logger:
+                            self.engine_logger.log(
+                                "critical",
+                                f"Account circuit breaker tripped account_id={account_id}",
+                            )
+            except Exception as exc:
+                logger.exception(
+                    "OMS worker failure key=%s intent=%s error=%s",
+                    key,
+                    intent_id,
+                    exc,
+                )
+                time.sleep(0.5)
+            finally:
+                q.task_done()
+
+    def _strategy_worker_loop(self, strategy_id: str, strategy) -> None:
+        q = self._strategy_task_queues[strategy_id]
+        while not self._shutdown_requested:
+            try:
+                task = q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            response_q = task["response_q"]
+            candle = task["candle"]
+            try:
+                t0 = time.perf_counter()
+                ctx = self.build_context_only(candle)
+                intent = strategy.on_candle(candle, ctx)
+                strategy_time_ms = (time.perf_counter() - t0) * 1000
+                response_q.put(
+                    {
+                        "strategy": strategy,
+                        "ctx": ctx,
+                        "intent": intent,
+                        "strategy_time_ms": strategy_time_ms,
+                    }
+                )
+            except Exception as exc:
+                response_q.put({"strategy": strategy, "error": exc})
+            finally:
+                q.task_done()
+
+    def _ensure_strategy_worker(self, strategy) -> None:
+        strategy_id = str(getattr(strategy, "name", "unknown_strategy"))
+        wid = self._worker_id("strategy", strategy_id)
+        if wid in self._disabled_worker_ids:
+            return
+        if (
+            strategy_id in self._strategy_workers
+            and self._strategy_workers[strategy_id].is_alive()
+        ):
+            return
+        if not self._can_restart_worker("strategy", strategy_id):
+            return
+        q = self._strategy_task_queues.get(strategy_id)
+        if q is None:
+            q = queue.Queue(maxsize=1)
+            self._strategy_task_queues[strategy_id] = q
+        t = threading.Thread(
+            target=self._strategy_worker_loop,
+            args=(strategy_id, strategy),
+            daemon=True,
+            name=f"strategy_worker_{strategy_id}",
+        )
+        self._strategy_workers[strategy_id] = t
+        t.start()
+
+    def _route_intents_worker(self) -> None:
+        while not self._shutdown_requested:
+            try:
+                item = self.intent_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            intent_id = item.get("intent_id")
+            if intent_id in self._routed_intent_ids:
+                self.intent_queue.task_done()
+                continue
+            accounts = self.account_router.route(item.get("intent"))
+            for account_id in accounts:
+                symbol = str(item.get("symbol") or "")
+                key = (account_id, symbol)
+                if (
+                    key not in self._account_symbol_queues
+                    and len(self._account_symbol_queues) >= self._max_active_account_symbol_keys
+                ):
+                    key = (account_id, self._fallback_symbol_key)
+                aq = self._account_symbol_queues.get(key)
+                if aq is None:
+                    aq = queue.Queue(maxsize=self._account_queue_maxsize)
+                    self._account_symbol_queues[key] = aq
+                if (
+                    key not in self._account_symbol_workers
+                    or not self._account_symbol_workers[key].is_alive()
+                ):
+                    if not self._can_restart_worker("oms", key):
+                        continue
+                    t = threading.Thread(
+                        target=self._process_account_symbol_queue,
+                        args=(key,),
+                        daemon=True,
+                        name=f"oms_worker_{account_id}_{symbol}",
+                    )
+                    self._account_symbol_workers[key] = t
+                    t.start()
+                routed = dict(item)
+                routed["account_id"] = account_id
+                routed["routed_ts"] = time.time()
+                if self._safe_queue_put(
+                    aq,
+                    routed,
+                    queue_name="account_symbol_queue",
+                    queue_key=key,
+                ) and self.engine_logger:
+                    self.engine_logger.log(
+                        "intent",
+                        f"ROUTED intent_id={intent_id} strategy_id={item.get('strategy_id')} account_id={account_id}",
+                    )
+            self._routed_intent_ids.add(intent_id)
+            self.intent_queue.task_done()
+
+    def _watchdog_loop(self) -> None:
+        while not self._shutdown_requested:
+            try:
+                self._ensure_workers_healthy()
+            except Exception:
+                pass
+            time.sleep(self._worker_watchdog_interval_seconds)
+
+    def _ensure_workers_healthy(self) -> None:
+        if not self._routing_worker or not self._routing_worker.is_alive():
+            self._start_execution_pipeline()
+        for strategy in self.strategies:
+            self._ensure_strategy_worker(strategy)
+        for key in list(self._account_symbol_queues.keys()):
+            worker = self._account_symbol_workers.get(key)
+            if worker is None or not worker.is_alive():
+                if not self._can_restart_worker("oms", key):
+                    continue
+                t = threading.Thread(
+                    target=self._process_account_symbol_queue,
+                    args=(key,),
+                    daemon=True,
+                    name=f"oms_worker_{key[0]}_{key[1]}",
+                )
+                self._account_symbol_workers[key] = t
+                t.start()
+
+    def _start_execution_pipeline(self) -> None:
+        if self._routing_worker and self._routing_worker.is_alive():
+            return
+        self._routing_worker = threading.Thread(
+            target=self._route_intents_worker,
+            daemon=True,
+            name="intent_router_worker",
+        )
+        self._routing_worker.start()
+        for strategy in self.strategies:
+            self._ensure_strategy_worker(strategy)
+        if not self._watchdog_worker or not self._watchdog_worker.is_alive():
+            self._watchdog_worker = threading.Thread(
+                target=self._watchdog_loop,
+                daemon=True,
+                name="engine_worker_watchdog",
+            )
+            self._watchdog_worker.start()
+
+    def _evaluate_strategies_parallel(self, candle: Dict[str, Any]) -> List[Dict[str, Any]]:
+        response_q: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+        expected = 0
+        for strategy in self.strategies:
+            if not strategy.should_evaluate(candle):
+                continue
+            self._ensure_strategy_worker(strategy)
+            strategy_id = str(getattr(strategy, "name", "unknown_strategy"))
+            task = {"candle": dict(candle), "response_q": response_q}
+            if self._safe_queue_put(
+                self._strategy_task_queues[strategy_id],
+                task,
+                queue_name="strategy_queue",
+                queue_key=strategy_id,
+            ):
+                expected += 1
+        out: List[Dict[str, Any]] = []
+        timeout = max(1.0, float(self.strategy_timeout_seconds or 5.0))
+        deadline = time.time() + timeout
+        while len(out) < expected and time.time() < deadline:
+            try:
+                item = response_q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if item.get("error") is not None:
+                logger.exception("Strategy evaluation failed: %s", item["error"])
+                continue
+            out.append(item)
+        return out
+
+    def _log_intent_filled(self, trade: Dict[str, Any]) -> None:
+        if not self.engine_logger:
+            return
+        intent_id = trade.get("intent_id") or trade.get("client_order_id") or ""
+        account_id = trade.get("account_id") or "default"
+        self.engine_logger.log(
+            "intent",
+            f"FILLED intent_id={intent_id} strategy_id={trade.get('strategy_id', 'unknown')} account_id={account_id}",
+        )
+
+    def _check_feed_stall_fail_safe(self) -> None:
+        if not self.realtime_feed or not self.symbols:
+            return
+        now = time.time()
+        stale_symbols = []
+        for sym in self.symbols:
+            last_tick = self._last_tick_timestamp.get(sym, 0.0)
+            last_candle = self._last_candle_timestamp.get(sym, 0.0)
+            last_seen = max(last_tick, last_candle)
+            if last_seen <= 0 or (now - last_seen) > self._feed_stall_seconds:
+                stale_symbols.append(sym)
+        if len(stale_symbols) != len(self.symbols):
+            return
+        msg = (
+            f"Feed stalled for all symbols > {self._feed_stall_seconds}s. "
+            f"symbols={stale_symbols}"
+        )
+        if self.engine_logger:
+            self.engine_logger.log("critical", msg)
+        self._telegram_plain(msg)
 
     def start(self, exchange, sector, rsi):
         if self.engine_logger:
@@ -708,6 +1242,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         tf = getattr(self.strategy, "timeframe", None)
         use_feed = self.realtime_feed and self.realtime_feed.is_connected()
         risk_manager = getattr(self.order_router, "risk", None)
+        self._start_execution_pipeline()
         loop_count = 0
         while not self._shutdown_requested:
             # pdb.set_trace()
@@ -724,6 +1259,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             # move to  Memory → every 5s , Feed health → every 1s ,Order state → every N minutes
             self._check_memory()
             self.check_feed_health()
+            self._check_feed_stall_fail_safe()
             self._do_order_state_check()
             self._sync_delta_ws_trades()
             self._retry_dhan_pending_fills()
@@ -764,25 +1300,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                                 candle.get("bucket_ts"),
                             )
                             continue
-                    # DHAN: REST closed OHLC when aggregator is cold, empty, or symbol key mismatched.
-                    if (
-                        candle is None
-                        and use_feed
-                        and str(self.venue or "").upper() == "DHAN"
-                        and self.candle_service
-                        and tf
-                    ):
-                        try:
-                            row = self.candle_service.get_latest_closed(
-                                symbol, str(tf), exchange, sector, rsi
-                            )
-                        except Exception:
-                            row = None
-                        if row is not None:
-                            candle = self._dhan_closed_row_to_candle(
-                                symbol, row, exchange, str(tf)
-                            )
-                            candle_source = "rest"
                     # Quote/ticker pseudo-candle (last_trade_time — usually not TF-aligned).
                     if candle is None and use_feed and self.realtime_feed:
                         candle = self.realtime_feed.get_last_candle(symbol, tf)
@@ -791,12 +1308,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             ts = candle.get("timestamp")
                             if isinstance(ts, (int, float)):
                                 self._last_candle_timestamp[symbol] = time.time()
-
-                    #  check this flow by commenting ws feed
-                    # if candle is None and self.candle_service:
-                        # candle = self.candle_service.get_latest_closed(
-                        #     symbol, tf, exchange, sector, rsi
-                        # )
 
                     #========Dummy candle for after mkt hours test ===========================
                     # if candle is None:
@@ -893,51 +1404,31 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     ):
                         self.engine_logger.candle_created(candle, timeframe=tf)
 
-                    if not self.strategy.should_evaluate(candle):
-                        continue
-
-                    t0 = time.perf_counter()
-                    try:
-                        ctx, intent = self.build_context(candle)
-                    except Exception as e:
-                        self._symbol_state[symbol]["error_count"] = (
-                            self._symbol_state[symbol].get("error_count", 0) + 1
-                        )
-                        if (
-                            self._symbol_state[symbol]["error_count"]
-                            >= self.symbol_error_threshold
-                        ):
-                            self._symbol_state[symbol]["paused"] = True
-                            if self.engine_logger:
-                                self.engine_logger.symbol_paused(
-                                    symbol, f"Repeated errors: {e}"
-                                )
-                        continue
-                    strategy_time_ms = (time.perf_counter() - t0) * 1000
-                    if intent and self._entries_paused_feed_stale:
-                        continue
-                    intent_has_entry = self._intent_has_entry(intent)
-                    if (
-                        intent
-                        and intent_has_entry
-                        and (
-                            self._entries_paused_order_mismatch
-                            or self._entries_paused_memory
-                            or self._entries_paused_latency
-                        )
-                    ):
-                        continue
-
                     self._enrich_candle_depth(symbol, candle)
-
-                    self._run_strategy(
-                        symbol,
-                        candle,
-                        ctx,
-                        intent,
-                        strategy_time_ms=strategy_time_ms,
-                        timeframe=tf,
-                    )
+                    for eval_result in self._evaluate_strategies_parallel(candle):
+                        intent = eval_result["intent"]
+                        if intent and self._entries_paused_feed_stale:
+                            continue
+                        intent_has_entry = self._intent_has_entry(intent)
+                        if (
+                            intent
+                            and intent_has_entry
+                            and (
+                                self._entries_paused_order_mismatch
+                                or self._entries_paused_memory
+                                or self._entries_paused_latency
+                            )
+                        ):
+                            continue
+                        self._run_strategy(
+                            symbol,
+                            candle,
+                            eval_result["ctx"],
+                            intent,
+                            strategy=eval_result["strategy"],
+                            strategy_time_ms=eval_result["strategy_time_ms"],
+                            timeframe=tf,
+                        )
             # To be checked properly else condition--> Pending
             else:
                 candles = None
@@ -955,9 +1446,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                                 "volume": ticker.get("volume", 0),
                                 "symbol": symbol,
                             }
-                if not candles and self.data:
-                    candles = self.data.get_latest_candles(self.symbols)
-
                 if not candles:
                     time.sleep(1)
                     continue
@@ -968,33 +1456,17 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     candle["exchange"] = exchange
                     if not self._validate_candle_integrity(candle, symbol):
                         continue
-                    t0 = time.perf_counter()
-                    try:
-                        ctx, intent = self.build_context(candle)
-                    except Exception as e:
-                        self._symbol_state[symbol]["error_count"] = (
-                            self._symbol_state[symbol].get("error_count", 0) + 1
-                        )
-                        if (
-                            self._symbol_state[symbol]["error_count"]
-                            >= self.symbol_error_threshold
-                        ):
-                            self._symbol_state[symbol]["paused"] = True
-                            if self.engine_logger:
-                                self.engine_logger.symbol_paused(
-                                    symbol, f"Repeated errors: {e}"
-                                )
-                        continue
-                    strategy_time_ms = (time.perf_counter() - t0) * 1000
                     self._enrich_candle_depth(symbol, candle)
-                    self._run_strategy(
-                        symbol,
-                        candle,
-                        ctx,
-                        intent,
-                        strategy_time_ms=strategy_time_ms,
-                        timeframe=None,
-                    )
+                    for eval_result in self._evaluate_strategies_parallel(candle):
+                        self._run_strategy(
+                            symbol,
+                            candle,
+                            eval_result["ctx"],
+                            eval_result["intent"],
+                            strategy=eval_result["strategy"],
+                            strategy_time_ms=eval_result["strategy_time_ms"],
+                            timeframe=None,
+                        )
 
             use_feed = self.realtime_feed and self.realtime_feed.is_connected()
             if self.tick_queue is not None and self.candle_aggregator is not None:
@@ -1059,6 +1531,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
     def _process_entry_like_intent(
         self,
         single_intent,
+        strategy,
         symbol,
         candle,
         strategy_time_ms: Optional[float],
@@ -1140,15 +1613,18 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             )
             self._validate_lot_size(single_intent, trading_sym)
             self._last_signal_hash_per_symbol[symbol] = signal_hash
-            t0 = time.perf_counter()
             price_map = {trading_sym: exec_price}
-            self.order_router.process_intent(single_intent, price_map)
-            broker_latency_ms = (time.perf_counter() - t0) * 1000
-            total_ms = (strategy_time_ms or 0) + broker_latency_ms
+            self._enqueue_intent(
+                strategy=strategy,
+                intent=single_intent,
+                price_map=price_map,
+                strategy_time_ms=strategy_time_ms,
+            )
+            total_ms = strategy_time_ms or 0
             if self.engine_logger and strategy_time_ms is not None:
                 self.engine_logger.latency(
                     strategy_time_ms=strategy_time_ms,
-                    broker_latency_ms=broker_latency_ms,
+                    broker_latency_ms=0.0,
                     total_latency_ms=total_ms,
                 )
             if total_ms > self.latency_critical_ms:
@@ -1168,19 +1644,21 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         candle,
         ctx,
         intent,
+        strategy=None,
         strategy_time_ms: Optional[float] = None,
         timeframe: Optional[str] = None,
     ):
+        strategy = strategy or self.strategy
         risk_manager = getattr(self.order_router, "risk", None)
         self.evaluate_sim_broker_stops(candle, ctx)
         open_positions = self.position_manager.get_open_positions(
-            underlying=symbol, strategy=self.strategy.name
+            underlying=symbol, strategy=strategy.name
         )
         for position in open_positions:
-            exit_signal = self.strategy.should_exit(position, candle, ctx)
+            exit_signal = strategy.should_exit(position, candle, ctx)
             if exit_signal:
                 exit_intents = (
-                    self.strategy.on_position_exit(position, candle, ctx) or []
+                    strategy.on_position_exit(position, candle, ctx) or []
                 )
                 is_sell = position.net_qty > 0
                 required_exit_side = "SELL" if is_sell else "BUY"
@@ -1203,6 +1681,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         if not is_main_exit:
                             self._process_entry_like_intent(
                                 raw_intent,
+                                strategy,
                                 symbol,
                                 candle,
                                 strategy_time_ms,
@@ -1241,8 +1720,12 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         ) or self._signal_hash(
                             symbol, timeframe or "", candle.get("timestamp"), "exit"
                         )
-                        self.order_router.process_intent(
-                            exit_intent, price_map, idempotency_key=exit_idem_key
+                        self._enqueue_intent(
+                            strategy=strategy,
+                            intent=exit_intent,
+                            price_map=price_map,
+                            idempotency_key=exit_idem_key,
+                            strategy_time_ms=strategy_time_ms,
                         )
 
         entry_intents = (
@@ -1254,6 +1737,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         for single_intent in entry_intents:
             self._process_entry_like_intent(
                 single_intent,
+                strategy,
                 symbol,
                 candle,
                 strategy_time_ms,

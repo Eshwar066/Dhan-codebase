@@ -1,74 +1,125 @@
-# Project structure
+# Project Structure (Current)
 
-High-level layout and flow. See **README.md** for architecture and **core/README.txt** for directory details.
+Compact map of the current repository layout and runtime ownership.
 
-## Directory tree
+## Top-Level Tree
 
-```
-Dhan codebase/
-├── core/
-│   ├── data/
-│   │   ├── datalayer/         IDataProvider, DhanDataProvider
-│   │   ├── sources/           DhanSource, NSEClient
-│   │   ├── adapters/          NSEAdapter, DhanAdapter (option chain; use StrategyContext)
-│   │   ├── data_router.py
-│   │   ├── option_chain_service.py
-│   │   └── candle_service.py
-│   ├── engine/
-│   │   ├── base_engine.py     build_context() → StrategyContext
-│   │   ├── backtest_engine.py
-│   │   └── live_engine.py
-│   ├── library/
-│   │   └── dhan_tradehull.py  In-project Dhan API (OHLC, option chain, orders)
-│   ├── models/
-│   │   ├── order_intent.py    OrderIntent
-│   │   └── strategy_context.py  StrategyContext (typed ctx)
-│   ├── broker/                Order placement (Dhan, Delta stub, Simulated)
-│   ├── orderExecution/        OrderRouter, RiskManager, IntentStore, PositionManager
-│   ├── strategies/            base, IndiaMktMixins, Leaps, Inside_bar_candle, registry
-│   └── utils/                 expiry_resolver, instruments, session
+```text
+Algo/
+├── README.md
+├── PROJECT_STRUCTURE.md
+├── PROJECT_FLOW_CHART.md
 ├── run/
-│   ├── config.py              RUN_MODE (default), STRATEGY_JOBS (per-job run_mode, venue, delta_leverage)
-│   └── main.py                Wire and run jobs
+│   ├── main.py
+│   ├── config.py
+│   └── engine_config.py
+├── core/
+│   ├── engine/
+│   ├── strategies/
+│   ├── data/
+│   ├── orderExecution/
+│   ├── broker/
+│   ├── models/
+│   ├── utils/
+│   ├── universe/
+│   ├── analytics/
+│   └── library/
+├── logger/
 ├── logs/
-├── Dependencies/              Instrument file (all_instrument{date}.csv)
-├── requirements.txt
-└── README.md
+├── reports/
+├── Dependencies/
+├── docs/
+└── graphify-out/
 ```
 
-## Flow (ASCII)
+## Ownership by Layer
 
+- `run/`  
+  Process entry and config translation (`STRATEGY_JOBS` -> `EngineConfig`).
+
+- `core/engine/`  
+  Engine orchestration:
+  - `base_engine.py`: shared context/wiring
+  - `backtest_engine.py`: historical replay engine
+  - `live_engine.py`: live loop, strategy workers, intent/OMS pipeline
+  - `factory.py`: builds isolated engine stacks
+  - `supervisor.py`: optional multi-engine process supervisor
+
+- `core/strategies/`  
+  Strategy implementations and registry (`registry.py`, `base.py`, strategy packages).
+
+- `core/data/`  
+  Market data and feed stack:
+  - `sources/`: broker/API fetchers
+  - `datalayer/`: provider abstraction for engines
+  - `feeds/`: websocket/feed adapters
+  - `candle_aggregator.py`: tick -> closed-candle aggregation
+  - `option_chain_service.py`, `data_router.py`
+
+- `core/orderExecution/`  
+  OMS and execution controls:
+  - `intent_store.py`
+  - `risk_manager.py`
+  - `position_manager.py`
+  - `order_router.py`
+  - `account_router.py`
+
+- `core/broker/internal/`  
+  Broker adapters:
+  - `dhan/`
+  - `delta/`
+  - `simulated/` (paper/backtest execution)
+
+- `logger/`  
+  Runtime logging helpers (`engine_logger`, `trade_logger`, `open_positions_logger`).
+
+- `logs/`, `reports/`  
+  Runtime output:
+  - structured logs
+  - open positions snapshots
+  - EOD and shutdown reports
+  - intent pipeline journal
+
+## Runtime Data Flow (Current)
+
+```text
+run/main.py
+  -> EngineFactory.create_engine(config)
+  -> LiveEngine / BacktestEngine
+
+LiveEngine (feed-driven):
+WebSocket Feed -> Tick Queue -> CandleAggregator -> Strategy Worker(s)
+  -> intent_queue -> AccountRouter
+  -> queue per (account_id, symbol)
+  -> OMS worker (retry + token bucket + breaker)
+  -> OrderRouter -> Broker
+  -> fills -> PositionManager (trade-led)
 ```
-Data layer (IDataProvider) → Engine → Strategy.on_candle(candle, ctx: StrategyContext)
-                                       → OrderIntent(s)
-                                       → OrderRouter → RiskManager → Broker
-                                                                     → PositionManager
-```
 
-## Key files
+## Important Files to Start With
 
-| Area        | Files |
-|------------|--------|
-| Entry      | run/main.py, run/config.py |
-| Data feed  | core/data/datalayer/, core/data/sources/dhan_source.py, core/data/option_chain_service.py |
-| Context    | core/models/strategy_context.py |
-| Engine     | core/engine/base_engine.py, backtest_engine.py, live_engine.py |
-| Strategy   | core/strategies/base.py, IndiaMktMixins.py, Leaps/LeapsQuatery_RSI_52_32.py |
-| Orders     | core/orderExecution/order_router.py, risk_manager.py, intent_store.py, position_manager.py |
-| Broker     | core/broker/dhanbroker.py, dhan_broker_api.py, simulated_broker.py, delta_broker.py |
-| Dhan API   | core/library/dhan_tradehull.py |
+- Entry/config:
+  - `run/main.py`
+  - `run/config.py`
+  - `run/engine_config.py`
 
-## README index
+- Engine/flow:
+  - `core/engine/factory.py`
+  - `core/engine/live_engine.py`
+  - `core/engine/backtest_engine.py`
 
-- **README.md** (root) – overview, flow, StrategyContext, data vs broker, improvements, live roadmap
-- **PROJECT_STRUCTURE.md** – this file; directory tree and README index
-- **core/README.txt** – core directory layout
-- **core/models/README.md** – OrderIntent, StrategyContext
-- **core/broker/README.md** – broker layer, files, Dhan/Delta/Simulated
-- **core/data/datalayer/README.md** – data layer, IDataProvider, files
-- **core/library/README.md** – Dhan Tradehull usage and data/order APIs
-- **core/orderExecution/README.md** – intent flow, risk, position manager, files
-- **core/utils/instruments/README.md** – InstrumentStore, CSV columns
-- **run/README.txt** – main.py, config, Dependencies, credentials
-- **core/strategies/Leaps/readme.txt** – LEAPS RSI strategy spec and implementation refs
-- **core/strategies/Inside_bar_candle/readme.txt** – Inside bar strategy and engine flow
+- OMS:
+  - `core/orderExecution/order_router.py`
+  - `core/orderExecution/intent_store.py`
+  - `core/orderExecution/position_manager.py`
+  - `core/orderExecution/account_router.py`
+
+- Data/feed:
+  - `core/data/candle_aggregator.py`
+  - `core/data/feeds/dhan_feed.py`
+  - `core/data/feeds/delta_feed.py`
+
+## Notes
+
+- Use `README.md` for the concise project overview.
+- Use `PROJECT_FLOW_CHART.md` for HLD + LLD execution diagrams.

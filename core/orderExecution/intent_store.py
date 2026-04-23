@@ -34,6 +34,38 @@ class IntentStatus(str, Enum):
     CANCELLED = "CANCELLED"
     EXPIRED = "EXPIRED"
 
+VALID_TRANSITIONS = {
+    IntentStatus.CREATED: {
+        IntentStatus.VALIDATED,
+        IntentStatus.REJECTED,
+        IntentStatus.CANCELLED,
+        IntentStatus.EXPIRED,
+    },
+    IntentStatus.VALIDATED: {
+        IntentStatus.SENT,
+        IntentStatus.REJECTED,
+        IntentStatus.CANCELLED,
+        IntentStatus.EXPIRED,
+    },
+    IntentStatus.SENT: {
+        IntentStatus.ACKED,
+        IntentStatus.FILLED,
+        IntentStatus.REJECTED,
+        IntentStatus.CANCELLED,
+        IntentStatus.EXPIRED,
+    },
+    IntentStatus.ACKED: {
+        IntentStatus.FILLED,
+        IntentStatus.REJECTED,
+        IntentStatus.CANCELLED,
+        IntentStatus.EXPIRED,
+    },
+    IntentStatus.FILLED: set(),
+    IntentStatus.REJECTED: set(),
+    IntentStatus.CANCELLED: set(),
+    IntentStatus.EXPIRED: set(),
+}
+
 
 # -------------------------
 # STORE
@@ -108,6 +140,18 @@ class IntentStore:
                 return None
 
             intent = self.intents[intent_id]
+            if isinstance(status, str):
+                status = IntentStatus(status)
+            cur = intent.get("status")
+            if isinstance(cur, str):
+                cur = IntentStatus(cur)
+                intent["status"] = cur
+            if cur != status:
+                allowed = VALID_TRANSITIONS.get(cur, set())
+                if status not in allowed:
+                    raise ValueError(
+                        f"Invalid intent transition {cur} -> {status} for {intent_id}"
+                    )
 
             intent["status"] = status
             intent["updated_at"] = time.time()

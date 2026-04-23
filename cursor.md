@@ -1,177 +1,152 @@
 
-
+Act as a senior algorithmic trading engineer with deep experience in building low-latency, multi-strategy, multi-broker execution systems; prioritize correctness, robustness, and scalable architecture over quick fixes.
+Treat this codebase as a production-grade trading system and operate as a senior algo developer with extensive experience in OMS design, market data systems, and fault-tolerant architectures.
+Assume the role of a highly experienced quantitative trading systems engineer; make decisions that ensure deterministic execution, risk safety, and scalability across multiple brokers and accounts.
 
 Implement this for project and update in main readme.md file and use this file as prompt and dont use this file name in project and main readme.md file
 
-Your TARGET flow
-ONE WebSocket
-      ↓
-Tick Queue
-      ↓
-CandleAggregator
-      ↓
-ONE Engine Loop
-      ↓
-Strategy Pool (parallel)
-      ↓
-Intent Queue
-      ↓
-Account Router
-      ↓
-Per-account OMS queues
-      ↓
-Broker APIs
-🔥 Core Difference (this is the key insight)
-Area	Current	New Model
-Engine	1 per strategy	1 for many strategies
-WebSocket	per strategy	shared
-Strategy execution	sequential	parallel
-OMS	per strategy	per account
-Scaling	horizontal (process)	hybrid (thread + process)
-⚠️ First reality check
 
-This line:
+Final Priority Order (production-safe)
+🔴 P0 (must fix before scaling capital)
+1. End-to-end latency budget (your #8)
 
-✔ Keep ONE engine (single-threaded)
-✔ Run strategies in parallel (thread pool)
+Right now you’re blind after enqueue:
 
-👉 is correct—but only if you restructure Engine responsibility
+broker_latency_ms = 0.0  ❌
 
-Because currently:
+👉 This is dangerous because:
 
-engine.start() → strategy.on_candle()
+Strategy thinks execution is fast
+Reality: order hits after 2–5 seconds
+✅ Fix
 
-👉 tightly coupled
+Track full pipeline:
 
-🧩 HOW TO INTEGRATE (step-by-step, practical)
+intent_created_ts
+→ routed_ts
+→ oms_start_ts
+→ broker_sent_ts
+→ exchange_ack_ts
 
-Don’t rewrite everything. Do this in layers.
+Then log:
 
-✅ STEP 1 — Keep existing engine, add Strategy Pool
-Replace this:
-# current
-strategy.on_candle(candle, ctx)
-With:
-# new
-for strategy in strategies:
-    executor.submit(strategy.on_candle, candle, ctx)
+total_latency =
+    broker_ack_ts - intent_created_ts
 
-Use:
+👉 And enforce:
 
-from concurrent.futures import ThreadPoolExecutor
+if total_latency > threshold:
+    pause_entries()
+🔴 2. Key cardinality cap (your #1)
 
-self.executor = ThreadPoolExecutor(max_workers=3)
-✅ STEP 2 — Introduce Intent Queue (CRITICAL)
+You already know the issue:
 
-Currently:
+(account, symbol) → unlimited queues ❌
+Real-world failure mode:
+Weekly options
+Multiple strikes
+10 strategies
 
-strategy → order_router (direct)
+👉 You’ll create hundreds of threads
 
-Change to:
+✅ Fix (simple but powerful)
+MAX_ACTIVE_KEYS = 200
 
-strategy → intent_queue → router
-Implementation:
-intent_queue = queue.Queue()
+If exceeded:
 
-Strategy:
+fallback_key = (account_id, "__FALLBACK__")
 
-intent_queue.put(intent)
-✅ STEP 3 — Build Account Router (NEW LAYER)
+or:
 
-This is the biggest conceptual upgrade.
+drop_low_priority_intents()
+🔴 3. Minimal persistence (your #7)
 
-Intent → which accounts?
+This is not optional if you run real money.
 
-Example:
+Current risk:
+Process crash →
+- open positions exist
+- engine forgets them
+- next signal duplicates trade
+✅ Minimum viable persistence
 
-class AccountRouter:
-    def route(self, intent):
-        return ["acc1", "acc2"]  # fanout logic
-✅ STEP 4 — Per-account Order Queues
+Don’t over-engineer DB.
 
-Instead of:
+Just persist:
 
-order_router.process_intent(intent)
+{
+  "intent_id": "...",
+  "account_id": "...",
+  "symbol": "...",
+  "status": "SENT"
+}
 
-Do:
+Store in:
 
-account_queues[acc].put(intent)
-✅ STEP 5 — OMS Worker per account
-def oms_worker(account):
-    while True:
-        intent = account_queue.get()
-        order_router.process_intent(intent)
+Redis / file append log / SQLite
+🟠 4. Restart loop guard (your #6)
 
-Each account:
+Without this:
 
-Account1 → Thread
-Account2 → Thread
-Account3 → Thread
-⚙️ Final integrated flow (your system AFTER upgrade)
-WebSocket (1)
-    ↓
-Tick Queue
-    ↓
-CandleAggregator
-    ↓
-Engine Loop (1 thread)
-    ↓
-ThreadPool (Strategies)
-    ↓
-Intent Queue
-    ↓
-Account Router
-    ↓
-Per-account Queues
-    ↓
-OMS Workers (threads)
-    ↓
-Broker APIs (:contentReference[oaicite:0]{index=0} / :contentReference[oaicite:1]{index=1})
-🧠 What stays SAME from your system
+bug → crash → restart → crash → infinite loop
+✅ Fix
+if restart_count_last_60s > 5:
+    disable_worker()
+    send_alert()
+🟠 5. Strategy lag alert (your #5)
 
-✅ CandleAggregator
-✅ LiveEngine loop
-✅ Strategy classes
-✅ OrderRouter logic
-✅ Broker adapters
+You already bounded queue:
 
-🔥 What CHANGES
+queue.Queue(maxsize=1)
 
-❌ strategy → order_router direct
-❌ one strategy per engine
+👉 Good—but silent drops are dangerous.
 
-✅ add thread pool
-✅ add intent queue
-✅ add account router
-✅ add per-account OMS workers
+✅ Add
+if enqueue_failed:
+    logger.warning("Strategy lagging: dropped signal")
+🟠 6. Per-account circuit breaker (your #3)
 
-⚠️ Hidden risks (don’t ignore this)
-1. Strategy thread safety
+Current:
 
-If strategies share state → race conditions
+global breaker → kills ALL accounts
 
-👉 Fix:
+👉 Bad for multi-account setups.
 
-no shared mutable state
-2. Order duplication
+✅ Fix
+breaker_state[account_id]
 
-Same intent sent twice to same account
+So:
 
-👉 Fix:
+Account A fails → pause A only
+Account B continues trading
+🟡 7. execution_attempt_id (your #2)
 
-intent_id + dedup check
-3. Latency explosion
+You’re right—it’s not broken, but incomplete.
 
-Thread pool misuse → slow execution
+✅ Add (cheap + powerful)
+execution_attempt_id = f"{intent_id}-{retry_count}"
 
-👉 Keep:
+Log it everywhere.
 
-max_workers = small (2–4)
-4. Broker rate limits
+🟡 8. Endpoint-level rate limit (your #4)
 
-Especially with Dhan
+Not urgent unless you see:
 
-👉 MUST add:
+HTTP 429 / throttling errors
+🧠 One thing you didn’t mention (but matters now)
+🔴 Feed dependency risk (because you removed REST)
 
-per-account rate limiter
+Your system now depends fully on:
 
+WebSocket → Aggregator
+
+👉 If feed dies:
+
+No candles → No exits → positions stuck ❌
+✅ Add immediately
+if now - last_tick_time > 5s:
+    alert("feed stalled")
+
+and optionally:
+
+force_exit_all_positions()

@@ -81,6 +81,7 @@ class OrderRouter:
             reject_orphan_fill_if_predates_position_open
         )
         self._consecutive_failures = 0
+        broker_sent_ts = time.time()
         # Order state cache: intent_id -> OrderState. Persisted to logs/order_state_{engine_id}.json.
         self._order_state: Dict[str, OrderState] = {}
         self._order_state_log: List[Dict[str, Any]] = []
@@ -219,7 +220,30 @@ class OrderRouter:
             self._order_state_log = log
         self._persist_order_state()
 
-    def process_intent(self, intent, price_map, idempotency_key=None):
+    @staticmethod
+    def _is_retryable_broker_error(exc: Exception) -> bool:
+        msg = str(exc or "").lower()
+        retry_tokens = (
+            "timeout",
+            "temporarily",
+            "connection reset",
+            "connection aborted",
+            "connection error",
+            "503",
+            "502",
+            "504",
+            "gateway",
+            "rate limit",
+        )
+        return any(token in msg for token in retry_tokens)
+
+    def process_intent(
+        self,
+        intent,
+        price_map,
+        idempotency_key=None,
+        raise_on_retryable_failure: bool = False,
+    ):
         if not self.risk.allow_intent(
             intent, price_map, candle_ts=getattr(intent, "candle_ts", None)
         ):
@@ -232,7 +256,7 @@ class OrderRouter:
                 action="risk_rejected",
                 message="Risk manager did not allow intent",
             )
-            return
+            return {"ok": False, "retryable": False, "reason": "risk_rejected"}
 
         # Fix 3: Intent Deduplication (scoped by engine_id + strategy_id to support multi-engine/multi-strategy)
         intent_engine_id = getattr(intent, "engine_id", None) or self.engine_id
@@ -263,7 +287,7 @@ class OrderRouter:
                             "oms",
                             f"Exit intent for {symbol} already in flight; skipping",
                         )
-                    return
+                    return {"ok": True, "retryable": False, "reason": "duplicate_exit"}
 
         # Resolve execution price: always prefer price_map (engine updates it with best bid/ask)
         sym = (
@@ -315,7 +339,7 @@ class OrderRouter:
                     action="insufficient_funds",
                     message=msg,
                 )
-                return
+                return {"ok": False, "retryable": False, "reason": "insufficient_funds"}
 
         # Ensure intent exists in store (for fill sync and stale exit refresh)
         if not self.intent_store.exists(intent.intent_id):
@@ -375,11 +399,14 @@ class OrderRouter:
         try:
             order_id = self.broker.place_order(intent, execution_price=exec_price)
         except Exception as e:
+            retryable = self._is_retryable_broker_error(e)
             self._consecutive_failures += 1
             if self.engine_logger:
                 self.engine_logger.log("risk_block", f"Broker place_order failed: {e}")
             if self.telegram_alert:
                 self.telegram_alert(f"Broker error: {sym} {side} qty={qty} — {e}")
+            if retryable and raise_on_retryable_failure:
+                raise RuntimeError(f"retryable_broker_error: {e}") from e
             if (
                 self._consecutive_failures >= self.circuit_breaker_threshold
                 and self.risk
@@ -398,7 +425,7 @@ class OrderRouter:
                 action="broker_error",
                 message=f"place_order failed: {e}",
             )
-            return
+            return {"ok": False, "retryable": retryable, "reason": "broker_error"}
 
         if order_id is None:
             self._consecutive_failures += 1
@@ -410,6 +437,8 @@ class OrderRouter:
                 self.telegram_alert(
                     f"Broker returned no order_id: {sym} {side} qty={qty}"
                 )
+            if raise_on_retryable_failure:
+                raise RuntimeError("retryable_broker_error: no_order_id")
             if (
                 self._consecutive_failures >= self.circuit_breaker_threshold
                 and self.risk
@@ -428,7 +457,7 @@ class OrderRouter:
                 action="broker_no_order_id",
                 message="Broker place_order returned None",
             )
-            return
+            return {"ok": False, "retryable": True, "reason": "no_order_id"}
 
         self._consecutive_failures = 0
         # Paper/sim broker may call process_fill inside place_order, so intent can already be FILLED.
@@ -490,6 +519,12 @@ class OrderRouter:
                 rec["status"],
                 broker_order_id=order_id,
             )
+        return {
+            "ok": True,
+            "retryable": False,
+            "reason": "order_placed",
+            "broker_sent_ts": broker_sent_ts,
+        }
 
     # working
     def refresh_stale_exit_orders(
