@@ -6,10 +6,12 @@ Event timestamps are UTC (ISO-8601).
 """
 
 import json
+import logging
 import os
 import threading
+from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 try:
@@ -29,6 +31,37 @@ STRATEGY_EVENTS = {
     "intent_routed",
     "order_placed",
     "order_failed",
+}
+
+EVENT_CORRELATION_RULES: Dict[str, Dict[str, Tuple[str, ...]]] = {
+    "signal_generated": {
+        "required": ("engine_id", "strategy_id"),
+        "optional": ("intent_id", "account_id"),
+    },
+    "intent_created": {
+        "required": ("engine_id", "strategy_id", "intent_id"),
+        "optional": ("account_id",),
+    },
+    "intent_routed": {
+        "required": ("engine_id", "strategy_id", "intent_id", "account_id"),
+        "optional": (),
+    },
+    "order_placed": {
+        "required": ("engine_id", "strategy_id", "intent_id"),
+        "optional": ("account_id",),
+    },
+    "order_failed": {
+        "required": ("engine_id", "strategy_id", "intent_id"),
+        "optional": ("account_id",),
+    },
+    "order_filled": {
+        "required": ("engine_id", "intent_id"),
+        "optional": ("strategy_id", "account_id"),
+    },
+    "latency_breakdown": {
+        "required": ("engine_id", "strategy_id", "intent_id", "account_id"),
+        "optional": (),
+    },
 }
 
 EVENT_TYPE_ALIASES = {
@@ -59,7 +92,62 @@ class EngineLogger:
         self._path = os.path.join(self._log_dir, f"{engine_id}.log")
         self._candles_path = os.path.join(self._log_dir, f"{engine_id}_candles.log")
         self._lock = threading.Lock()
+        self._line_formatter = logging.Formatter("%(message)s")
+        self._file_handlers: Dict[str, TimedRotatingFileHandler] = {}
         os.makedirs(self._log_dir, exist_ok=True)
+
+    def _get_file_handler(self, path: str) -> TimedRotatingFileHandler:
+        handler = self._file_handlers.get(path)
+        if handler is not None:
+            return handler
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        handler = TimedRotatingFileHandler(
+            filename=path,
+            when="midnight",
+            interval=1,
+            backupCount=14,
+            encoding="utf-8",
+            utc=True,
+        )
+        handler.setFormatter(self._line_formatter)
+        self._file_handlers[path] = handler
+        return handler
+
+    def _emit_line(self, path: str, line: str) -> None:
+        handler = self._get_file_handler(path)
+        record = logging.LogRecord(
+            name="engine_json",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=0,
+            msg=line.rstrip("\n"),
+            args=(),
+            exc_info=None,
+        )
+        handler.emit(record)
+
+    @staticmethod
+    def _is_missing(value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return not value.strip()
+        return False
+
+    def _validate_correlation(self, payload: Dict[str, Any]) -> None:
+        event_type = str(payload.get("event_type") or "")
+        rules = EVENT_CORRELATION_RULES.get(event_type)
+        if not rules:
+            return
+        missing = [
+            key
+            for key in rules.get("required", ())
+            if self._is_missing(payload.get(key))
+        ]
+        if missing:
+            raise ValueError(
+                f"Missing required correlation fields for event_type={event_type}: {missing}"
+            )
 
     def _payload(
         self,
@@ -99,6 +187,12 @@ class EngineLogger:
         if account_id is not None:
             base["account_id"] = account_id
         base.update(extra)
+        base["correlation"] = {
+            "engine_id": base.get("engine_id"),
+            "strategy_id": base.get("strategy_id"),
+            "intent_id": base.get("intent_id"),
+            "account_id": base.get("account_id"),
+        }
         return base
 
     def log(self, event_type: str, message: str = "", **kwargs) -> None:
@@ -111,18 +205,17 @@ class EngineLogger:
                 f"Missing strategy_id for strategy event_type={event_type}"
             )
         payload = self._payload(event_type, message=message, **kwargs)
+        self._validate_correlation(payload)
         line = json.dumps(payload, default=str) + "\n"
         with self._lock:
             os.makedirs(self._log_dir, exist_ok=True)
-            with open(self._path, "a", encoding="utf-8") as f:
-                f.write(line)
+            self._emit_line(self._path, line)
             payload_strategy = str(payload.get("strategy_id") or "").strip()
             if payload_strategy and payload_strategy != self.strategy:
                 alt_dir = os.path.join(self._base_log_root, _safe_dir_name(payload_strategy))
                 os.makedirs(alt_dir, exist_ok=True)
                 alt_path = os.path.join(alt_dir, f"{self.engine_id}.log")
-                with open(alt_path, "a", encoding="utf-8") as f:
-                    f.write(line)
+                self._emit_line(alt_path, line)
 
     @staticmethod
     def _bar_timestamp_to_ist_iso(ts: Any) -> Optional[str]:
@@ -200,8 +293,7 @@ class EngineLogger:
         line = json.dumps(payload, default=str) + "\n"
         with self._lock:
             os.makedirs(self._log_dir, exist_ok=True)
-            with open(self._candles_path, "a", encoding="utf-8") as f:
-                f.write(line)
+            self._emit_line(self._candles_path, line)
 
     def order_placed(
         self,
