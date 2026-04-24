@@ -35,6 +35,7 @@ Thumbs.db
 
 # Ignore CSV instrument dumps
 *.csv
+*.json
 
 # ----------------------------
 # Graphify (AST knowledge graph; regenerate: graphify update .)

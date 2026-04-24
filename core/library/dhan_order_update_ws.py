@@ -19,11 +19,17 @@ import json
 import logging
 import threading
 import time
+from collections import deque
 from typing import Any, Callable, Dict, Optional
 
 import websocket
 
-from core.library.dhan_ws_common import StallWatchdog, reconnect_sleep_with_jitter
+from core.library.dhan_ws_common import (
+    StallWatchdog,
+    is_dhan_market_open,
+    reconnect_sleep_with_jitter,
+    sleep_until_next_dhan_market_open,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,8 +86,14 @@ class DhanOrderUpdateClient:
         self._logged_in = False
         self._connect_generation = 0
         self._reconnect_backoff_sec = 2.0
+        self._reconnect_backoff_cap_sec = 180.0
         self._last_activity_ts = time.time()
         self._is_warm = False
+        self._cooldown_until_ts = 0.0
+        self._failure_timestamps: deque[float] = deque()
+        self._reconnect_guard_threshold = 10
+        self._reconnect_guard_window_sec = 60.0
+        self._reconnect_guard_cooldown_sec = 90.0
         self._stall = StallWatchdog(
             name="DhanOrderUpdateWS",
             stall_sec=self._stall_timeout_seconds,
@@ -268,6 +280,7 @@ class DhanOrderUpdateClient:
 
     def _on_error(self, _ws: websocket.WebSocketApp, error: Exception) -> None:
         logger.warning("Dhan order-update WebSocket error: %s", error)
+        self._mark_failure(error)
         if self.on_error:
             try:
                 self.on_error(error)
@@ -285,9 +298,49 @@ class DhanOrderUpdateClient:
             close_status_code,
             close_msg,
         )
+        self._mark_failure(close_msg)
+
+    @staticmethod
+    def _is_429_signal(err: Any) -> bool:
+        msg = str(err or "").lower()
+        return "429" in msg or "too many requests" in msg or "blocked" in msg
+
+    def _mark_failure(self, err: Any) -> None:
+        now = time.time()
+        self._failure_timestamps.append(now)
+        while self._failure_timestamps and (
+            now - self._failure_timestamps[0] > self._reconnect_guard_window_sec
+        ):
+            self._failure_timestamps.popleft()
+        if self._is_429_signal(err):
+            self._cooldown_until_ts = max(
+                self._cooldown_until_ts, now + self._reconnect_guard_cooldown_sec
+            )
+            self._reconnect_backoff_sec = max(self._reconnect_backoff_sec, 20.0)
+            logger.warning(
+                "Dhan order-update WS entered cooldown after 429 until %s",
+                time.strftime("%H:%M:%S", time.localtime(self._cooldown_until_ts)),
+            )
+            return
+        if len(self._failure_timestamps) >= self._reconnect_guard_threshold:
+            self._cooldown_until_ts = max(
+                self._cooldown_until_ts, now + self._reconnect_guard_cooldown_sec
+            )
+            self._reconnect_backoff_sec = max(self._reconnect_backoff_sec, 15.0)
+            logger.warning(
+                "Dhan order-update WS reconnect storm detected; cooling down until %s",
+                time.strftime("%H:%M:%S", time.localtime(self._cooldown_until_ts)),
+            )
 
     def _run_loop(self) -> None:
         while not self._stop.is_set():
+            if not is_dhan_market_open():
+                sleep_until_next_dhan_market_open(stop_event=self._stop, log=logger.info)
+                continue
+            now = time.time()
+            if now < self._cooldown_until_ts:
+                time.sleep(min(5.0, self._cooldown_until_ts - now))
+                continue
             self._ws = websocket.WebSocketApp(
                 DHAN_ORDER_UPDATE_WS_URL,
                 on_open=self._on_open,
@@ -303,7 +356,9 @@ class DhanOrderUpdateClient:
             if self._stop.is_set():
                 break
             logger.info("Dhan order-update WebSocket scheduling reconnect (jittered backoff)")
-            self._reconnect_backoff_sec = reconnect_sleep_with_jitter(self._reconnect_backoff_sec)
+            self._reconnect_backoff_sec = reconnect_sleep_with_jitter(
+                self._reconnect_backoff_sec, cap=self._reconnect_backoff_cap_sec
+            )
 
     def connect(self) -> None:
         if self._thread and self._thread.is_alive():

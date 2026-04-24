@@ -20,7 +20,6 @@ from run.config import (
     RUN_MODE,
     RunMode,
     ENGINE_JOBS,
-    STRATEGY_JOBS,
     DEFAULT_VENUE,
     DEFAULT_ROOT_LOG_LEVEL,
     DEFAULT_LIBRARY_LOG_LEVEL,
@@ -89,7 +88,7 @@ def job_to_engine_config(job: dict) -> EngineConfig:
 def run_engine(config: EngineConfig) -> None:
     """Create one engine from config and run it (backtest or live)."""
     if not config.enabled:
-        print(f"⚠️ {config.strategy_name} ({config.broker_name}) is disabled. Skipping.")
+        print(f"[WARN] {config.strategy_name} ({config.broker_name}) is disabled. Skipping.")
         return
 
     loaded_strategies = [config.strategy_name] + list(config.strategy_names or [])
@@ -99,13 +98,13 @@ def run_engine(config: EngineConfig) -> None:
         config.broker_name,
         ", ".join(loaded_strategies),
     )
-    print(f"▶ Running {config.strategy_name} ({config.broker_name})...")
+    print(f"[RUN] Running {config.strategy_name} ({config.broker_name})...")
     engine = EngineFactory.create_engine(config)
 
     symbols = config.symbols or []
     if not symbols and config.strategy_name == "IPOBreakout":
         print(
-            "⚠️ IPOBreakout: no symbols from universe (NSE EQUITY_L missing/failed or filter returned empty). "
+            "[WARN] IPOBreakout: no symbols from universe (NSE EQUITY_L missing/failed or filter returned empty). "
             "Strategy will not receive any candles. Ensure Dependencies/equity_universe/EQUITY_L_latest.csv exists or set symbols in config."
         )
 
@@ -141,8 +140,7 @@ def main():
     )
     args = parser.parse_args()
 
-    raw_jobs = ENGINE_JOBS or STRATEGY_JOBS
-    configs = [job_to_engine_config(job) for job in raw_jobs]
+    configs = [job_to_engine_config(job) for job in ENGINE_JOBS]
     if args.venue:
         configs = [c for c in configs if c.broker_name == args.venue]
         if not configs:

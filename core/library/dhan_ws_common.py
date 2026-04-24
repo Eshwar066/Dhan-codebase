@@ -6,9 +6,13 @@ import logging
 import random
 import threading
 import time
+from datetime import date as dt_date, datetime, time as dtime, timedelta, timezone
 from typing import Any, Callable, List, Optional
 
 logger = logging.getLogger(__name__)
+IST = timezone(timedelta(hours=5, minutes=30))
+DHAN_MARKET_OPEN = dtime(hour=9, minute=14)
+DHAN_MARKET_CLOSE = dtime(hour=15, minute=31)
 
 
 def reconnect_sleep_with_jitter(backoff_sec: float, cap: float = 60.0) -> float:
@@ -16,6 +20,61 @@ def reconnect_sleep_with_jitter(backoff_sec: float, cap: float = 60.0) -> float:
     delay = min(float(backoff_sec), cap) + random.uniform(0.0, 1.0)
     time.sleep(delay)
     return min(float(backoff_sec) * 1.5, cap)
+
+
+def is_dhan_market_open(now_ist: Optional[datetime] = None) -> bool:
+    now = now_ist or datetime.now(IST)
+    if not _is_dhan_trading_day(now.date()):
+        return False
+    t = now.time()
+    return DHAN_MARKET_OPEN <= t <= DHAN_MARKET_CLOSE
+
+
+def _is_dhan_holiday(day: dt_date) -> bool:
+    try:
+        from core.utils.session.session_manager import SessionManager
+
+        probe = datetime.combine(day, dtime.min, tzinfo=IST)
+        return bool(SessionManager.is_holiday(probe, "INDEX"))
+    except Exception:
+        return False
+
+
+def _is_dhan_trading_day(day: dt_date) -> bool:
+    if day.weekday() >= 5:
+        return False
+    if _is_dhan_holiday(day):
+        return False
+    return True
+
+
+def sleep_until_next_dhan_market_open(
+    stop_event: Optional[threading.Event] = None,
+    log: Optional[Callable[..., None]] = None,
+) -> None:
+    logger_fn = log or logger.info
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            return
+        now = datetime.now(IST)
+        if is_dhan_market_open(now):
+            return
+        candidate = now.date()
+        if now.weekday() >= 5 or now.time() > DHAN_MARKET_CLOSE:
+            candidate = candidate + timedelta(days=1)
+        while not _is_dhan_trading_day(candidate):
+            candidate = candidate + timedelta(days=1)
+        next_open = datetime.combine(candidate, DHAN_MARKET_OPEN, tzinfo=IST)
+        delay = max(1.0, (next_open - now).total_seconds())
+        logger_fn(
+            "Market closed — skipping websocket start; sleeping until next open at %s IST",
+            next_open.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        if stop_event is None:
+            time.sleep(delay)
+            continue
+        if stop_event.wait(timeout=delay):
+            return
 
 
 class StallWatchdog:

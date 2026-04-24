@@ -20,7 +20,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import websocket
 
-from core.library.dhan_ws_common import StallWatchdog, reconnect_sleep_with_jitter
+from core.library.dhan_ws_common import (
+    StallWatchdog,
+    is_dhan_market_open,
+    reconnect_sleep_with_jitter,
+    sleep_until_next_dhan_market_open,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -313,6 +318,9 @@ class DhanDepthWebSocket:
 
     def _run_forever(self) -> None:
         while not self._stop.is_set():
+            if not is_dhan_market_open():
+                sleep_until_next_dhan_market_open(stop_event=self._stop, log=logger.info)
+                continue
             self._ws = self._make_ws_app()
             try:
                 self._ws.run_forever(ping_interval=20, ping_timeout=10)

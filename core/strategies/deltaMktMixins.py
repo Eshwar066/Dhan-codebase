@@ -18,7 +18,7 @@ import pdb
 
 from core.utils.expiry_resolver import ExpiryResolver
 from core.utils.lag_diag import lag_diag_enabled
-from run.config import RUN_MODE, RunMode, STRATEGY_JOBS
+from run.config import RUN_MODE, RunMode, ENGINE_JOBS
 
 logger = logging.getLogger(__name__)
 
@@ -1006,8 +1006,10 @@ class DeltaMktMixins:
         strategy_name = str(getattr(self, "name", ""))
         if not strategy_name:
             return False
-        for job in STRATEGY_JOBS:
-            if str(job.get("name")) != strategy_name:
+        for job in ENGINE_JOBS:
+            names = [str(job.get("name") or "")]
+            names.extend([str(s) for s in (job.get("strategies") or [])])
+            if strategy_name not in names:
                 continue
             if str(job.get("venue", "")).upper() != "DELTA":
                 continue
