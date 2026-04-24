@@ -38,8 +38,8 @@ Thumbs.db
 
 # ----------------------------
 # Graphify (AST knowledge graph; regenerate: graphify update .)
-# Ignore volatile/large artifacts. Safe to commit graphify-out/GRAPH_REPORT.md (and wiki/ if present).
+# Ignore volatile/large artifacts. Safe to commit reports/graphify-out/GRAPH_REPORT.md (and wiki/ if present).
 # ----------------------------
-graphify-out/cache/
-graphify-out/graph.json
-graphify-out/graph.html
+reports/graphify-out/cache/
+reports/graphify-out/graph.json
+reports/graphify-out/graph.html

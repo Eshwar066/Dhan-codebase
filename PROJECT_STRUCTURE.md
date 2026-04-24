@@ -29,7 +29,7 @@ Algo/
 ├── reports/
 ├── Dependencies/
 ├── docs/
-└── graphify-out/
+└── reports/graphify-out/
 ```
 
 ## Ownership by Layer

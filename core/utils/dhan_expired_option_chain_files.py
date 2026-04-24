@@ -1,12 +1,12 @@
 """
 Load Dhan expired option OHLC from locally downloaded CSVs (same layout as
-``dhan expired option chain/Expired options data.py``):
+``data/dhan_expired_option_chain/Expired options data.py``):
 
     {root}/ATM Wise data/{SYMBOL}/{YYYY-MM-DD}/{ATM±n}/{SYMBOL}_{YYYY-MM-DD}_CALL.csv
     {root}/ATM Wise data/{SYMBOL}/{YYYY-MM-DD}/{ATM±n}/{SYMBOL}_{YYYY-MM-DD}_PUT.csv
 
 ``root`` is the folder that contains ``ATM Wise data`` — e.g.
-``dhan expired option chain/dhan/Two month Options data 15 mins`` or
+``data/dhan_expired_option_chain/dhan/Two month Options data 15 mins`` or
 ``.../Monthly Options data 15 mins``.
 """
 
@@ -29,14 +29,14 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 def default_expired_option_chain_root() -> Optional[Path]:
     """
     If ``DHAN_EXPIRED_OPTION_CHAIN_ROOT`` is unset, look under
-    ``<repo>/dhan expired option chain/`` for a data folder that contains
+    ``<repo>/data/dhan_expired_option_chain/`` for a data folder that contains
     ``ATM Wise data`` (see candidates below).
     """
     env = (os.getenv("DHAN_EXPIRED_OPTION_CHAIN_ROOT") or "").strip()
     if env:
         p = Path(env).expanduser()
         return p if p.is_dir() else None
-    base = _PROJECT_ROOT / "dhan expired option chain"
+    base = _PROJECT_ROOT / "data" / "dhan_expired_option_chain"
     if not base.is_dir():
         return None
     # Prefer: dhan/Two month Options data 15 mins (then top-level fallbacks)
@@ -187,7 +187,7 @@ def load_expired_option_chain_from_files(
     if atm_wise is None:
         logger.debug(
             "Dhan expired option files: no root (set DHAN_EXPIRED_OPTION_CHAIN_ROOT "
-            "or add e.g. dhan expired option chain/dhan/Two month Options data 15 mins "
+            "or add e.g. data/dhan_expired_option_chain/dhan/Two month Options data 15 mins "
             "with ATM Wise data inside)"
         )
         return None

@@ -22,7 +22,7 @@ hourly closes (10:15 … 15:15) on those 15m candles.
 
 **Backtest:** option marks come from locally downloaded Dhan expired option CSVs
 (``ATM Wise data/{SYMBOL}/{expiry}/{ATM±n}/…``). Set ``DHAN_EXPIRED_OPTION_CHAIN_ROOT`` to the
-folder that contains ``ATM Wise data``, or place data under ``dhan expired option chain/Monthly Options data *``.
+folder that contains ``ATM Wise data``, or place data under ``data/dhan_expired_option_chain/Monthly Options data *``.
 The **interval** of downloaded bars should match strategy ``timeframe`` (e.g. 15 vs 60 minutes).
 """
 

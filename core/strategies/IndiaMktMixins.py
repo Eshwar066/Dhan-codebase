@@ -76,7 +76,7 @@ class IndiaMktMixins:
         return q if q > 0 else self._entry_order_qty(inst)
 
     # ==================================================
-    # DHAN EXPIRED OPTION CSV (BACKTEST) — same layout as dhan expired option chain download scripts
+    # DHAN EXPIRED OPTION CSV (BACKTEST) — same layout as data/dhan_expired_option_chain download scripts
     # ==================================================
     @staticmethod
     def dhan_expired_option_atm_folder_label(

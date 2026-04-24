@@ -517,8 +517,8 @@ class DhanSource:
     ):
         """
         Backtest option OHLC: prefer CSVs under ``DHAN_EXPIRED_OPTION_CHAIN_ROOT``
-        (or ``dhan expired option chain/Monthly Options data *``). Same layout as
-        ``dhan expired option chain/Expired options data.py``.
+        (or ``data/dhan_expired_option_chain/Monthly Options data *``). Same layout as
+        ``data/dhan_expired_option_chain/Expired options data.py``.
         """
         trade_dt = self._to_date(from_date)
         if trade_dt is None:
