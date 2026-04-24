@@ -1,0 +1,17 @@
+[Unit]
+Description=Trading Control API (FastAPI)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/Dhan-codebase
+Environment=PYTHONUNBUFFERED=1
+Environment=UI_ALLOWED_ORIGINS=https://trader.yourdomain.com,http://localhost:5173,http://127.0.0.1:5173
+ExecStart=/root/Dhan-codebase/.venv/bin/uvicorn control_api.app:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+
