@@ -14,13 +14,12 @@ Optional: use Supervisor in code to run both venues in one process (two threads)
 
 import argparse
 import logging
-import os
 import sys
-from pathlib import Path
 
 from run.config import (
     RUN_MODE,
     RunMode,
+    ENGINE_JOBS,
     STRATEGY_JOBS,
     DEFAULT_VENUE,
     DEFAULT_ROOT_LOG_LEVEL,
@@ -33,10 +32,21 @@ from core.engine.factory import EngineFactory
 
 
 def job_to_engine_config(job: dict) -> EngineConfig:
-    """Build EngineConfig from a STRATEGY_JOBS entry. Per-job run_mode overrides global RUN_MODE."""
+    """Build EngineConfig from either ENGINE_JOBS or legacy STRATEGY_JOBS shape."""
     venue = job.get("venue", DEFAULT_VENUE)
     backtest = job.get("backtest") or {}
     live = job.get("live") or {}
+    strategies = list(job.get("strategies") or [])
+    primary_strategy = job.get("name") or (strategies[0] if strategies else None)
+    extra_strategies = (
+        list(job.get("strategy_names") or [])
+        if job.get("strategy_names") is not None
+        else strategies[1:]
+    )
+    if not primary_strategy:
+        raise ValueError(
+            f"Invalid job config for engine_id={job.get('engine_id')}: missing strategy name."
+        )
     # Per-job run_mode: "PAPER" | "LIVE" | "BACKTEST"; if omitted or invalid, use global RUN_MODE
     run_mode_raw = job.get("run_mode")
     try:
@@ -46,8 +56,8 @@ def job_to_engine_config(job: dict) -> EngineConfig:
     return EngineConfig(
         broker_name=venue,
         run_mode=run_mode,
-        strategy_name=job["name"],
-        strategy_names=job.get("strategy_names"),
+        strategy_name=primary_strategy,
+        strategy_names=extra_strategies,
         symbols=job["symbols"],
         enabled=job.get("enabled", True),
         engine_id=job.get("engine_id"),
@@ -71,12 +81,6 @@ def job_to_engine_config(job: dict) -> EngineConfig:
         latency_critical_ms=job.get("latency_critical_ms", 150.0),
         latency_critical_cycles=job.get("latency_critical_cycles", 3),
         symbol_error_threshold=job.get("symbol_error_threshold", 5),
-        telegram_bot_token=(
-            (job.get("telegram") or {}).get("bot_token") if isinstance(job.get("telegram"), dict) else None
-        ) or os.getenv("TELEGRAM_BOT_TOKEN"),
-        telegram_chat_id=(
-            (job.get("telegram") or {}).get("chat_id") if isinstance(job.get("telegram"), dict) else None
-        ) or os.getenv("TELEGRAM_CHAT_ID"),
         root_log_level=str(job.get("log_level") or DEFAULT_ROOT_LOG_LEVEL),
         library_log_level=str(job.get("library_log_level") or DEFAULT_LIBRARY_LOG_LEVEL),
     )
@@ -137,7 +141,8 @@ def main():
     )
     args = parser.parse_args()
 
-    configs = [job_to_engine_config(job) for job in STRATEGY_JOBS]
+    raw_jobs = ENGINE_JOBS or STRATEGY_JOBS
+    configs = [job_to_engine_config(job) for job in raw_jobs]
     if args.venue:
         configs = [c for c in configs if c.broker_name == args.venue]
         if not configs:

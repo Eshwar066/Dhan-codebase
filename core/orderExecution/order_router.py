@@ -7,7 +7,6 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 # Trade-led OMS: positions are updated only from trade events (fills), not from order state.
 
-OptionalAlert = Optional[Callable[[str], None]]
 import pdb
 import datetime
 
@@ -55,7 +54,6 @@ class OrderRouter:
         slippage_threshold_pct: float = None,
         engine_id: Optional[str] = None,
         strategy_id: Optional[str] = None,
-        telegram_alert: OptionalAlert = None,
         # Orphan fill sync (no intent match): ignore stale / pre-session broker rows
         max_orphan_fill_age_seconds: Optional[float] = 300,
         reject_orphan_fills_before_oms_session: bool = True,
@@ -72,7 +70,6 @@ class OrderRouter:
         self.slippage_threshold_pct = slippage_threshold_pct
         self.engine_id = engine_id
         self.strategy_id = strategy_id
-        self.telegram_alert = telegram_alert
         self.max_orphan_fill_age_seconds = max_orphan_fill_age_seconds
         self.reject_orphan_fills_before_oms_session = (
             reject_orphan_fills_before_oms_session
@@ -323,12 +320,12 @@ class OrderRouter:
                 msg = funds_check.get("message") or "Insufficient funds"
                 if self.engine_logger:
                     self.engine_logger.log(
-                        "risk_block",
+                        "order_failed",
                         f"Funds check failed: {msg} (shortfall={shortfall})",
-                    )
-                if self.telegram_alert:
-                    self.telegram_alert(
-                        f"⚠️ Order blocked – insufficient funds: {sym} {side} qty={qty}. {msg} Shortfall: {shortfall}"
+                        symbol=sym,
+                        side=side,
+                        qty=qty,
+                        strategy_id=intent_strategy_id,
                     )
                 self.intent_store.update(
                     intent.intent_id, IntentStatus.REJECTED, order_state=OrderState.REJECTED
@@ -402,9 +399,15 @@ class OrderRouter:
             retryable = self._is_retryable_broker_error(e)
             self._consecutive_failures += 1
             if self.engine_logger:
-                self.engine_logger.log("risk_block", f"Broker place_order failed: {e}")
-            if self.telegram_alert:
-                self.telegram_alert(f"Broker error: {sym} {side} qty={qty} — {e}")
+                self.engine_logger.log(
+                    "order_failed",
+                    f"Broker place_order failed: {e}",
+                    symbol=sym,
+                    side=side,
+                    qty=qty,
+                    intent_id=getattr(intent, "intent_id", None),
+                    strategy_id=intent_strategy_id,
+                )
             if retryable and raise_on_retryable_failure:
                 raise RuntimeError(f"retryable_broker_error: {e}") from e
             if (
@@ -430,13 +433,17 @@ class OrderRouter:
         if order_id is None:
             self._consecutive_failures += 1
             if self.engine_logger:
-                self.engine_logger.log("risk_block", "Broker place_order returned None")
+                self.engine_logger.log(
+                    "order_failed",
+                    "Broker place_order returned None",
+                    symbol=sym,
+                    side=side,
+                    qty=qty,
+                    intent_id=getattr(intent, "intent_id", None),
+                    strategy_id=intent_strategy_id,
+                )
             else:
                 logger.warning("Broker place_order returned None for %s %s qty=%s", sym, side, qty)
-            if self.telegram_alert:
-                self.telegram_alert(
-                    f"Broker returned no order_id: {sym} {side} qty={qty}"
-                )
             if raise_on_retryable_failure:
                 raise RuntimeError("retryable_broker_error: no_order_id")
             if (
@@ -476,10 +483,6 @@ class OrderRouter:
                 action="order_placed",
                 message=f"order_id={order_id}",
             )
-            if self.telegram_alert:
-                self.telegram_alert(
-                    f"Order placed: {sym} {side} qty={qty} order_id={order_id},price={exec_price},"
-                )
             if self.engine_logger:
                 self.engine_logger.order_placed(
                     symbol=sym,
@@ -488,6 +491,7 @@ class OrderRouter:
                     price=exec_price,
                     order_id=order_id,
                     intent_id=getattr(intent, "intent_id", None),
+                    strategy_id=intent_strategy_id,
                 )
             self.intent_store.update(
                 intent.intent_id,
@@ -501,10 +505,6 @@ class OrderRouter:
                     sent_rec["last_price_update_ts"] = time.time()
         else:
             # Paper/sim filled synchronously: keep status FILLED, still log order_placed for audit.
-            if self.telegram_alert:
-                self.telegram_alert(
-                    f"Order placed: {sym} {side} qty={qty} order_id={order_id},price={exec_price},"
-                )
             if self.engine_logger:
                 self.engine_logger.order_placed(
                     symbol=sym,
@@ -513,6 +513,7 @@ class OrderRouter:
                     price=exec_price,
                     order_id=order_id,
                     intent_id=getattr(intent, "intent_id", None),
+                    strategy_id=intent_strategy_id,
                 )
             self.intent_store.update(
                 intent.intent_id,
@@ -1176,6 +1177,7 @@ class OrderRouter:
             price,
             order_id=order_id,
             intent_id=intent_id,
+            strategy_id=strategy,
         )
 
     def process_fill(
@@ -1209,6 +1211,7 @@ class OrderRouter:
                 price,
                 order_id=order_id,
                 intent_id=intent_id,
+                strategy_id=strategy,
             )
             return
         # Skip duplicate callback only when PM already reflects this fill — not merely when
@@ -1314,6 +1317,7 @@ class OrderRouter:
             price,
             order_id=order_id,
             intent_id=intent_id,
+            strategy_id=strategy,
         )
         if intent_id and self.intent_store:
             self._set_order_state(
@@ -1346,6 +1350,14 @@ class OrderRouter:
             return False
         intent_id = trade.get("intent_id") or trade.get("client_order_id") or trade.get("tag")
         if not intent_id:
+            if self.engine_logger:
+                self.engine_logger.log(
+                    "intent_not_found_for_trade",
+                    "Trade missing intent_id/client_order_id/tag; cannot apply fill",
+                    order_id=trade.get("order_id"),
+                    trade_id=trade_id,
+                    strategy_id=trade.get("strategy_id"),
+                )
             return False
         price = float(trade.get("price") or 0)
         size = float(trade.get("size") or 0)
@@ -1356,6 +1368,15 @@ class OrderRouter:
         # Resolve instrument and metadata from intent_store
         intent = self.intent_store.get(intent_id) if self.intent_store else None
         if not intent:
+            if self.engine_logger:
+                self.engine_logger.log(
+                    "intent_not_found_for_trade",
+                    "Intent not found for trade; fill not applied",
+                    intent_id=intent_id,
+                    order_id=order_id,
+                    trade_id=trade_id,
+                    strategy_id=trade.get("strategy_id"),
+                )
             return False
         instrument = trade.get("instrument") or intent.get("instrument")
         if not instrument:
@@ -1502,6 +1523,7 @@ class OrderRouter:
         self.report_fill(
             sym, side, int(size), trade.get("expected_price"), price,
             order_id=order_id, intent_id=intent_id,
+            strategy_id=intent.get("strategy") or payload.get("strategy_id") or trade.get("strategy"),
         )
         self._set_order_state(
             intent_id,
@@ -1963,6 +1985,7 @@ class OrderRouter:
             price,
             order_id=order_id or None,
             intent_id=intent_id,
+            strategy_id=strat,
         )
         if intent_id and self.intent_store:
             self._set_order_state(
@@ -2099,11 +2122,18 @@ class OrderRouter:
         fill_price,
         order_id=None,
         intent_id=None,
+        strategy_id=None,
     ):
         """Logs order_filled and high_slippage_warning if above threshold. Called by process_fill or legacy paths."""
         if self.engine_logger:
             self.engine_logger.order_filled(
-                symbol=symbol, side=side, qty=qty, price=fill_price, order_id=order_id
+                symbol=symbol,
+                side=side,
+                qty=qty,
+                price=fill_price,
+                order_id=order_id,
+                intent_id=intent_id,
+                strategy_id=strategy_id,
             )
         if (
             self.slippage_threshold_pct is not None
@@ -2119,8 +2149,4 @@ class OrderRouter:
                         expected_price=expected_price,
                         fill_price=fill_price,
                         slippage_pct=pct * 100,
-                    )
-                if self.telegram_alert:
-                    self.telegram_alert(
-                        f"High slippage: {symbol} expected={expected_price:.2f} fill={fill_price:.2f} ({pct * 100:.2f}%)"
                     )

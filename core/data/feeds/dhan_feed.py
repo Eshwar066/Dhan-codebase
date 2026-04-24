@@ -8,6 +8,7 @@ Dhan Live Market Feed WebSocket implementing RealtimeFeed.
 """
 
 import time
+import queue
 from typing import Any, Dict, List, Optional
 
 from core.data.feeds.base_feed import RealtimeFeed
@@ -25,6 +26,7 @@ class DhanWebSocketFeed(RealtimeFeed):
         access_token: str,
         client_id: str,
         instruments: List[Dict[str, str]],
+        engine_logger: Optional[Any] = None,
     ):
         """
         instruments: list of {"ExchangeSegment": "NSE_EQ", "SecurityId": "11536", "symbol": "RELIANCE"}.
@@ -35,6 +37,7 @@ class DhanWebSocketFeed(RealtimeFeed):
         self.instruments = list(instruments)
         self._ws: Optional[DhanWebSocket] = None
         self._tick_queue: Optional[Any] = None
+        self._engine_logger = engine_logger
 
     def set_tick_queue(self, queue: Any) -> None:
         """Push normalized ticks to queue for CandleAggregator. Set before start()."""
@@ -65,6 +68,13 @@ class DhanWebSocketFeed(RealtimeFeed):
                 "volume": vol,
                 "timestamp": float(ts),
             })
+        except queue.Full:
+            if self._engine_logger:
+                self._engine_logger.log(
+                    "tick_dropped_queue_full",
+                    f"Dhan tick dropped due to full queue symbol={symbol}",
+                    symbol=symbol,
+                )
         except Exception:
             pass
 

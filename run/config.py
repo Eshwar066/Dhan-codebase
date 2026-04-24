@@ -20,23 +20,19 @@ DEFAULT_VENUE = "DHAN"  # "DHAN" | "DELTA"
 DEFAULT_ROOT_LOG_LEVEL = "INFO"
 DEFAULT_LIBRARY_LOG_LEVEL = "WARNING"
 
-# Per-job run_mode: set "run_mode": "PAPER" or "run_mode": "LIVE" (or "BACKTEST") on each job.
-# If omitted, RUN_MODE above is used. You can run some strategies in paper and others in live in the same process.
-STRATEGY_JOBS = [
-    # Primary DHAN engine (multi-strategy): LEAPS_RSI + NiftyIntradayMagicalLine
+# New architecture: one job per engine, multiple strategies per engine.
+# Each engine job shares venue/broker/risk/pipeline settings, and strategy list defines
+# what the engine loads concurrently.
+ENGINE_JOBS = [
     {
-        "name": "LEAPS_RSI",
+        "engine_id": "dhan_leaps_rsi",
         "venue": "DHAN",
         "enabled": True,
-        "strategy_names": ["NiftyIntradayMagicalLine"],
-        "run_mode": "PAPER",  # or "LIVE"; omit to use RUN_MODE default
+        "run_mode": "PAPER",
         "capital": 200000,
         "ORDER_QTY_LOTS": 1,
         "symbols": ["NIFTY"],
-        "telegram": {
-            "bot_token": "8663481671:AAHY-OnE8OiaJmkOfXbwqoe4InosJVblAtM",
-            "chat_id": "1021479950",
-        },
+        "strategies": ["LEAPS_RSI", "NiftyIntradayMagicalLine"],
         "live": {"exchange": "INDEX", "sector": "YES", "rsi": "YES"},
         "backtest": {
             "start_date": "2023-10-19",
@@ -46,36 +42,13 @@ STRATEGY_JOBS = [
             "sector": "YES",
         },
     },
-     # Nifty intraday magical line: entry on 15m 9:15–9:30 (close 9:30); SL on 1h :15 closes (10:15…15:15); 15:15 square-off;
-    # monthly expiry (rollover after 15th), delta band + premium fallback. Dhan NIFTY OPTIDX — use exchange NSE (live + backtest).
     {
-        "name": "NiftyIntradayMagicalLine",
-        "venue": "DHAN",
-        "enabled": False,  # included via LEAPS_RSI.strategy_names in the primary job above
-        "ORDER_QTY_LOTS": 1,
-        "run_mode": "PAPER",  # or "PAPER"; omit to use RUN_MODE default
-        "capital": 200000,
-        "symbols": ["NIFTY"],
-        "instrument": "OPTION",
-        "telegram": {
-            "bot_token": "8663481671:AAHY-OnE8OiaJmkOfXbwqoe4InosJVblAtM",
-            "chat_id": "1021479950",
-        },
-        "live": {"exchange": "INDEX", "sector": "YES"},
-        "backtest": {
-            "start_date": "2025-01-01",
-            "end_date": "2025-06-30",
-            "timeframe": "15",
-            "exchange": "INDEX",
-            "sector": "YES",
-        },
-    },
-    {
-        "name": "MagicalLines",
+        "engine_id": "dhan_magicallines",
         "venue": "DHAN",
         "enabled": False,
         "capital": 200000,
         "symbols": ["NIFTY"],
+        "strategies": ["MagicalLines"],
         "live": {"exchange": "INDEX", "sector": "YES"},
         "backtest": {
             "start_date": "2026-01-01",
@@ -86,12 +59,12 @@ STRATEGY_JOBS = [
         },
     },
     {
-        "name": "IPOBreakout",
+        "engine_id": "dhan_ipo_breakout",
         "venue": "DHAN",
         "enabled": False,
-        "engine_id": "dhan_ipo_breakout",
         "capital": 200000,
         "symbols": None,
+        "strategies": ["IPOBreakout"],
         "backtest": {
             "start_date": "2022-01-01",
             "end_date": "2026-02-20",
@@ -112,13 +85,12 @@ STRATEGY_JOBS = [
         },
     },
     {
-        "name": "SignalFloodTest",
+        "engine_id": "dhan_test_pipeline",
         "venue": "DHAN",
         "enabled": False,
-        "engine_id": "dhan_test_pipeline",
         "capital": 10000,
         "symbols": ["NIFTY"],
-        "instrument": "FUTURES",
+        "strategies": ["SignalFloodTest"],
         "daily_max_loss": 100,
         "max_open_positions": 1,
         "max_portfolio_exposure": 5000,
@@ -140,26 +112,19 @@ STRATEGY_JOBS = [
             "sector": "YES",
         },
     },
-    # OneDayMagicalLine: DELTA BTC options (sell CE/PE; buy to close / exits). Same wiring as FuturesEMAHighLow / SignalFloodTest (DELTA).
-    # Backtest: omit run_mode (uses RUN_MODE). Live: add "run_mode": "LIVE".
-    # Testnet: delta_testnet True + DEMO_DELTA_API_KEY / DEMO_DELTA_API_SECRET | Mainnet live: delta_testnet False + DELTA_API_KEY / DELTA_API_SECRET.
     {
-        "name": "OneDayMagicalLine",
+        "engine_id": "delta_oneday_magicalline",
         "venue": "DELTA",
         "enabled": True,
-        "run_mode": "LIVE",  # uncomment for Delta paper/live; omit for backtest (uses RUN_MODE)
+        "run_mode": "LIVE",
         "capital": 200000,
         "symbols": ["BTCUSD"],
-        "instrument": "OPTION",
+        "strategies": ["OneDayMagicalLine"],
         "delta_india": True,
         "delta_testnet": False,
         "delta_leverage": 10,
         "max_open_positions": 5,
         "check_short_option_margin_enabled": True,
-        "telegram": {
-            "bot_token": "8389724629:AAHY_CGcBF8HZCexedsEJFw80Mf6SxH5Bkk",
-            "chat_id": "1021479950",
-        },
         "live": {"exchange": "DELTA", "sector": "YES"},
         "backtest": {
             "start_date": "2026-02-01",
@@ -169,14 +134,13 @@ STRATEGY_JOBS = [
             "sector": "YES",
         },
     },
-    # ema 5, 0.7 for profit  and 0.3 for loss used both for nifty and btc, etc
     {
-        "name": "FuturesEMAHighLow",
+        "engine_id": "delta_futures_ema_highlow",
         "venue": "DELTA",
         "enabled": False,
         "capital": 200000,
         "symbols": ["BTCUSD"],
-        "instrument": "FUTURES",
+        "strategies": ["FuturesEMAHighLow"],
         "delta_india": True,
         "delta_testnet": False,
         "delta_leverage": 1,
@@ -189,55 +153,47 @@ STRATEGY_JOBS = [
             "sector": "YES",
         },
     },
-    # dont use this
     {
-        "name": "Futures_EMA_Momentum",
+        "engine_id": "delta_futures_ema_momentum",
         "venue": "DELTA",
         "enabled": False,
-        "engine_id": "delta_futures_ema_momentum",
         "capital": 200000000,
         "symbols": ["BTCUSD"],
-        "instrument": "FUTURES",
+        "strategies": ["Futures_EMA_Momentum"],
         "delta_india": True,
         "delta_testnet": False,
         "delta_leverage": 1,
         "live": {"exchange": "INDEX", "sector": "YES"},
         "backtest": {
-            "start_date": "2024-09-01",  # dont go below this in delta exchange "2024-02-01"
+            "start_date": "2024-09-01",
             "end_date": "2026-03-13",
             "timeframe": "60",
         },
     },
     {
-        "name": "SignalFloodTest",
+        "engine_id": "delta_test_pipeline",
         "venue": "DELTA",
         "enabled": False,
         "run_mode": "LIVE",
-        "engine_id": "delta_test_pipeline",
+        "capital": 10000,
         "symbols": ["BTCUSD"],
-        "instrument": "FUTURES",
+        "strategies": ["SignalFloodTest"],
         "delta_india": True,
         "delta_testnet": True,
         "delta_leverage": 10,
-        "capital": 10000,
-        "daily_max_loss": 10000,  # not in engine
-        "max_open_positions": 6,  # not in engine
-        "max_portfolio_exposure": 1000,  # In Engine (RiskManager)
+        "daily_max_loss": 10000,
+        "max_open_positions": 6,
+        "max_portfolio_exposure": 1000,
         "cooldown_seconds": 5,
         "risk_per_trade_percent": 1.0,
-        "check_short_option_margin_enabled": False,  # futures-only; no option margin check
-        "feed_stale_seconds": 30,  # In Engine
-        "order_state_check_interval_min": 1,  # In engine
-        "memory_threshold_percent": 5,  # In engine
-        "latency_critical_ms": 6000,  # In engine
-        "latency_critical_cycles": 6,  # In engine
-        "symbol_error_threshold": 6,  # In engine
-        # "strategy_timeout_seconds": 1000000000, # do we need this
+        "check_short_option_margin_enabled": False,
+        "feed_stale_seconds": 30,
+        "order_state_check_interval_min": 1,
+        "memory_threshold_percent": 5,
+        "latency_critical_ms": 6000,
+        "latency_critical_cycles": 6,
+        "symbol_error_threshold": 6,
         "live": {"exchange": "DELTA", "sector": "YES"},
-        "telegram": {
-            "bot_token": "8389724629:AAHY_CGcBF8HZCexedsEJFw80Mf6SxH5Bkk",
-            "chat_id": "1021479950",
-        },
         "backtest": {
             "start_date": "2024-03-20",
             "end_date": "2024-03-25",

@@ -2,7 +2,7 @@
 Structured JSON logging per engine. One file per engine: logs/{engine_id}.log.
 Closed candles: logs/{engine_id}_candles.log (see candle_created).
 No print(); all events logged as one JSON object per line.
-Timestamps are in India/Bangalore (IST, UTC+5:30).
+Event timestamps are UTC (ISO-8601).
 """
 
 import json
@@ -21,6 +21,22 @@ IST = ZoneInfo("Asia/Kolkata")
 
 LOGS_DIR = "logs"
 REPORTS_DIR = "reports"
+
+# Only strategy-originated events should be hard-required to carry strategy_id.
+STRATEGY_EVENTS = {
+    "signal_generated",
+    "intent_created",
+    "intent_routed",
+    "order_placed",
+    "order_failed",
+}
+
+EVENT_TYPE_ALIASES = {
+    "candle_created": "candle_closed",
+    "closed_candle_skip": "candle_closed_skipped",
+    "feed_health_warning": "feed_stalled",
+    "feed_health_recovered": "feed_recovered",
+}
 
 
 def _safe_dir_name(name: Optional[str]) -> str:
@@ -49,21 +65,22 @@ class EngineLogger:
         self,
         event_type: str,
         message: str = "",
-        strategy: Optional[str] = None,
+        strategy_id: Optional[str] = None,
         symbol: Optional[str] = None,
         side: Optional[str] = None,
         qty: Optional[int] = None,
         price: Optional[float] = None,
         order_id: Optional[str] = None,
         intent_id: Optional[str] = None,
+        account_id: Optional[str] = None,
         **extra,
     ) -> Dict[str, Any]:
         base = {
             "engine_id": self.engine_id,
             "venue": self.venue,
-            "strategy": strategy or self.strategy,
+            "strategy_id": strategy_id or self.strategy,
             "event_type": event_type,
-            "timestamp": datetime.now(IST).isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         if message:
             base["message"] = message
@@ -79,17 +96,27 @@ class EngineLogger:
             base["order_id"] = order_id
         if intent_id is not None:
             base["intent_id"] = intent_id
+        if account_id is not None:
+            base["account_id"] = account_id
         base.update(extra)
         return base
 
     def log(self, event_type: str, message: str = "", **kwargs) -> None:
+        # Backward compatibility: old call-sites may still pass "strategy".
+        if "strategy" in kwargs and "strategy_id" not in kwargs:
+            kwargs["strategy_id"] = kwargs.pop("strategy")
+        event_type = EVENT_TYPE_ALIASES.get(event_type, event_type)
+        if event_type in STRATEGY_EVENTS:
+            assert kwargs.get("strategy_id") is not None, (
+                f"Missing strategy_id for strategy event_type={event_type}"
+            )
         payload = self._payload(event_type, message=message, **kwargs)
         line = json.dumps(payload, default=str) + "\n"
         with self._lock:
             os.makedirs(self._log_dir, exist_ok=True)
             with open(self._path, "a", encoding="utf-8") as f:
                 f.write(line)
-            payload_strategy = str(payload.get("strategy") or "").strip()
+            payload_strategy = str(payload.get("strategy_id") or "").strip()
             if payload_strategy and payload_strategy != self.strategy:
                 alt_dir = os.path.join(self._base_log_root, _safe_dir_name(payload_strategy))
                 os.makedirs(alt_dir, exist_ok=True)
@@ -154,7 +181,7 @@ class EngineLogger:
             except Exception:
                 tf_sec = None
         payload = self._payload(
-            "candle_created",
+            "candle_closed",
             message="Closed candle",
             symbol=candle.get("symbol"),
             timeframe=timeframe,
@@ -176,11 +203,53 @@ class EngineLogger:
             with open(self._candles_path, "a", encoding="utf-8") as f:
                 f.write(line)
 
-    def order_placed(self, symbol: str, side: str, qty: int, price: Optional[float], order_id: Optional[str], intent_id: Optional[str] = None) -> None:
-        self.log("order_placed", message="Order placed", symbol=symbol, side=side, qty=qty, price=price, order_id=order_id, intent_id=intent_id)
+    def order_placed(
+        self,
+        symbol: str,
+        side: str,
+        qty: int,
+        price: Optional[float],
+        order_id: Optional[str],
+        intent_id: Optional[str] = None,
+        strategy_id: Optional[str] = None,
+        account_id: Optional[str] = None,
+    ) -> None:
+        self.log(
+            "order_placed",
+            message="Order placed",
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            price=price,
+            order_id=order_id,
+            intent_id=intent_id,
+            strategy_id=strategy_id,
+            account_id=account_id,
+        )
 
-    def order_filled(self, symbol: str, side: str, qty: int, price: float, order_id: Optional[str]) -> None:
-        self.log("order_filled", message="Order filled", symbol=symbol, side=side, qty=qty, price=price, order_id=order_id)
+    def order_filled(
+        self,
+        symbol: str,
+        side: str,
+        qty: int,
+        price: float,
+        order_id: Optional[str],
+        intent_id: Optional[str] = None,
+        strategy_id: Optional[str] = None,
+        account_id: Optional[str] = None,
+    ) -> None:
+        self.log(
+            "order_filled",
+            message="Order filled",
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            price=price,
+            order_id=order_id,
+            intent_id=intent_id,
+            strategy_id=strategy_id,
+            account_id=account_id,
+        )
 
     def exit_triggered(self, symbol: str, side: str, qty: int, reason: str = "") -> None:
         self.log("exit_triggered", message=reason or "Exit triggered", symbol=symbol, side=side, qty=qty)
@@ -207,14 +276,14 @@ class EngineLogger:
         self.log("latency", message="Latency metrics", strategy_time_ms=strategy_time_ms, broker_latency_ms=broker_latency_ms, total_latency_ms=total_latency_ms, **extra)
 
     def feed_health_warning(self, message: str, symbol: Optional[str] = None) -> None:
-        self.log("feed_health_warning", message=message, symbol=symbol)
+        self.log("feed_stalled", message=message, symbol=symbol)
 
     def feed_health_recovered(self, message: str, symbol: Optional[str] = None) -> None:
-        self.log("feed_health_recovered", message=message, symbol=symbol)
+        self.log("feed_recovered", message=message, symbol=symbol)
 
     def closed_candle_skip(self, symbol: str, reason: str, **extra: Any) -> None:
         """Log skip reason; pass ``diagnostics=`` or other fields for feed/timestamp debugging."""
-        self.log("closed_candle_skip", message=reason, symbol=symbol, **extra)
+        self.log("candle_closed_skipped", message=reason, symbol=symbol, **extra)
 
     def eod_export(self, path: str, message: str = "EOD export written") -> None:
         self.log("eod_export", message=message, export_path=path)

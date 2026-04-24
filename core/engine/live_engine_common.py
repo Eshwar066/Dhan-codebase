@@ -168,7 +168,7 @@ class LiveEngineHelpersMixin:
 
     # ---------- Signal logging (entry and exit) ----------
 
-    def _log_and_telegram_signal(
+    def _log_signal(
         self,
         intent: Any,
         symbol: str,
@@ -176,8 +176,7 @@ class LiveEngineHelpersMixin:
         qty_fallback: Optional[int] = None,
     ) -> None:
         """
-        Log and send Telegram for a strategy-generated signal (entry or exit).
-        Requires self.engine_logger and self.order_router (for telegram_alert).
+        Log a strategy-generated signal (entry or exit) as structured JSON.
         """
         _sym = (
             getattr(getattr(intent, "instrument", None), "trading_symbol", None)
@@ -199,7 +198,7 @@ class LiveEngineHelpersMixin:
         )
         if getattr(self, "engine_logger", None):
             self.engine_logger.log(
-                "signal",
+                "signal_generated",
                 _msg,
                 symbol=_sym,
                 side=_side,
@@ -207,16 +206,9 @@ class LiveEngineHelpersMixin:
                 intent_id=_intent_id,
                 action=action,
                 price=_price,
+                strategy_id=getattr(intent, "strategy_id", None)
+                or getattr(intent, "strategy", None),
             )
-        telegram = getattr(getattr(self, "order_router", None), "telegram_alert", None)
-        if callable(telegram):
-            telegram(_msg)
-
-    def _telegram_plain(self, message: str) -> None:
-        """Send a Telegram alert if order_router has telegram_alert configured."""
-        telegram = getattr(getattr(self, "order_router", None), "telegram_alert", None)
-        if callable(telegram):
-            telegram(message)
 
     # ---------- Strategy helpers ----------
 
@@ -669,7 +661,6 @@ class LiveEngineHelpersMixin:
                 )
                 if self.engine_logger:
                     self.engine_logger.feed_health_recovered(msg)
-                self._telegram_plain(msg)
                 if gen > 0:
                     self._dhan_feed_last_connect_generation_alerted = gen
         else:
@@ -680,7 +671,6 @@ class LiveEngineHelpersMixin:
                 )
                 if self.engine_logger:
                     self.engine_logger.websocket_disconnect(msg)
-                self._telegram_plain(msg)
 
         self._dhan_feed_was_connected = connected
 
@@ -717,10 +707,6 @@ class LiveEngineHelpersMixin:
                         f"No data for {symbol} in {self.feed_stale_seconds}s",
                         symbol=symbol,
                     )
-                if not was_stale:
-                    self._telegram_plain(
-                        f"⚠️ Dhan feed stale: no data for {symbol} in {self.feed_stale_seconds}s | engine={self.engine_id}"
-                    )
                 self._symbol_state[symbol]["feed_stale"] = True
             else:
                 if was_stale and has_data:
@@ -729,9 +715,6 @@ class LiveEngineHelpersMixin:
                             f"Data recovered for {symbol}",
                             symbol=symbol,
                         )
-                    self._telegram_plain(
-                        f"✅ Dhan feed recovered: {symbol} | engine={self.engine_id}"
-                    )
                 self._symbol_state[symbol]["feed_stale"] = False
         self._entries_paused_feed_stale = any_stale
 
@@ -773,7 +756,6 @@ class LiveEngineHelpersMixin:
             self.engine_logger.log("oms", msg)
         else:
             logger.info(msg)
-        self._telegram_plain(f"ℹ️ {msg}")
 
     def _export_eod(self, date_str: str) -> None:
         """Export open positions, realized pnl to reports/{engine_id}_{date}.csv."""

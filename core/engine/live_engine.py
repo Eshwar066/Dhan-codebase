@@ -758,8 +758,11 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             return
         if self.engine_logger:
             self.engine_logger.log(
-                "intent",
+                "intent_created",
                 f"CREATED intent_id={payload['intent_id']} strategy_id={payload['strategy_id']}",
+                intent_id=payload["intent_id"],
+                strategy_id=payload["strategy_id"],
+                symbol=payload.get("symbol"),
             )
 
     def _safe_queue_put(
@@ -949,8 +952,13 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         self._entries_paused_latency = True
                     if self.engine_logger:
                         self.engine_logger.log(
-                            "intent",
+                            "order_placed",
                             f"ORDER_PLACED intent_id={intent_id} strategy_id={item.get('strategy_id')} account_id={account_id} execution_attempt_id={item.get('execution_attempt_id')}",
+                            intent_id=intent_id,
+                            strategy_id=item.get("strategy_id"),
+                            account_id=account_id,
+                            symbol=item.get("symbol"),
+                            execution_attempt_id=item.get("execution_attempt_id"),
                         )
                 else:
                     self._account_failure_counts[account_id] = (
@@ -1076,8 +1084,12 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     queue_key=key,
                 ) and self.engine_logger:
                     self.engine_logger.log(
-                        "intent",
+                        "intent_routed",
                         f"ROUTED intent_id={intent_id} strategy_id={item.get('strategy_id')} account_id={account_id}",
+                        intent_id=intent_id,
+                        strategy_id=item.get("strategy_id"),
+                        account_id=account_id,
+                        symbol=item.get("symbol"),
                     )
             self._routed_intent_ids.add(intent_id)
             self.intent_queue.task_done()
@@ -1163,9 +1175,22 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             return
         intent_id = trade.get("intent_id") or trade.get("client_order_id") or ""
         account_id = trade.get("account_id") or "default"
+        strategy_id = trade.get("strategy_id")
+        if not strategy_id and intent_id:
+            try:
+                rec = self.order_router.intent_store.get(intent_id)
+                if rec:
+                    payload = rec.get("payload") or {}
+                    strategy_id = rec.get("strategy") or payload.get("strategy_id")
+            except Exception:
+                strategy_id = None
         self.engine_logger.log(
-            "intent",
+            "order_filled",
             f"FILLED intent_id={intent_id} strategy_id={trade.get('strategy_id', 'unknown')} account_id={account_id}",
+            intent_id=intent_id,
+            strategy_id=strategy_id,
+            account_id=account_id,
+            order_id=trade.get("order_id"),
         )
 
     def _check_feed_stall_fail_safe(self) -> None:
@@ -1186,8 +1211,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             f"symbols={stale_symbols}"
         )
         if self.engine_logger:
-            self.engine_logger.log("critical", msg)
-        self._telegram_plain(msg)
+            self.engine_logger.log("feed_stalled", msg)
 
     def start(self, exchange, sector, rsi):
         if self.engine_logger:
@@ -1216,9 +1240,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             return
 
         _rm = getattr(self.run_mode, "value", None) or str(self.run_mode or "")
-        self._telegram_plain(
-            f"Engine started: {self.engine_id} | venue={self.venue} | mode={_rm}"
-        )
         self._log_startup_balance_snapshot()
 
         self._do_order_state_check()
@@ -1499,9 +1520,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             if self._shutdown_signal is not None
             else "shutdown"
         )
-        self._telegram_plain(
-            f"Engine stopped: {self.engine_id} | venue={self.venue} | mode={_rm} | {_why}"
-        )
 
         snapshot_path = None
         try:
@@ -1557,7 +1575,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         risk_manager,
     ) -> None:
         """LIMIT/ENTRY/SL-M and other non-MAIN_EXIT intents (depth-based entry pricing)."""
-        self._log_and_telegram_signal(
+        self._log_signal(
             single_intent,
             symbol,
             action=getattr(single_intent, "action", "ENTRY"),
@@ -1713,7 +1731,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             exit_intent = dataclasses.replace(
                                 exit_intent, side=required_exit_side
                             )
-                        self._log_and_telegram_signal(
+                        self._log_signal(
                             exit_intent,
                             symbol,
                             action="EXIT",

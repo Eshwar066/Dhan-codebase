@@ -6,6 +6,7 @@ Used by LiveEngine when BROKER_NAME == "DELTA" for real-time data.
 """
 
 import logging
+import queue
 import threading
 from typing import Any, Dict, List, Optional
 
@@ -91,6 +92,13 @@ class DeltaWebSocketFeed(RealtimeFeed):
                     "timestamp": timestamp_sec,
                 }
             )
+        except queue.Full:
+            if self._engine_logger:
+                self._engine_logger.log(
+                    "tick_dropped_queue_full",
+                    f"Delta tick dropped due to full queue symbol={symbol}",
+                    symbol=symbol,
+                )
         except Exception as e:
             logger.debug("Delta feed: tick queue put failed: %s", e)
 

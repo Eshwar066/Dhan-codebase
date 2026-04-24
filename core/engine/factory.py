@@ -44,7 +44,6 @@ from core.broker import (
 from core.orderExecution.order_router import OrderRouter
 from core.orderExecution.account_router import AccountRouter
 from core.orderExecution.intent_store import IntentStore
-from core.utils.telegram_alert import send_telegram_alert
 from core.orderExecution.position_manager import PositionManager
 from core.orderExecution.risk_manager import RiskManager, make_short_option_margin_check
 from core.utils.delta_env import get_delta_credentials
@@ -257,13 +256,6 @@ class EngineFactory:
                 intent_store=intent_store,
             )
 
-        # Optional Telegram alerts for Delta (order placed, errors, slippage)
-        telegram_alert = None
-        if getattr(config, "telegram_bot_token", None) and getattr(config, "telegram_chat_id", None):
-            _token = config.telegram_bot_token
-            _chat = config.telegram_chat_id
-            telegram_alert = lambda msg: send_telegram_alert(msg, _chat, _token)
-
         order_router = OrderRouter(
             risk_manager=risk_manager,
             broker=broker,
@@ -275,7 +267,6 @@ class EngineFactory:
             slippage_threshold_pct=getattr(config, "slippage_threshold_pct", None),
             engine_id=getattr(config, "engine_id", None),
             strategy_id=config.strategy_name,
-            telegram_alert=telegram_alert,
         )
         # Option shorting: validate SPAN + exposure margin when broker supports it (unless disabled in config)
         if getattr(config, "check_short_option_margin_enabled", True) is not False:
@@ -341,7 +332,6 @@ class EngineFactory:
                     india=config.delta_india,
                     subscribe_private=True,
                     engine_logger=engine_logger,
-                    telegram_alert=telegram_alert,
                 )
                 if any(getattr(s, "timeframe", None) for s in strategies):
                     tick_queue = queue.Queue(maxsize=50000)
@@ -369,6 +359,7 @@ class EngineFactory:
                         access_token=access_token,
                         client_id=client_id,
                         instruments=instruments,
+                        engine_logger=engine_logger,
                     )
                     if any(getattr(s, "timeframe", None) for s in strategies):
                         tick_queue = queue.Queue(maxsize=50000)

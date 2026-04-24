@@ -15,6 +15,11 @@ python -m run.main --venue DELTA
 
 # run all enabled jobs
 python -m run.main
+
+#dummy feed command
+cd /root/Dhan-codebase
+source .venv/bin/activate
+python -m run.dummy_live
 ```
 
 ## Core Runtime Modes
