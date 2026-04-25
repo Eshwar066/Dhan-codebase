@@ -1149,7 +1149,20 @@ class Tradehull:
             return 0
 
     def convert_to_date_time(self, epoch):
-        return self.Dhan.convert_to_date_time(epoch)
+        """Convert Dhan epoch values to timezone-aware datetimes.
+
+        Handles both second and millisecond epoch inputs and avoids relying on
+        SDK helper methods whose signatures vary across dhanhq versions.
+        """
+        try:
+            value = float(epoch)
+            # Dhan timestamps can be in milliseconds for some endpoints.
+            if value > 1e11:
+                value = value / 1000.0
+            return datetime.datetime.fromtimestamp(value, tz=datetime.timezone.utc)
+        except Exception:
+            # Keep legacy fallback for unusual payloads or SDK-specific formats.
+            return self.Dhan.convert_to_date_time(epoch)
 
     def get_start_date(self):
         try:

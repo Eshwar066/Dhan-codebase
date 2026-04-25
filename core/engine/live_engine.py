@@ -201,6 +201,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self._worker_restart_events: Dict[str, deque] = {}
         self._disabled_worker_ids: set[str] = set()
         self._feed_stall_seconds = max(1.0, float(feed_stall_seconds or 60.0))
+        self._feed_stall_last_log_ts: float = 0.0
+        self._feed_stall_log_interval_seconds: float = 60.0
         self._intent_journal_path = os.path.join(
             "logs", f"{self.engine_id}_intent_pipeline.jsonl"
         )
@@ -932,6 +934,15 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
     def _check_feed_stall_fail_safe(self) -> None:
         if not self.realtime_feed or not self.symbols:
             return
+        # Outside market hours, stale feed is expected; suppress false alerts/spam.
+        if not self._is_market_open_for_feed_health():
+            self._feed_stall_last_log_ts = 0.0
+            return
+        try:
+            if not self.realtime_feed.is_connected():
+                return
+        except Exception:
+            return
         now = time.time()
         stale_symbols = []
         for sym in self.symbols:
@@ -941,6 +952,13 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             if last_seen <= 0 or (now - last_seen) > self._feed_stall_seconds:
                 stale_symbols.append(sym)
         if len(stale_symbols) != len(self.symbols):
+            self._feed_stall_last_log_ts = 0.0
+            return
+        if (
+            self._feed_stall_last_log_ts > 0.0
+            and (now - self._feed_stall_last_log_ts)
+            < self._feed_stall_log_interval_seconds
+        ):
             return
         msg = (
             f"Feed stalled for all symbols > {self._feed_stall_seconds}s. "
@@ -948,6 +966,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         )
         if self.engine_logger:
             self.engine_logger.log("feed_stalled", msg)
+        self._feed_stall_last_log_ts = now
 
     def start(self, exchange, sector, rsi):
         if self.engine_logger:
