@@ -11,7 +11,7 @@ import os
 import threading
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 try:
@@ -71,6 +71,20 @@ EVENT_TYPE_ALIASES = {
     "feed_health_recovered": "feed_recovered",
 }
 
+TELEGRAM_ALERT_EVENTS = {
+    "engine_start",
+    "graceful_shutdown",
+    "signal_generated",
+    "feed_stalled",
+    "feed_recovered",
+    "websocket_disconnect",
+    "order_placed",
+    "order_failed",
+    "order_rejected",
+    "risk_block",
+    "kill_switch",
+}
+
 
 def _safe_dir_name(name: Optional[str]) -> str:
     raw = str(name or "GLOBAL").strip() or "GLOBAL"
@@ -82,10 +96,18 @@ class EngineLogger:
     Per-engine structured logger. Thread-safe. Writes JSON lines to logs/{engine_id}.log.
     """
 
-    def __init__(self, engine_id: str, venue: str, strategy: str, log_dir: Optional[str] = None):
+    def __init__(
+        self,
+        engine_id: str,
+        venue: str,
+        strategy: str,
+        log_dir: Optional[str] = None,
+        telegram_alert: Optional[Callable[[str], None]] = None,
+    ):
         self.engine_id = engine_id
         self.venue = venue
         self.strategy = strategy
+        self._telegram_alert = telegram_alert
         self._base_log_root = log_dir or LOGS_DIR
         self._strategy_dir = _safe_dir_name(strategy)
         self._log_dir = os.path.join(self._base_log_root, self._strategy_dir)
@@ -216,6 +238,35 @@ class EngineLogger:
                 os.makedirs(alt_dir, exist_ok=True)
                 alt_path = os.path.join(alt_dir, f"{self.engine_id}.log")
                 self._emit_line(alt_path, line)
+        self._send_telegram_alert(payload)
+
+    def _send_telegram_alert(self, payload: Dict[str, Any]) -> None:
+        if not self._telegram_alert:
+            return
+        event_type = str(payload.get("event_type") or "")
+        if event_type not in TELEGRAM_ALERT_EVENTS:
+            return
+        parts = [
+            f"[{self.venue}] {self.engine_id}",
+            f"event={event_type}",
+        ]
+        strategy_id = payload.get("strategy_id")
+        if strategy_id:
+            parts.append(f"strategy={strategy_id}")
+        symbol = payload.get("symbol")
+        if symbol:
+            parts.append(f"symbol={symbol}")
+        order_id = payload.get("order_id")
+        if order_id:
+            parts.append(f"order_id={order_id}")
+        msg = str(payload.get("message") or "").strip()
+        if msg:
+            parts.append(f"msg={msg}")
+        try:
+            self._telegram_alert(" | ".join(parts))
+        except Exception:
+            # Alerting must never interfere with engine/logging path.
+            pass
 
     @staticmethod
     def _bar_timestamp_to_ist_iso(ts: Any) -> Optional[str]:
@@ -286,7 +337,6 @@ class EngineLogger:
             close=candle.get("close"),
             volume=candle.get("volume"),
             bucket_ts=candle.get("bucket_ts"),
-            bar_timestamp=ts_out,
             bar_timestamp_ist=bar_ts_ist,
             exchange=candle.get("exchange"),
         )

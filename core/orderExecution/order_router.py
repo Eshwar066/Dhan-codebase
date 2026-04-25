@@ -260,6 +260,7 @@ class OrderRouter:
         intent_strategy_id = (
             getattr(intent, "strategy_id", None)
             or getattr(intent, "strategy_name", None)
+            or getattr(intent, "strategy", None)
             or self.strategy_id
         )
         if getattr(intent, "action", "") == "EXIT":

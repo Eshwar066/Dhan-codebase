@@ -52,6 +52,9 @@ def job_to_engine_config(job: dict) -> EngineConfig:
         run_mode = RunMode(str(run_mode_raw).upper()) if run_mode_raw else RUN_MODE
     except (ValueError, AttributeError):
         run_mode = RUN_MODE
+    telegram_cfg = job.get("telegram") or {}
+    telegram_bot_token = job.get("telegram_bot_token") or telegram_cfg.get("bot_token")
+    telegram_chat_id = job.get("telegram_chat_id") or telegram_cfg.get("chat_id")
     return EngineConfig(
         broker_name=venue,
         run_mode=run_mode,
@@ -80,6 +83,8 @@ def job_to_engine_config(job: dict) -> EngineConfig:
         latency_critical_ms=job.get("latency_critical_ms", 150.0),
         latency_critical_cycles=job.get("latency_critical_cycles", 3),
         symbol_error_threshold=job.get("symbol_error_threshold", 5),
+        telegram_bot_token=telegram_bot_token,
+        telegram_chat_id=telegram_chat_id,
         root_log_level=str(job.get("log_level") or DEFAULT_ROOT_LOG_LEVEL),
         library_log_level=str(job.get("library_log_level") or DEFAULT_LIBRARY_LOG_LEVEL),
     )

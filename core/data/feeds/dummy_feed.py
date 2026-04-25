@@ -5,6 +5,7 @@ Use with LiveEngine + CandleAggregator in PAPER mode to validate:
 - feed -> tick queue -> aggregator pipeline
 - strategy execution on closed candles
 - feed stall and tick-order edge cases
+
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ class DummyRealtimeFeed(RealtimeFeed):
     Deterministic synthetic feed that emits normalized ticks:
     {"symbol", "price", "volume", "timestamp"} where timestamp is Unix seconds.
     """
+    is_dummy_feed = True
 
     def __init__(
         self,
@@ -30,7 +32,8 @@ class DummyRealtimeFeed(RealtimeFeed):
         tick_interval_ms: int = 200,
         seed: int = 42,
         *,
-        start_price: float = 100.0,
+        start_datetime: Optional[datetime] = None,
+        start_price: float = 23900,
         drift_min: float = -0.2,
         drift_max: float = 0.2,
         stall_after_ticks: Optional[int] = None,
@@ -46,6 +49,9 @@ class DummyRealtimeFeed(RealtimeFeed):
 
         self.tick_interval = max(0.01, float(tick_interval_ms) / 1000.0)
         self._rng = random.Random(seed)
+        if start_datetime is not None and start_datetime.tzinfo is None:
+            start_datetime = start_datetime.replace(tzinfo=timezone.utc)
+        self._start_datetime = start_datetime
         self._running = False
         self._connected = False
         self._thread: Optional[threading.Thread] = None
@@ -114,7 +120,11 @@ class DummyRealtimeFeed(RealtimeFeed):
         }
 
     def _run(self) -> None:
-        base_time = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        base_time = (
+            self._start_datetime
+            if self._start_datetime is not None
+            else datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        )
         tick_count = 0
 
         while self._running:

@@ -131,6 +131,7 @@ class OpenPositionsLogger:
         self.engine_id = engine_id or "engine"
         self.venue = venue or ""
         self.strategy = strategy or "GLOBAL"
+        self._base_log_root = log_dir
         self.run_mode = run_mode
         self._run_mode_str = (
             getattr(run_mode, "value", None) or str(run_mode) or ""
@@ -143,6 +144,16 @@ class OpenPositionsLogger:
         os.makedirs(log_dir, exist_ok=True)
         self._ensure_csv_schema()
         self._compact_legacy_to_snapshot()
+
+    @staticmethod
+    def _safe_strategy_name(name: Optional[str]) -> str:
+        return str(name or "GLOBAL").replace("/", "_").replace("\\", "_").replace(" ", "_")
+
+    def _path_for_strategy(self, strategy: Optional[str]) -> str:
+        safe_strategy = self._safe_strategy_name(strategy)
+        strategy_dir = os.path.join(self._base_log_root, safe_strategy)
+        os.makedirs(strategy_dir, exist_ok=True)
+        return os.path.join(strategy_dir, f"{self.engine_id}_open_positions.csv")
 
     def _compact_legacy_to_snapshot(self) -> None:
         """On startup, collapse older append-only logs to one row per still-open symbol."""
@@ -203,14 +214,15 @@ class OpenPositionsLogger:
                     out["level"] = odml.get("level", "")
         return out
 
-    def _read_open_snapshot(self) -> Dict[str, Dict[str, Any]]:
+    def _read_open_snapshot(self, path: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
         """
         Last row wins per symbol; keep only symbols that are still open (net_qty != 0
         and not a fill CLOSE). Supports legacy append-only files until rewritten.
         """
-        if not os.path.exists(self._path) or os.path.getsize(self._path) == 0:
+        target_path = path or self._path
+        if not os.path.exists(target_path) or os.path.getsize(target_path) == 0:
             return {}
-        with open(self._path, newline="", encoding="utf-8") as f:
+        with open(target_path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             if not reader.fieldnames:
                 return {}
@@ -233,8 +245,12 @@ class OpenPositionsLogger:
             open_rows[sym] = row
         return open_rows
 
-    def _write_snapshot(self, rows_by_symbol: Dict[str, Dict[str, Any]]) -> None:
-        with open(self._path, "w", newline="", encoding="utf-8") as f:
+    def _write_snapshot(
+        self, rows_by_symbol: Dict[str, Dict[str, Any]], path: Optional[str] = None
+    ) -> None:
+        target_path = path or self._path
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        with open(target_path, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=FIELDNAMES)
             w.writeheader()
             for sym in sorted(rows_by_symbol.keys()):
@@ -280,12 +296,23 @@ class OpenPositionsLogger:
             }
         )
         with self._lock:
+            # Keep legacy engine-primary snapshot for compatibility.
             snap = self._read_open_snapshot()
             if new_qty == 0:
                 snap.pop(symbol, None)
             else:
                 snap[symbol] = finalized
             self._write_snapshot(snap)
+
+            # Also maintain strategy-specific snapshot.
+            row_strategy = str(finalized.get("strategy") or "").strip() or self.strategy
+            strategy_path = self._path_for_strategy(row_strategy)
+            strat_snap = self._read_open_snapshot(strategy_path)
+            if new_qty == 0:
+                strat_snap.pop(symbol, None)
+            else:
+                strat_snap[symbol] = finalized
+            self._write_snapshot(strat_snap, strategy_path)
 
     def record_broker_reconcile_snapshot(self, position_manager: Any) -> None:
         """Live: replace file with one row per non-flat position after PM synced to broker."""
@@ -322,3 +349,11 @@ class OpenPositionsLogger:
             )
         with self._lock:
             self._write_snapshot(snap)
+            # Strategy-wise snapshots (for multi-strategy engines).
+            by_strategy: Dict[str, Dict[str, Dict[str, Any]]] = {}
+            for sym, row in snap.items():
+                strategy_name = str(row.get("strategy") or "").strip() or self.strategy
+                bucket = by_strategy.setdefault(strategy_name, {})
+                bucket[sym] = row
+            for strategy_name, strategy_rows in by_strategy.items():
+                self._write_snapshot(strategy_rows, self._path_for_strategy(strategy_name))

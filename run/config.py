@@ -32,6 +32,10 @@ ENGINE_JOBS = [
         "capital": 200000,
         "ORDER_QTY_LOTS": 1,
         "symbols": ["NIFTY"],
+        "telegram": {
+            "bot_token": "8663481671:AAHY-OnE8OiaJmkOfXbwqoe4InosJVblAtM",
+            "chat_id": "1021479950",
+        },
         "strategies": ["LEAPS_RSI", "NiftyIntradayMagicalLine"],
         "live": {"exchange": "INDEX", "sector": "YES", "rsi": "YES"},
         "backtest": {
@@ -124,6 +128,10 @@ ENGINE_JOBS = [
         "delta_testnet": False,
         "delta_leverage": 10,
         "max_open_positions": 5,
+        "telegram": {
+            "bot_token": "8389724629:AAHY_CGcBF8HZCexedsEJFw80Mf6SxH5Bkk",
+            "chat_id": "1021479950",
+        },
         "check_short_option_margin_enabled": True,
         "live": {"exchange": "DELTA", "sector": "YES"},
         "backtest": {

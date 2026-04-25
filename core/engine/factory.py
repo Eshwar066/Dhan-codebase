@@ -48,6 +48,7 @@ from core.orderExecution.position_manager import PositionManager
 from core.orderExecution.risk_manager import RiskManager, make_short_option_margin_check
 from core.utils.delta_env import get_delta_credentials
 from core.utils.instruments.instrument_store import InstrumentStore
+from core.utils.telegram_alert import send_telegram_alert
 from logger.trade_logger import TradeLogger
 from logger.open_positions_logger import OpenPositionsLogger
 from logger.engine_logger import EngineLogger
@@ -195,6 +196,17 @@ class EngineFactory:
             dhan_source = DhanSource()
             data_provider = DhanDataProvider(dhan_source)
 
+        telegram_alert = None
+        if getattr(config, "telegram_bot_token", None) and getattr(
+            config, "telegram_chat_id", None
+        ):
+            def telegram_alert(message: str) -> None:
+                send_telegram_alert(
+                    message=message,
+                    receiver_chat_id=str(config.telegram_chat_id),
+                    bot_token=str(config.telegram_bot_token),
+                )
+
         # ---------- OMS (isolated per engine) ----------
         logger = TradeLogger()
         _engine_id = config.engine_id or "live"
@@ -218,6 +230,7 @@ class EngineFactory:
             engine_id=config.engine_id,
             venue=config.broker_name,
             strategy=config.strategy_name,
+            telegram_alert=telegram_alert,
         )
         risk_manager = RiskManager(
             position_manager=position_manager,
@@ -332,6 +345,7 @@ class EngineFactory:
                     india=config.delta_india,
                     subscribe_private=True,
                     engine_logger=engine_logger,
+                    telegram_alert=telegram_alert,
                 )
                 if any(getattr(s, "timeframe", None) for s in strategies):
                     tick_queue = queue.Queue(maxsize=50000)

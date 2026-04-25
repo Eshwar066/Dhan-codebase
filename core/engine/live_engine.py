@@ -1024,6 +1024,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 self._dhan_order_ws_bound = False
         tf = getattr(self.strategy, "timeframe", None)
         use_feed = self.realtime_feed and self.realtime_feed.is_connected()
+        
         risk_manager = getattr(self.order_router, "risk", None)
         self._start_execution_pipeline()
         loop_count = 0
@@ -1067,7 +1068,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 for symbol in self.symbols:
                     candle = None
                     candle_source = "none"
-                    if use_aggregator:
+                    if use_aggregator:                        
                         candle, candle_source = self._get_last_closed_from_aggregator(
                             symbol, tf
                         )
@@ -1092,32 +1093,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             if isinstance(ts, (int, float)):
                                 self._last_candle_timestamp[symbol] = time.time()
 
-                    #========Dummy candle for after mkt hours test ===========================
-                    # if candle is None:
-                    #     from zoneinfo import ZoneInfo
-                    #     ist = ZoneInfo("Asia/Kolkata")
-                    #     bar = dt.datetime.now(ist).replace(
-                    #             hour=9, minute=15, second=0, microsecond=0
-                    #     )
-                    #     bucket = bar.timestamp()
-                    #     if self._last_evaluated_candle_ts.get(symbol) == bucket:
-                    #         continue
-                    #     px = 25000.0
-                    #     candle = {
-                    #             "timestamp": bar.astimezone(dt.timezone.utc).replace(
-                    #                 tzinfo=None
-                    #             ),
-                    #             "open": px,
-                    #             "high": px,
-                    #             "low": px,
-                    #             "close": px,
-                    #             "volume": 1,
-                    #             "bucket_ts": bucket,
-                    #     }
-                    #         # pdb.set_trace()
-                    # else:
-                    #     print(">>candle is None")
-                    #     continue
                     if candle is None:
                         # print(">>candle is None")
                         continue
@@ -1170,8 +1145,15 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         continue
 
                     if use_aggregator:
+                        
                         # check the time of the entry candle at mkt time
-                        if self._live_bar_is_stale_or_replay(symbol, candle, tf):
+                        is_dummy_feed = bool(
+                            getattr(self.realtime_feed, "is_dummy_feed", False)
+                        )
+                        if (
+                            not is_dummy_feed
+                            and self._live_bar_is_stale_or_replay(symbol, candle, tf)
+                        ):
                             continue
                         if candle.get("bucket_ts") is not None:
                             self._has_seen_aggregator_bucket[symbol] = True
