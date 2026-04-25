@@ -17,7 +17,6 @@ import threading
 import json
 from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
-import pdb
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +28,7 @@ from core.engine.live_engine_common import (
     LiveEngineHelpersMixin,
 )
 from core.engine.execution_engine import ExecutionEngine
+from core.engine.indicator_manager import IndicatorManager
 from core.orderExecution.account_router import AccountRouter
 
 try:
@@ -163,6 +163,11 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self._max_ticks_per_cycle = 10000
         self._ws_trade_event_bound = False
         self.dhan_order_update_feed = dhan_order_update_feed
+        self._live_exchange = "INDEX"
+        self._live_sector = "NO"
+        self.indicator_manager = IndicatorManager(
+            self.data, engine_logger=self.engine_logger
+        )
         self.account_router = account_router or AccountRouter()
         self.intent_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue(
             maxsize=max(1, int(intent_queue_maxsize or 1000))
@@ -878,15 +883,24 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         for strategy in self.strategies:
             self._ensure_strategy_worker(strategy)
 
+
+    def _enrich_candle_for_strategy(self, strategy: Any, candle: Dict[str, Any]) -> Dict[str, Any]:
+        return self.indicator_manager.enrich_candle_for_strategy(
+            strategy=strategy,
+            candle=candle,
+            candle_bucket_fn=self._candle_bucket_start_unix,
+        )
+
     def _evaluate_strategies_parallel(self, candle: Dict[str, Any]) -> List[Dict[str, Any]]:
         response_q: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         expected = 0
         for strategy in self.strategies:
-            if not strategy.should_evaluate(candle):
+            strategy_candle = self._enrich_candle_for_strategy(strategy, candle)
+            if not strategy.should_evaluate(strategy_candle):
                 continue
             self._ensure_strategy_worker(strategy)
             strategy_id = str(getattr(strategy, "name", "unknown_strategy"))
-            task = {"candle": dict(candle), "response_q": response_q}
+            task = {"candle": dict(strategy_candle), "response_q": response_q}
             if self._safe_queue_put(
                 self._strategy_task_queues[strategy_id],
                 task,
@@ -969,6 +983,11 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self._feed_stall_last_log_ts = now
 
     def start(self, exchange, sector, rsi):
+        self._live_exchange = str(exchange or "INDEX")
+        self._live_sector = str(sector or "NO")
+        self.indicator_manager.set_runtime_context(
+            exchange=self._live_exchange, sector=self._live_sector
+        )
         if self.engine_logger:
             self.engine_logger.engine_start("Live engine started")
             for strategy_obj in self.strategies:
@@ -1167,7 +1186,17 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     if self.engine_logger and self._should_log_closed_candle(
                         symbol, tf, candle
                     ):
-                        self.engine_logger.candle_created(candle, timeframe=tf)
+                        candle_for_log = dict(candle)
+                        try:
+                            # Log candle with primary-strategy indicators (e.g. RSI) when available.
+                            candle_for_log = self._enrich_candle_for_strategy(
+                                self.strategy, candle
+                            )
+                        except Exception:
+                            candle_for_log = dict(candle)
+                        self.engine_logger.candle_created(
+                            candle_for_log, timeframe=tf
+                        )
 
                     self._enrich_candle_depth(symbol, candle)
                     for eval_result in self._evaluate_strategies_parallel(candle):

@@ -1,12 +1,12 @@
-# Graph Report - C:\Users\eshwa\Desktop\Algo  (2026-04-24)
+# Graph Report - C:\Users\eshwa\Desktop\Algo  (2026-04-25)
 
 ## Corpus Check
-- 124 files · ~138,680 words
+- 125 files · ~139,004 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 2044 nodes · 5100 edges · 61 communities detected
-- Extraction: 52% EXTRACTED · 48% INFERRED · 0% AMBIGUOUS · INFERRED: 2432 edges (avg confidence: 0.64)
+- 2173 nodes · 5558 edges · 88 communities detected
+- Extraction: 49% EXTRACTED · 51% INFERRED · 0% AMBIGUOUS · INFERRED: 2855 edges (avg confidence: 0.63)
 - Token cost: 0 input · 0 output
 
 ## Community Hubs (Navigation)
@@ -71,20 +71,49 @@
 - [[_COMMUNITY_Community 58|Community 58]]
 - [[_COMMUNITY_Community 59|Community 59]]
 - [[_COMMUNITY_Community 60|Community 60]]
+- [[_COMMUNITY_Community 61|Community 61]]
+- [[_COMMUNITY_Community 62|Community 62]]
+- [[_COMMUNITY_Community 63|Community 63]]
+- [[_COMMUNITY_Community 64|Community 64]]
+- [[_COMMUNITY_Community 65|Community 65]]
+- [[_COMMUNITY_Community 66|Community 66]]
+- [[_COMMUNITY_Community 67|Community 67]]
+- [[_COMMUNITY_Community 68|Community 68]]
+- [[_COMMUNITY_Community 69|Community 69]]
+- [[_COMMUNITY_Community 70|Community 70]]
+- [[_COMMUNITY_Community 71|Community 71]]
+- [[_COMMUNITY_Community 72|Community 72]]
+- [[_COMMUNITY_Community 73|Community 73]]
+- [[_COMMUNITY_Community 74|Community 74]]
+- [[_COMMUNITY_Community 75|Community 75]]
+- [[_COMMUNITY_Community 76|Community 76]]
+- [[_COMMUNITY_Community 77|Community 77]]
+- [[_COMMUNITY_Community 78|Community 78]]
+- [[_COMMUNITY_Community 79|Community 79]]
+- [[_COMMUNITY_Community 80|Community 80]]
+- [[_COMMUNITY_Community 81|Community 81]]
+- [[_COMMUNITY_Community 82|Community 82]]
+- [[_COMMUNITY_Community 83|Community 83]]
+- [[_COMMUNITY_Community 84|Community 84]]
+- [[_COMMUNITY_Community 85|Community 85]]
+- [[_COMMUNITY_Community 86|Community 86]]
+- [[_COMMUNITY_Community 87|Community 87]]
 
 ## God Nodes (most connected - your core abstractions)
-1. `RunMode` - 123 edges
-2. `IndiaMktMixins` - 84 edges
-3. `Tradehull` - 75 edges
-4. `ExpiryResolver` - 74 edges
-5. `LiveEngine` - 69 edges
-6. `SessionManager` - 68 edges
-7. `DeltaSource` - 62 edges
-8. `StallWatchdog` - 58 edges
-9. `BaseStrategy` - 58 edges
-10. `DeltaRestClient` - 57 edges
+1. `RunMode` - 172 edges
+2. `ExpiryResolver` - 92 edges
+3. `IndiaMktMixins` - 87 edges
+4. `IntentStatus` - 80 edges
+5. `LiveEngine` - 78 edges
+6. `Tradehull` - 75 edges
+7. `LiveEngineHelpersMixin` - 71 edges
+8. `DeltaSource` - 69 edges
+9. `SessionManager` - 68 edges
+10. `BaseEngine` - 65 edges
 
 ## Surprising Connections (you probably didn't know these)
+- `BaseBroker` --uses--> `Order placement via Delta Exchange. Uses DeltaBrokerApi (DeltaSource / delta_res`  [INFERRED]
+  C:\Users\eshwa\Desktop\Algo\core\broker\base.py → C:\Users\eshwa\Desktop\Algo\core\broker\internal\delta\broker.py
 - `BaseBroker` --uses--> `Find order in live list; if not there, look up in /v2/orders/history and /v2/fil`  [INFERRED]
   C:\Users\eshwa\Desktop\Algo\core\broker\base.py → C:\Users\eshwa\Desktop\Algo\core\broker\internal\delta\broker.py
 - `BaseBroker` --uses--> `Resolve order status from order history or fills when not in live list.`  [INFERRED]
@@ -93,106 +122,104 @@
   C:\Users\eshwa\Desktop\Algo\core\broker\base.py → C:\Users\eshwa\Desktop\Algo\core\broker\internal\delta\broker.py
 - `BaseBroker` --uses--> `Resolve fill by broker order_id when fill API does not return client_order_id.`  [INFERRED]
   C:\Users\eshwa\Desktop\Algo\core\broker\base.py → C:\Users\eshwa\Desktop\Algo\core\broker\internal\delta\broker.py
-- `Thin wrapper around DhanOrderUpdateClient for LiveEngine wiring.` --uses--> `DhanOrderUpdateClient`  [INFERRED]
-  C:\Users\eshwa\Desktop\Algo\core\data\feeds\dhan_order_update_feed.py → C:\Users\eshwa\Desktop\Algo\core\library\dhan_order_update_ws.py
 
 ## Communities
 
 ### Community 0 - "Community 0"
-Cohesion: 0.02
-Nodes (129): AccountRouter, AccountRoutingConfig, all_accounts(), _dedupe_keep_order(), Deterministic, side-effect-free mapping from intent -> account ids., BacktestEngine, BaseBroker, BaseEngine (+121 more)
+Cohesion: 0.01
+Nodes (145): AccountRoutingConfig, all_accounts(), _dedupe_keep_order(), _order_intent_to_payload(), Check available balance and required/SPAN margin before placing order., Convert OrderIntent to dict for Dhan payload., Recent fills from order list (TRADED/filled) for trade-led OMS sync., Resolve fill price/size for a given intent_id (tag) from filled orders. (+137 more)
 
 ### Community 1 - "Community 1"
 Cohesion: 0.02
-Nodes (119): Find order in live list; if not there, look up in /v2/orders/history and /v2/fil, Resolve order status from order history or fills when not in live list., Resolve fill price and size from /v2/fills for a given client_order_id (intent_i, Resolve fill by broker order_id when fill API does not return client_order_id., INR available margin/cash from Dhan fund limits — same keys as DeltaBroker, raise_for_status(), Raises :class:`HTTPError`, if one occurred., atm_label_from_spot_strike() (+111 more)
+Nodes (73): BaseStrategy, Optional: broker-driven close (liquidation, orphan fill, etc.). Override to sync, BaseStrategy, DeltaMktMixins, delta_option_trading_symbol(), Delta ``/v2/products`` option symbol, e.g. ``P-BTC-70400-210326``.     Prefer `, Output:         NIFTY 30 MAR 25000 PUT         NIFTY 30 MAR 25000 CALL, FuturesEMAHighLow (+65 more)
 
 ### Community 2 - "Community 2"
-Cohesion: 0.02
-Nodes (95): BaseAdapter, BaseStrategy, StrategyContext without calling ``on_candle`` (for fill-time hooks)., SimulatedBroker: fire resting MAIN_SL when option LTP crosses trigger (backtest/, Optional: broker-driven close (liquidation, orphan fill, etc.). Override to sync, Uniquely identifies a tradable contract (netting, hedges, rollovers)., Resolve option contract to Instrument for order intent. Returns None if not foun, Resolve futures contract to Instrument. Returns None if not found. (+87 more)
+Cohesion: 0.03
+Nodes (96): BacktestEngine, BaseBroker, BaseEngine, DeltaBroker, DhanBroker, Return PositionManager state in same format as live brokers so reconcile is a no, Order placement via Delta Exchange. Uses DeltaBrokerApi (DeltaSource / delta_res, SimulatedBroker (+88 more)
 
 ### Community 3 - "Community 3"
 Cohesion: 0.02
-Nodes (100): Return up to max_bars last closed candles for symbol/resolution (newest last)., _resolution_to_seconds(), Subscribe to ``l2_orderbook`` for ``symbol`` if not already covered., Raw L2 order book for symbol (bids/asks). Used for best bid/ask., Best bid price for symbol from L2 order book. For Delta limit BUY at best bid., Best ask price for symbol from L2 order book. For Delta limit SELL at best ask., Thread-safe: update instruments; applied on next reconnect., Return latest depth for symbol: {bids: [{price, quantity, num_orders}, ...], ask (+92 more)
+Nodes (107): BaseBroker, StrategyContext without calling ``on_candle`` (for fill-time hooks)., Optional idempotency hook. LIVE brokers may override., Optional: before placing an order, check available balance vs required/SPAN marg, Abstract broker contract for order placement and position/exit.     Engines and, Optional. LIVE brokers may override to reconcile broker truth., Return normalized { symbol: { qty, avg_price, segment, lot_size } } for reconcil, Return list of open (pending/active) orders for order-state consistency check. (+99 more)
 
 ### Community 4 - "Community 4"
 Cohesion: 0.02
-Nodes (48): Abstract base for real-time market/account feeds (WebSocket).  Implementations:, Interface for a real-time feed (WebSocket) that can supply:     - Ticker / LTP p, Last ticker/LTP for symbol. Keys may include: close, mark_price, symbol, etc., Last closed (or latest) candle for symbol.         resolution: e.g. "1m", "5m",, Open/pending orders for symbol (if private feed supported)., Current positions by symbol (if private feed supported)., Optional: set engine-owned queue for tick streaming. When set, feed pushes, RealtimeFeed (+40 more)
+Nodes (102): DhanDepthWebSocket, _parse_depth_header(), _parse_depth_rows(), _parse_disconnect_packet(), Dhan Full Market Depth WebSocket client.  - 20 Level: wss://depth-api-feed.dha, instruments: list of {"ExchangeSegment": "NSE_EQ", "SecurityId": "11536", "symbo, Thread-safe: update instruments; applied on next reconnect., Thread-safe: update instruments; applied on next reconnect. (+94 more)
 
 ### Community 5 - "Community 5"
-Cohesion: 0.03
-Nodes (59): DeltaBrokerApi, _ensure_list_str(), Order history via order_history (v2/orders/history) for resolving fill status wh, Fills via fills() (v2/fills) for order fill status., Resolve symbol to Delta product_id (e.g. BTCUSD -> id)., Edit orders in batch (e.g. update limit_price). Each order: { 'id': order_id, 'l, Set leverage for a Delta product (by product_id)., Set leverage for each symbol in the list. Resolves symbol -> product_id and call (+51 more)
+Cohesion: 0.02
+Nodes (75): Abstract base for real-time market/account feeds (WebSocket).  Implementations:, Interface for a real-time feed (WebSocket) that can supply:     - Ticker / LTP p, Last ticker/LTP for symbol. Keys may include: close, mark_price, symbol, etc., Last closed (or latest) candle for symbol.         resolution: e.g. "1m", "5m",, Open/pending orders for symbol (if private feed supported)., Current positions by symbol (if private feed supported)., Optional: set engine-owned queue for tick streaming. When set, feed pushes, RealtimeFeed (+67 more)
 
 ### Community 6 - "Community 6"
-Cohesion: 0.03
-Nodes (58): _order_intent_to_payload(), Check available balance and required/SPAN margin before placing order., Convert OrderIntent to dict for Dhan payload., _is_delta_ticker_message(), Match Delta ``v2/ticker`` updates. Some builds use different ``type`` casing, DeltaMktMixins, _append_live_strike_scan_rows(), delta_option_trading_symbol() (+50 more)
+Cohesion: 0.04
+Nodes (106): AccountRouter, Deterministic, side-effect-free mapping from intent -> account ids., BaseEngine, Uniquely identifies a tradable contract (netting, hedges, rollovers)., Resolve option contract to Instrument for order intent. Returns None if not foun, Resolve futures contract to Instrument. Returns None if not found., RunMode, _append_live_strike_scan_rows() (+98 more)
 
 ### Community 7 - "Community 7"
 Cohesion: 0.03
-Nodes (59): Remove resting MAIN_SL when the main position exits via MAIN_EXIT (normal exit)., For short options, SL triggers when option premium (LTP) >= trigger (stop on pre, Paper: no open orders (instant fill). Same interface as live so order-state veri, Paper: fills already applied in place_order via process_fill. Same interface as, Paper: orders are filled immediately, so never in open list. Same interface as l, Paper: fill already applied in place_order. Same interface as live for missing-o, Paper: same as get_fill_for_client_order_id. Same interface as live., Enum (+51 more)
+Nodes (32): _bucket_ts(), _candle_to_dict(), Prop-grade Candle Aggregator: tick → 1m only; higher timeframes from closed 1m o, Aggregate closed 1m into higher TFs; close only when bucket boundary aligns., Return the last CLOSED candle only. Never returns forming candle; no repainting., Return up to max_bars last closed candles for symbol/resolution (newest last)., Symbols that have at least some state (for health checks)., Integer bucket boundary. ts_sec in Unix seconds; tf_seconds e.g. 60, 300. (+24 more)
 
 ### Community 8 - "Community 8"
-Cohesion: 0.02
-Nodes (46): DeltaWebSocketFeed, Delta Exchange WebSocket feed implementing RealtimeFeed.  Subscribes to v2/tic, Set event-driven callback for private user-trade events., Real-time feed using Delta Exchange WebSocket.     Subscribes to ticker and can, Drain recent private user-trade events from WebSocket buffer., Push normalized ticks to queue for CandleAggregator. Set before start()., generate_signature(), DeltaWebSocket (+38 more)
+Cohesion: 0.05
+Nodes (49): body_string(), cancel_order_format(), create_order_format(), DeltaRestClient, get_time_stamp(), OrderType, parseResponse(), query_string() (+41 more)
 
 ### Community 9 - "Community 9"
-Cohesion: 0.05
-Nodes (42): ABC, BaseInstrumentStore, IBrokerApi, Instrument, Shared instrument model and abstract store interface. Broker-specific logic liv, Contract for order placement and position/order lookup at the exchange.     Imp, Single tradable contract (option/future/equity). Used by order intents and posit, List of orders for idempotency / status lookup. (+34 more)
+Cohesion: 0.04
+Nodes (60): _parse_nse_equity_l(), Equity universe service: loads NSE equity list from EQUITY_L (daily sync). Sour, Load from EQUITY_L_latest.csv (in cache_dir, e.g. Dependencies/equity_universe);, Return list of all equity symbols., Days since listing for symbol. None if unknown or not in universe.         Pure, Re-download if needed and reload from EQUITY_L_latest.csv (in cache_dir)., Return { symbol: EquityMeta } for symbols that exist in universe., Optional: schedule refresh (e.g. hour=20 after market close).         Call from (+52 more)
 
 ### Community 10 - "Community 10"
-Cohesion: 0.04
-Nodes (53): load_position_metadata_from_csv(), OpenPositionsLogger, _parse_net_qty(), CSV snapshot of currently open positions only (fills + live broker reconcile)., - Fills (paper + live): updates that symbol's row when qty changes; removes the, On startup, collapse older append-only logs to one row per still-open symbol., One-time migrate older CSVs when new columns are introduced (rewrite in place)., Last row wins per symbol; keep only symbols that are still open (net_qty != 0 (+45 more)
+Cohesion: 0.05
+Nodes (43): ABC, BaseInstrumentStore, IBrokerApi, Instrument, Shared instrument model and abstract store interface. Broker-specific logic liv, Contract for order placement and position/order lookup at the exchange.     Imp, Single tradable contract (option/future/equity). Used by order intents and posit, List of orders for idempotency / status lookup. (+35 more)
 
 ### Community 11 - "Community 11"
+Cohesion: 0.04
+Nodes (23): NeoAPI, Retrieves quotes for the given instrument tokens.          Args:, Cancels an order with the given `order_id` using the NEO API.          Args: o, Cancels a cover order with the given `order_id` using the NEO API.          Ar, Cancels a bracket order with the given `order_id` using the NEO API., Retrieves a list of orders in the order book using the NEO API.          Raise, Retrieves the order history for a given order ID using the NEO API.          A, Retrieves a filtered list of trades using the NEO API.          Args: (+15 more)
+
+### Community 12 - "Community 12"
 Cohesion: 0.05
 Nodes (18): IDataProvider, Contract for market data used by engines and order management.     Implementati, NSE expiry dates for a symbol/year. Optional for non-NSE providers., Live option chain (e.g. Dhan format)., Expired option data for backtest (e.g. Dhan)., Return lot size for symbol when known; None otherwise. Override in broker implem, DeltaDataProvider, Delta Exchange implementation of the data layer. Delegates to DeltaSource for m (+10 more)
 
-### Community 12 - "Community 12"
-Cohesion: 0.08
-Nodes (28): EquityUniverseService, _parse_nse_equity_l(), Equity universe service: loads NSE equity list from EQUITY_L (daily sync). Sour, Load from EQUITY_L_latest.csv (in cache_dir, e.g. Dependencies/equity_universe);, Return list of all equity symbols., Days since listing for symbol. None if unknown or not in universe.         Pure, Re-download if needed and reload from EQUITY_L_latest.csv (in cache_dir)., Return { symbol: EquityMeta } for symbols that exist in universe. (+20 more)
-
 ### Community 13 - "Community 13"
 Cohesion: 0.07
-Nodes (25): DhanBrokerApi, Dhan broker API: order placement and position/order lookup via Dhan., Fills from order list (filled/TRADED orders) for trade-led OMS., IBrokerApi implementation for Dhan. Order placement + positions + order list., Simulated broker for both PAPER and BACKTEST. No real exchange; instant fill. PA, _sl_orders_log_path(), diff_against_previous(), download_scrip_master() (+17 more)
+Nodes (13): DeltaBrokerApi, DhanBrokerApi, _ensure_list_str(), Dhan broker API: order placement and position/order lookup via Dhan., Order history via order_history (v2/orders/history) for resolving fill status wh, Fills via fills() (v2/fills) for order fill status., Resolve symbol to Delta product_id (e.g. BTCUSD -> id)., Edit orders in batch (e.g. update limit_price). Each order: { 'id': order_id, 'l (+5 more)
 
 ### Community 14 - "Community 14"
-Cohesion: 0.1
-Nodes (7): Dhan private order-update WebSocket feed (incremental fills → synthetic trades)., Incremental fill payloads (see dhan_order_update_ws)., DhanOrderUpdateClient, _is_429_signal(), Dhan Live Order Update WebSocket (private stream).  Docs: https://dhanhq.co/do, Background WebSocket to Dhan order-update stream.     Calls on_synthetic_trade, _txn_to_side()
+Cohesion: 0.11
+Nodes (20): _sl_orders_log_path(), diff_against_previous(), download_scrip_master(), file_sha256(), Daily / on-demand Dhan instrument master sync (scrip master CSV).  Source URL, Download full scrip master to dest_csv (parent dirs created)., Compare row count and content hash to previous file.     Returns dict with chan, Download to ``all_instrument{date}.csv``, diff vs previous day's file if present (+12 more)
 
 ### Community 15 - "Community 15"
-Cohesion: 0.1
-Nodes (20): cache_key_delta_intraday(), _drop_flat_candles(), load_df(), File cache for Delta Exchange historical intraday data. Uses data_cache/delta_h, Drop rows where open, high, low, close are all equal (no-trade bars)., Load a DataFrame from Delta cache. Returns None if missing or invalid., Save a DataFrame to Delta cache. Flat candles (o==h==l==c) are not stored., Key for Delta intraday cache: symbol + timeframe. Dates not in key. (+12 more)
+Cohesion: 0.09
+Nodes (9): BaseAdapter, SimulatedBroker: fire resting MAIN_SL when option LTP crosses trigger (backtest/, BaseAdapter, DataRouter, DhanAdapter, NSEAdapter, OptionChainService, Typed strategy context passed to strategies and services. Replaces dict-based c (+1 more)
 
 ### Community 16 - "Community 16"
-Cohesion: 0.23
-Nodes (9): Calculates start_date and end_date for intraday candles,         ensuring we fe, get_last_candle_close(), is_holiday(), is_market_open(), next_candle_close(), normalize_exchange(), _now(), _tf_to_minutes() (+1 more)
+Cohesion: 0.11
+Nodes (24): atm_label_from_spot_strike(), default_expired_option_chain_root(), leg_csv_path(), load_expired_option_chain_from_files(), _normalize_expiry_str(), _option_right_filename(), Load Dhan expired option OHLC from locally downloaded CSVs (same layout as ``da, Map numeric strikes (or precomputed ``ATM`` / ``ATM±n`` folder names) to folder (+16 more)
 
 ### Community 17 - "Community 17"
-Cohesion: 0.29
-Nodes (6): _bucket_ts(), _candle_to_dict(), Prop-grade Candle Aggregator: tick → 1m only; higher timeframes from closed 1m o, Aggregate closed 1m into higher TFs; close only when bucket boundary aligns., Integer bucket boundary. ts_sec in Unix seconds; tf_seconds e.g. 60, 300., Process one tick. O(1). Updates only 1m current; closes 1m and propagates when b
+Cohesion: 0.15
+Nodes (13): calculate_pnl(), load_trade_log(), performance_summary(), print_performance_summary(), Trade log and performance analytics.  - Trade log: trade_id, entry_time, exit_, Full performance summary from a trades DataFrame.      Trades must have column, Return a copy of the trades DataFrame with equity curve and drawdown columns add, Compute PnL for a single trade row.     BUY: (exit_price - entry_price) * qty (+5 more)
 
 ### Community 18 - "Community 18"
 Cohesion: 0.31
 Nodes (4): EquityInstrument, FutureInstrument, Instrument, OptionInstrument
 
 ### Community 19 - "Community 19"
+Cohesion: 0.29
+Nodes (7): _drop_flat_candles(), load_df(), File cache for Delta Exchange historical intraday data. Uses data_cache/delta_h, Drop rows where open, high, low, close are all equal (no-trade bars)., Load a DataFrame from Delta cache. Returns None if missing or invalid., Save a DataFrame to Delta cache. Flat candles (o==h==l==c) are not stored., save_df()
+
+### Community 20 - "Community 20"
 Cohesion: 0.33
 Nodes (5): postback_body_to_trade_hint(), Dhan Postback (webhook) — optional third path for order lifecycle events.  Doc, Best-effort map of a postback JSON body to fields useful for OMS.     Actual sc, Placeholder: implement HMAC/signature verification per Dhan postback documentati, verify_postback_signature()
 
-### Community 20 - "Community 20"
+### Community 21 - "Community 21"
 Cohesion: 0.4
 Nodes (2): generate_quarterly_expiries(), last_thursday()
 
-### Community 21 - "Community 21"
+### Community 22 - "Community 22"
 Cohesion: 0.4
 Nodes (4): generate_monthly_expiries(), last_thursday(), Jan 2025 expiry -> 1 Dec 2024; Feb 2025 expiry -> 1 Jan 2025; etc., two_month_window_start_for_expiry()
 
-### Community 22 - "Community 22"
+### Community 23 - "Community 23"
 Cohesion: 0.67
 Nodes (1): EDIS (e-disclosure) — required for selling delivery (CNC) equity from demat.
-
-### Community 23 - "Community 23"
-Cohesion: 1.0
-Nodes (0): 
 
 ### Community 24 - "Community 24"
 Cohesion: 1.0
@@ -204,51 +231,51 @@ Nodes (0):
 
 ### Community 26 - "Community 26"
 Cohesion: 1.0
-Nodes (1): Place a single order. Returns dict with "status" and on success "order_id".
+Nodes (0): 
 
 ### Community 27 - "Community 27"
 Cohesion: 1.0
-Nodes (1): Current positions (broker-specific format).
+Nodes (1): Place a single order. Returns dict with "status" and on success "order_id".
 
 ### Community 28 - "Community 28"
 Cohesion: 1.0
-Nodes (1): Place order from OrderIntent or dict. Returns order_id or None.
+Nodes (1): Current positions (broker-specific format).
 
 ### Community 29 - "Community 29"
 Cohesion: 1.0
-Nodes (1): Exit a position explicitly. Must internally call place_order().
+Nodes (1): Place order from OrderIntent or dict. Returns order_id or None.
 
 ### Community 30 - "Community 30"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (1): Exit a position explicitly. Must internally call place_order().
 
 ### Community 31 - "Community 31"
 Cohesion: 1.0
-Nodes (1): Historical intraday candles for backtest.
+Nodes (0): 
 
 ### Community 32 - "Community 32"
 Cohesion: 1.0
-Nodes (1): Latest OHLC/LTP per symbol (live/tick mode).
+Nodes (1): Historical intraday candles for backtest.
 
 ### Community 33 - "Community 33"
 Cohesion: 1.0
-Nodes (1): Live expiry list (broker-specific format, e.g. indices).
+Nodes (1): Latest OHLC/LTP per symbol (live/tick mode).
 
 ### Community 34 - "Community 34"
 Cohesion: 1.0
-Nodes (1): Connect and start receiving data (e.g. spawn background thread).
+Nodes (1): Live expiry list (broker-specific format, e.g. indices).
 
 ### Community 35 - "Community 35"
 Cohesion: 1.0
-Nodes (1): Disconnect and stop the feed.
+Nodes (1): Connect and start receiving data (e.g. spawn background thread).
 
 ### Community 36 - "Community 36"
 Cohesion: 1.0
-Nodes (1): Return True if the feed is connected and receiving.
+Nodes (1): Disconnect and stop the feed.
 
 ### Community 37 - "Community 37"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (1): Return True if the feed is connected and receiving.
 
 ### Community 38 - "Community 38"
 Cohesion: 1.0
@@ -256,11 +283,11 @@ Nodes (0):
 
 ### Community 39 - "Community 39"
 Cohesion: 1.0
-Nodes (1): Normalize tag/action filter to a list of upper-case strings; None => no filter.
+Nodes (1): Return a stable signature only when strategy explicitly opts into         cross
 
 ### Community 40 - "Community 40"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (1): Fallback patch only for the last row when RSI is missing/NaN.         Never rew
 
 ### Community 41 - "Community 41"
 Cohesion: 1.0
@@ -268,7 +295,7 @@ Nodes (0):
 
 ### Community 42 - "Community 42"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (1): Normalize tag/action filter to a list of upper-case strings; None => no filter.
 
 ### Community 43 - "Community 43"
 Cohesion: 1.0
@@ -280,7 +307,7 @@ Nodes (0):
 
 ### Community 45 - "Community 45"
 Cohesion: 1.0
-Nodes (1): Single-bar RSI approximation (no pandas). Returns None if insufficient data.
+Nodes (0): 
 
 ### Community 46 - "Community 46"
 Cohesion: 1.0
@@ -288,154 +315,314 @@ Nodes (0):
 
 ### Community 47 - "Community 47"
 Cohesion: 1.0
-Nodes (1): Select last expiry of target month/year.
+Nodes (0): 
 
 ### Community 48 - "Community 48"
 Cohesion: 1.0
-Nodes (1): Dhan / Tradehull monthly option chain index for backtest (``expiry_code`` is int
+Nodes (1): Single-bar RSI approximation (no pandas). Returns None if insufficient data.
 
 ### Community 49 - "Community 49"
 Cohesion: 1.0
-Nodes (1): Map DHAN ``expiry_code`` (0 = front monthly, 1 = next monthly) to a calendar exp
+Nodes (0): 
 
 ### Community 50 - "Community 50"
 Cohesion: 1.0
-Nodes (1): Inverse of ``dhan_expiry_index_to_date``: map a calendar expiry to DHAN ``expiry
+Nodes (1): Select last expiry of target month/year.
 
 ### Community 51 - "Community 51"
 Cohesion: 1.0
-Nodes (1): Normalize values from ``params['expiry_code']`` / ``ctx.selected_expiry``: DHAN
+Nodes (1): Dhan / Tradehull monthly option chain index for backtest (``expiry_code`` is int
 
 ### Community 52 - "Community 52"
 Cohesion: 1.0
-Nodes (1): Quarterly expiry label (future use).
+Nodes (1): Map DHAN ``expiry_code`` (0 = front monthly, 1 = next monthly) to a calendar exp
 
 ### Community 53 - "Community 53"
 Cohesion: 1.0
-Nodes (1): Quarterly month selector (used by NSE & quarterly logic).
+Nodes (1): Inverse of ``dhan_expiry_index_to_date``: map a calendar expiry to DHAN ``expiry
 
 ### Community 54 - "Community 54"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (1): Normalize values from ``params['expiry_code']`` / ``ctx.selected_expiry``: DHAN
 
 ### Community 55 - "Community 55"
 Cohesion: 1.0
-Nodes (1): Same bar instant as ``bar_timestamp``, expressed in Asia/Kolkata (IST) for logs.
+Nodes (1): Quarterly expiry label (future use).
 
 ### Community 56 - "Community 56"
 Cohesion: 1.0
-Nodes (1): Background thread: if connected but no application traffic for stall_sec, close
+Nodes (1): Quarterly month selector (used by NSE & quarterly logic).
 
 ### Community 57 - "Community 57"
 Cohesion: 1.0
-Nodes (1): Optional control-plane helper: hold references to Dhan market / order / depth cl
+Nodes (0): 
 
 ### Community 58 - "Community 58"
 Cohesion: 1.0
-Nodes (1): Sleep with jitter to avoid synchronized reconnect storms; return next backoff (c
+Nodes (1): Same bar instant as ``bar_timestamp``, expressed in Asia/Kolkata (IST) for logs.
 
 ### Community 59 - "Community 59"
 Cohesion: 1.0
-Nodes (1): Background thread: if connected but no application traffic for stall_sec, close
+Nodes (1): Log skip reason; pass ``diagnostics=`` or other fields for feed/timestamp debugg
 
 ### Community 60 - "Community 60"
+Cohesion: 1.0
+Nodes (1): Build step_size size dictionary for all stock option underlyings (OPTSTK)
+
+### Community 61 - "Community 61"
+Cohesion: 1.0
+Nodes (1): Shared indicator layer for live engine.      Maintains per-(symbol,timeframe)
+
+### Community 62 - "Community 62"
+Cohesion: 1.0
+Nodes (1): Fallback patch only for the last row when RSI is missing/NaN.         Never rew
+
+### Community 63 - "Community 63"
+Cohesion: 1.0
+Nodes (1): Shared indicator layer for live engine.      Maintains per-(symbol,timeframe)
+
+### Community 64 - "Community 64"
+Cohesion: 1.0
+Nodes (1): Fallback patch only for the last row when RSI is missing/NaN.         Never rew
+
+### Community 65 - "Community 65"
+Cohesion: 1.0
+Nodes (1): Returns nearest OTM strikes relative to spot.         For spot = 17700, step =
+
+### Community 66 - "Community 66"
+Cohesion: 1.0
+Nodes (1): Output:         NIFTY 30 MAR 25000 PUT         NIFTY 30 MAR 25000 CALL
+
+### Community 67 - "Community 67"
+Cohesion: 1.0
+Nodes (1): Select last expiry of target month/year.
+
+### Community 68 - "Community 68"
+Cohesion: 1.0
+Nodes (1): Dhan / Tradehull monthly option chain index for backtest (``expiry_code`` is int
+
+### Community 69 - "Community 69"
+Cohesion: 1.0
+Nodes (1): Map DHAN ``expiry_code`` (0 = front monthly, 1 = next monthly) to a calendar exp
+
+### Community 70 - "Community 70"
+Cohesion: 1.0
+Nodes (1): Inverse of ``dhan_expiry_index_to_date``: map a calendar expiry to DHAN ``expiry
+
+### Community 71 - "Community 71"
+Cohesion: 1.0
+Nodes (1): Normalize values from ``params['expiry_code']`` / ``ctx.selected_expiry``: DHAN
+
+### Community 72 - "Community 72"
+Cohesion: 1.0
+Nodes (1): Quarterly expiry label (future use).
+
+### Community 73 - "Community 73"
+Cohesion: 1.0
+Nodes (1): Quarterly month selector (used by NSE & quarterly logic).
+
+### Community 74 - "Community 74"
+Cohesion: 1.0
+Nodes (1): Build step_size size dictionary for all stock option underlyings (OPTSTK)
+
+### Community 75 - "Community 75"
+Cohesion: 1.0
+Nodes (1): Per-engine structured logger. Thread-safe. Writes JSON lines to logs/{engine_id}
+
+### Community 76 - "Community 76"
+Cohesion: 1.0
+Nodes (1): Same bar instant as ``bar_timestamp``, expressed in Asia/Kolkata (IST) for logs.
+
+### Community 77 - "Community 77"
+Cohesion: 1.0
+Nodes (1): Append one JSON line per closed candle to logs/{engine_id}_candles.log.
+
+### Community 78 - "Community 78"
+Cohesion: 1.0
+Nodes (1): Log skip reason; pass ``diagnostics=`` or other fields for feed/timestamp debugg
+
+### Community 79 - "Community 79"
+Cohesion: 1.0
+Nodes (1): On startup, collapse older append-only logs to one row per still-open symbol.
+
+### Community 80 - "Community 80"
+Cohesion: 1.0
+Nodes (1): One-time migrate older CSVs when new columns are introduced (rewrite in place).
+
+### Community 81 - "Community 81"
+Cohesion: 1.0
+Nodes (1): Last row wins per symbol; keep only symbols that are still open (net_qty != 0
+
+### Community 82 - "Community 82"
+Cohesion: 1.0
+Nodes (1): Live: replace file with one row per non-flat position after PM synced to broker.
+
+### Community 83 - "Community 83"
+Cohesion: 1.0
+Nodes (1): Background thread: if connected but no application traffic for stall_sec, close
+
+### Community 84 - "Community 84"
+Cohesion: 1.0
+Nodes (1): Optional control-plane helper: hold references to Dhan market / order / depth cl
+
+### Community 85 - "Community 85"
+Cohesion: 1.0
+Nodes (1): Sleep with jitter to avoid synchronized reconnect storms; return next backoff (c
+
+### Community 86 - "Community 86"
+Cohesion: 1.0
+Nodes (1): Background thread: if connected but no application traffic for stall_sec, close
+
+### Community 87 - "Community 87"
 Cohesion: 1.0
 Nodes (1): Optional control-plane helper: hold references to Dhan market / order / depth cl
 
 ## Knowledge Gaps
-- **228 isolated node(s):** `Trade log and performance analytics.  - Trade log: trade_id, entry_time, exit_`, `Compute PnL for a single trade row.     BUY: (exit_price - entry_price) * qty`, `Load trade log from CSV into a DataFrame.      Args:         csv_path: Path t`, `Sharpe ratio from trade PnL: (mean return - risk_free_rate) / std(return).`, `Full performance summary from a trades DataFrame.      Trades must have column` (+223 more)
+- **282 isolated node(s):** `Trade log and performance analytics.  - Trade log: trade_id, entry_time, exit_`, `Compute PnL for a single trade row.     BUY: (exit_price - entry_price) * qty`, `Load trade log from CSV into a DataFrame.      Args:         csv_path: Path t`, `Sharpe ratio from trade PnL: (mean return - risk_free_rate) / std(return).`, `Full performance summary from a trades DataFrame.      Trades must have column` (+277 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **Thin community `Community 23`** (2 nodes): `slippage.py`, `allowed_slippage()`
-  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 24`** (1 nodes): `__init__.py`
+- **Thin community `Community 24`** (2 nodes): `slippage.py`, `allowed_slippage()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 - **Thin community `Community 25`** (1 nodes): `__init__.py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 26`** (1 nodes): `Place a single order. Returns dict with "status" and on success "order_id".`
+- **Thin community `Community 26`** (1 nodes): `__init__.py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 27`** (1 nodes): `Current positions (broker-specific format).`
+- **Thin community `Community 27`** (1 nodes): `Place a single order. Returns dict with "status" and on success "order_id".`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 28`** (1 nodes): `Place order from OrderIntent or dict. Returns order_id or None.`
+- **Thin community `Community 28`** (1 nodes): `Current positions (broker-specific format).`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 29`** (1 nodes): `Exit a position explicitly. Must internally call place_order().`
+- **Thin community `Community 29`** (1 nodes): `Place order from OrderIntent or dict. Returns order_id or None.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 30`** (1 nodes): `__init__.py`
+- **Thin community `Community 30`** (1 nodes): `Exit a position explicitly. Must internally call place_order().`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 31`** (1 nodes): `Historical intraday candles for backtest.`
+- **Thin community `Community 31`** (1 nodes): `__init__.py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 32`** (1 nodes): `Latest OHLC/LTP per symbol (live/tick mode).`
+- **Thin community `Community 32`** (1 nodes): `Historical intraday candles for backtest.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 33`** (1 nodes): `Live expiry list (broker-specific format, e.g. indices).`
+- **Thin community `Community 33`** (1 nodes): `Latest OHLC/LTP per symbol (live/tick mode).`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 34`** (1 nodes): `Connect and start receiving data (e.g. spawn background thread).`
+- **Thin community `Community 34`** (1 nodes): `Live expiry list (broker-specific format, e.g. indices).`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 35`** (1 nodes): `Disconnect and stop the feed.`
+- **Thin community `Community 35`** (1 nodes): `Connect and start receiving data (e.g. spawn background thread).`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 36`** (1 nodes): `Return True if the feed is connected and receiving.`
+- **Thin community `Community 36`** (1 nodes): `Disconnect and stop the feed.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 37`** (1 nodes): `__init__.py`
+- **Thin community `Community 37`** (1 nodes): `Return True if the feed is connected and receiving.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 - **Thin community `Community 38`** (1 nodes): `__init__.py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 39`** (1 nodes): `Normalize tag/action filter to a list of upper-case strings; None => no filter.`
+- **Thin community `Community 39`** (1 nodes): `Return a stable signature only when strategy explicitly opts into         cross`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 40`** (1 nodes): `registry.py`
+- **Thin community `Community 40`** (1 nodes): `Fallback patch only for the last row when RSI is missing/NaN.         Never rew`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 41`** (1 nodes): `runtime_spec.py`
+- **Thin community `Community 41`** (1 nodes): `__init__.py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 42`** (1 nodes): `__init__.py`
+- **Thin community `Community 42`** (1 nodes): `Normalize tag/action filter to a list of upper-case strings; None => no filter.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 43`** (1 nodes): `__init__.py`
+- **Thin community `Community 43`** (1 nodes): `registry.py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 44`** (1 nodes): `__init__.py`
+- **Thin community `Community 44`** (1 nodes): `runtime_spec.py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 45`** (1 nodes): `Single-bar RSI approximation (no pandas). Returns None if insufficient data.`
+- **Thin community `Community 45`** (1 nodes): `__init__.py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 - **Thin community `Community 46`** (1 nodes): `__init__.py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 47`** (1 nodes): `Select last expiry of target month/year.`
+- **Thin community `Community 47`** (1 nodes): `__init__.py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 48`** (1 nodes): `Dhan / Tradehull monthly option chain index for backtest (``expiry_code`` is int`
+- **Thin community `Community 48`** (1 nodes): `Single-bar RSI approximation (no pandas). Returns None if insufficient data.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 49`** (1 nodes): `Map DHAN ``expiry_code`` (0 = front monthly, 1 = next monthly) to a calendar exp`
+- **Thin community `Community 49`** (1 nodes): `__init__.py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 50`** (1 nodes): `Inverse of ``dhan_expiry_index_to_date``: map a calendar expiry to DHAN ``expiry`
+- **Thin community `Community 50`** (1 nodes): `Select last expiry of target month/year.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 51`** (1 nodes): `Normalize values from ``params['expiry_code']`` / ``ctx.selected_expiry``: DHAN`
+- **Thin community `Community 51`** (1 nodes): `Dhan / Tradehull monthly option chain index for backtest (``expiry_code`` is int`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 52`** (1 nodes): `Quarterly expiry label (future use).`
+- **Thin community `Community 52`** (1 nodes): `Map DHAN ``expiry_code`` (0 = front monthly, 1 = next monthly) to a calendar exp`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 53`** (1 nodes): `Quarterly month selector (used by NSE & quarterly logic).`
+- **Thin community `Community 53`** (1 nodes): `Inverse of ``dhan_expiry_index_to_date``: map a calendar expiry to DHAN ``expiry`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 54`** (1 nodes): `Expired options data.py`
+- **Thin community `Community 54`** (1 nodes): `Normalize values from ``params['expiry_code']`` / ``ctx.selected_expiry``: DHAN`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 55`** (1 nodes): `Same bar instant as ``bar_timestamp``, expressed in Asia/Kolkata (IST) for logs.`
+- **Thin community `Community 55`** (1 nodes): `Quarterly expiry label (future use).`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 56`** (1 nodes): `Background thread: if connected but no application traffic for stall_sec, close`
+- **Thin community `Community 56`** (1 nodes): `Quarterly month selector (used by NSE & quarterly logic).`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 57`** (1 nodes): `Optional control-plane helper: hold references to Dhan market / order / depth cl`
+- **Thin community `Community 57`** (1 nodes): `Expired options data.py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 58`** (1 nodes): `Sleep with jitter to avoid synchronized reconnect storms; return next backoff (c`
+- **Thin community `Community 58`** (1 nodes): `Same bar instant as ``bar_timestamp``, expressed in Asia/Kolkata (IST) for logs.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 59`** (1 nodes): `Background thread: if connected but no application traffic for stall_sec, close`
+- **Thin community `Community 59`** (1 nodes): `Log skip reason; pass ``diagnostics=`` or other fields for feed/timestamp debugg`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 60`** (1 nodes): `Optional control-plane helper: hold references to Dhan market / order / depth cl`
+- **Thin community `Community 60`** (1 nodes): `Build step_size size dictionary for all stock option underlyings (OPTSTK)`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 61`** (1 nodes): `Shared indicator layer for live engine.      Maintains per-(symbol,timeframe)`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 62`** (1 nodes): `Fallback patch only for the last row when RSI is missing/NaN.         Never rew`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 63`** (1 nodes): `Shared indicator layer for live engine.      Maintains per-(symbol,timeframe)`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 64`** (1 nodes): `Fallback patch only for the last row when RSI is missing/NaN.         Never rew`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 65`** (1 nodes): `Returns nearest OTM strikes relative to spot.         For spot = 17700, step =`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 66`** (1 nodes): `Output:         NIFTY 30 MAR 25000 PUT         NIFTY 30 MAR 25000 CALL`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 67`** (1 nodes): `Select last expiry of target month/year.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 68`** (1 nodes): `Dhan / Tradehull monthly option chain index for backtest (``expiry_code`` is int`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 69`** (1 nodes): `Map DHAN ``expiry_code`` (0 = front monthly, 1 = next monthly) to a calendar exp`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 70`** (1 nodes): `Inverse of ``dhan_expiry_index_to_date``: map a calendar expiry to DHAN ``expiry`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 71`** (1 nodes): `Normalize values from ``params['expiry_code']`` / ``ctx.selected_expiry``: DHAN`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 72`** (1 nodes): `Quarterly expiry label (future use).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 73`** (1 nodes): `Quarterly month selector (used by NSE & quarterly logic).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 74`** (1 nodes): `Build step_size size dictionary for all stock option underlyings (OPTSTK)`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 75`** (1 nodes): `Per-engine structured logger. Thread-safe. Writes JSON lines to logs/{engine_id}`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 76`** (1 nodes): `Same bar instant as ``bar_timestamp``, expressed in Asia/Kolkata (IST) for logs.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 77`** (1 nodes): `Append one JSON line per closed candle to logs/{engine_id}_candles.log.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 78`** (1 nodes): `Log skip reason; pass ``diagnostics=`` or other fields for feed/timestamp debugg`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 79`** (1 nodes): `On startup, collapse older append-only logs to one row per still-open symbol.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 80`** (1 nodes): `One-time migrate older CSVs when new columns are introduced (rewrite in place).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 81`** (1 nodes): `Last row wins per symbol; keep only symbols that are still open (net_qty != 0`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 82`** (1 nodes): `Live: replace file with one row per non-flat position after PM synced to broker.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 83`** (1 nodes): `Background thread: if connected but no application traffic for stall_sec, close`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 84`** (1 nodes): `Optional control-plane helper: hold references to Dhan market / order / depth cl`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 85`** (1 nodes): `Sleep with jitter to avoid synchronized reconnect storms; return next backoff (c`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 86`** (1 nodes): `Background thread: if connected but no application traffic for stall_sec, close`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 87`** (1 nodes): `Optional control-plane helper: hold references to Dhan market / order / depth cl`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `RunMode` connect `Community 2` to `Community 0`, `Community 1`, `Community 6`, `Community 7`, `Community 9`, `Community 11`?**
-  _High betweenness centrality (0.095) - this node is a cross-community bridge._
-- **Why does `create_live_engine()` connect `Community 0` to `Community 1`, `Community 3`, `Community 4`, `Community 5`, `Community 6`, `Community 7`, `Community 8`, `Community 9`, `Community 10`, `Community 11`, `Community 13`?**
-  _High betweenness centrality (0.061) - this node is a cross-community bridge._
-- **Why does `IndiaMktMixins` connect `Community 2` to `Community 1`, `Community 13`, `Community 6`?**
-  _High betweenness centrality (0.042) - this node is a cross-community bridge._
-- **Are the 218 inferred relationships involving `str` (e.g. with `.place_bracket_stop_loss()` and `.set_leverage_for_symbols()`) actually correct?**
-  _`str` has 218 INFERRED edges - model-reasoned connections that need verification._
-- **Are the 120 inferred relationships involving `RunMode` (e.g. with `OptionChainService` and `api: "NSE" or "DHAN"; ctx: StrategyContext; params: option chain params.`) actually correct?**
-  _`RunMode` has 120 INFERRED edges - model-reasoned connections that need verification._
-- **Are the 54 inferred relationships involving `IndiaMktMixins` (e.g. with `RunMode` and `ExpiryResolver`) actually correct?**
-  _`IndiaMktMixins` has 54 INFERRED edges - model-reasoned connections that need verification._
-- **Are the 24 inferred relationships involving `Tradehull` (e.g. with `DhanSource` and `Dhan data and order execution via in-project Tradehull library. All data feedin`) actually correct?**
-  _`Tradehull` has 24 INFERRED edges - model-reasoned connections that need verification._
+- **Why does `create_live_engine()` connect `Community 2` to `Community 0`, `Community 3`, `Community 5`, `Community 6`, `Community 7`, `Community 10`, `Community 12`, `Community 13`?**
+  _High betweenness centrality (0.102) - this node is a cross-community bridge._
+- **Why does `RunMode` connect `Community 6` to `Community 0`, `Community 1`, `Community 2`, `Community 3`, `Community 8`, `Community 10`, `Community 12`, `Community 15`?**
+  _High betweenness centrality (0.098) - this node is a cross-community bridge._
+- **Why does `IntentStatus` connect `Community 3` to `Community 8`, `Community 0`, `Community 2`, `Community 10`?**
+  _High betweenness centrality (0.056) - this node is a cross-community bridge._
+- **Are the 229 inferred relationships involving `str` (e.g. with `.place_bracket_stop_loss()` and `.set_leverage_for_symbols()`) actually correct?**
+  _`str` has 229 INFERRED edges - model-reasoned connections that need verification._
+- **Are the 169 inferred relationships involving `RunMode` (e.g. with `OptionChainService` and `api: "NSE" or "DHAN"; ctx: StrategyContext; params: option chain params.`) actually correct?**
+  _`RunMode` has 169 INFERRED edges - model-reasoned connections that need verification._
+- **Are the 88 inferred relationships involving `ExpiryResolver` (e.g. with `DhanAdapter` and `DhanSource`) actually correct?**
+  _`ExpiryResolver` has 88 INFERRED edges - model-reasoned connections that need verification._
+- **Are the 57 inferred relationships involving `IndiaMktMixins` (e.g. with `RunMode` and `ExpiryResolver`) actually correct?**
+  _`IndiaMktMixins` has 57 INFERRED edges - model-reasoned connections that need verification._

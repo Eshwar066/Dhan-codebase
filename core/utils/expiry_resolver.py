@@ -23,12 +23,9 @@ class ExpiryResolver:
         *,
         dhan_calendar_rollover_day=None,
     ):
-        # NSE will check later-->Pending
-
-        if isinstance(trade_date, str):
-            trade_date = pd.to_datetime(trade_date).date()
-        elif isinstance(trade_date, dt.datetime):
-            trade_date = trade_date.date()
+        # Normalize once to a pure date so downstream comparisons (e.g. in
+        # _derive_monthly_series) never mix pd.Timestamp with datetime.date.
+        trade_date = pd.Timestamp(trade_date).date()
 
         # ---------- NSE path ----------
         if api.upper() == "NSE":

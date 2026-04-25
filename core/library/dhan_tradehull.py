@@ -3462,6 +3462,8 @@ class Tradehull:
                         lambda x: self.convert_to_date_time(x)
                     )
                     earliest_day_date = df_day["timestamp"].min()
+                    if pd.notna(earliest_day_date):
+                        earliest_day_date = pd.Timestamp(earliest_day_date).date()
 
                     if from_date < earliest_day_date:
                         print(

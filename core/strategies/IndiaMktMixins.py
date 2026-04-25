@@ -382,9 +382,74 @@ class IndiaMktMixins:
         - NSE-style wide tables: ``CE LTP`` / ``PE LTP`` style columns.
         - DHAN rolling option bars: use ``close`` as option price (no separate LTP column).
         """
-        for col in chain.columns:
-            if option_type_upper in col.upper() and "LTP" in col.upper():
-                return col
+        if chain is None or not isinstance(chain, pd.DataFrame) or chain.empty:
+            return None
+
+        opt = str(option_type_upper or "").upper().strip()
+        if opt in ("CALL", "CE"):
+            opt_tokens = ("CE", "CALL")
+            side_prefix = "CE"
+        elif opt in ("PUT", "PE"):
+            opt_tokens = ("PE", "PUT")
+            side_prefix = "PE"
+        else:
+            opt_tokens = (opt,) if opt else tuple()
+            side_prefix = ""
+
+        cols = list(chain.columns)
+        upper_map = {c: str(c).upper().strip() for c in cols}
+
+        # 1) Preferred explicit LTP columns for the side, e.g. CE LTP / PE LTP.
+        for token in opt_tokens:
+            target = f"{token} LTP"
+            for c, cu in upper_map.items():
+                if cu == target:
+                    return c
+
+        # 2) Any side-specific LTP-style column (robust to separators/order).
+        for c, cu in upper_map.items():
+            if "LTP" not in cu:
+                continue
+            if any(token in cu for token in opt_tokens):
+                return c
+
+        # 3) Side-specific close/last columns.
+        for c, cu in upper_map.items():
+            if any(token in cu for token in opt_tokens) and (
+                "CLOSE" in cu or "LAST" in cu
+            ):
+                return c
+
+        # 4) Side-specific bid/ask fallback (midpoint is built downstream).
+        if side_prefix:
+            bid_target = f"{side_prefix} BID"
+            ask_target = f"{side_prefix} ASK"
+            bid_col = next((c for c, cu in upper_map.items() if cu == bid_target), None)
+            ask_col = next((c for c, cu in upper_map.items() if cu == ask_target), None)
+            if bid_col and ask_col:
+                return bid_col
+
+            # Handle alternatives like "CE Bid Price", "PE Ask Price", etc.
+            bid_like = next(
+                (
+                    c
+                    for c, cu in upper_map.items()
+                    if side_prefix in cu and "BID" in cu and ("QTY" not in cu)
+                ),
+                None,
+            )
+            ask_like = next(
+                (
+                    c
+                    for c, cu in upper_map.items()
+                    if side_prefix in cu and "ASK" in cu and ("QTY" not in cu)
+                ),
+                None,
+            )
+            if bid_like and ask_like:
+                return bid_like
+
+        # 5) Last resort for rolling backtest option bars.
         if "close" in chain.columns:
             return "close"
         return None
@@ -653,6 +718,7 @@ class IndiaMktMixins:
             )
         except Exception:
             pass
+            
         if chain is None:
             print(">>no option chain data", ctx, params)
             return None
@@ -722,7 +788,21 @@ class IndiaMktMixins:
                 row = filt
                 skip_premium_check = True
             else:
-                prem_num = pd.to_numeric(live_df[premium_col], errors="coerce").fillna(0)
+                prem_num = pd.to_numeric(live_df[premium_col], errors="coerce")
+                # Bid/ask fallback: when selected premium_col is bid-like, use side midpoint.
+                pu = str(premium_col).upper()
+                if "BID" in pu and ("QTY" not in pu):
+                    side_prefix = "CE" if option_type_upper in ("CE", "CALL") else "PE"
+                    ask_col = None
+                    for c in live_df.columns:
+                        cu = str(c).upper()
+                        if side_prefix in cu and "ASK" in cu and ("QTY" not in cu):
+                            ask_col = c
+                            break
+                    if ask_col:
+                        ask_num = pd.to_numeric(live_df[ask_col], errors="coerce")
+                        prem_num = (prem_num + ask_num) / 2.0
+                prem_num = prem_num.fillna(0)
                 row = live_df[prem_num.between(float(min_prem), float(max_prem), inclusive="both")]
                 if row.empty:
                     row = live_df[prem_num > 0]

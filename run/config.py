@@ -36,11 +36,11 @@ ENGINE_JOBS = [
             "bot_token": "8663481671:AAHY-OnE8OiaJmkOfXbwqoe4InosJVblAtM",
             "chat_id": "1021479950",
         },
-        "strategies": ["LEAPS_RSI", "NiftyIntradayMagicalLine"],
+        "strategies": ["LEAPS_RSI",], #"NiftyIntradayMagicalLine"
         "live": {"exchange": "INDEX", "sector": "YES", "rsi": "YES"},
         "backtest": {
-            "start_date": "2023-10-19",
-            "end_date": "2026-02-20",
+            "start_date": "2026-04-24",
+            "end_date": "2026-04-24",
             "timeframe": "60",
             "exchange": "INDEX",
             "sector": "YES",

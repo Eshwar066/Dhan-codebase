@@ -337,6 +337,8 @@ class EngineLogger:
             close=candle.get("close"),
             volume=candle.get("volume"),
             bucket_ts=candle.get("bucket_ts"),
+            rsi=candle.get("rsi"),
+            prev_rsi=candle.get("prev_rsi"),
             bar_timestamp_ist=bar_ts_ist,
             exchange=candle.get("exchange"),
         )

@@ -1,6 +1,5 @@
 import pandas as pd
 import talib
-import pdb
 
 from run.config import RUN_MODE, RunMode
 from core.strategies.base import BaseStrategy
@@ -20,7 +19,7 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     name = "LEAPS_RSI"
     timeframe = "60"
     required_context = ["option_chain"]
-    api = "NSE"
+    api = "DHAN"
     expiryType = "QUARTERLY"
     valid_times = VALID_TIMES
 
@@ -35,12 +34,16 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         df["prev_rsi"] = df["rsi"].shift(1)
         return df
 
+    def requires_live_rsi_patch(self) -> bool:
+        return True
+
     # ==================================================
     # SHOULD EVALUATE
     # ==================================================
     def should_evaluate(self, candle):
         rsi = candle.get("rsi")
         prev = candle.get("prev_rsi")
+        # return True
         if pd.isna(rsi) or pd.isna(prev):
             return False
         return (prev >= 32 and rsi < 32) or (prev <= 52 and rsi > 52)
@@ -52,8 +55,7 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         ts = pd.to_datetime(candle["timestamp"])
         if not self._is_valid_time(ts, VALID_TIMES):
             return None
-
-        # pdb.set_trace()
+        
         rsi = candle["rsi"]
         if rsi < 32:
             option_type = "CALL"
@@ -62,6 +64,8 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             option_type = "PUT"
             regime = "RSI_GT_52"
         else:
+            # option_type = "CALL"
+            # regime = "RSI_LT_32"
             return None
 
         structure_id = self.build_structure_id(candle, regime)
@@ -83,21 +87,28 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             return None
 
         expiry = ctx.selected_expiry
-
+        trade_date = pd.to_datetime(candle["timestamp"]).date()
+        expiry_for_symbol = expiry
+        # DHAN option-chain flow stores expiry as rolling series index (0/1/..).
+        # Convert to calendar date before building option symbol.
+        if isinstance(expiry, (int, float)):
+            expiry_for_symbol = ExpiryResolver.dhan_expiry_index_to_date(
+                trade_date, int(expiry)
+            )
         # Build the trading symbol
         trading_symbol = ExpiryResolver.build_option_symbol(
             self,
             candle["symbol"],
-            expiry,
+            expiry_for_symbol,
             strike,
             option_type,
         )
-
+       
         # Fetch Instrument object from InstrumentStore
         inst = ctx.instrument_store.intent_creation_details(
             trading_symbol,
             ctx.exchange,
-            expiry,
+            expiry_for_symbol,
             option_type,
             strike,
         )
@@ -136,6 +147,8 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         if position.tag != "MAIN":
             return False
         rsi = candle.get("rsi")
+        if pd.isna(rsi):
+            return False
         if position.instrument.option_type in ("CE", "CALL") and rsi > 52:
             return True
         if position.instrument.option_type in ("PE", "PUT") and rsi < 32:

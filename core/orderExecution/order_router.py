@@ -78,7 +78,6 @@ class OrderRouter:
             reject_orphan_fill_if_predates_position_open
         )
         self._consecutive_failures = 0
-        broker_sent_ts = time.time()
         # Order state cache: intent_id -> OrderState. Persisted to logs/order_state_{engine_id}.json.
         self._order_state: Dict[str, OrderState] = {}
         self._order_state_log: List[Dict[str, Any]] = []
@@ -521,6 +520,7 @@ class OrderRouter:
                 rec["status"],
                 broker_order_id=order_id,
             )
+        broker_sent_ts = time.time()
         return {
             "ok": True,
             "retryable": False,
