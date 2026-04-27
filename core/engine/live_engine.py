@@ -208,6 +208,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self._feed_stall_seconds = max(1.0, float(feed_stall_seconds or 60.0))
         self._feed_stall_last_log_ts: float = 0.0
         self._feed_stall_log_interval_seconds: float = 60.0
+        # Aggregate closed-candle skip logs to avoid per-tick log spam.
+        self._closed_candle_skip_counts: Dict[str, int] = {}
+        self._closed_candle_skip_last_log_ts: Dict[str, float] = {}
+        self._closed_candle_skip_log_interval_seconds: float = 600.0
         self._intent_journal_path = os.path.join(
             "logs", f"{self.engine_id}_intent_pipeline.jsonl"
         )
@@ -1124,9 +1128,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
 
                     # This code checks if the candle is fully closed; if not, it logs a warning and skips strategy evaluation to avoid trading on incomplete market data.
                     if not self._is_closed_candle(candle, tf, now=_now):
-                        if self.engine_logger and self._should_log_closed_candle_skip(
-                            symbol, tf, candle
-                        ):
+                        if self.engine_logger:
                             diag = self._closed_candle_diagnostics(
                                 candle,
                                 str(tf),
@@ -1141,11 +1143,32 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                                     )
                             except Exception:
                                 pass
-                            self.engine_logger.closed_candle_skip(
-                                symbol,
-                                "Forming or misaligned candle; skip evaluation",
-                                diagnostics=diag,
+                            skip_reason = str(diag.get("skip_reason") or "unknown")
+                            source_key = str(candle_source or "unknown")
+                            agg_key = (
+                                f"{symbol}|{str(tf)}|{source_key}|{skip_reason}"
                             )
+                            count = self._closed_candle_skip_counts.get(agg_key, 0) + 1
+                            self._closed_candle_skip_counts[agg_key] = count
+                            now_ts = time.time()
+                            last_ts = self._closed_candle_skip_last_log_ts.get(
+                                agg_key, 0.0
+                            )
+                            if (
+                                now_ts - last_ts
+                                >= self._closed_candle_skip_log_interval_seconds
+                            ):
+                                self._closed_candle_skip_last_log_ts[agg_key] = now_ts
+                                self.engine_logger.closed_candle_skip(
+                                    symbol,
+                                    f"Skipped {count} {skip_reason} {source_key} candles in last "
+                                    f"{int(self._closed_candle_skip_log_interval_seconds)}s",
+                                    diagnostics=diag,
+                                    skip_count=count,
+                                    skip_reason=skip_reason,
+                                    candle_source=source_key,
+                                )
+                                self._closed_candle_skip_counts[agg_key] = 0
                         continue
 
                     eval_bucket = self._candle_bucket_start_unix(candle)
@@ -1362,8 +1385,20 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 self.engine_logger.time_window_blocked("Outside allowed trading hours")
             return
         signal_kind = str(getattr(single_intent, "action", "ENTRY") or "ENTRY").lower()
+        side = str(getattr(single_intent, "side", "") or "").upper()
+        tag = str(getattr(single_intent, "tag", "") or "").upper()
+        intent_id = str(getattr(single_intent, "intent_id", "") or "")
+        trading_sym = str(
+            getattr(getattr(single_intent, "instrument", None), "trading_symbol", symbol)
+            or symbol
+        )
+        # Make dedupe key intent-specific so MAIN/HEDGE on same candle are both allowed.
+        # Keep action as base "signal kind", and extend with intent discriminators.
+        signal_kind_ext = f"{signal_kind}|{trading_sym}|{side}|{tag}"
+        if intent_id:
+            signal_kind_ext = f"{signal_kind_ext}|{intent_id}"
         signal_hash = self._signal_hash(
-            symbol, timeframe or "", candle.get("timestamp"), signal_kind
+            symbol, timeframe or "", candle.get("timestamp"), signal_kind_ext
         )
 
         # Dublicate signal blocker ==> tested ✅
