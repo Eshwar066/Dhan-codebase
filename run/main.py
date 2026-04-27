@@ -63,6 +63,7 @@ def job_to_engine_config(job: dict) -> EngineConfig:
         symbols=job["symbols"],
         enabled=job.get("enabled", True),
         engine_id=job.get("engine_id"),
+        market_exchange=job.get("exchange"),
         capital=job.get("capital"),
         risk_per_trade_percent=job.get("risk_per_trade_percent"),
         daily_max_loss=job.get("daily_max_loss"),

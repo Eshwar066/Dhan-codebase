@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 from run.config import RunMode
 from core.engine.base_engine import BaseEngine
-from core.data.candle_aggregator import _resolution_to_seconds
+from core.data.candle_aggregator import _bucket_ts, _resolution_to_seconds
 from core.engine.live_engine_common import (
     DEFAULT_FEED_STALE_SECONDS,
     LiveEngineHelpersMixin,
@@ -56,6 +56,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         realtime_feed=None,
         engine_id: Optional[str] = None,
         venue: Optional[str] = None,
+        market_exchange: Optional[str] = None,
         engine_logger: Optional[Any] = None,
         feed_stale_seconds: float = DEFAULT_FEED_STALE_SECONDS,
         allowed_trading_hours: Optional[List[Tuple[str, str]]] = None,
@@ -112,6 +113,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self.candle_aggregator = candle_aggregator
         self.engine_id = engine_id or "live"
         self.venue = venue or ""
+        self.market_exchange = str(market_exchange or "").upper()
         self.engine_logger = engine_logger
         self.feed_stale_seconds = feed_stale_seconds
         self._last_tick_timestamp: Dict[str, float] = {}
@@ -688,7 +690,17 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         tf_sec = int(_resolution_to_seconds(tf))
         if tf_sec <= 0:
             tf_sec = 60
-        bucket = sec - (sec % tf_sec)
+        if self.market_exchange == "NSE":
+            bucket = _bucket_ts(
+                sec,
+                tf_sec,
+                session_start_sec=(9 * 3600) + (15 * 60),
+                session_end_sec=(15 * 3600) + (30 * 60),
+            )
+        else:
+            bucket = sec - (sec % tf_sec)
+        if bucket is None:
+            bucket = sec - (sec % tf_sec)
         return {
             "symbol": symbol,
             "open": float(row["open"]),

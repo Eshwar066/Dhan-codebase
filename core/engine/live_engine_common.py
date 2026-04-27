@@ -375,10 +375,10 @@ class LiveEngineHelpersMixin:
         bt = candle.get("bucket_ts")
         if bt is not None:
             try:
-                b = int(float(bt))
-                # CandleAggregator buckets are unix seconds floored to TF; trust when consistent.
-                if b % tf_sec == 0:
-                    return True
+                int(float(bt))
+                # bucket_ts originates from CandleAggregator/engine bucketing and can be
+                # session-anchored (e.g. NSE/BSE 1h at 09:15), so do not require epoch modulus.
+                return True
             except (TypeError, ValueError):
                 pass
 
@@ -443,11 +443,8 @@ class LiveEngineHelpersMixin:
             out["skip_reason"] = "forming"
         elif bt is not None:
             try:
-                b = int(float(bt))
-                if b % tf_sec == 0:
-                    out["skip_reason"] = "unexpected_should_pass"
-                else:
-                    out["skip_reason"] = "bucket_not_on_tf_grid"
+                int(float(bt))
+                out["skip_reason"] = "unexpected_should_pass"
             except (TypeError, ValueError):
                 out["skip_reason"] = "misaligned"
         else:

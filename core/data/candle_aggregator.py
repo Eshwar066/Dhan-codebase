@@ -15,6 +15,7 @@ Prop-grade Candle Aggregator: tick → 1m only; higher timeframes from closed 1m
 # 4️⃣ Add late-tick rejection guard
 
 from collections import deque
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 # Supported timeframes: 1m base; higher from closed 1m only.
@@ -38,6 +39,7 @@ TIMEFRAME_SECONDS = {
 }
 SECONDS_1M = 60
 MAX_CLOSED_LEN = 300
+IST_TZ = timezone(timedelta(hours=5, minutes=30))
 
 
 def _resolution_to_seconds(resolution: Optional[str]) -> int:
@@ -47,9 +49,42 @@ def _resolution_to_seconds(resolution: Optional[str]) -> int:
     return TIMEFRAME_SECONDS.get(r, TIMEFRAME_SECONDS.get("1m", 60))
 
 
-def _bucket_ts(ts_sec: float, tf_seconds: int) -> int:
-    """Integer bucket boundary. ts_sec in Unix seconds; tf_seconds e.g. 60, 300."""
+def _bucket_ts(
+    ts_sec: float,
+    tf_seconds: int,
+    *,
+    session_start_sec: Optional[int] = None,
+    session_end_sec: Optional[int] = None,
+) -> Optional[int]:
+    """
+    Integer bucket boundary.
+
+    - Default: wall-clock epoch bucketing.
+    - Session mode: if session boundaries are provided, reject timestamps outside the
+      session for intraday TFs and anchor >=1h buckets to session start.
+    """
     t = int(ts_sec)
+    if tf_seconds <= 0:
+        return None
+
+    if (
+        session_start_sec is not None
+        and session_end_sec is not None
+        and 60 <= tf_seconds < 86400
+    ):
+        dt_ist = datetime.fromtimestamp(t, IST_TZ)
+        sec_of_day = dt_ist.hour * 3600 + dt_ist.minute * 60 + dt_ist.second
+        if sec_of_day < session_start_sec or sec_of_day >= session_end_sec:
+            return None
+
+        # For hourly+ bars, anchor buckets to market open (e.g., 09:15 for NSE/BSE).
+        if tf_seconds >= 3600:
+            offset = sec_of_day - session_start_sec
+            bucket_start_sec = session_start_sec + (offset // tf_seconds) * tf_seconds
+            day_start_ist = dt_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+            bucket_dt_ist = day_start_ist + timedelta(seconds=bucket_start_sec)
+            return int(bucket_dt_ist.astimezone(timezone.utc).timestamp())
+
     return t - (t % tf_seconds)
 
 
@@ -73,8 +108,15 @@ class CandleAggregator:
     Single state owner: only the processor loop that calls on_tick() mutates state.
     """
 
-    def __init__(self, max_closed_per_tf: int = MAX_CLOSED_LEN):
+    def __init__(
+        self,
+        max_closed_per_tf: int = MAX_CLOSED_LEN,
+        session_start_sec: Optional[int] = None,
+        session_end_sec: Optional[int] = None,
+    ):
         self._max_closed = max(1, min(max_closed_per_tf, 500))
+        self._session_start_sec = session_start_sec
+        self._session_end_sec = session_end_sec
         # symbol -> timeframe_seconds -> {"current": dict | None, "closed": deque}
         self._state: Dict[str, Dict[int, Dict[str, Any]]] = {}
         # Ordered list of higher TF seconds (excluding 1m) for propagation
@@ -104,9 +146,23 @@ class CandleAggregator:
         volume = float(volume) if volume is not None else 0.0
         ts = float(timestamp_sec)
 
-        bucket_1m = _bucket_ts(ts, SECONDS_1M)
         cell_1m = self._ensure_symbol_tf(symbol, SECONDS_1M)
         cur = cell_1m["current"]
+        bucket_1m = _bucket_ts(
+            ts,
+            SECONDS_1M,
+            session_start_sec=self._session_start_sec,
+            session_end_sec=self._session_end_sec,
+        )
+
+        # Outside configured intraday session: finalize any in-progress candle and stop.
+        if bucket_1m is None:
+            if cur is not None:
+                closed_1m = cur
+                cell_1m["closed"].append(closed_1m)
+                cell_1m["current"] = None
+                self._propagate_from_closed_1m(symbol, closed_1m)
+            return
 
         if cur is None:
             cell_1m["current"] = _candle_to_dict(symbol, price, price, price, price, volume, bucket_1m)
@@ -132,7 +188,15 @@ class CandleAggregator:
         bucket_1m = closed_1m["bucket_ts"]
         for tf_sec in self._higher_tf_seconds:
             cell = self._ensure_symbol_tf(symbol, tf_sec)
-            target_bucket = _bucket_ts(bucket_1m, tf_sec)
+            target_bucket = _bucket_ts(
+                bucket_1m,
+                tf_sec,
+                session_start_sec=self._session_start_sec,
+                session_end_sec=self._session_end_sec,
+            )
+            if target_bucket is None:
+                # Intraday out-of-session / invalid bucket for this TF.
+                continue
             cur = cell["current"]
 
             if cur is None:

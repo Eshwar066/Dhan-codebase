@@ -8,7 +8,7 @@ class RunMode(str, Enum):
 
 
 # 🔁 Default run mode when a job does not specify "run_mode".
-RUN_MODE = RunMode.PAPER
+RUN_MODE = RunMode.LIVE
 
 # Global fallback: entry quantity in lots (used when a job does not override).
 ORDER_QTY_LOTS = 1
@@ -28,7 +28,7 @@ ENGINE_JOBS = [
         "engine_id": "dhan_leaps_rsi",
         "venue": "DHAN",
         "enabled": True,
-        "run_mode": "PAPER",
+        "run_mode": "LIVE",
         "capital": 200000,
         "ORDER_QTY_LOTS": 1,
         "symbols": ["NIFTY"],
@@ -36,6 +36,7 @@ ENGINE_JOBS = [
             "bot_token": "8663481671:AAHY-OnE8OiaJmkOfXbwqoe4InosJVblAtM",
             "chat_id": "1021479950",
         },
+        "exchange": "NSE",
         "strategies": ["LEAPS_RSI",], #"NiftyIntradayMagicalLine"
         "live": {"exchange": "INDEX", "sector": "YES", "rsi": "YES"},
         "backtest": {
