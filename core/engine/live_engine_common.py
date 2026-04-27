@@ -595,22 +595,29 @@ class LiveEngineHelpersMixin:
         return True
 
     def _should_log_closed_candle_skip(
-        self, symbol: str, tf: Optional[str], candle: Dict[str, Any]
+        self,
+        symbol: str,
+        tf: Optional[str],
+        candle: Dict[str, Any],
+        *,
+        skip_reason: Optional[str] = None,
     ) -> bool:
         """
         Rate-limit ``closed_candle_skip`` JSON logs. Without this, a non-aligned or forming
         bar in a tight engine loop can emit hundreds of identical lines per second.
         """
         bucket = self._candle_bucket_start_unix(candle)
-        ts_fb = str(candle.get("timestamp"))
-        key = f"{symbol}|{tf or 'NA'}|{bucket if bucket is not None else ts_fb}"
+        reason = str(skip_reason or "unknown")
+        bucket_key = str(bucket) if bucket is not None else "none"
+        # Stable key prevents per-second timestamp churn when bucket_ts is missing.
+        key = f"{symbol}|{tf or 'NA'}|{reason}|{bucket_key}"
         now = time.time()
         d = getattr(self, "_last_closed_candle_skip_ts", None)
         if d is None:
             d = {}
             self._last_closed_candle_skip_ts = d
         last = d.get(key, 0.0)
-        if now - last < 5.0:
+        if now - last < 120.0:
             return False
         d[key] = now
         return True
@@ -810,7 +817,7 @@ class LiveEngineHelpersMixin:
                     self._last_tick_timestamp[s] = time.time()
                     self._tick_debug_count += 1
                     now = time.time()
-                    if now - self._tick_debug_last_log >= 600:
+                    if now - self._tick_debug_last_log >= 1800:
                         msg = f"Tick health: {self._tick_debug_count} ticks in last 5s"
                         if self.engine_logger:
                             self.engine_logger.log("tick_health", msg)

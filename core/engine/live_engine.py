@@ -1136,16 +1136,47 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
 
                     # This code checks if the candle is fully closed; if not, it logs a warning and skips strategy evaluation to avoid trading on incomplete market data.
                     if not self._is_closed_candle(candle, tf, now=_now):
-                        if self.engine_logger and self._should_log_closed_candle_skip(
-                            symbol, tf, candle
-                        ):
-                            diag = self._closed_candle_diagnostics(
-                                candle,
-                                str(tf),
-                                _now,
-                                use_aggregator=bool(use_aggregator),
-                                candle_source=candle_source,
+                        diag = self._closed_candle_diagnostics(
+                            candle,
+                            str(tf),
+                            _now,
+                            use_aggregator=bool(use_aggregator),
+                            candle_source=candle_source,
+                        )
+                        skip_reason = str(diag.get("skip_reason") or "unknown")
+                        # Aggregate repetitive skip diagnostics and emit compact periodic summaries.
+                        stats = getattr(self, "_closed_skip_counts", None)
+                        if stats is None:
+                            stats = {}
+                            self._closed_skip_counts = stats
+                        key = f"{symbol}|{tf}|{skip_reason}"
+                        st = stats.get(key)
+                        now_s = time.time()
+                        if st is None:
+                            st = {"count": 0, "start": now_s, "last_emit": 0.0}
+                            stats[key] = st
+                        st["count"] += 1
+                        if self.engine_logger and (now_s - float(st["last_emit"])) >= 300.0:
+                            self.engine_logger.log(
+                                "closed_candle_skip_summary",
+                                (
+                                    "Skipped closed-candle evaluations "
+                                    f"count={st['count']} window_sec={int(now_s - float(st['start']))} "
+                                    f"reason={skip_reason}"
+                                ),
+                                symbol=symbol,
+                                timeframe=str(tf),
+                                skip_reason=skip_reason,
+                                count=int(st["count"]),
+                                window_sec=int(now_s - float(st["start"])),
                             )
+                            st["count"] = 0
+                            st["start"] = now_s
+                            st["last_emit"] = now_s
+
+                        if self.engine_logger and self._should_log_closed_candle_skip(
+                            symbol, tf, candle, skip_reason=skip_reason
+                        ):
                             try:
                                 if self.candle_aggregator:
                                     diag["aggregator_symbol_keys"] = (
