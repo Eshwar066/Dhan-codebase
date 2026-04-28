@@ -35,6 +35,12 @@ try:
     from logger.engine_logger import REPORTS_DIR
 except ImportError:
     REPORTS_DIR = "reports"
+
+
+class NoMarketDataError(RuntimeError):
+    """Raised when WebSocket stays alive but market ticks stop arriving."""
+
+
 class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
     """
     Live/paper engine. Uses realtime_feed (WebSocket/aggregator) candle flow
@@ -210,6 +216,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self._feed_stall_seconds = max(1.0, float(feed_stall_seconds or 60.0))
         self._feed_stall_last_log_ts: float = 0.0
         self._feed_stall_log_interval_seconds: float = 60.0
+        # Startup grace: allow feed to warm before declaring global stall.
+        self._feed_first_tick_grace_seconds: float = 30.0
+        self._feed_start_grace_until_ts: float = 0.0
         self._intent_journal_path = os.path.join(
             "logs", f"{self.engine_id}_intent_pipeline.jsonl"
         )
@@ -970,6 +979,34 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         except Exception:
             return
         now = time.time()
+        # DHAN-specific hard guard: connection may stay alive while market data stalls.
+        # Track pure market-tick heartbeat separately and fail fast when no ticks arrive.
+        if str(self.venue or "").upper() == "DHAN":
+            last_market_tick_ts = 0.0
+            try:
+                last_market_tick_ts = float(
+                    getattr(self.realtime_feed, "last_market_tick_ts", 0.0) or 0.0
+                )
+            except Exception:
+                last_market_tick_ts = 0.0
+            if last_market_tick_ts > 0.0 and (now - last_market_tick_ts) > 5.0:
+                msg = (
+                    f"No market ticks for {now - last_market_tick_ts:.1f}s "
+                    "(threshold=5s) while feed is connected"
+                )
+                raise NoMarketDataError(msg)
+        # During startup warmup, suppress "all symbols stalled" when no symbol has seen any data yet.
+        if now < self._feed_start_grace_until_ts:
+            any_seen = False
+            for sym in self.symbols:
+                if max(
+                    self._last_tick_timestamp.get(sym, 0.0),
+                    self._last_candle_timestamp.get(sym, 0.0),
+                ) > 0:
+                    any_seen = True
+                    break
+            if not any_seen:
+                return
         stale_symbols = []
         for sym in self.symbols:
             last_tick = self._last_tick_timestamp.get(sym, 0.0)
@@ -997,6 +1034,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
     def start(self, exchange, sector, rsi):
         self._live_exchange = str(exchange or "INDEX")
         self._live_sector = str(sector or "NO")
+        self._feed_start_grace_until_ts = (
+            time.time() + float(self._feed_first_tick_grace_seconds)
+        )
         self.indicator_manager.set_runtime_context(
             exchange=self._live_exchange, sector=self._live_sector
         )
@@ -1115,8 +1155,15 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                                 candle.get("bucket_ts"),
                             )
                             continue
-                    # Quote/ticker pseudo-candle (last_trade_time — usually not TF-aligned).
-                    if candle is None and use_feed and self.realtime_feed:
+                    # Quote/ticker pseudo-candle fallback should be used only when
+                    # aggregator mode is NOT active. In aggregator mode, pseudo-candles
+                    # can create flat/synthetic OHLC rows (open==high==low==close).
+                    if (
+                        candle is None
+                        and (not use_aggregator)
+                        and use_feed
+                        and self.realtime_feed
+                    ):
                         candle = self.realtime_feed.get_last_candle(symbol, tf)
                         if candle:
                             candle_source = "quote_feed"

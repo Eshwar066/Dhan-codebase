@@ -38,10 +38,32 @@ class DhanWebSocketFeed(RealtimeFeed):
         self._ws: Optional[DhanWebSocket] = None
         self._tick_queue: Optional[Any] = None
         self._engine_logger = engine_logger
+        self._last_tick_ts_by_symbol: Dict[str, float] = {}
 
     def set_tick_queue(self, queue: Any) -> None:
         """Push normalized ticks to queue for CandleAggregator. Set before start()."""
         self._tick_queue = queue
+
+    def _normalized_tick_ts(self, symbol: str, raw_ts: Any) -> float:
+        now = time.time()
+        ts: Optional[float] = None
+        if isinstance(raw_ts, (int, float)):
+            candidate = float(raw_ts)
+            if candidate > 1e12:
+                candidate = candidate / 1e3
+            if candidate > 1e9:
+                ts = candidate
+
+        # Fallback for stale/invalid broker LTT:
+        # - missing/invalid timestamp
+        # - too old relative to wall clock
+        # - non-monotonic for this symbol (prevents bucket getting stuck)
+        last = float(self._last_tick_ts_by_symbol.get(symbol, 0.0) or 0.0)
+        if ts is None or (now - ts) > 3.0 or (last > 0 and ts <= last):
+            ts = now
+
+        self._last_tick_ts_by_symbol[symbol] = float(ts)
+        return float(ts)
 
     def _push_tick(self, symbol: str, data: Dict[str, Any]) -> None:
         if self._tick_queue is None:
@@ -52,16 +74,7 @@ class DhanWebSocketFeed(RealtimeFeed):
                 return
             price = float(price)
             vol = float(data.get("volume") or data.get("last_traded_quantity") or 0)
-            ts = data.get("last_trade_time")
-            if ts is not None and isinstance(ts, (int, float)):
-                if ts > 1e12:
-                    ts = ts / 1e3
-                elif ts > 1e9:
-                    pass
-                else:
-                    ts = time.time()
-            else:
-                ts = time.time()
+            ts = self._normalized_tick_ts(symbol, data.get("last_trade_time"))
             self._tick_queue.put_nowait({
                 "symbol": symbol,
                 "price": price,
@@ -119,6 +132,10 @@ class DhanWebSocketFeed(RealtimeFeed):
     @property
     def is_warm(self) -> bool:
         return bool(self._ws and self._ws.is_warm)
+
+    @property
+    def last_market_tick_ts(self) -> float:
+        return float(self._ws.last_market_tick_ts) if self._ws else 0.0
 
     def get_last_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
         if not self._ws:
