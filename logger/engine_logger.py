@@ -378,26 +378,14 @@ class EngineLogger:
             except Exception:
                 tf_sec = None
 
-        # bar_timestamp_ist = bar *close* (end of interval), not mismatching indicator-row open times.
+        # bar_timestamp_ist = bar *open* (start of interval).
         bar_ts_ist: Optional[str] = None
         bt = candle.get("bucket_ts")
-        ex = candle.get("exchange")
-        if bt is not None and tf_sec is not None and int(tf_sec) > 0:
+        if bt is not None:
             try:
-                close_unix = self._bar_close_unix_from_bucket(
-                    float(bt), int(tf_sec), ex if isinstance(ex, str) else None
-                )
-                bar_ts_ist = self._bar_timestamp_to_ist_iso(close_unix)
+                bar_ts_ist = self._bar_timestamp_to_ist_iso(float(bt))
             except Exception:
                 bar_ts_ist = None
-        if bar_ts_ist is None and tf_sec is not None and int(tf_sec) > 0:
-            open_u = self._coerce_to_unix_seconds(ts)
-            if open_u is not None:
-                try:
-                    close_unix = float(open_u) + float(tf_sec)
-                    bar_ts_ist = self._bar_timestamp_to_ist_iso(close_unix)
-                except Exception:
-                    bar_ts_ist = None
         if bar_ts_ist is None:
             bar_ts_ist = self._bar_timestamp_to_ist_iso(ts)
 

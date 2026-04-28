@@ -606,10 +606,15 @@ class LiveEngineHelpersMixin:
         Rate-limit ``closed_candle_skip`` JSON logs. Without this, a non-aligned or forming
         bar in a tight engine loop can emit hundreds of identical lines per second.
         """
-        bucket = self._candle_bucket_start_unix(candle)
+        # When bucket_ts is missing (e.g. quote_feed pseudo-candle), do NOT use
+        # _candle_bucket_start_unix(candle) -- it is the live "now" and changes
+        # every second, so the throttle key was unique every loop (no 120s cap).
+        if candle.get("bucket_ts") is not None:
+            bucket = self._candle_bucket_start_unix(candle)
+            bucket_key = str(bucket) if bucket is not None else "none"
+        else:
+            bucket_key = "no_bucket_ts"
         reason = str(skip_reason or "unknown")
-        bucket_key = str(bucket) if bucket is not None else "none"
-        # Stable key prevents per-second timestamp churn when bucket_ts is missing.
         key = f"{symbol}|{tf or 'NA'}|{reason}|{bucket_key}"
         now = time.time()
         d = getattr(self, "_last_closed_candle_skip_ts", None)

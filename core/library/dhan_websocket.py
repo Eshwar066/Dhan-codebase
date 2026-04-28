@@ -230,12 +230,13 @@ class DhanWebSocket:
         on_ticker: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         on_quote: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         on_disconnect: Optional[Callable[[int], None]] = None,
-        stall_timeout_seconds: float = 60,
+        stall_timeout_seconds: float = 90,
     ):
         """
         instruments: list of {"ExchangeSegment": "NSE_EQ", "SecurityId": "11536", "symbol": "RELIANCE"}.
         SecurityId as string; symbol used for get_last_ticker(symbol).
         stall_timeout_seconds: if >0, force-close socket when no inbound packets for this long (zombie detection).
+        Includes all inbound websocket frames (binary + text heartbeat/acks) via _on_message.
         """
         self.access_token = access_token
         self.client_id = str(client_id)
@@ -394,6 +395,10 @@ class DhanWebSocket:
                 self.on_disconnect(reason or 0)
 
     def _on_message(self, ws: websocket.WebSocketApp, message) -> None:
+        # Count any inbound frame as activity (binary market packet or text heartbeat/ack).
+        # Earlier we only touched activity for binary frames, which could trigger false
+        # stall watchdog closes when traffic was mostly non-binary control frames.
+        self._touch_activity()
         if isinstance(message, bytes):
             self._on_binary(ws, message)
         # else text (e.g. JSON) – ignore or log
