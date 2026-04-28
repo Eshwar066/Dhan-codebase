@@ -269,9 +269,63 @@ class EngineLogger:
             pass
 
     @staticmethod
+    def _coerce_to_unix_seconds(ts: Any) -> Optional[float]:
+        """Normalize candle timestamp to UNIX seconds for arithmetic."""
+        if ts is None:
+            return None
+        try:
+            if isinstance(ts, datetime):
+                dt_ = ts
+                if dt_.tzinfo is None:
+                    dt_ = dt_.replace(tzinfo=timezone.utc)
+                return float(dt_.timestamp())
+            if isinstance(ts, (int, float)):
+                sec = float(ts)
+                if sec >= 1e15:
+                    sec /= 1e6
+                elif sec >= 1e12:
+                    sec /= 1000.0
+                return sec
+            s = str(ts).strip()
+            if not s:
+                return None
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            parsed = datetime.fromisoformat(s)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return float(parsed.timestamp())
+        except Exception:
+            return None
+
+    @staticmethod
+    def _bar_close_unix_from_bucket(
+        bucket_unix: float,
+        tf_sec: int,
+        exchange: Optional[str],
+    ) -> float:
+        """
+        Bar close instant (UNIX): bucket start + timeframe length.
+        NSE cash INDEX 1H: final truncated segment is 15:15–15:30 IST (not a full hour);
+        naive bucket+3600 would land at 16:15 — clamp to session close 15:30.
+        """
+        close_u = float(bucket_unix) + float(tf_sec)
+        ex = str(exchange or "").upper()
+        if tf_sec != 3600 or ex not in ("INDEX", "NSE_INDEX", "NSE"):
+            return close_u
+        try:
+            buck_dt = datetime.fromtimestamp(float(bucket_unix), tz=IST)
+            if buck_dt.hour == 15 and buck_dt.minute == 15:
+                close_dt = buck_dt.replace(hour=15, minute=30, second=0, microsecond=0)
+                return float(close_dt.timestamp())
+        except Exception:
+            pass
+        return close_u
+
+    @staticmethod
     def _bar_timestamp_to_ist_iso(ts: Any) -> Optional[str]:
         """
-        Same bar instant as ``bar_timestamp``, expressed in Asia/Kolkata (IST) for logs.
+        Bar instant as ISO in Asia/Kolkata (IST). Used for open/close UNIX conversion.
         Naive datetimes are interpreted as UTC (same convention as LiveEngine candle timestamps).
         """
         if ts is None:
@@ -317,13 +371,36 @@ class EngineLogger:
             ts_out = ts.isoformat()
         else:
             ts_out = ts
-        bar_ts_ist = self._bar_timestamp_to_ist_iso(ts)
         tf_sec = None
         if _resolution_to_seconds is not None and timeframe is not None:
             try:
                 tf_sec = int(_resolution_to_seconds(str(timeframe)))
             except Exception:
                 tf_sec = None
+
+        # bar_timestamp_ist = bar *close* (end of interval), not mismatching indicator-row open times.
+        bar_ts_ist: Optional[str] = None
+        bt = candle.get("bucket_ts")
+        ex = candle.get("exchange")
+        if bt is not None and tf_sec is not None and int(tf_sec) > 0:
+            try:
+                close_unix = self._bar_close_unix_from_bucket(
+                    float(bt), int(tf_sec), ex if isinstance(ex, str) else None
+                )
+                bar_ts_ist = self._bar_timestamp_to_ist_iso(close_unix)
+            except Exception:
+                bar_ts_ist = None
+        if bar_ts_ist is None and tf_sec is not None and int(tf_sec) > 0:
+            open_u = self._coerce_to_unix_seconds(ts)
+            if open_u is not None:
+                try:
+                    close_unix = float(open_u) + float(tf_sec)
+                    bar_ts_ist = self._bar_timestamp_to_ist_iso(close_unix)
+                except Exception:
+                    bar_ts_ist = None
+        if bar_ts_ist is None:
+            bar_ts_ist = self._bar_timestamp_to_ist_iso(ts)
+
         payload = self._payload(
             "candle_closed",
             message="Closed candle",

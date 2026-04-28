@@ -138,7 +138,7 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         )
 
         # Return intents as a list
-        return [sell_intent, hedge_intent] if hedge_intent else [sell_intent]
+        return [hedge_intent,sell_intent] if hedge_intent else [sell_intent]
 
     # ==================================================
     # EXIT SIGNAL
