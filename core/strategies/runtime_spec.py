@@ -56,6 +56,41 @@ STRATEGY_RUNTIME_SPEC = {
             }
         },
     },
+    "OIPositionalBuy": {
+        RunMode.BACKTEST: {
+            "data": {
+                "option_chain": {
+                    "exchange": "NSE",
+                    "interval": "15",
+                    "segment": "OPT",
+                    "api": "DHAN",
+                    "expiry_flag": "MONTHLY",
+                }
+            }
+        },
+        RunMode.PAPER: {
+            "data": {
+                "option_chain": {
+                    "exchange": "NSE",
+                    "interval": "15",
+                    "segment": "OPT",
+                    "api": "DHAN",
+                    "expiry_flag": "MONTHLY",
+                }
+            }
+        },
+        RunMode.LIVE: {
+            "data": {
+                "option_chain": {
+                    "exchange": "NSE",
+                    "interval": "15",
+                    "segment": "OPT",
+                    "api": "DHAN",
+                    "expiry_flag": "MONTHLY",
+                }
+            }
+        },
+    },
     "Futures_EMA_Momentum": {
         RunMode.BACKTEST: {"data": {}},
         RunMode.PAPER: {"data": {}},

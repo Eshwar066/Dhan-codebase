@@ -3,150 +3,56 @@ Act as a senior algorithmic trading engineer with deep experience in building lo
 Treat this codebase as a production-grade trading system and operate as a senior algo developer with extensive experience in OMS design, market data systems, and fault-tolerant architectures.
 Assume the role of a highly experienced quantitative trading systems engineer; make decisions that ensure deterministic execution, risk safety, and scalability across multiple brokers and accounts.
 
-Implement this for project and update in main readme.md file and use this file as prompt and dont use this file name in project and main readme.md file
+Implement this for dhan broker  and use this file as prompt and dont use this file name in project and main readme.md file
 
 
-Final Priority Order (production-safe)
-🔴 P0 (must fix before scaling capital)
-1. End-to-end latency budget (your #8)
+OI Positional buy strategy
 
-Right now you’re blind after enqueue:
+Strikes in 100s
 
-broker_latency_ms = 0.0  ❌
+Timeframe: 15 min
 
-👉 This is dangerous because:
+09:30:
+    capture full option chain snapshot
+    candidates = strikes with 180–220 premium for both CE and PE
+ 
+INTRADAY LOOP:
+    if premium >= 1.5x or 50per:
+        exit
+        reselect  strike near to previously entered premium
+        
 
-Strategy thinks execution is fast
-Reality: order hits after 2–5 seconds
-✅ Fix
+    if SL hit 40per:
+        exit (no revenge entry)
 
-Track full pipeline:
+10:45:
+     
+    for each strike:
+        compare with 9:30
+        classify OI signal--> long
 
-intent_created_ts
-→ routed_ts
-→ oms_start_ts
-→ broker_sent_ts
-→ exchange_ack_ts
+    select best valid strike
+    enter trade
 
-Then log:
 
-total_latency =
-    broker_ack_ts - intent_created_ts
+15:15:
+    compare current vs 9:30
 
-👉 And enforce:
+    if same signal:
+        hold overnight
+	Next day at 9:30 take the current holding strike data(OI and Premium) as benchmark and opp strike at 180-220 premium strike and compare at 10:45--> repeat the process
 
-if total_latency > threshold:
-    pause_entries()
-🔴 2. Key cardinality cap (your #1)
+    elif opposite signal:
+        exit
+        scan opposite side
+        if long signal on comparing with benchmark:
+            enter
 
-You already know the issue:
-
-(account, symbol) → unlimited queues ❌
-Real-world failure mode:
-Weekly options
-Multiple strikes
-10 strategies
-
-👉 You’ll create hundreds of threads
-
-✅ Fix (simple but powerful)
-MAX_ACTIVE_KEYS = 200
-
-If exceeded:
-
-fallback_key = (account_id, "__FALLBACK__")
-
-or:
-
-drop_low_priority_intents()
-🔴 3. Minimal persistence (your #7)
-
-This is not optional if you run real money.
-
-Current risk:
-Process crash →
-- open positions exist
-- engine forgets them
-- next signal duplicates trade
-✅ Minimum viable persistence
-
-Don’t over-engineer DB.
-
-Just persist:
-
-{
-  "intent_id": "...",
-  "account_id": "...",
-  "symbol": "...",
-  "status": "SENT"
-}
-
-Store in:
-
-Redis / file append log / SQLite
-🟠 4. Restart loop guard (your #6)
-
-Without this:
-
-bug → crash → restart → crash → infinite loop
-✅ Fix
-if restart_count_last_60s > 5:
-    disable_worker()
-    send_alert()
-🟠 5. Strategy lag alert (your #5)
-
-You already bounded queue:
-
-queue.Queue(maxsize=1)
-
-👉 Good—but silent drops are dangerous.
-
-✅ Add
-if enqueue_failed:
-    logger.warning("Strategy lagging: dropped signal")
-🟠 6. Per-account circuit breaker (your #3)
-
-Current:
-
-global breaker → kills ALL accounts
-
-👉 Bad for multi-account setups.
-
-✅ Fix
-breaker_state[account_id]
-
-So:
-
-Account A fails → pause A only
-Account B continues trading
-🟡 7. execution_attempt_id (your #2)
-
-You’re right—it’s not broken, but incomplete.
-
-✅ Add (cheap + powerful)
-execution_attempt_id = f"{intent_id}-{retry_count}"
-
-Log it everywhere.
-
-🟡 8. Endpoint-level rate limit (your #4)
-
-Not urgent unless you see:
-
-HTTP 429 / throttling errors
-🧠 One thing you didn’t mention (but matters now)
-🔴 Feed dependency risk (because you removed REST)
-
-Your system now depends fully on:
-
-WebSocket → Aggregator
-
-👉 If feed dies:
-
-No candles → No exits → positions stuck ❌
-✅ Add immediately
-if now - last_tick_time > 5s:
-    alert("feed stalled")
-
-and optionally:
-
-force_exit_all_positions()
+Additionally:
+       
+	Problem 3: Late entry risk (10:45)
+	Sometimes move already done.
+	✅ Fix:
+	Add condition:
+	premium change from 9:30 < 80%
+	
