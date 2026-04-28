@@ -52,6 +52,40 @@ class IndicatorManager:
             return False
 
     @staticmethod
+    def _compute_rsi_columns(df: Any, period: int = 14) -> Any:
+        """Compute full RSI/prev_RSI columns for strategies that explicitly require RSI."""
+        import pandas as pd
+
+        if df is None or len(df) == 0 or "close" not in df.columns:
+            return df
+        try:
+            p = max(1, int(period))
+        except Exception:
+            p = 14
+
+        close = pd.to_numeric(df["close"], errors="coerce")
+        if close.isna().all():
+            return df
+
+        try:
+            import talib
+
+            rsi = talib.RSI(close.astype(float).values, timeperiod=p)
+            df["rsi"] = pd.Series(rsi, index=df.index, dtype="float64")
+        except Exception:
+            # Fallback to Wilder-style smoothing when TA-Lib is unavailable.
+            delta = close.diff()
+            gain = delta.clip(lower=0)
+            loss = -delta.clip(upper=0)
+            avg_gain = gain.ewm(alpha=1 / p, adjust=False).mean()
+            avg_loss = loss.ewm(alpha=1 / p, adjust=False).mean()
+            rs = avg_gain / avg_loss
+            df["rsi"] = 100 - (100 / (1 + rs))
+
+        df["prev_rsi"] = df["rsi"].shift(1)
+        return df
+
+    @staticmethod
     def _timeframe_to_seconds(tf: str) -> int:
         raw = str(tf or "").strip().lower()
         if not raw:
@@ -96,66 +130,6 @@ class IndicatorManager:
         except Exception:
             warmup = 0
         return max(150, warmup + 50)
-
-    @staticmethod
-    def compute_live_rsi_if_missing(df: Any, period: int = 14) -> Any:
-        """
-        Fallback patch only for the last row when RSI is missing/NaN.
-        Never rewrites an existing valid RSI series.
-        """
-        import pandas as pd
-
-        if df is None or len(df) == 0:
-            return df
-        if "close" not in df.columns:
-            return df
-        try:
-            p = max(1, int(period))
-        except Exception:
-            p = 14
-
-        last_idx = df.index[-1]
-        has_rsi_col = "rsi" in df.columns
-        if has_rsi_col and not pd.isna(df.at[last_idx, "rsi"]):
-            return df
-        if len(df) < p + 1:
-            return df
-
-        close = pd.to_numeric(df["close"], errors="coerce")
-        if close.iloc[-(p + 1) :].isna().any():
-            return df
-
-        window = close.iloc[-(p + 1) :]
-        delta = window.diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-        avg_gain = gain.iloc[1:].mean()
-        avg_loss = loss.iloc[1:].mean()
-        rs = float("inf") if avg_loss == 0 else (avg_gain / avg_loss)
-        rsi_last = 100 - (100 / (1 + rs))
-        df.at[last_idx, "rsi"] = float(rsi_last)
-
-        if "prev_rsi" in df.columns:
-            prev_val = float("nan")
-            if len(df) >= p + 2:
-                prev_window = close.iloc[-(p + 2) : -1]
-                if len(prev_window) == p + 1 and not prev_window.isna().any():
-                    prev_delta = prev_window.diff()
-                    prev_gain = prev_delta.clip(lower=0)
-                    prev_loss = -prev_delta.clip(upper=0)
-                    prev_avg_gain = prev_gain.iloc[1:].mean()
-                    prev_avg_loss = prev_loss.iloc[1:].mean()
-                    prev_rs = (
-                        float("inf")
-                        if prev_avg_loss == 0
-                        else (prev_avg_gain / prev_avg_loss)
-                    )
-                    prev_val = 100 - (100 / (1 + prev_rs))
-            elif has_rsi_col and len(df) >= 2:
-                prev_val = df.iloc[-2].get("rsi", float("nan"))
-            df.at[last_idx, "prev_rsi"] = float(prev_val)
-
-        return df
 
     def _bootstrap_base_candle_state(
         self, symbol: str, tf: str, exchange: str, sector: str, window: int
@@ -350,7 +324,8 @@ class IndicatorManager:
                 except Exception:
                     pass
             if self._strategy_requires_rsi(strategy):
-                df = self.compute_live_rsi_if_missing(df)
+                period = getattr(strategy, "rsi_period", 14)
+                df = self._compute_rsi_columns(df, period=period)
             strategy_state = {"df": df, "base_sig": base_sig}
             self._strategy_indicator_state[strategy_key] = strategy_state
 

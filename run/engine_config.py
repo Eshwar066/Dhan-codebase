@@ -69,6 +69,7 @@ class EngineConfig:
 
     # Engine identity (for logging and reports)
     engine_id: Optional[str] = None
+    market_exchange: Optional[str] = None
 
     # Capital bucket (per-engine; no shared capital)
     capital: Optional[float] = None

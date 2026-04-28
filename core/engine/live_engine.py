@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 from run.config import RunMode
 from core.engine.base_engine import BaseEngine
-from core.data.candle_aggregator import _resolution_to_seconds
+from core.data.candle_aggregator import _bucket_ts, _resolution_to_seconds
 from core.engine.live_engine_common import (
     DEFAULT_FEED_STALE_SECONDS,
     LiveEngineHelpersMixin,
@@ -35,6 +35,12 @@ try:
     from logger.engine_logger import REPORTS_DIR
 except ImportError:
     REPORTS_DIR = "reports"
+
+
+class NoMarketDataError(RuntimeError):
+    """Raised when WebSocket stays alive but market ticks stop arriving."""
+
+
 class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
     """
     Live/paper engine. Uses realtime_feed (WebSocket/aggregator) candle flow
@@ -56,6 +62,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         realtime_feed=None,
         engine_id: Optional[str] = None,
         venue: Optional[str] = None,
+        market_exchange: Optional[str] = None,
         engine_logger: Optional[Any] = None,
         feed_stale_seconds: float = DEFAULT_FEED_STALE_SECONDS,
         allowed_trading_hours: Optional[List[Tuple[str, str]]] = None,
@@ -112,6 +119,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self.candle_aggregator = candle_aggregator
         self.engine_id = engine_id or "live"
         self.venue = venue or ""
+        self.market_exchange = str(market_exchange or "").upper()
         self.engine_logger = engine_logger
         self.feed_stale_seconds = feed_stale_seconds
         self._last_tick_timestamp: Dict[str, float] = {}
@@ -212,6 +220,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self._closed_candle_skip_counts: Dict[str, int] = {}
         self._closed_candle_skip_last_log_ts: Dict[str, float] = {}
         self._closed_candle_skip_log_interval_seconds: float = 600.0
+        # Startup grace: allow feed to warm before declaring global stall.
+        self._feed_first_tick_grace_seconds: float = 30.0
+        self._feed_start_grace_until_ts: float = 0.0
         self._intent_journal_path = os.path.join(
             "logs", f"{self.engine_id}_intent_pipeline.jsonl"
         )
@@ -692,7 +703,17 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         tf_sec = int(_resolution_to_seconds(tf))
         if tf_sec <= 0:
             tf_sec = 60
-        bucket = sec - (sec % tf_sec)
+        if self.market_exchange == "NSE":
+            bucket = _bucket_ts(
+                sec,
+                tf_sec,
+                session_start_sec=(9 * 3600) + (15 * 60),
+                session_end_sec=(15 * 3600) + (30 * 60),
+            )
+        else:
+            bucket = sec - (sec % tf_sec)
+        if bucket is None:
+            bucket = sec - (sec % tf_sec)
         return {
             "symbol": symbol,
             "open": float(row["open"]),
@@ -962,6 +983,34 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         except Exception:
             return
         now = time.time()
+        # DHAN-specific hard guard: connection may stay alive while market data stalls.
+        # Track pure market-tick heartbeat separately and fail fast when no ticks arrive.
+        if str(self.venue or "").upper() == "DHAN":
+            last_market_tick_ts = 0.0
+            try:
+                last_market_tick_ts = float(
+                    getattr(self.realtime_feed, "last_market_tick_ts", 0.0) or 0.0
+                )
+            except Exception:
+                last_market_tick_ts = 0.0
+            if last_market_tick_ts > 0.0 and (now - last_market_tick_ts) > 5.0:
+                msg = (
+                    f"No market ticks for {now - last_market_tick_ts:.1f}s "
+                    "(threshold=5s) while feed is connected"
+                )
+                raise NoMarketDataError(msg)
+        # During startup warmup, suppress "all symbols stalled" when no symbol has seen any data yet.
+        if now < self._feed_start_grace_until_ts:
+            any_seen = False
+            for sym in self.symbols:
+                if max(
+                    self._last_tick_timestamp.get(sym, 0.0),
+                    self._last_candle_timestamp.get(sym, 0.0),
+                ) > 0:
+                    any_seen = True
+                    break
+            if not any_seen:
+                return
         stale_symbols = []
         for sym in self.symbols:
             last_tick = self._last_tick_timestamp.get(sym, 0.0)
@@ -989,6 +1038,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
     def start(self, exchange, sector, rsi):
         self._live_exchange = str(exchange or "INDEX")
         self._live_sector = str(sector or "NO")
+        self._feed_start_grace_until_ts = (
+            time.time() + float(self._feed_first_tick_grace_seconds)
+        )
         self.indicator_manager.set_runtime_context(
             exchange=self._live_exchange, sector=self._live_sector
         )
@@ -1107,8 +1159,15 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                                 candle.get("bucket_ts"),
                             )
                             continue
-                    # Quote/ticker pseudo-candle (last_trade_time — usually not TF-aligned).
-                    if candle is None and use_feed and self.realtime_feed:
+                    # Quote/ticker pseudo-candle fallback should be used only when
+                    # aggregator mode is NOT active. In aggregator mode, pseudo-candles
+                    # can create flat/synthetic OHLC rows (open==high==low==close).
+                    if (
+                        candle is None
+                        and (not use_aggregator)
+                        and use_feed
+                        and self.realtime_feed
+                    ):
                         candle = self.realtime_feed.get_last_candle(symbol, tf)
                         if candle:
                             candle_source = "quote_feed"
@@ -1128,14 +1187,47 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
 
                     # This code checks if the candle is fully closed; if not, it logs a warning and skips strategy evaluation to avoid trading on incomplete market data.
                     if not self._is_closed_candle(candle, tf, now=_now):
-                        if self.engine_logger:
-                            diag = self._closed_candle_diagnostics(
-                                candle,
-                                str(tf),
-                                _now,
-                                use_aggregator=bool(use_aggregator),
-                                candle_source=candle_source,
+                        diag = self._closed_candle_diagnostics(
+                            candle,
+                            str(tf),
+                            _now,
+                            use_aggregator=bool(use_aggregator),
+                            candle_source=candle_source,
+                        )
+                        skip_reason = str(diag.get("skip_reason") or "unknown")
+                        # Aggregate repetitive skip diagnostics and emit compact periodic summaries.
+                        stats = getattr(self, "_closed_skip_counts", None)
+                        if stats is None:
+                            stats = {}
+                            self._closed_skip_counts = stats
+                        key = f"{symbol}|{tf}|{skip_reason}"
+                        st = stats.get(key)
+                        now_s = time.time()
+                        if st is None:
+                            st = {"count": 0, "start": now_s, "last_emit": 0.0}
+                            stats[key] = st
+                        st["count"] += 1
+                        if self.engine_logger and (now_s - float(st["last_emit"])) >= 300.0:
+                            self.engine_logger.log(
+                                "closed_candle_skip_summary",
+                                (
+                                    "Skipped closed-candle evaluations "
+                                    f"count={st['count']} window_sec={int(now_s - float(st['start']))} "
+                                    f"reason={skip_reason}"
+                                ),
+                                symbol=symbol,
+                                timeframe=str(tf),
+                                skip_reason=skip_reason,
+                                count=int(st["count"]),
+                                window_sec=int(now_s - float(st["start"])),
                             )
+                            st["count"] = 0
+                            st["start"] = now_s
+                            st["last_emit"] = now_s
+
+                        if self.engine_logger and self._should_log_closed_candle_skip(
+                            symbol, tf, candle, skip_reason=skip_reason
+                        ):
                             try:
                                 if self.candle_aggregator:
                                     diag["aggregator_symbol_keys"] = (

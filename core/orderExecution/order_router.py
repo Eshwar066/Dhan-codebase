@@ -85,6 +85,11 @@ class OrderRouter:
         # Trade-led: only apply each trade once; positions = f(trades), not f(order state)
         self._processed_trade_ids: Set[str] = set()
         self._processed_trade_ids_max = 10000
+        # Reconciliation guard for cumulative partial-fill handling:
+        # intent_id -> last cumulative filled quantity already applied to PM.
+        self._last_applied_filled_by_intent: Dict[str, float] = {}
+        # Pending FORCE_EXIT watchdog threshold (seconds).
+        self._force_exit_pending_max_wait_sec: float = 300.0
         # EXTERNAL_CLOSE: additive confidence (see _external_close_confidence_score)
         self._orphan_close_score_threshold = 6
         self._orphan_close_suspect_floor = 5
@@ -652,7 +657,7 @@ class OrderRouter:
         if not hasattr(self.broker, "get_open_orders"):
             return True, {}
         try:
-            broker_open = self.broker.get_open_orders()
+            broker_open_raw = self.broker.get_open_orders()
         except Exception as e:
             if self.engine_logger:
                 self.engine_logger.order_state_mismatch(
@@ -661,6 +666,12 @@ class OrderRouter:
             else:
                 logger.warning("Failed to fetch broker open orders: %s", e)
             return False, {"error": str(e)}
+
+        broker_open = [
+            self._normalize_broker_order_for_recon(o)
+            for o in (broker_open_raw or [])
+            if isinstance(o, dict)
+        ]
 
         # Trade-led: sync trades (fills) first so positions are up to date before we compare order state
         self.sync_trades_from_broker()
@@ -679,6 +690,9 @@ class OrderRouter:
         # 1. Orphans: On broker but not in local pending
         # We might have recorded them earlier, so check if they exist AT ALL in intent_store
         orphans = []
+        resolved_orphans: Set[str] = set()
+        resolved_missing: Set[str] = set()
+        now_ts = time.time()
         for o in broker_open:
             tag = o.get("tag")
             if not tag:
@@ -762,6 +776,7 @@ class OrderRouter:
                     self.engine_logger.log(
                         "oms", f"Adopted orphan order {tag} for {engine_sym}"
                     )
+                resolved_orphans.add(str(tag))
 
             elif tag in local_intent_ids:
                 # Local thinks it's pending, broker confirms it's open. Sync order ID and persist OPEN.
@@ -778,6 +793,7 @@ class OrderRouter:
                     broker_order_id=intent.get("broker_order_id") or o.get("order_id"),
                     order_state=OrderState.OPEN,
                 )
+                resolved_missing.add(str(tag))
 
         # 2. Missing: In local pending but not on broker open list
         # Usually FILLED/REJECTED/CANCELLED. Only poll broker when cache doesn't have terminal state.
@@ -792,7 +808,10 @@ class OrderRouter:
             # until trigger/execution. If broker acknowledged with order_id, keep it
             # as valid pending instead of flagging as missing every reconcile cycle.
             if action == "FORCE_EXIT" and i.get("broker_order_id"):
-                continue
+                created_at = float(i.get("created_at") or 0.0)
+                if created_at > 0 and (now_ts - created_at) < self._force_exit_pending_max_wait_sec:
+                    resolved_missing.add(str(intent_id))
+                    continue
             missing.append(i)
         missing_needing_poll = [
             i
@@ -811,24 +830,22 @@ class OrderRouter:
                 try:
                     order = self.broker.find_order_by_client_id(tag)
                     if order:
+                        order = self._normalize_broker_order_for_recon(order)
                         status = (order.get("status") or "").lower()
-                        filled = (
-                            float(order["filled_size"])
-                            if order.get("filled_size") is not None
-                            else (
-                                float(order.get("size", 0))
-                                - float(order.get("unfilled_size", 0))
-                            )
-                        )
-                        size = float(order.get("size", 0))
+                        filled = float(order.get("filled_size") or 0.0)
+                        size = float(order.get("size") or 0.0)
 
                         # Partial fill: filled > 0 and unfilled > 0 (filled < size)
                         if size > 0 and filled > 0 and filled < size:
+                            prev_cum = float(
+                                self._last_applied_filled_by_intent.get(tag, 0.0)
+                            )
+                            delta = float(filled) - prev_cum
                             self._set_order_state(
                                 tag,
                                 OrderState.PARTIAL,
                                 action="sync_partial",
-                                message=f"Polling: filled={filled} size={size}",
+                                message=f"Polling: filled={filled} delta={delta} size={size}",
                             )
                             self.intent_store.update(
                                 tag,
@@ -836,11 +853,11 @@ class OrderRouter:
                                 broker_order_id=order.get("order_id"),
                                 order_state=OrderState.PARTIAL,
                             )
-                            if self.position_manager:
+                            if delta > 0 and self.position_manager:
                                 self.process_fill(
                                     instrument=i.get("instrument"),
                                     side=i.get("side"),
-                                    qty=filled,
+                                    qty=delta,
                                     price=float(
                                         order.get("average_fill_price")
                                         or i.get("price", 0)
@@ -853,6 +870,8 @@ class OrderRouter:
                                     candle_ts=i.get("candle_ts"),
                                     action=i.get("action"),
                                 )
+                                self._last_applied_filled_by_intent[tag] = float(filled)
+                            resolved_missing.add(str(tag))
                         elif status == "filled" or (size > 0 and filled >= size):
                             if self.engine_logger:
                                 self.engine_logger.log(
@@ -900,6 +919,8 @@ class OrderRouter:
                                 broker_order_id=order.get("order_id"),
                                 order_state=OrderState.FILLED,
                             )
+                            self._last_applied_filled_by_intent[tag] = float(size or filled)
+                            resolved_missing.add(str(tag))
 
                         elif status in ("cancelled", "rejected", "expired"):
                             ost = (
@@ -920,6 +941,7 @@ class OrderRouter:
                             self.intent_store.update(
                                 tag, IntentStatus.REJECTED, order_state=ost
                             )
+                            resolved_missing.add(str(tag))
                     else:
                         # Trade-led: order missing from open list. Resolve fill by client_order_id first,
                         # then by broker order_id (fills API often returns only order_id, not client_order_id).
@@ -953,6 +975,7 @@ class OrderRouter:
                                             "oms",
                                             f"Missing order {tag}: applied trade from /v2/fills (trade-led)",
                                         )
+                                    resolved_missing.add(str(tag))
                             else:
                                 self._set_order_state(
                                     tag,
@@ -963,6 +986,7 @@ class OrderRouter:
                                 self.intent_store.update(
                                     tag, IntentStatus.FILLED, order_state=OrderState.FILLED
                                 )
+                                resolved_missing.add(str(tag))
                         else:
                             # No trade found: do not update position or mark FILLED (trade-led: no trade → no position change)
                             if self.engine_logger:
@@ -976,12 +1000,22 @@ class OrderRouter:
                             "oms", f"Failed to sync status for {tag}: {e}"
                         )
 
+        unresolved_orphan_tags = [
+            str(o.get("tag"))
+            for o in orphans
+            if str(o.get("tag")) not in resolved_orphans
+        ]
+        unresolved_missing_ids = [
+            str(i.get("intent_id"))
+            for i in missing
+            if str(i.get("intent_id")) not in resolved_missing
+        ]
         diff = {
-            "orphan_broker_orders": len(orphans),
-            "missing_local_records": len(missing),
+            "unresolved_orphan_broker_orders": len(unresolved_orphan_tags),
+            "unresolved_missing_local_records": len(unresolved_missing_ids),
         }
 
-        if orphans or missing:
+        if unresolved_orphan_tags or unresolved_missing_ids:
             if self.engine_logger:
                 self.engine_logger.order_state_mismatch(
                     "Order state mismatch detected", details=diff
@@ -989,6 +1023,45 @@ class OrderRouter:
             return False, diff
 
         return True, {}
+
+    @staticmethod
+    def _normalize_broker_order_for_recon(order: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize broker order payload to stable fields for reconciliation logic."""
+        if not isinstance(order, dict):
+            return {}
+
+        def _to_float(v: Any) -> float:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return 0.0
+
+        order_id = order.get("order_id") or order.get("orderId")
+        status = (order.get("status") or order.get("orderStatus") or "").lower()
+        tag = order.get("tag") or order.get("intent_id")
+        size = _to_float(order.get("size") or order.get("quantity") or order.get("qty"))
+        filled = _to_float(
+            order.get("filled_size")
+            or order.get("filled")
+            or order.get("filled_qty")
+            or order.get("filledQty")
+        )
+        unfilled = _to_float(
+            order.get("unfilled_size")
+            or order.get("remaining_qty")
+            or order.get("pending_qty")
+        )
+        if filled <= 0.0 and size > 0.0 and unfilled > 0.0:
+            filled = max(0.0, size - unfilled)
+
+        out = dict(order)
+        out["order_id"] = order_id
+        out["status"] = status
+        out["tag"] = tag
+        out["size"] = size
+        out["filled_size"] = filled
+        out["unfilled_size"] = unfilled
+        return out
 
     @staticmethod
     def _instrument_trading_symbol(inst: Any) -> str:

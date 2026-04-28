@@ -357,6 +357,8 @@ class EngineFactory:
         elif config.broker_name == "DHAN":
             access_token = os.getenv("DHAN_ACCESS_TOKEN")
             client_id = os.getenv("DHAN_CLIENT_CODE")
+            market_exchange = str(getattr(config, "market_exchange", "") or "").upper()
+            is_nse = market_exchange == "NSE"
             if not access_token or not client_id:
                 logger.warning("Dhan realtime feed skipped: DHAN_ACCESS_TOKEN or DHAN_CLIENT_CODE not set")
             if (
@@ -377,7 +379,13 @@ class EngineFactory:
                     )
                     if any(getattr(s, "timeframe", None) for s in strategies):
                         tick_queue = queue.Queue(maxsize=50000)
-                        candle_aggregator = CandleAggregator()
+                        if is_nse:
+                            candle_aggregator = CandleAggregator(
+                                session_start_sec=(9 * 3600) + (15 * 60),
+                                session_end_sec=(15 * 3600) + (30 * 60),
+                            )
+                        else:
+                            candle_aggregator = CandleAggregator()
                         realtime_feed.set_tick_queue(tick_queue)
                     realtime_feed.start()
             if access_token and client_id:
@@ -400,6 +408,7 @@ class EngineFactory:
             candle_aggregator=candle_aggregator,
             engine_id=config.engine_id,
             venue=config.broker_name,
+            market_exchange=getattr(config, "market_exchange", None),
             engine_logger=engine_logger,
             feed_stale_seconds=getattr(config, "feed_stale_seconds", None) or 60,
             allowed_trading_hours=getattr(config, "allowed_trading_hours", None),

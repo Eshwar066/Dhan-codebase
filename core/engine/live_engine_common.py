@@ -375,10 +375,10 @@ class LiveEngineHelpersMixin:
         bt = candle.get("bucket_ts")
         if bt is not None:
             try:
-                b = int(float(bt))
-                # CandleAggregator buckets are unix seconds floored to TF; trust when consistent.
-                if b % tf_sec == 0:
-                    return True
+                int(float(bt))
+                # bucket_ts originates from CandleAggregator/engine bucketing and can be
+                # session-anchored (e.g. NSE/BSE 1h at 09:15), so do not require epoch modulus.
+                return True
             except (TypeError, ValueError):
                 pass
 
@@ -443,11 +443,8 @@ class LiveEngineHelpersMixin:
             out["skip_reason"] = "forming"
         elif bt is not None:
             try:
-                b = int(float(bt))
-                if b % tf_sec == 0:
-                    out["skip_reason"] = "unexpected_should_pass"
-                else:
-                    out["skip_reason"] = "bucket_not_on_tf_grid"
+                int(float(bt))
+                out["skip_reason"] = "unexpected_should_pass"
             except (TypeError, ValueError):
                 out["skip_reason"] = "misaligned"
         else:
@@ -598,22 +595,34 @@ class LiveEngineHelpersMixin:
         return True
 
     def _should_log_closed_candle_skip(
-        self, symbol: str, tf: Optional[str], candle: Dict[str, Any]
+        self,
+        symbol: str,
+        tf: Optional[str],
+        candle: Dict[str, Any],
+        *,
+        skip_reason: Optional[str] = None,
     ) -> bool:
         """
         Rate-limit ``closed_candle_skip`` JSON logs. Without this, a non-aligned or forming
         bar in a tight engine loop can emit hundreds of identical lines per second.
         """
-        bucket = self._candle_bucket_start_unix(candle)
-        ts_fb = str(candle.get("timestamp"))
-        key = f"{symbol}|{tf or 'NA'}|{bucket if bucket is not None else ts_fb}"
+        # When bucket_ts is missing (e.g. quote_feed pseudo-candle), do NOT use
+        # _candle_bucket_start_unix(candle) -- it is the live "now" and changes
+        # every second, so the throttle key was unique every loop (no 120s cap).
+        if candle.get("bucket_ts") is not None:
+            bucket = self._candle_bucket_start_unix(candle)
+            bucket_key = str(bucket) if bucket is not None else "none"
+        else:
+            bucket_key = "no_bucket_ts"
+        reason = str(skip_reason or "unknown")
+        key = f"{symbol}|{tf or 'NA'}|{reason}|{bucket_key}"
         now = time.time()
         d = getattr(self, "_last_closed_candle_skip_ts", None)
         if d is None:
             d = {}
             self._last_closed_candle_skip_ts = d
         last = d.get(key, 0.0)
-        if now - last < 5.0:
+        if now - last < 120.0:
             return False
         d[key] = now
         return True
@@ -813,7 +822,7 @@ class LiveEngineHelpersMixin:
                     self._last_tick_timestamp[s] = time.time()
                     self._tick_debug_count += 1
                     now = time.time()
-                    if now - self._tick_debug_last_log >= 600:
+                    if now - self._tick_debug_last_log >= 1800:
                         msg = f"Tick health: {self._tick_debug_count} ticks in last 5s"
                         if self.engine_logger:
                             self.engine_logger.log("tick_health", msg)

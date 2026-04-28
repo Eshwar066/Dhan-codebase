@@ -230,12 +230,13 @@ class DhanWebSocket:
         on_ticker: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         on_quote: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         on_disconnect: Optional[Callable[[int], None]] = None,
-        stall_timeout_seconds: float = 60,
+        stall_timeout_seconds: float = 90,
     ):
         """
         instruments: list of {"ExchangeSegment": "NSE_EQ", "SecurityId": "11536", "symbol": "RELIANCE"}.
         SecurityId as string; symbol used for get_last_ticker(symbol).
         stall_timeout_seconds: if >0, force-close socket when no inbound packets for this long (zombie detection).
+        Includes all inbound websocket frames (binary + text heartbeat/acks) via _on_message.
         """
         self.access_token = access_token
         self.client_id = str(client_id)
@@ -260,6 +261,7 @@ class DhanWebSocket:
         self._reconnect_backoff_sec = 2.0
         self._reconnect_backoff_cap_sec = 180.0
         self._last_activity_ts = time.time()
+        self._last_market_tick_ts = 0.0
         self._is_warm = False
         self._cooldown_until_ts = 0.0
         self._failure_timestamps: deque[float] = deque()
@@ -293,7 +295,11 @@ class DhanWebSocket:
             self._rebuild_security_map_locked()
 
     def _touch_activity(self) -> None:
-        self._last_activity_ts = time.time()
+        now = time.time()
+        self._last_activity_ts = now
+
+    def _touch_market_tick(self) -> None:
+        self._last_market_tick_ts = time.time()
 
     def _build_url(self) -> str:
         q = urllib.parse.urlencode({
@@ -355,6 +361,7 @@ class DhanWebSocket:
         if code == FEED_RESPONSE_TICKER:
             parsed = _parse_ticker_packet(data)
             if parsed:
+                self._touch_market_tick()
                 with self._lock:
                     self._last_ticker[symbol] = {**parsed, "symbol": symbol}
                 if self.on_ticker:
@@ -362,6 +369,7 @@ class DhanWebSocket:
         elif code == FEED_RESPONSE_QUOTE:
             parsed = _parse_quote_packet(data)
             if parsed:
+                self._touch_market_tick()
                 with self._lock:
                     self._last_quote[symbol] = {**parsed, "symbol": symbol}
                     self._last_ticker[symbol] = {"last_price": parsed["last_price"], "last_trade_time": parsed.get("last_trade_time"), "symbol": symbol}
@@ -370,6 +378,7 @@ class DhanWebSocket:
         elif code == FEED_RESPONSE_FULL:
             parsed = _parse_full_packet(data)
             if parsed:
+                self._touch_market_tick()
                 with self._lock:
                     self._last_quote[symbol] = {**parsed, "symbol": symbol}
                     self._last_ticker[symbol] = {"last_price": parsed["last_price"], "last_trade_time": parsed.get("last_trade_time"), "symbol": symbol}
@@ -394,6 +403,10 @@ class DhanWebSocket:
                 self.on_disconnect(reason or 0)
 
     def _on_message(self, ws: websocket.WebSocketApp, message) -> None:
+        # Count any inbound frame as activity (binary market packet or text heartbeat/ack).
+        # Earlier we only touched activity for binary frames, which could trigger false
+        # stall watchdog closes when traffic was mostly non-binary control frames.
+        self._touch_activity()
         if isinstance(message, bytes):
             self._on_binary(ws, message)
         # else text (e.g. JSON) – ignore or log
@@ -533,3 +546,7 @@ class DhanWebSocket:
     def get_last_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
         with self._lock:
             return self._last_quote.get(symbol)
+
+    @property
+    def last_market_tick_ts(self) -> float:
+        return float(self._last_market_tick_ts or 0.0)
