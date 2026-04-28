@@ -2,7 +2,7 @@
 Structured JSON logging per engine. One file per engine: logs/{engine_id}.log.
 Closed candles: logs/{engine_id}_candles.log (see candle_created).
 No print(); all events logged as one JSON object per line.
-Event timestamps are UTC (ISO-8601).
+Event timestamps are IST (ISO-8601).
 """
 
 import json
@@ -190,7 +190,7 @@ class EngineLogger:
             "venue": self.venue,
             "strategy_id": strategy_id or self.strategy,
             "event_type": event_type,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(IST).isoformat(),
         }
         if message:
             base["message"] = message

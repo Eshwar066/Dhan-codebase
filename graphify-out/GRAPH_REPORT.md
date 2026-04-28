@@ -1,7 +1,7 @@
 # Graph Report - C:\Users\eshwa\Desktop\Algo  (2026-04-29)
 
 ## Corpus Check
-- 126 files · ~142,338 words
+- 126 files · ~142,163 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
@@ -679,11 +679,11 @@ Nodes (1): Optional control-plane helper: hold references to Dhan market / order
 _Questions this graph is uniquely positioned to answer:_
 
 - **Why does `RunMode` connect `Community 2` to `Community 0`, `Community 1`, `Community 4`, `Community 5`, `Community 6`, `Community 8`, `Community 11`, `Community 12`?**
-  _High betweenness centrality (0.131) - this node is a cross-community bridge._
+  _High betweenness centrality (0.144) - this node is a cross-community bridge._
 - **Why does `IntentStatus` connect `Community 3` to `Community 1`, `Community 4`, `Community 6`?**
-  _High betweenness centrality (0.075) - this node is a cross-community bridge._
+  _High betweenness centrality (0.048) - this node is a cross-community bridge._
 - **Why does `create_live_engine()` connect `Community 4` to `Community 0`, `Community 1`, `Community 3`, `Community 5`, `Community 6`, `Community 7`, `Community 8`, `Community 10`, `Community 11`, `Community 12`?**
-  _High betweenness centrality (0.073) - this node is a cross-community bridge._
+  _High betweenness centrality (0.047) - this node is a cross-community bridge._
 - **Are the 236 inferred relationships involving `str` (e.g. with `.place_bracket_stop_loss()` and `.set_leverage_for_symbols()`) actually correct?**
   _`str` has 236 INFERRED edges - model-reasoned connections that need verification._
 - **Are the 213 inferred relationships involving `RunMode` (e.g. with `OptionChainService` and `api: "NSE" or "DHAN"; ctx: StrategyContext; params: option chain params.`) actually correct?**
