@@ -708,16 +708,17 @@ class IndiaMktMixins:
         }
 
         chain = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
-        try:
-            log_option_chain_snapshot(
-                chain,
-                ctx=ctx,
-                strategy_name=getattr(self, "name", "") or "",
-                api=self.api,
-                params=params,
-            )
-        except Exception:
-            pass
+        if bool(params.get("snapshot", False)):
+            try:
+                log_option_chain_snapshot(
+                    chain,
+                    ctx=ctx,
+                    strategy_name=getattr(self, "name", "") or "",
+                    api=self.api,
+                    params=params,
+                )
+            except Exception:
+                pass
             
         if chain is None:
             print(">>no option chain data", ctx, params)

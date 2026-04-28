@@ -46,6 +46,8 @@ def log_option_chain_snapshot(
         "off",
     ):
         return
+    if isinstance(params, dict) and not bool(params.get("snapshot", False)):
+        return
     if chain is None:
         return
 
@@ -55,9 +57,17 @@ def log_option_chain_snapshot(
     except OSError:
         return
 
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    ts_now = datetime.now(timezone.utc)
+    ts = ts_now.strftime("%Y%m%d_%H%M%S_%f")
+    date_part = str((params or {}).get("snapshot_date") or ts_now.strftime("%Y-%m-%d"))
+    time_part = str((params or {}).get("snapshot_time") or ts_now.strftime("%H%M"))
     sym = _safe_filename_part(getattr(ctx, "symbol", None) or "UNK")
     strat = _safe_filename_part(strategy_name or "strategy")
+    out_dir = out_dir / _safe_filename_part(date_part)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
 
     df: Optional[pd.DataFrame] = None
     meta: dict[str, Any] = {}
@@ -94,11 +104,15 @@ def log_option_chain_snapshot(
     df_out = pd.concat([prefix, df.reset_index(drop=True)], axis=1)
 
     exp_part = meta.get("snapshot_expiry") or "exp"
-    fname = f"chain_{strat}_{sym}_{_safe_filename_part(str(exp_part))}_{ts}.csv"
+    time_token = _safe_filename_part(time_part)
+    fname = f"chain_{strat}_{sym}_{_safe_filename_part(str(exp_part))}_{time_token}.csv"
     path = out_dir / fname
 
     try:
-        df_out.to_csv(path, index=False, encoding="utf-8")
+        if path.exists():
+            df_out.to_csv(path, index=False, encoding="utf-8", mode="a", header=False)
+        else:
+            df_out.to_csv(path, index=False, encoding="utf-8")
     except OSError:
         return
 

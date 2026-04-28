@@ -16,9 +16,9 @@ ENTRY_SNAPSHOT_TIME = time(9, 30)
 ENTRY_EVAL_TIME = time(10, 45)
 EOD_REVIEW_TIME = time(15, 15)
 
-PREMIUM_MIN = 180.0
-PREMIUM_MAX = 220.0
-PREMIUM_CHANGE_LIMIT_PCT = 80.0
+PREMIUM_MIN = 180
+PREMIUM_MAX = 220
+PREMIUM_CHANGE_LIMIT_PCT = 80
 TARGET_MULTIPLIER = 1.5
 STOP_LOSS_PCT = 0.40
 
@@ -66,7 +66,7 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
     api = "DHAN"
     expiryType = "MONTHLY"
     otm_strike_step = 100
-    otm_strike_count = 25
+    otm_strike_count = 30
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -94,6 +94,22 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
         if ts.tzinfo is None:
             ts = ts.tz_localize("UTC")
         return ts.tz_convert(IST).date()
+
+    def _snapshot_enabled_for_candle(self, candle: dict) -> bool:
+        t = self._ist_time(candle)
+        return t in {ENTRY_SNAPSHOT_TIME, ENTRY_EVAL_TIME, EOD_REVIEW_TIME}
+
+    def _snapshot_params(self, candle: dict) -> Dict[str, Any]:
+        ts = pd.Timestamp(candle["timestamp"])
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        ts_ist = ts.tz_convert(IST)
+        enabled = self._snapshot_enabled_for_candle(candle)
+        return {
+            "snapshot": enabled,
+            "snapshot_date": ts_ist.strftime("%Y-%m-%d"),
+            "snapshot_time": ts_ist.strftime("%H%M"),
+        }
 
     def _oi_column(self, df: pd.DataFrame, option_type: str) -> Optional[str]:
         opt = option_type.upper()
@@ -128,6 +144,7 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
             "expiry_flag": "MONTH",
             "securityId": "13",
         }
+        params.update(self._snapshot_params(candle))
         raw = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
         df = raw.get("chain") if isinstance(raw, dict) else raw
         if not isinstance(df, pd.DataFrame) or df.empty:
