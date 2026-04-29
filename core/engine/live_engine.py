@@ -242,6 +242,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self._max_candle_bucket_unix: Dict[str, int] = {}
         # After at least one tick-built bar (bucket_ts set), drop REST rows without bucket_ts
         self._has_seen_aggregator_bucket: Dict[str, bool] = {}
+        # First live bar alignment is run once per symbol after bootstrap history is available.
+        self._first_live_alignment_done: Dict[str, bool] = {}
         self.execution_engine = ExecutionEngine(
             engine_id=self.engine_id,
             intent_queue=self.intent_queue,
@@ -279,6 +281,52 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             niml = metadata_extras.get("nifty_intraday_magical_line")
             if isinstance(niml, dict) and niml.get("symbol"):
                 return str(niml["symbol"])
+        return None
+
+    def _align_first_live_bar(
+        self, first_live_ts: Optional[int], last_hist_ts: Optional[int], tf_sec: int
+    ) -> Optional[int]:
+        if first_live_ts is None or last_hist_ts is None:
+            return first_live_ts
+        if first_live_ts < last_hist_ts:
+            aligned = int(last_hist_ts) + int(tf_sec)
+            logger.warning(
+                "FORCING_LIVE_ALIGNMENT symbol_first_live=%s last_hist=%s aligned=%s tf_sec=%s",
+                first_live_ts,
+                last_hist_ts,
+                aligned,
+                tf_sec,
+            )
+            return aligned
+        return first_live_ts
+
+    def _get_last_hist_bucket_ts(
+        self, symbol: str, tf: str, exchange: str, sector: str
+    ) -> Optional[int]:
+        try:
+            state = self.indicator_manager._bootstrap_base_candle_state(
+                symbol=symbol,
+                tf=tf,
+                exchange=exchange,
+                sector=sector,
+                window=self.indicator_manager.indicator_window_size(self.strategy),
+            )
+            df = state.get("df")
+            if df is None or len(df) == 0 or "timestamp" not in df.columns:
+                return None
+            last_ts = df.iloc[-1].get("timestamp")
+            if last_ts is None:
+                return None
+            if hasattr(last_ts, "to_pydatetime"):
+                last_ts = last_ts.to_pydatetime()
+            if isinstance(last_ts, dt.datetime):
+                if last_ts.tzinfo is None:
+                    last_ts = last_ts.replace(tzinfo=dt.timezone.utc)
+                return int(last_ts.astimezone(dt.timezone.utc).timestamp())
+            if isinstance(last_ts, (int, float)):
+                return int(float(last_ts))
+        except Exception:
+            return None
         return None
 
     def _on_pm_main_entry_fill(self, **kwargs: Any) -> None:
@@ -1284,11 +1332,47 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         is_dummy_feed = bool(
                             getattr(self.realtime_feed, "is_dummy_feed", False)
                         )
+                        tf_sec = max(60, int(_resolution_to_seconds(tf)))
                         if (
-                            not is_dummy_feed
-                            and self._live_bar_is_stale_or_replay(symbol, candle, tf)
+                            not self._first_live_alignment_done.get(symbol, False)
+                            and eval_bucket is not None
                         ):
+                            last_hist_ts = self._get_last_hist_bucket_ts(
+                                symbol=symbol,
+                                tf=str(tf),
+                                exchange=exchange,
+                                sector=sector,
+                            )
+                            aligned_first_live = self._align_first_live_bar(
+                                int(eval_bucket), last_hist_ts, tf_sec
+                            )
+                            self._first_live_alignment_done[symbol] = True
+                            if (
+                                aligned_first_live is not None
+                                and eval_bucket < aligned_first_live
+                            ):
+                                logger.warning(
+                                    "Skipping pre-alignment live bar symbol=%s bucket=%s aligned_start=%s",
+                                    symbol,
+                                    eval_bucket,
+                                    aligned_first_live,
+                                )
+                                continue
+
+                        skip_bar, replay_bar = (False, False)
+                        if not is_dummy_feed:
+                            skip_bar, replay_bar = self._live_bar_is_stale_or_replay(
+                                symbol, candle, tf
+                            )
+                        if skip_bar:
                             continue
+                        if replay_bar:
+                            logger.debug(
+                                "REPLAY_BAR_ACCEPTED symbol=%s bucket=%s max_seen=%s",
+                                symbol,
+                                eval_bucket,
+                                self._max_candle_bucket_unix.get(symbol),
+                            )
                         if candle.get("bucket_ts") is not None:
                             self._has_seen_aggregator_bucket[symbol] = True
                         if eval_bucket is not None:
