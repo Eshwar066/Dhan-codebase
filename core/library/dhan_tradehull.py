@@ -2348,7 +2348,15 @@ class Tradehull:
             }
 
     def get_orderbook(self, debug="NO"):
+        response = None
         try:
+            # Keep redirect loops bounded when underlying client uses requests.Session.
+            session = getattr(self.Dhan, "session", None)
+            if session is not None and hasattr(session, "max_redirects"):
+                try:
+                    session.max_redirects = 3
+                except Exception:
+                    pass
             time.sleep(1)
             response = self.Dhan.get_order_list()
             if debug.upper() == "YES":
@@ -2356,8 +2364,23 @@ class Tradehull:
             if response["status"] == "success":
                 return pd.DataFrame(response["data"])
             else:
+                remarks = str(response.get("remarks") or "")
+                if "Exceeded 30 redirects" in remarks:
+                    self.logger.error(
+                        "ORDERBOOK_REDIRECT_LOOP final_url=%s status=%s remarks=%s",
+                        getattr(response, "url", None),
+                        getattr(response, "status_code", None),
+                        remarks,
+                    )
                 raise Exception(response)
         except Exception as e:
+            self.logger.error("ORDERBOOK_FETCH_ERROR error=%s", str(e))
+            if "Exceeded 30 redirects" in str(e):
+                self.logger.error(
+                    "ORDERBOOK_REDIRECT_LOOP final_url=%s status=%s",
+                    getattr(response, "url", None),
+                    getattr(response, "status_code", None),
+                )
             print(f"Error at get_orderbook as {e}")
             return {
                 "status": "failure",

@@ -531,7 +531,7 @@ class LiveEngineHelpersMixin:
 
     def _live_bar_is_stale_or_replay(
         self, symbol: str, candle: Dict[str, Any], tf: str
-    ) -> bool:
+    ) -> tuple[bool, bool]:
         """
         When ticks + CandleAggregator are active, reject:
         - REST fallback rows without bucket_ts after we have seen real buckets
@@ -547,21 +547,27 @@ class LiveEngineHelpersMixin:
                 "Skip %s: missing bucket_ts after live aggregated bars (REST replay)",
                 symbol,
             )
-            return True
+            return True, False
 
         if bs is None:
-            return False
+            return False, False
 
-        if max_seen is not None and bs < max_seen:
+        tf_sec = max(60, int(_resolution_to_seconds(tf)))
+        tolerance_sec = tf_sec
+
+        if max_seen is not None and bs < (max_seen - tolerance_sec):
             logger.debug(
-                "Skip %s: non-monotonic bucket %s < max_seen %s",
+                "Skip %s: stale bucket %s < (max_seen %s - tolerance %s)",
                 symbol,
                 bs,
                 max_seen,
+                tolerance_sec,
             )
-            return True
+            return True, False
 
-        tf_sec = max(60, int(_resolution_to_seconds(tf)))
+        if max_seen is not None and bs <= max_seen:
+            return False, True
+
         age_sec = time.time() - float(bs)
         stale_sec = max(15 * 60, 5 * tf_sec)
         if age_sec > stale_sec:
@@ -572,9 +578,9 @@ class LiveEngineHelpersMixin:
                 stale_sec,
                 bs,
             )
-            return True
+            return True, False
 
-        return False
+        return False, False
 
     def _should_log_closed_candle(
         self, symbol: str, tf: Optional[str], candle: Dict[str, Any]

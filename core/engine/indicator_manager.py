@@ -27,6 +27,7 @@ class IndicatorManager:
         # Optional shared indicator cache for explicitly compatible strategies.
         # key: (symbol, timeframe, shared_signature, base_sig)
         self._indicator_cache: Dict[Any, Any] = {}
+        self._startup_logged: bool = False
 
     def set_runtime_context(self, exchange: str, sector: str) -> None:
         self._live_exchange = str(exchange or "INDEX")
@@ -245,6 +246,17 @@ class IndicatorManager:
                         if not pd.isna(last_hist_ts):
                             tf_secs = self._timeframe_to_seconds(tf)
                             gap = (row_ts - last_hist_ts).total_seconds()
+                            if not self._startup_logged:
+                                logger.info(
+                                    "STARTUP_CONTINUITY_STATE symbol=%s tf=%s last_hist_ts=%s first_live_ts=%s tf_sec=%s bucket_alignment=%.1f",
+                                    symbol,
+                                    tf,
+                                    str(last_hist_ts),
+                                    str(row_ts),
+                                    tf_secs,
+                                    float(gap),
+                                )
+                                self._startup_logged = True
                             if gap <= 0 or gap > (tf_secs * 3):
                                 logger.warning(
                                     "Indicator continuity mismatch: symbol=%s tf=%s last_hist=%s first_live=%s gap_sec=%.1f",
