@@ -6,7 +6,7 @@ from collections import defaultdict
 from typing import Any, Optional
 
 import pandas as pd
-from logger.trade_logger import TradeLogger
+from utils.logger.trade_logger import TradeLogger
 from datetime import datetime
 import uuid
 from core.utils.instruments.instrument_store import Instrument

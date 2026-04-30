@@ -1,0 +1,12 @@
+{
+  "states": {},
+  "log": [
+    {
+      "timestamp": "2026-04-30T13:39:38.451Z",
+      "intent_id": "",
+      "state": "",
+      "action": "cache_rebuild",
+      "message": "Merged order states from intent_store at startup"
+    }
+  ]
+}

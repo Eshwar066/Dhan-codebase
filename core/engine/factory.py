@@ -49,9 +49,9 @@ from core.orderExecution.risk_manager import RiskManager, make_short_option_marg
 from core.utils.delta_env import get_delta_credentials
 from core.utils.instruments.instrument_store import InstrumentStore
 from core.utils.telegram_alert import send_telegram_alert
-from logger.trade_logger import TradeLogger
-from logger.open_positions_logger import OpenPositionsLogger
-from logger.engine_logger import EngineLogger
+from utils.logger.trade_logger import TradeLogger
+from utils.logger.open_positions_logger import OpenPositionsLogger
+from utils.logger.engine_logger import EngineLogger
 
 try:
     from core.universe.equity_universe_service import EquityUniverseService
