@@ -819,6 +819,9 @@ class LiveEngineHelpersMixin:
             except Exception:
                 break
             try:
+                s = None
+                p = None
+                ts = None
                 s = tick.get("symbol")
                 p = tick.get("price")
                 v = tick.get("volume", 0)
@@ -829,12 +832,31 @@ class LiveEngineHelpersMixin:
                     self._tick_debug_count += 1
                     now = time.time()
                     if now - self._tick_debug_last_log >= 1800:
-                        msg = f"Tick health: {self._tick_debug_count} ticks in last 5s"
+                        window_sec = int(now - self._tick_debug_last_log)
+                        msg = (
+                            f"Tick health: {self._tick_debug_count} ticks in last "
+                            f"{window_sec}s"
+                        )
                         if self.engine_logger:
-                            self.engine_logger.log("tick_health", msg)
+                            self.engine_logger.log(
+                                "tick_health",
+                                msg,
+                                tick_count=int(self._tick_debug_count),
+                                window_sec=window_sec,
+                            )
                         else:
                             logger.info(msg)
                         self._tick_debug_count = 0
                         self._tick_debug_last_log = now
             except Exception as e:
-                logger.debug("Invalid tick or aggregator error: %s", e)
+                if self.engine_logger:
+                    self.engine_logger.error(
+                        "aggregator_error",
+                        f"Aggregator error for symbol={s}: {e}",
+                        symbol=s,
+                        price=p,
+                        tick_timestamp=ts,
+                        error=str(e),
+                    )
+                else:
+                    logger.exception("Aggregator error for symbol=%s", s)

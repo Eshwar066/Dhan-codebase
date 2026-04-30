@@ -240,6 +240,14 @@ class EngineLogger:
                 self._emit_line(alt_path, line)
         self._send_telegram_alert(payload)
 
+    def error(self, event_type: str, message: str = "", **kwargs) -> None:
+        """Structured error event wrapper."""
+        self.log(event_type, message=message, severity="error", **kwargs)
+
+    def info(self, event_type: str, message: str = "", **kwargs) -> None:
+        """Structured info event wrapper."""
+        self.log(event_type, message=message, severity="info", **kwargs)
+
     def _send_telegram_alert(self, payload: Dict[str, Any]) -> None:
         if not self._telegram_alert:
             return
@@ -493,6 +501,10 @@ class EngineLogger:
     def closed_candle_skip(self, symbol: str, reason: str, **extra: Any) -> None:
         """Log skip reason; pass ``diagnostics=`` or other fields for feed/timestamp debugging."""
         self.log("candle_closed_skipped", message=reason, symbol=symbol, **extra)
+
+    def candle_skipped(self, symbol: str, reason: str, **extra: Any) -> None:
+        """Compatibility event for pipeline skip observability."""
+        self.log("candle_skipped", message=reason, symbol=symbol, **extra)
 
     def eod_export(self, path: str, message: str = "EOD export written") -> None:
         self.log("eod_export", message=message, export_path=path)

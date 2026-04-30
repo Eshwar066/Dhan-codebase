@@ -9,10 +9,13 @@ Dhan Live Market Feed WebSocket implementing RealtimeFeed.
 
 import time
 import queue
+import logging
 from typing import Any, Dict, List, Optional
 
 from core.data.feeds.base_feed import RealtimeFeed
 from core.library.dhan_websocket import DhanWebSocket
+
+logger = logging.getLogger(__name__)
 
 
 class DhanWebSocketFeed(RealtimeFeed):
@@ -70,6 +73,7 @@ class DhanWebSocketFeed(RealtimeFeed):
     def _push_tick(self, symbol: str, data: Dict[str, Any]) -> None:
         if self._tick_queue is None:
             return
+        tick_payload: Optional[Dict[str, Any]] = None
         try:
             price = data.get("last_price")
             if price is None:
@@ -77,12 +81,22 @@ class DhanWebSocketFeed(RealtimeFeed):
             price = float(price)
             vol = float(data.get("volume") or data.get("last_traded_quantity") or 0)
             ts = self._normalized_tick_ts(symbol, data.get("last_trade_time"))
-            self._tick_queue.put_nowait({
+            tick_payload = {
                 "symbol": symbol,
                 "price": price,
                 "volume": vol,
                 "timestamp": float(ts),
-            })
+            }
+            self._tick_queue.put_nowait(tick_payload)
+            if self._engine_logger:
+                self._engine_logger.log(
+                    "tick_received",
+                    f"Tick received symbol={symbol} price={price}",
+                    symbol=symbol,
+                    price=price,
+                    volume=vol,
+                    tick_timestamp=float(ts),
+                )
         except queue.Full:
             if self._engine_logger:
                 self._engine_logger.log(
@@ -90,8 +104,18 @@ class DhanWebSocketFeed(RealtimeFeed):
                     f"Dhan tick dropped due to full queue symbol={symbol}",
                     symbol=symbol,
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            if self._engine_logger:
+                self._engine_logger.error(
+                    "tick_normalization_failed",
+                    f"Tick normalization failed for symbol={symbol}: {e}",
+                    symbol=symbol,
+                    error=str(e),
+                    raw_tick=str(data)[:300],
+                    normalized_tick=str(tick_payload)[:300] if tick_payload else None,
+                )
+            else:
+                logger.exception("Tick normalization failed for symbol=%s", symbol)
 
     def start(self) -> None:
         if self._ws:
@@ -106,6 +130,7 @@ class DhanWebSocketFeed(RealtimeFeed):
             instruments=self.instruments,
             on_ticker=on_ticker,
             on_quote=on_quote,
+            engine_logger=self._engine_logger,
             stall_timeout_seconds=self._stall_timeout_seconds
             if self._stall_timeout_seconds is not None
             else 90.0,

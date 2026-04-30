@@ -1308,6 +1308,15 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                                     skip_reason=skip_reason,
                                     candle_source=source_key,
                                 )
+                                self.engine_logger.candle_skipped(
+                                    symbol,
+                                    f"Skipped candle reason={skip_reason}",
+                                    diagnostics=diag,
+                                    skip_reason=skip_reason,
+                                    candle_source=source_key,
+                                    bucket_ts=candle.get("bucket_ts"),
+                                    timeframe=str(tf),
+                                )
                                 self._closed_candle_skip_counts[agg_key] = 0
                         continue
 
@@ -1327,7 +1336,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         continue
 
                     if use_aggregator:
-                        
                         # check the time of the entry candle at mkt time
                         is_dummy_feed = bool(
                             getattr(self.realtime_feed, "is_dummy_feed", False)
@@ -1382,6 +1390,38 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             )
                     if eval_key is not None:
                         self._last_evaluated_candle_ts[symbol] = eval_key
+                    if self.engine_logger:
+                        queue_size = None
+                        try:
+                            if self.tick_queue is not None:
+                                queue_size = int(self.tick_queue.qsize())
+                        except Exception:
+                            queue_size = None
+                        aggregator_state = (
+                            "active"
+                            if (
+                                use_aggregator
+                                and self.candle_aggregator is not None
+                                and candle_source.startswith("aggregator")
+                            )
+                            else "inactive"
+                        )
+                        self.engine_logger.log(
+                            "pipeline_state",
+                            (
+                                f"Pipeline state symbol={symbol} source={candle_source} "
+                                f"aggregator={aggregator_state}"
+                            ),
+                            symbol=symbol,
+                            timeframe=str(tf),
+                            candle_source=candle_source,
+                            tick_queue_size=queue_size,
+                            last_tick_ts=float(self._last_tick_timestamp.get(symbol, 0.0)),
+                            last_candle_ts=float(self._last_candle_timestamp.get(symbol, 0.0)),
+                            aggregator_state=aggregator_state,
+                            bucket_ts=candle.get("bucket_ts"),
+                            eval_key=eval_key,
+                        )
                     if self.engine_logger and self._should_log_closed_candle(
                         symbol, tf, candle
                     ):
@@ -1397,7 +1437,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             candle_for_log, timeframe=tf
                         )
 
-                    self._enrich_candle_depth(symbol, candle)
+                    self._enrich_candle_depth(symbol, candle) 
                     for eval_result in self._evaluate_strategies_parallel(candle):
                         eval_strategy = eval_result.get("strategy")
                         eval_strategy_name = str(

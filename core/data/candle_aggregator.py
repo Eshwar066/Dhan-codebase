@@ -113,14 +113,18 @@ class CandleAggregator:
         max_closed_per_tf: int = MAX_CLOSED_LEN,
         session_start_sec: Optional[int] = None,
         session_end_sec: Optional[int] = None,
+        engine_logger: Optional[Any] = None,
     ):
         self._max_closed = max(1, min(max_closed_per_tf, 500))
         self._session_start_sec = session_start_sec
         self._session_end_sec = session_end_sec
+        self._engine_logger = engine_logger
         # symbol -> timeframe_seconds -> {"current": dict | None, "closed": deque}
         self._state: Dict[str, Dict[int, Dict[str, Any]]] = {}
         # Ordered list of higher TF seconds (excluding 1m) for propagation
         self._higher_tf_seconds: List[int] = [300, 900, 1800, 3600, 7200, 14400, 86400]
+        self._last_tick_ts_by_symbol: Dict[str, float] = {}
+        self._tick_count_by_symbol_bucket: Dict[str, int] = {}
 
     def _ensure_symbol_tf(self, symbol: str, tf_seconds: int) -> Dict[str, Any]:
         if symbol not in self._state:
@@ -145,6 +149,19 @@ class CandleAggregator:
             return
         volume = float(volume) if volume is not None else 0.0
         ts = float(timestamp_sec)
+        prev_tick_ts = float(self._last_tick_ts_by_symbol.get(symbol, 0.0) or 0.0)
+        if prev_tick_ts > 0:
+            gap_sec = ts - prev_tick_ts
+            if gap_sec > 10.0 and self._engine_logger:
+                self._engine_logger.log(
+                    "tick_gap_detected",
+                    f"Tick gap detected symbol={symbol} gap_sec={gap_sec:.2f}",
+                    symbol=symbol,
+                    gap_sec=round(gap_sec, 3),
+                    prev_tick_ts=prev_tick_ts,
+                    tick_timestamp=ts,
+                )
+        self._last_tick_ts_by_symbol[symbol] = ts
 
         cell_1m = self._ensure_symbol_tf(symbol, SECONDS_1M)
         cur = cell_1m["current"]
@@ -166,6 +183,16 @@ class CandleAggregator:
 
         if cur is None:
             cell_1m["current"] = _candle_to_dict(symbol, price, price, price, price, volume, bucket_1m)
+            self._tick_count_by_symbol_bucket[f"{symbol}|{bucket_1m}"] = 1
+            if self._engine_logger:
+                self._engine_logger.log(
+                    "candle_building",
+                    f"Candle building started symbol={symbol} bucket={bucket_1m}",
+                    symbol=symbol,
+                    bucket_ts=bucket_1m,
+                    tick_count=1,
+                    timeframe="1m",
+                )
             return
 
         if cur["bucket_ts"] == bucket_1m:
@@ -175,12 +202,37 @@ class CandleAggregator:
             cell_1m["current"] = _candle_to_dict(
                 symbol, cur["open"], high, low, price, cur["volume"] + volume, bucket_1m
             )
+            key = f"{symbol}|{bucket_1m}"
+            tick_count = int(self._tick_count_by_symbol_bucket.get(key, 0)) + 1
+            self._tick_count_by_symbol_bucket[key] = tick_count
+            if self._engine_logger and (tick_count == 2 or tick_count % 10 == 0):
+                self._engine_logger.log(
+                    "candle_building",
+                    f"Candle building symbol={symbol} bucket={bucket_1m} ticks={tick_count}",
+                    symbol=symbol,
+                    bucket_ts=bucket_1m,
+                    tick_count=tick_count,
+                    timeframe="1m",
+                )
             return
 
         # Bucket changed: close previous 1m, append to closed, then propagate
         closed_1m = cur
         cell_1m["closed"].append(closed_1m)
+        old_key = f"{symbol}|{cur['bucket_ts']}"
+        if old_key in self._tick_count_by_symbol_bucket:
+            del self._tick_count_by_symbol_bucket[old_key]
         cell_1m["current"] = _candle_to_dict(symbol, price, price, price, price, volume, bucket_1m)
+        self._tick_count_by_symbol_bucket[f"{symbol}|{bucket_1m}"] = 1
+        if self._engine_logger:
+            self._engine_logger.log(
+                "candle_building",
+                f"Candle building started symbol={symbol} bucket={bucket_1m}",
+                symbol=symbol,
+                bucket_ts=bucket_1m,
+                tick_count=1,
+                timeframe="1m",
+            )
         self._propagate_from_closed_1m(symbol, closed_1m)
 
     def _propagate_from_closed_1m(self, symbol: str, closed_1m: Dict[str, Any]) -> None:

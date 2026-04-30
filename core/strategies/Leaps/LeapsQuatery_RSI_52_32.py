@@ -17,7 +17,7 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     """
 
     name = "LEAPS_RSI"
-    timeframe = "60"
+    timeframe = "5"
     required_context = ["option_chain"]
     api = "DHAN"
     expiryType = "QUARTERLY"
@@ -52,9 +52,9 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     # ENTRY
     # ==================================================
     def on_candle(self, candle, ctx):
-        ts = pd.to_datetime(candle["timestamp"])
-        if not self._is_valid_time(ts, VALID_TIMES):
-            return None
+        # ts = pd.to_datetime(candle["timestamp"])
+        # if not self._is_valid_time(ts, VALID_TIMES):
+        #     return None
         
         rsi = candle["rsi"]
         if rsi < 32:

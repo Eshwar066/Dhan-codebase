@@ -349,7 +349,7 @@ class EngineFactory:
                 )
                 if any(getattr(s, "timeframe", None) for s in strategies):
                     tick_queue = queue.Queue(maxsize=50000)
-                    candle_aggregator = CandleAggregator()
+                    candle_aggregator = CandleAggregator(engine_logger=engine_logger)
                     realtime_feed.set_tick_queue(tick_queue)
                 realtime_feed.start()
             elif not api_key or not api_secret:
@@ -386,9 +386,12 @@ class EngineFactory:
                             candle_aggregator = CandleAggregator(
                                 session_start_sec=(9 * 3600) + (15 * 60),
                                 session_end_sec=(15 * 3600) + (30 * 60),
+                                engine_logger=engine_logger,
                             )
                         else:
-                            candle_aggregator = CandleAggregator()
+                            candle_aggregator = CandleAggregator(
+                                engine_logger=engine_logger
+                            )
                         realtime_feed.set_tick_queue(tick_queue)
                     realtime_feed.start()
             if access_token and client_id:
