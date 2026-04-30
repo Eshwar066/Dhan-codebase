@@ -358,7 +358,8 @@ class EngineFactory:
             access_token = os.getenv("DHAN_ACCESS_TOKEN")
             client_id = os.getenv("DHAN_CLIENT_CODE")
             market_exchange = str(getattr(config, "market_exchange", "") or "").upper()
-            is_nse = market_exchange == "NSE"
+            is_nse_like = market_exchange in {"NSE", "INDEX", "NSE_INDEX"}
+            is_mcx = market_exchange == "MCX"
             if not access_token or not client_id:
                 logger.warning("Dhan realtime feed skipped: DHAN_ACCESS_TOKEN or DHAN_CLIENT_CODE not set")
             if (
@@ -382,10 +383,17 @@ class EngineFactory:
                     )
                     if any(getattr(s, "timeframe", None) for s in strategies):
                         tick_queue = queue.Queue(maxsize=50000)
-                        if is_nse:
+                        if is_nse_like:
                             candle_aggregator = CandleAggregator(
                                 session_start_sec=(9 * 3600) + (15 * 60),
                                 session_end_sec=(15 * 3600) + (30 * 60),
+                                engine_logger=engine_logger,
+                            )
+                        elif is_mcx:
+                            # Anchor hourly buckets at top-of-hour in IST (18:00-19:00, ...).
+                            candle_aggregator = CandleAggregator(
+                                session_start_sec=0,
+                                session_end_sec=24 * 3600,
                                 engine_logger=engine_logger,
                             )
                         else:

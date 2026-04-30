@@ -124,9 +124,9 @@ class DhanWebSocketFeed(RealtimeFeed):
             return
         if not self.instruments:
             return
-        # Quote/full packets carry volume + LTT; ticker-only duplicates the stream and can
-        # alternate LTT interpretations vs quote on the same symbol (false tick gaps).
-        on_ticker = None
+        # For some instruments (notably MCX), broker may predominantly emit ticker packets.
+        # Keep both callbacks wired so candle pipeline always receives ticks.
+        on_ticker = (lambda s, d: self._push_tick(s, d)) if self._tick_queue else None
         on_quote = (lambda s, d: self._push_tick(s, d)) if self._tick_queue else None
         self._ws = DhanWebSocket(
             access_token=self.access_token,
