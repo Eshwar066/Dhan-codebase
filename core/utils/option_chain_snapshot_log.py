@@ -1,5 +1,5 @@
 """
-Append option chain snapshots (live / backtest) to CSV under logs/option_chain_snapshots/.
+Append option chain snapshots (live / backtest) to CSV.
 
 Set ALGO_OPTION_CHAIN_CSV_LOG=0 to disable.
 """
@@ -17,6 +17,7 @@ import pandas as pd
 
 _ROOT = Path(__file__).resolve().parents[2]
 _LOG_SUBDIR = "logs/option_chain_snapshots"
+_OPTION_BUILDUP_SUBDIR = "logs/option_buildup"
 
 
 def _safe_filename_part(s: str, max_len: int = 64) -> str:
@@ -51,14 +52,13 @@ def log_option_chain_snapshot(
     if chain is None:
         return
 
-    out_dir = _ROOT / _LOG_SUBDIR
-    try:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return
+    target = str((params or {}).get("snapshot_target") or "").strip().lower()
+    if target == "option_buildup":
+        out_dir = _ROOT / _OPTION_BUILDUP_SUBDIR
+    else:
+        out_dir = _ROOT / _LOG_SUBDIR
 
     ts_now = datetime.now(timezone.utc)
-    ts = ts_now.strftime("%Y%m%d_%H%M%S_%f")
     date_part = str((params or {}).get("snapshot_date") or ts_now.strftime("%Y-%m-%d"))
     time_part = str((params or {}).get("snapshot_time") or ts_now.strftime("%H%M"))
     sym = _safe_filename_part(getattr(ctx, "symbol", None) or "UNK")
@@ -102,10 +102,15 @@ def log_option_chain_snapshot(
         }
     )
     df_out = pd.concat([prefix, df.reset_index(drop=True)], axis=1)
+    df_out.insert(1, "_snapshot_date", date_part)
+    df_out.insert(2, "_snapshot_slot", time_part)
 
-    exp_part = meta.get("snapshot_expiry") or "exp"
     time_token = _safe_filename_part(time_part)
-    fname = f"chain_{strat}_{sym}_{_safe_filename_part(str(exp_part))}_{time_token}.csv"
+    if target == "option_buildup":
+        fname = f"{time_token}.csv"
+    else:
+        exp_part = meta.get("snapshot_expiry") or "exp"
+        fname = f"chain_{strat}_{sym}_{_safe_filename_part(str(exp_part))}_{time_token}.csv"
     path = out_dir / fname
 
     try:

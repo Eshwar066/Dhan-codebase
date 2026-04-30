@@ -5,6 +5,7 @@ from core.strategies.MagicalLines.MagicalLines import MagicalLines
 from core.strategies.MagicalLines.NiftyIntradayMagicalLine import NiftyIntradayMagicalLine
 from core.strategies.Intraday.oneDayMagicalLine import OneDayMagicalLine
 from core.strategies.OpenIntrest.OIPostionalBuy.OIPosBuy import OIPositionalBuy
+from core.strategies.OpenIntrest.optionbuildup import OptionBuildup
 from core.strategies.Futures.Futures_EMA.Futures_EMA import FuturesEMAHighLow
 from core.strategies.Futures.Futures_EMA_Momentum.Futures_EMA_Momentum import (
     FuturesEMAMomentum,
@@ -58,6 +59,15 @@ STRATEGY_MAP = {
     },
     "OIPositionalBuy": {
         "strategy": OIPositionalBuy,
+        "instrument": "OPTION",
+        "allowed_modes": [
+            RunMode.BACKTEST,
+            RunMode.PAPER,
+            RunMode.LIVE,
+        ],
+    },
+    "OptionBuildup": {
+        "strategy": OptionBuildup,
         "instrument": "OPTION",
         "allowed_modes": [
             RunMode.BACKTEST,
