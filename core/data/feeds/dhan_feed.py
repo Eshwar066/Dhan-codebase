@@ -27,6 +27,7 @@ class DhanWebSocketFeed(RealtimeFeed):
         client_id: str,
         instruments: List[Dict[str, str]],
         engine_logger: Optional[Any] = None,
+        stall_timeout_seconds: Optional[float] = None,
     ):
         """
         instruments: list of {"ExchangeSegment": "NSE_EQ", "SecurityId": "11536", "symbol": "RELIANCE"}.
@@ -39,6 +40,7 @@ class DhanWebSocketFeed(RealtimeFeed):
         self._tick_queue: Optional[Any] = None
         self._engine_logger = engine_logger
         self._last_tick_ts_by_symbol: Dict[str, float] = {}
+        self._stall_timeout_seconds = stall_timeout_seconds
 
     def set_tick_queue(self, queue: Any) -> None:
         """Push normalized ticks to queue for CandleAggregator. Set before start()."""
@@ -104,6 +106,9 @@ class DhanWebSocketFeed(RealtimeFeed):
             instruments=self.instruments,
             on_ticker=on_ticker,
             on_quote=on_quote,
+            stall_timeout_seconds=self._stall_timeout_seconds
+            if self._stall_timeout_seconds is not None
+            else 90.0,
         )
         self._ws.connect()
 

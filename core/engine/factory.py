@@ -104,9 +104,9 @@ class EngineFactory:
             data_provider = DhanDataProvider(source)
 
         # ---------- OMS (isolated per engine) ----------
-        logger = TradeLogger()
+        trade_logger = TradeLogger()
         position_manager = PositionManager(
-            logger=logger,
+            logger=trade_logger,
             open_positions_logger=None,
         )
         intent_store = IntentStore()
@@ -208,7 +208,7 @@ class EngineFactory:
                 )
 
         # ---------- OMS (isolated per engine) ----------
-        logger = TradeLogger()
+        trade_logger = TradeLogger()
         _engine_id = config.engine_id or "live"
         _strategy_dir = str(config.strategy_name or "GLOBAL").replace("/", "_").replace("\\", "_").replace(" ", "_")
         _open_positions_csv = os.path.join(
@@ -221,7 +221,7 @@ class EngineFactory:
             strategy=config.strategy_name,
         )
         position_manager = PositionManager(
-            logger=logger,
+            logger=trade_logger,
             open_positions_logger=open_positions_logger,
             open_positions_csv_path=_open_positions_csv,
         )
@@ -376,6 +376,9 @@ class EngineFactory:
                         client_id=client_id,
                         instruments=instruments,
                         engine_logger=engine_logger,
+                        stall_timeout_seconds=getattr(
+                            config, "market_ws_stall_timeout_seconds", None
+                        ),
                     )
                     if any(getattr(s, "timeframe", None) for s in strategies):
                         tick_queue = queue.Queue(maxsize=50000)

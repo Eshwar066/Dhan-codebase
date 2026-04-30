@@ -73,6 +73,7 @@ def job_to_engine_config(job: dict) -> EngineConfig:
         order_qty_lots=job.get("ORDER_QTY_LOTS"),
         check_short_option_margin_enabled=job.get("check_short_option_margin_enabled"),
         feed_stale_seconds=job.get("feed_stale_seconds"),
+        market_ws_stall_timeout_seconds=job.get("market_ws_stall_timeout_seconds"),
         backtest=backtest,
         live=live,
         delta_testnet=job.get("delta_testnet", True),

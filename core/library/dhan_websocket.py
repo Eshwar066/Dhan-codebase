@@ -32,11 +32,14 @@ logger = logging.getLogger(__name__)
 
 
 def _dhan_market_stall_should_close() -> bool:
-    """Reconnect on stall only during NSE index session; after hours a quiet socket is normal."""
+    """Reconnect on stall only during active Dhan sessions (NSE/MCX)."""
     try:
         from core.utils.session.session_manager import SessionManager
 
-        return SessionManager.is_market_open("INDEX")
+        return bool(
+            SessionManager.is_market_open("INDEX")
+            or SessionManager.is_market_open("MCX")
+        )
     except Exception:
         return True
 
@@ -245,6 +248,17 @@ class DhanWebSocket:
         self.on_quote = on_quote
         self.on_disconnect = on_disconnect
         self._stall_timeout_seconds = float(stall_timeout_seconds)
+        # MCX contracts can stay quiet for longer stretches; avoid churn from
+        # aggressive stall closes intended for NSE-like high-frequency ticks.
+        try:
+            segments = {
+                str((inv or {}).get("ExchangeSegment") or "").strip().upper()
+                for inv in self.instruments
+            }
+            if "MCX_COMM" in segments and self._stall_timeout_seconds <= 90.0:
+                self._stall_timeout_seconds = 0.0
+        except Exception:
+            pass
 
         self._ws: Optional[websocket.WebSocketApp] = None
         self._thread: Optional[threading.Thread] = None
@@ -487,9 +501,20 @@ class DhanWebSocket:
                 self._thread = None
 
     def _run_forever(self) -> None:
+        gate_exchange = None
+        try:
+            segments = {
+                str((inv or {}).get("ExchangeSegment") or "").strip().upper()
+                for inv in (self.instruments or [])
+            }
+            gate_exchange = "MCX" if "MCX_COMM" in segments else "INDEX"
+        except Exception:
+            gate_exchange = None
         while not self._stop.is_set():
-            if not is_dhan_market_open():
-                sleep_until_next_dhan_market_open(stop_event=self._stop, log=logger.info)
+            if not is_dhan_market_open(exchange=gate_exchange):
+                sleep_until_next_dhan_market_open(
+                    stop_event=self._stop, log=logger.info, exchange=gate_exchange
+                )
                 continue
             now = time.time()
             if now < self._cooldown_until_ts:

@@ -346,14 +346,20 @@ class DhanInstrumentStore(BaseInstrumentStore):
         seen: set = set()
         symbols_upper = [s.strip().upper() for s in symbols if s]
         df = self.df
+        custom_sym_col = df["SEM_CUSTOM_SYMBOL"].fillna("").astype(str).str.strip().str.upper()
+        trading_sym_col = df["SEM_TRADING_SYMBOL"].fillna("").astype(str).str.strip().str.upper()
+        exch_col = df.get("SEM_EXM_EXCH_ID", pd.Series([""] * len(df))).fillna("").astype(str).str.strip().str.upper()
+        itype_col = df.get("SEM_EXCH_INSTRUMENT_TYPE", pd.Series([""] * len(df))).fillna("").astype(str).str.strip().str.upper()
+        sm_name_col = df.get("SM_SYMBOL_NAME", pd.Series([""] * len(df))).fillna("").astype(str).str.strip().str.upper()
+
         for sym in symbols_upper:
             if sym in seen:
                 continue
             # Index: single row per name, use IDX_I
             if sym in self.INDEX_SYMBOLS:
                 match = df[
-                    (df["SEM_CUSTOM_SYMBOL"].str.upper() == sym)
-                    | (df["SEM_TRADING_SYMBOL"].str.upper() == sym)
+                    (custom_sym_col == sym)
+                    | (trading_sym_col == sym)
                 ]
                 if not match.empty:
                     row = match.iloc[-1]
@@ -367,9 +373,18 @@ class DhanInstrumentStore(BaseInstrumentStore):
                 continue
             # Equity/FNO: take first match (or nearest expiry for FNO)
             match = df[
-                (df["SEM_CUSTOM_SYMBOL"].str.upper() == sym)
-                | (df["SEM_TRADING_SYMBOL"].str.upper() == sym)
+                (custom_sym_col == sym)
+                | (trading_sym_col == sym)
             ]
+            # MCX fallback: resolve underlying symbol (e.g. GOLD) to a tradable contract.
+            # Prefer FUT/FUTCOM over options, then nearest expiry if available.
+            if match.empty:
+                mcx_underlying = df[(exch_col == "MCX") & (sm_name_col == sym)]
+                if not mcx_underlying.empty:
+                    preferred = mcx_underlying[
+                        itype_col.loc[mcx_underlying.index].isin(["FUT", "FUTCOM"])
+                    ]
+                    match = preferred if not preferred.empty else mcx_underlying
             if match.empty:
                 continue
             if "SEM_EXPIRY_DATE" in match.columns and match["SEM_EXPIRY_DATE"].notna().any():
