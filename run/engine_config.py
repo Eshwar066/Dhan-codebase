@@ -89,6 +89,8 @@ class EngineConfig:
     feed_stale_seconds: Optional[float] = None
     # Dhan market WS stall watchdog timeout in seconds (0 disables forced stall close).
     market_ws_stall_timeout_seconds: Optional[float] = None
+    # Enable verbose runtime diagnostics (including high-frequency tick logs).
+    debug_mode: bool = False
 
     # Backtest params (used when run_mode == BACKTEST)
     backtest: Optional[Dict[str, Any]] = None

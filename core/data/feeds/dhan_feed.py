@@ -31,6 +31,7 @@ class DhanWebSocketFeed(RealtimeFeed):
         client_id: str,
         instruments: List[Dict[str, str]],
         engine_logger: Optional[Any] = None,
+        debug_mode: bool = False,
         stall_timeout_seconds: Optional[float] = None,
     ):
         """
@@ -43,6 +44,7 @@ class DhanWebSocketFeed(RealtimeFeed):
         self._ws: Optional[DhanWebSocket] = None
         self._tick_queue: Optional[Any] = None
         self._engine_logger = engine_logger
+        self._debug_mode = bool(debug_mode)
         self._last_tick_ts_by_symbol: Dict[str, float] = {}
         self._stall_timeout_seconds = stall_timeout_seconds
 
@@ -89,7 +91,7 @@ class DhanWebSocketFeed(RealtimeFeed):
                 "timestamp": float(ts),
             }
             self._tick_queue.put_nowait(tick_payload)
-            if self._engine_logger:
+            if self._engine_logger and self._debug_mode:
                 self._engine_logger.log(
                     "tick_received",
                     f"Tick received symbol={symbol} price={price}",

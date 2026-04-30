@@ -1041,10 +1041,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 )
             except Exception:
                 last_market_tick_ts = 0.0
-            if last_market_tick_ts > 0.0 and (now - last_market_tick_ts) > 5.0:
+            if last_market_tick_ts > 0.0 and (now - last_market_tick_ts) > 60:
                 msg = (
                     f"No market ticks for {now - last_market_tick_ts:.1f}s "
-                    "(threshold=5s) while feed is connected"
+                    "(threshold=60s) while feed is connected"
                 )
                 raise NoMarketDataError(msg)
         # During startup warmup, suppress "all symbols stalled" when no symbol has seen any data yet.

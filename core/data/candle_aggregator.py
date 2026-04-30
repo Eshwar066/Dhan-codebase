@@ -116,11 +116,13 @@ class CandleAggregator:
         session_start_sec: Optional[int] = None,
         session_end_sec: Optional[int] = None,
         engine_logger: Optional[Any] = None,
+        debug_mode: bool = False,
     ):
         self._max_closed = max(1, min(max_closed_per_tf, 500))
         self._session_start_sec = session_start_sec
         self._session_end_sec = session_end_sec
         self._engine_logger = engine_logger
+        self._debug_mode = bool(debug_mode)
         # symbol -> timeframe_seconds -> {"current": dict | None, "closed": deque}
         self._state: Dict[str, Dict[int, Dict[str, Any]]] = {}
         # Ordered list of higher TF seconds (excluding 1m) for propagation
@@ -154,7 +156,7 @@ class CandleAggregator:
         prev_tick_ts = float(self._last_tick_ts_by_symbol.get(symbol, 0.0) or 0.0)
         if prev_tick_ts > 0:
             gap_sec = ts - prev_tick_ts
-            if gap_sec > 10.0 and self._engine_logger:
+            if gap_sec > 60.0 and self._engine_logger:
                 self._engine_logger.log(
                     "tick_gap_detected",
                     f"Tick gap detected symbol={symbol} gap_sec={gap_sec:.2f}",
@@ -188,7 +190,7 @@ class CandleAggregator:
         if cur is None:
             cell_1m["current"] = _candle_to_dict(symbol, price, price, price, price, volume, bucket_1m)
             self._tick_count_by_symbol_bucket[f"{symbol}|{bucket_1m}"] = 1
-            if self._engine_logger:
+            if self._engine_logger and self._debug_mode:
                 self._engine_logger.log(
                     "candle_building",
                     f"Candle building started symbol={symbol} bucket={bucket_1m}",
@@ -209,7 +211,7 @@ class CandleAggregator:
             key = f"{symbol}|{bucket_1m}"
             tick_count = int(self._tick_count_by_symbol_bucket.get(key, 0)) + 1
             self._tick_count_by_symbol_bucket[key] = tick_count
-            if self._engine_logger and (tick_count == 2 or tick_count % 10 == 0):
+            if self._engine_logger and (tick_count == 2 or tick_count % 10 == 0) and self._debug_mode:
                 self._engine_logger.log(
                     "candle_building",
                     f"Candle building symbol={symbol} bucket={bucket_1m} ticks={tick_count}",
@@ -228,7 +230,7 @@ class CandleAggregator:
             del self._tick_count_by_symbol_bucket[old_key]
         cell_1m["current"] = _candle_to_dict(symbol, price, price, price, price, volume, bucket_1m)
         self._tick_count_by_symbol_bucket[f"{symbol}|{bucket_1m}"] = 1
-        if self._engine_logger:
+        if self._engine_logger and self._debug_mode:
             self._engine_logger.log(
                 "candle_building",
                 f"Candle building started symbol={symbol} bucket={bucket_1m}",

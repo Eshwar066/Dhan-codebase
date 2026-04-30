@@ -349,7 +349,10 @@ class EngineFactory:
                 )
                 if any(getattr(s, "timeframe", None) for s in strategies):
                     tick_queue = queue.Queue(maxsize=50000)
-                    candle_aggregator = CandleAggregator(engine_logger=engine_logger)
+                    candle_aggregator = CandleAggregator(
+                        engine_logger=engine_logger,
+                        debug_mode=bool(getattr(config, "debug_mode", False)),
+                    )
                     realtime_feed.set_tick_queue(tick_queue)
                 realtime_feed.start()
             elif not api_key or not api_secret:
@@ -377,6 +380,7 @@ class EngineFactory:
                         client_id=client_id,
                         instruments=instruments,
                         engine_logger=engine_logger,
+                        debug_mode=bool(getattr(config, "debug_mode", False)),
                         stall_timeout_seconds=getattr(
                             config, "market_ws_stall_timeout_seconds", None
                         ),
@@ -388,6 +392,7 @@ class EngineFactory:
                                 session_start_sec=(9 * 3600) + (15 * 60),
                                 session_end_sec=(15 * 3600) + (30 * 60),
                                 engine_logger=engine_logger,
+                                debug_mode=bool(getattr(config, "debug_mode", False)),
                             )
                         elif is_mcx:
                             # Anchor hourly buckets at top-of-hour in IST (18:00-19:00, ...).
@@ -395,10 +400,12 @@ class EngineFactory:
                                 session_start_sec=0,
                                 session_end_sec=24 * 3600,
                                 engine_logger=engine_logger,
+                                debug_mode=bool(getattr(config, "debug_mode", False)),
                             )
                         else:
                             candle_aggregator = CandleAggregator(
-                                engine_logger=engine_logger
+                                engine_logger=engine_logger,
+                                debug_mode=bool(getattr(config, "debug_mode", False)),
                             )
                         realtime_feed.set_tick_queue(tick_queue)
                     realtime_feed.start()

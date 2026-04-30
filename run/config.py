@@ -20,6 +20,9 @@ DEFAULT_VENUE = "DHAN"  # "DHAN" | "DELTA"
 DEFAULT_ROOT_LOG_LEVEL = "INFO"
 DEFAULT_LIBRARY_LOG_LEVEL = "WARNING"
 
+# Global debug toggle for high-frequency diagnostic logs (e.g. per-tick logs).
+DEBUG_MODE = False
+
 # New architecture: one job per engine, multiple strategies per engine.
 # Each engine job shares venue/broker/risk/pipeline settings, and strategy list defines
 # what the engine loads concurrently.
@@ -31,10 +34,10 @@ ENGINE_JOBS = [
         "run_mode": "PAPER",
         "capital": 200000,
         "ORDER_QTY_LOTS": 1,
-        "symbols": ["NIFTY"],
-        "exchange": "NSE",
-        # "symbols": ["GOLD"],
-        # "exchange": "MCX",
+        # "symbols": ["NIFTY"],
+        # "exchange": "NSE",
+        "symbols": ["GOLD"],
+        "exchange": "MCX",
         "market_ws_stall_timeout_seconds": 0,
         "telegram": {
             "bot_token": "8663481671:AAHY-OnE8OiaJmkOfXbwqoe4InosJVblAtM",
@@ -42,8 +45,8 @@ ENGINE_JOBS = [
         },
         
         "strategies": ["LEAPS_RSI",], #"NiftyIntradayMagicalLine"
-        "live": {"exchange": "INDEX", "sector": "YES", "rsi": "YES"},
-        # "live": {"exchange": "MCX", "sector": "NO", "rsi": "NO"},
+        # "live": {"exchange": "INDEX", "sector": "YES", "rsi": "YES"},
+        "live": {"exchange": "MCX", "sector": "NO", "rsi": "YES"},
         "backtest": {
             "start_date": "2026-04-24",
             "end_date": "2026-04-24",

@@ -186,11 +186,15 @@ class IndicatorManager:
                 continue
             self._rsi_logged_keys.add(key)
             payload = {
-                "strategy_id": strategy_id,
+                # "strategy_id": strategy_id,
                 "symbol": symbol,
                 "timeframe": tf,
                 "source": "live_append" if seeded else "historical_seed",
                 "candle_timestamp_ist": ist_ts,
+                "open": row.get("open"),
+                "high": row.get("high"),
+                "low": row.get("low"),
+                "close": row.get("close"),
                 "rsi": row.get("rsi"),
                 "prev_rsi": row.get("prev_rsi"),
             }
@@ -427,7 +431,9 @@ class IndicatorManager:
                 df = self._compute_rsi_columns(df, period=period)
                 if not self._rsi_debug_printed:
                     try:
-                        print(df.tail(20)[["timestamp", "close", "rsi", "prev_rsi"]])
+                        dbg = df.tail(20).copy()
+                        dbg["timestamp_ist"] = dbg["timestamp"].apply(self._to_ist_iso)
+                        print(dbg[["timestamp_ist", "close", "rsi", "prev_rsi"]])
                     except Exception:
                         pass
                     self._rsi_debug_printed = True
