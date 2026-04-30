@@ -216,6 +216,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self._feed_stall_seconds = max(1.0, float(feed_stall_seconds or 60.0))
         self._feed_stall_last_log_ts: float = 0.0
         self._feed_stall_log_interval_seconds: float = 60.0
+        # Aggregate closed-candle skip logs to avoid per-tick log spam.
+        self._closed_candle_skip_counts: Dict[str, int] = {}
+        self._closed_candle_skip_last_log_ts: Dict[str, float] = {}
+        self._closed_candle_skip_log_interval_seconds: float = 600.0
         # Startup grace: allow feed to warm before declaring global stall.
         self._feed_first_tick_grace_seconds: float = 30.0
         self._feed_start_grace_until_ts: float = 0.0
@@ -238,6 +242,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self._max_candle_bucket_unix: Dict[str, int] = {}
         # After at least one tick-built bar (bucket_ts set), drop REST rows without bucket_ts
         self._has_seen_aggregator_bucket: Dict[str, bool] = {}
+        # First live bar alignment is run once per symbol after bootstrap history is available.
+        self._first_live_alignment_done: Dict[str, bool] = {}
         self.execution_engine = ExecutionEngine(
             engine_id=self.engine_id,
             intent_queue=self.intent_queue,
@@ -275,6 +281,52 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             niml = metadata_extras.get("nifty_intraday_magical_line")
             if isinstance(niml, dict) and niml.get("symbol"):
                 return str(niml["symbol"])
+        return None
+
+    def _align_first_live_bar(
+        self, first_live_ts: Optional[int], last_hist_ts: Optional[int], tf_sec: int
+    ) -> Optional[int]:
+        if first_live_ts is None or last_hist_ts is None:
+            return first_live_ts
+        if first_live_ts < last_hist_ts:
+            aligned = int(last_hist_ts) + int(tf_sec)
+            logger.warning(
+                "FORCING_LIVE_ALIGNMENT symbol_first_live=%s last_hist=%s aligned=%s tf_sec=%s",
+                first_live_ts,
+                last_hist_ts,
+                aligned,
+                tf_sec,
+            )
+            return aligned
+        return first_live_ts
+
+    def _get_last_hist_bucket_ts(
+        self, symbol: str, tf: str, exchange: str, sector: str
+    ) -> Optional[int]:
+        try:
+            state = self.indicator_manager._bootstrap_base_candle_state(
+                symbol=symbol,
+                tf=tf,
+                exchange=exchange,
+                sector=sector,
+                window=self.indicator_manager.indicator_window_size(self.strategy),
+            )
+            df = state.get("df")
+            if df is None or len(df) == 0 or "timestamp" not in df.columns:
+                return None
+            last_ts = df.iloc[-1].get("timestamp")
+            if last_ts is None:
+                return None
+            if hasattr(last_ts, "to_pydatetime"):
+                last_ts = last_ts.to_pydatetime()
+            if isinstance(last_ts, dt.datetime):
+                if last_ts.tzinfo is None:
+                    last_ts = last_ts.replace(tzinfo=dt.timezone.utc)
+                return int(last_ts.astimezone(dt.timezone.utc).timestamp())
+            if isinstance(last_ts, (int, float)):
+                return int(float(last_ts))
+        except Exception:
+            return None
         return None
 
     def _on_pm_main_entry_fill(self, **kwargs: Any) -> None:
@@ -989,10 +1041,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 )
             except Exception:
                 last_market_tick_ts = 0.0
-            if last_market_tick_ts > 0.0 and (now - last_market_tick_ts) > 5.0:
+            if last_market_tick_ts > 0.0 and (now - last_market_tick_ts) > 60:
                 msg = (
                     f"No market ticks for {now - last_market_tick_ts:.1f}s "
-                    "(threshold=5s) while feed is connected"
+                    "(threshold=60s) while feed is connected"
                 )
                 raise NoMarketDataError(msg)
         # During startup warmup, suppress "all symbols stalled" when no symbol has seen any data yet.
@@ -1231,11 +1283,41 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                                     )
                             except Exception:
                                 pass
-                            self.engine_logger.closed_candle_skip(
-                                symbol,
-                                "Forming or misaligned candle; skip evaluation",
-                                diagnostics=diag,
+                            skip_reason = str(diag.get("skip_reason") or "unknown")
+                            source_key = str(candle_source or "unknown")
+                            agg_key = (
+                                f"{symbol}|{str(tf)}|{source_key}|{skip_reason}"
                             )
+                            count = self._closed_candle_skip_counts.get(agg_key, 0) + 1
+                            self._closed_candle_skip_counts[agg_key] = count
+                            now_ts = time.time()
+                            last_ts = self._closed_candle_skip_last_log_ts.get(
+                                agg_key, 0.0
+                            )
+                            if (
+                                now_ts - last_ts
+                                >= self._closed_candle_skip_log_interval_seconds
+                            ):
+                                self._closed_candle_skip_last_log_ts[agg_key] = now_ts
+                                self.engine_logger.closed_candle_skip(
+                                    symbol,
+                                    f"Skipped {count} {skip_reason} {source_key} candles in last "
+                                    f"{int(self._closed_candle_skip_log_interval_seconds)}s",
+                                    diagnostics=diag,
+                                    skip_count=count,
+                                    skip_reason=skip_reason,
+                                    candle_source=source_key,
+                                )
+                                self.engine_logger.candle_skipped(
+                                    symbol,
+                                    f"Skipped candle reason={skip_reason}",
+                                    diagnostics=diag,
+                                    skip_reason=skip_reason,
+                                    candle_source=source_key,
+                                    bucket_ts=candle.get("bucket_ts"),
+                                    timeframe=str(tf),
+                                )
+                                self._closed_candle_skip_counts[agg_key] = 0
                         continue
 
                     eval_bucket = self._candle_bucket_start_unix(candle)
@@ -1254,16 +1336,51 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         continue
 
                     if use_aggregator:
-                        
                         # check the time of the entry candle at mkt time
                         is_dummy_feed = bool(
                             getattr(self.realtime_feed, "is_dummy_feed", False)
                         )
+                        tf_sec = max(60, int(_resolution_to_seconds(tf)))
                         if (
-                            not is_dummy_feed
-                            and self._live_bar_is_stale_or_replay(symbol, candle, tf)
+                            not self._first_live_alignment_done.get(symbol, False)
+                            and eval_bucket is not None
                         ):
+                            last_hist_ts = self._get_last_hist_bucket_ts(
+                                symbol=symbol,
+                                tf=str(tf),
+                                exchange=exchange,
+                                sector=sector,
+                            )
+                            aligned_first_live = self._align_first_live_bar(
+                                int(eval_bucket), last_hist_ts, tf_sec
+                            )
+                            self._first_live_alignment_done[symbol] = True
+                            if (
+                                aligned_first_live is not None
+                                and eval_bucket < aligned_first_live
+                            ):
+                                logger.warning(
+                                    "Skipping pre-alignment live bar symbol=%s bucket=%s aligned_start=%s",
+                                    symbol,
+                                    eval_bucket,
+                                    aligned_first_live,
+                                )
+                                continue
+
+                        skip_bar, replay_bar = (False, False)
+                        if not is_dummy_feed:
+                            skip_bar, replay_bar = self._live_bar_is_stale_or_replay(
+                                symbol, candle, tf
+                            )
+                        if skip_bar:
                             continue
+                        if replay_bar:
+                            logger.debug(
+                                "REPLAY_BAR_ACCEPTED symbol=%s bucket=%s max_seen=%s",
+                                symbol,
+                                eval_bucket,
+                                self._max_candle_bucket_unix.get(symbol),
+                            )
                         if candle.get("bucket_ts") is not None:
                             self._has_seen_aggregator_bucket[symbol] = True
                         if eval_bucket is not None:
@@ -1273,6 +1390,38 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             )
                     if eval_key is not None:
                         self._last_evaluated_candle_ts[symbol] = eval_key
+                    if self.engine_logger:
+                        queue_size = None
+                        try:
+                            if self.tick_queue is not None:
+                                queue_size = int(self.tick_queue.qsize())
+                        except Exception:
+                            queue_size = None
+                        aggregator_state = (
+                            "active"
+                            if (
+                                use_aggregator
+                                and self.candle_aggregator is not None
+                                and candle_source.startswith("aggregator")
+                            )
+                            else "inactive"
+                        )
+                        self.engine_logger.log(
+                            "pipeline_state",
+                            (
+                                f"Pipeline state symbol={symbol} source={candle_source} "
+                                f"aggregator={aggregator_state}"
+                            ),
+                            symbol=symbol,
+                            timeframe=str(tf),
+                            candle_source=candle_source,
+                            tick_queue_size=queue_size,
+                            last_tick_ts=float(self._last_tick_timestamp.get(symbol, 0.0)),
+                            last_candle_ts=float(self._last_candle_timestamp.get(symbol, 0.0)),
+                            aggregator_state=aggregator_state,
+                            bucket_ts=candle.get("bucket_ts"),
+                            eval_key=eval_key,
+                        )
                     if self.engine_logger and self._should_log_closed_candle(
                         symbol, tf, candle
                     ):
@@ -1288,7 +1437,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             candle_for_log, timeframe=tf
                         )
 
-                    self._enrich_candle_depth(symbol, candle)
+                    self._enrich_candle_depth(symbol, candle) 
                     for eval_result in self._evaluate_strategies_parallel(candle):
                         eval_strategy = eval_result.get("strategy")
                         eval_strategy_name = str(
@@ -1452,8 +1601,20 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 self.engine_logger.time_window_blocked("Outside allowed trading hours")
             return
         signal_kind = str(getattr(single_intent, "action", "ENTRY") or "ENTRY").lower()
+        side = str(getattr(single_intent, "side", "") or "").upper()
+        tag = str(getattr(single_intent, "tag", "") or "").upper()
+        intent_id = str(getattr(single_intent, "intent_id", "") or "")
+        trading_sym = str(
+            getattr(getattr(single_intent, "instrument", None), "trading_symbol", symbol)
+            or symbol
+        )
+        # Make dedupe key intent-specific so MAIN/HEDGE on same candle are both allowed.
+        # Keep action as base "signal kind", and extend with intent discriminators.
+        signal_kind_ext = f"{signal_kind}|{trading_sym}|{side}|{tag}"
+        if intent_id:
+            signal_kind_ext = f"{signal_kind_ext}|{intent_id}"
         signal_hash = self._signal_hash(
-            symbol, timeframe or "", candle.get("timestamp"), signal_kind
+            symbol, timeframe or "", candle.get("timestamp"), signal_kind_ext
         )
 
         # Dublicate signal blocker ==> tested ✅

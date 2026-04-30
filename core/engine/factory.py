@@ -49,9 +49,9 @@ from core.orderExecution.risk_manager import RiskManager, make_short_option_marg
 from core.utils.delta_env import get_delta_credentials
 from core.utils.instruments.instrument_store import InstrumentStore
 from core.utils.telegram_alert import send_telegram_alert
-from logger.trade_logger import TradeLogger
-from logger.open_positions_logger import OpenPositionsLogger
-from logger.engine_logger import EngineLogger
+from utils.logger.trade_logger import TradeLogger
+from utils.logger.open_positions_logger import OpenPositionsLogger
+from utils.logger.engine_logger import EngineLogger
 
 try:
     from core.universe.equity_universe_service import EquityUniverseService
@@ -104,9 +104,9 @@ class EngineFactory:
             data_provider = DhanDataProvider(source)
 
         # ---------- OMS (isolated per engine) ----------
-        logger = TradeLogger()
+        trade_logger = TradeLogger()
         position_manager = PositionManager(
-            logger=logger,
+            logger=trade_logger,
             open_positions_logger=None,
         )
         intent_store = IntentStore()
@@ -208,7 +208,7 @@ class EngineFactory:
                 )
 
         # ---------- OMS (isolated per engine) ----------
-        logger = TradeLogger()
+        trade_logger = TradeLogger()
         _engine_id = config.engine_id or "live"
         _strategy_dir = str(config.strategy_name or "GLOBAL").replace("/", "_").replace("\\", "_").replace(" ", "_")
         _open_positions_csv = os.path.join(
@@ -221,7 +221,7 @@ class EngineFactory:
             strategy=config.strategy_name,
         )
         position_manager = PositionManager(
-            logger=logger,
+            logger=trade_logger,
             open_positions_logger=open_positions_logger,
             open_positions_csv_path=_open_positions_csv,
         )
@@ -349,7 +349,10 @@ class EngineFactory:
                 )
                 if any(getattr(s, "timeframe", None) for s in strategies):
                     tick_queue = queue.Queue(maxsize=50000)
-                    candle_aggregator = CandleAggregator()
+                    candle_aggregator = CandleAggregator(
+                        engine_logger=engine_logger,
+                        debug_mode=bool(getattr(config, "debug_mode", False)),
+                    )
                     realtime_feed.set_tick_queue(tick_queue)
                 realtime_feed.start()
             elif not api_key or not api_secret:
@@ -358,7 +361,8 @@ class EngineFactory:
             access_token = os.getenv("DHAN_ACCESS_TOKEN")
             client_id = os.getenv("DHAN_CLIENT_CODE")
             market_exchange = str(getattr(config, "market_exchange", "") or "").upper()
-            is_nse = market_exchange == "NSE"
+            is_nse_like = market_exchange in {"NSE", "INDEX", "NSE_INDEX"}
+            is_mcx = market_exchange == "MCX"
             if not access_token or not client_id:
                 logger.warning("Dhan realtime feed skipped: DHAN_ACCESS_TOKEN or DHAN_CLIENT_CODE not set")
             if (
@@ -376,16 +380,33 @@ class EngineFactory:
                         client_id=client_id,
                         instruments=instruments,
                         engine_logger=engine_logger,
+                        debug_mode=bool(getattr(config, "debug_mode", False)),
+                        stall_timeout_seconds=getattr(
+                            config, "market_ws_stall_timeout_seconds", None
+                        ),
                     )
                     if any(getattr(s, "timeframe", None) for s in strategies):
                         tick_queue = queue.Queue(maxsize=50000)
-                        if is_nse:
+                        if is_nse_like:
                             candle_aggregator = CandleAggregator(
                                 session_start_sec=(9 * 3600) + (15 * 60),
                                 session_end_sec=(15 * 3600) + (30 * 60),
+                                engine_logger=engine_logger,
+                                debug_mode=bool(getattr(config, "debug_mode", False)),
+                            )
+                        elif is_mcx:
+                            # Anchor hourly buckets at top-of-hour in IST (18:00-19:00, ...).
+                            candle_aggregator = CandleAggregator(
+                                session_start_sec=0,
+                                session_end_sec=24 * 3600,
+                                engine_logger=engine_logger,
+                                debug_mode=bool(getattr(config, "debug_mode", False)),
                             )
                         else:
-                            candle_aggregator = CandleAggregator()
+                            candle_aggregator = CandleAggregator(
+                                engine_logger=engine_logger,
+                                debug_mode=bool(getattr(config, "debug_mode", False)),
+                            )
                         realtime_feed.set_tick_queue(tick_queue)
                     realtime_feed.start()
             if access_token and client_id:

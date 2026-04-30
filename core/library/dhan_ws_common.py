@@ -22,12 +22,35 @@ def reconnect_sleep_with_jitter(backoff_sec: float, cap: float = 60.0) -> float:
     return min(float(backoff_sec) * 1.5, cap)
 
 
-def is_dhan_market_open(now_ist: Optional[datetime] = None) -> bool:
+def _is_exchange_open(exchange: str, now_ist: datetime) -> bool:
+    try:
+        from core.utils.session.session_manager import SessionManager
+        return bool(SessionManager.is_market_open(exchange))
+    except Exception:
+        if exchange == "MCX":
+            if now_ist.weekday() >= 5:
+                return False
+            try:
+                from core.utils.session.session_manager import SessionManager
+                if SessionManager.is_holiday(now_ist, "MCX"):
+                    return False
+            except Exception:
+                pass
+            return dtime(hour=9, minute=0) <= now_ist.time() <= dtime(hour=23, minute=30)
+        if not _is_dhan_trading_day(now_ist.date()):
+            return False
+        return DHAN_MARKET_OPEN <= now_ist.time() <= DHAN_MARKET_CLOSE
+
+
+def is_dhan_market_open(
+    now_ist: Optional[datetime] = None, exchange: Optional[str] = None
+) -> bool:
     now = now_ist or datetime.now(IST)
-    if not _is_dhan_trading_day(now.date()):
-        return False
-    t = now.time()
-    return DHAN_MARKET_OPEN <= t <= DHAN_MARKET_CLOSE
+    if exchange:
+        return _is_exchange_open(str(exchange).upper(), now)
+    # Unknown venue at callsite (e.g. private order-update WS): stay active
+    # whenever any Dhan exchange session is open.
+    return _is_exchange_open("INDEX", now) or _is_exchange_open("MCX", now)
 
 
 def _is_dhan_holiday(day: dt_date) -> bool:
@@ -51,20 +74,41 @@ def _is_dhan_trading_day(day: dt_date) -> bool:
 def sleep_until_next_dhan_market_open(
     stop_event: Optional[threading.Event] = None,
     log: Optional[Callable[..., None]] = None,
+    exchange: Optional[str] = None,
 ) -> None:
     logger_fn = log or logger.info
     while True:
         if stop_event is not None and stop_event.is_set():
             return
         now = datetime.now(IST)
-        if is_dhan_market_open(now):
+        if is_dhan_market_open(now, exchange=exchange):
             return
+        target = str(exchange or "").upper()
+        is_mcx = target == "MCX"
+        open_time = dtime(hour=9, minute=0) if is_mcx else DHAN_MARKET_OPEN
+        close_time = dtime(hour=23, minute=30) if is_mcx else DHAN_MARKET_CLOSE
+
         candidate = now.date()
-        if now.weekday() >= 5 or now.time() > DHAN_MARKET_CLOSE:
+        if now.weekday() >= 5 or now.time() > close_time:
             candidate = candidate + timedelta(days=1)
-        while not _is_dhan_trading_day(candidate):
-            candidate = candidate + timedelta(days=1)
-        next_open = datetime.combine(candidate, DHAN_MARKET_OPEN, tzinfo=IST)
+        while True:
+            if candidate.weekday() >= 5:
+                candidate = candidate + timedelta(days=1)
+                continue
+            try:
+                from core.utils.session.session_manager import SessionManager
+                holiday_ex = "MCX" if is_mcx else "INDEX"
+                probe = datetime.combine(candidate, dtime.min, tzinfo=IST)
+                if SessionManager.is_holiday(probe, holiday_ex):
+                    candidate = candidate + timedelta(days=1)
+                    continue
+            except Exception:
+                if not _is_dhan_trading_day(candidate):
+                    candidate = candidate + timedelta(days=1)
+                    continue
+            break
+
+        next_open = datetime.combine(candidate, open_time, tzinfo=IST)
         delay = max(1.0, (next_open - now).total_seconds())
         logger_fn(
             "Market closed — skipping websocket start; sleeping until next open at %s IST",

@@ -1113,7 +1113,7 @@ class IndiaMktMixins:
         return self.create_order_intent(
             inst=inst,
             side="BUY",
-            qty=1,
+            qty=self._entry_order_qty(inst),
             price=hedge_price,
             order_type="LIMIT",
             strategy=self.name,

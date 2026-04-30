@@ -531,7 +531,7 @@ class LiveEngineHelpersMixin:
 
     def _live_bar_is_stale_or_replay(
         self, symbol: str, candle: Dict[str, Any], tf: str
-    ) -> bool:
+    ) -> tuple[bool, bool]:
         """
         When ticks + CandleAggregator are active, reject:
         - REST fallback rows without bucket_ts after we have seen real buckets
@@ -547,21 +547,27 @@ class LiveEngineHelpersMixin:
                 "Skip %s: missing bucket_ts after live aggregated bars (REST replay)",
                 symbol,
             )
-            return True
+            return True, False
 
         if bs is None:
-            return False
+            return False, False
 
-        if max_seen is not None and bs < max_seen:
+        tf_sec = max(60, int(_resolution_to_seconds(tf)))
+        tolerance_sec = tf_sec
+
+        if max_seen is not None and bs < (max_seen - tolerance_sec):
             logger.debug(
-                "Skip %s: non-monotonic bucket %s < max_seen %s",
+                "Skip %s: stale bucket %s < (max_seen %s - tolerance %s)",
                 symbol,
                 bs,
                 max_seen,
+                tolerance_sec,
             )
-            return True
+            return True, False
 
-        tf_sec = max(60, int(_resolution_to_seconds(tf)))
+        if max_seen is not None and bs <= max_seen:
+            return False, True
+
         age_sec = time.time() - float(bs)
         stale_sec = max(15 * 60, 5 * tf_sec)
         if age_sec > stale_sec:
@@ -572,9 +578,9 @@ class LiveEngineHelpersMixin:
                 stale_sec,
                 bs,
             )
-            return True
+            return True, False
 
-        return False
+        return False, False
 
     def _should_log_closed_candle(
         self, symbol: str, tf: Optional[str], candle: Dict[str, Any]
@@ -813,6 +819,9 @@ class LiveEngineHelpersMixin:
             except Exception:
                 break
             try:
+                s = None
+                p = None
+                ts = None
                 s = tick.get("symbol")
                 p = tick.get("price")
                 v = tick.get("volume", 0)
@@ -823,12 +832,31 @@ class LiveEngineHelpersMixin:
                     self._tick_debug_count += 1
                     now = time.time()
                     if now - self._tick_debug_last_log >= 1800:
-                        msg = f"Tick health: {self._tick_debug_count} ticks in last 5s"
+                        window_sec = int(now - self._tick_debug_last_log)
+                        msg = (
+                            f"Tick health: {self._tick_debug_count} ticks in last "
+                            f"{window_sec}s"
+                        )
                         if self.engine_logger:
-                            self.engine_logger.log("tick_health", msg)
+                            self.engine_logger.log(
+                                "tick_health",
+                                msg,
+                                tick_count=int(self._tick_debug_count),
+                                window_sec=window_sec,
+                            )
                         else:
                             logger.info(msg)
                         self._tick_debug_count = 0
                         self._tick_debug_last_log = now
             except Exception as e:
-                logger.debug("Invalid tick or aggregator error: %s", e)
+                if self.engine_logger:
+                    self.engine_logger.error(
+                        "aggregator_error",
+                        f"Aggregator error for symbol={s}: {e}",
+                        symbol=s,
+                        price=p,
+                        tick_timestamp=ts,
+                        error=str(e),
+                    )
+                else:
+                    logger.exception("Aggregator error for symbol=%s", s)

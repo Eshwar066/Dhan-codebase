@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
+import os
 import time
 from typing import Any, Dict
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
+IST = ZoneInfo("Asia/Kolkata")
 
 
 class IndicatorManager:
@@ -27,6 +31,11 @@ class IndicatorManager:
         # Optional shared indicator cache for explicitly compatible strategies.
         # key: (symbol, timeframe, shared_signature, base_sig)
         self._indicator_cache: Dict[Any, Any] = {}
+        self._startup_logged: bool = False
+        self._rsi_logged_keys = set()
+        self._rsi_seeded_streams = set()
+        self._rsi_log_root = "logs"
+        self._rsi_debug_printed = False
 
     def set_runtime_context(self, exchange: str, sector: str) -> None:
         self._live_exchange = str(exchange or "INDEX")
@@ -131,6 +140,72 @@ class IndicatorManager:
             warmup = 0
         return max(150, warmup + 50)
 
+    @staticmethod
+    def _to_ist_iso(ts: Any) -> str:
+        try:
+            dt_ts = ts
+            if not isinstance(dt_ts, dt.datetime):
+                dt_ts = dt.datetime.fromisoformat(str(ts))
+            if dt_ts.tzinfo is None:
+                dt_ts = dt_ts.replace(tzinfo=dt.timezone.utc)
+            return dt_ts.astimezone(IST).isoformat()
+        except Exception:
+            return ""
+
+    def _append_rsi_history_log(
+        self,
+        strategy_id: str,
+        symbol: str,
+        tf: str,
+        df: Any,
+    ) -> None:
+        if df is None or len(df) == 0:
+            return
+        if "timestamp" not in df.columns or "rsi" not in df.columns:
+            return
+
+        strategy_dir = str(strategy_id or "GLOBAL").strip() or "GLOBAL"
+        log_dir = os.path.join(self._rsi_log_root, strategy_dir)
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, f"{strategy_dir}_rsi_history.log")
+        stream_key = (strategy_id, symbol, tf)
+        seeded = stream_key in self._rsi_seeded_streams
+        rows = [df.iloc[-1]] if seeded else [r for _, r in df.iterrows()]
+
+        for row in rows:
+            ts = row.get("timestamp")
+            if ts is None:
+                continue
+            if hasattr(ts, "to_pydatetime"):
+                ts = ts.to_pydatetime()
+            ist_ts = self._to_ist_iso(ts)
+            if not ist_ts:
+                continue
+            key = (strategy_id, symbol, tf, ist_ts)
+            if key in self._rsi_logged_keys:
+                continue
+            self._rsi_logged_keys.add(key)
+            payload = {
+                # "strategy_id": strategy_id,
+                "symbol": symbol,
+                "timeframe": tf,
+                "source": "live_append" if seeded else "historical_seed",
+                "candle_timestamp_ist": ist_ts,
+                "open": row.get("open"),
+                "high": row.get("high"),
+                "low": row.get("low"),
+                "close": row.get("close"),
+                "rsi": row.get("rsi"),
+                "prev_rsi": row.get("prev_rsi"),
+            }
+            try:
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(payload, default=str) + "\n")
+            except Exception:
+                logger.exception("Failed writing RSI history log: %s", path)
+                return
+        self._rsi_seeded_streams.add(stream_key)
+
     def _bootstrap_base_candle_state(
         self, symbol: str, tf: str, exchange: str, sector: str, window: int
     ) -> Dict[str, Any]:
@@ -151,7 +226,7 @@ class IndicatorManager:
 
         utc_today = dt.datetime.utcnow().date()
         end_business_day = _to_business_day(utc_today)
-        start_business_day = _to_business_day(end_business_day - dt.timedelta(days=365))
+        start_business_day = _to_business_day(end_business_day - dt.timedelta(days=20))
         start_date = start_business_day.strftime("%Y-%m-%d")
         end_date = end_business_day.strftime("%Y-%m-%d")
         df = None
@@ -220,8 +295,15 @@ class IndicatorManager:
         if bucket is None:
             bucket = candle_bucket_fn(candle)
         if bucket is not None and base_state.get("last_bucket") != bucket:
+            # Canonicalize live candle time to bar-open timestamp for continuity checks.
+            # Prefer bucket_ts (seconds since epoch, bar start), then fallback to candle timestamp.
+            row_ts = pd.NaT
+            if bucket is not None:
+                row_ts = pd.to_datetime(bucket, unit="s", utc=True, errors="coerce")
+            if pd.isna(row_ts):
+                row_ts = pd.to_datetime(candle.get("timestamp"), utc=True, errors="coerce")
             row = {
-                "timestamp": pd.to_datetime(candle.get("timestamp"), utc=True, errors="coerce"),
+                "timestamp": row_ts,
                 "open": candle.get("open"),
                 "high": candle.get("high"),
                 "low": candle.get("low"),
@@ -236,6 +318,10 @@ class IndicatorManager:
 
             if len(base_df) > 0 and "timestamp" in base_df.columns:
                 last_hist_ts = pd.to_datetime(base_df.iloc[-1].get("timestamp"), utc=True, errors="coerce")
+                # Reject stale/duplicate live candle that is not strictly newer than history.
+                if not pd.isna(last_hist_ts) and row_ts <= last_hist_ts:
+                    base_state["last_bucket"] = bucket
+                    return dict(candle)
                 # Detect duplicated append attempts from replay/re-entrant paths.
                 if not pd.isna(last_hist_ts) and last_hist_ts == row_ts:
                     base_state["last_bucket"] = bucket
@@ -245,6 +331,17 @@ class IndicatorManager:
                         if not pd.isna(last_hist_ts):
                             tf_secs = self._timeframe_to_seconds(tf)
                             gap = (row_ts - last_hist_ts).total_seconds()
+                            if not self._startup_logged:
+                                logger.info(
+                                    "STARTUP_CONTINUITY_STATE symbol=%s tf=%s last_hist_ts=%s first_live_ts=%s tf_sec=%s bucket_alignment=%.1f",
+                                    symbol,
+                                    tf,
+                                    str(last_hist_ts),
+                                    str(row_ts),
+                                    tf_secs,
+                                    float(gap),
+                                )
+                                self._startup_logged = True
                             if gap <= 0 or gap > (tf_secs * 3):
                                 logger.warning(
                                     "Indicator continuity mismatch: symbol=%s tf=%s last_hist=%s first_live=%s gap_sec=%.1f",
@@ -324,8 +421,28 @@ class IndicatorManager:
                 except Exception:
                     pass
             if self._strategy_requires_rsi(strategy):
+                # Enforce clean monotonic sequence before RSI computation.
+                df = (
+                    df.sort_values("timestamp")
+                    .drop_duplicates(subset=["timestamp"])
+                    .reset_index(drop=True)
+                )
                 period = getattr(strategy, "rsi_period", 14)
                 df = self._compute_rsi_columns(df, period=period)
+                if not self._rsi_debug_printed:
+                    try:
+                        dbg = df.tail(20).copy()
+                        dbg["timestamp_ist"] = dbg["timestamp"].apply(self._to_ist_iso)
+                        print(dbg[["timestamp_ist", "close", "rsi", "prev_rsi"]])
+                    except Exception:
+                        pass
+                    self._rsi_debug_printed = True
+                self._append_rsi_history_log(
+                    strategy_id=str(getattr(strategy, "name", "unknown_strategy")),
+                    symbol=symbol,
+                    tf=tf,
+                    df=df,
+                )
             strategy_state = {"df": df, "base_sig": base_sig}
             self._strategy_indicator_state[strategy_key] = strategy_state
 

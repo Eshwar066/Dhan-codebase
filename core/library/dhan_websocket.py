@@ -32,11 +32,14 @@ logger = logging.getLogger(__name__)
 
 
 def _dhan_market_stall_should_close() -> bool:
-    """Reconnect on stall only during NSE index session; after hours a quiet socket is normal."""
+    """Reconnect on stall only during active Dhan sessions (NSE/MCX)."""
     try:
         from core.utils.session.session_manager import SessionManager
 
-        return SessionManager.is_market_open("INDEX")
+        return bool(
+            SessionManager.is_market_open("INDEX")
+            or SessionManager.is_market_open("MCX")
+        )
     except Exception:
         return True
 
@@ -230,6 +233,7 @@ class DhanWebSocket:
         on_ticker: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         on_quote: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         on_disconnect: Optional[Callable[[int], None]] = None,
+        engine_logger: Optional[Any] = None,
         stall_timeout_seconds: float = 90,
     ):
         """
@@ -244,7 +248,19 @@ class DhanWebSocket:
         self.on_ticker = on_ticker
         self.on_quote = on_quote
         self.on_disconnect = on_disconnect
+        self._engine_logger = engine_logger
         self._stall_timeout_seconds = float(stall_timeout_seconds)
+        # MCX contracts can stay quiet for longer stretches; avoid churn from
+        # aggressive stall closes intended for NSE-like high-frequency ticks.
+        try:
+            segments = {
+                str((inv or {}).get("ExchangeSegment") or "").strip().upper()
+                for inv in self.instruments
+            }
+            if "MCX_COMM" in segments and self._stall_timeout_seconds <= 90.0:
+                self._stall_timeout_seconds = 0.0
+        except Exception:
+            pass
 
         self._ws: Optional[websocket.WebSocketApp] = None
         self._thread: Optional[threading.Thread] = None
@@ -325,6 +341,12 @@ class DhanWebSocket:
         }
         self._send_json(msg)
         logger.debug("Dhan WS subscribe batch size %s", len(batch))
+        if self._engine_logger:
+            self._engine_logger.log(
+                "ws_subscribe_batch",
+                f"Dhan WS subscribe batch size={len(batch)}",
+                batch_size=len(batch),
+            )
 
     def _make_ws_app(self) -> websocket.WebSocketApp:
         return websocket.WebSocketApp(
@@ -349,6 +371,13 @@ class DhanWebSocket:
             sub_gen,
             len(inst),
         )
+        if self._engine_logger:
+            self._engine_logger.log(
+                "ws_subscribed",
+                f"Dhan market WS subscribed generation={sub_gen} instruments={len(inst)}",
+                subscribe_generation=sub_gen,
+                instruments_count=len(inst),
+            )
 
     def _on_binary(self, ws: websocket.WebSocketApp, data: bytes) -> None:
         self._touch_activity()
@@ -399,6 +428,12 @@ class DhanWebSocket:
         elif code == FEED_RESPONSE_DISCONNECT:
             reason = _parse_disconnect_packet(data)
             logger.warning("Dhan WS disconnection packet reason=%s", reason)
+            if self._engine_logger:
+                self._engine_logger.log(
+                    "ws_disconnect_packet",
+                    f"Dhan WS disconnection packet reason={reason}",
+                    reason=reason,
+                )
             if self.on_disconnect:
                 self.on_disconnect(reason or 0)
 
@@ -422,11 +457,23 @@ class DhanWebSocket:
             "Dhan market WebSocket connected (generation=%s); subscribing instruments",
             gen,
         )
+        if self._engine_logger:
+            self._engine_logger.log(
+                "ws_connected",
+                f"Dhan market WebSocket connected generation={gen}",
+                connect_generation=gen,
+            )
         time.sleep(0.5)
         self._subscribe_all()
 
     def _on_error(self, ws: websocket.WebSocketApp, error: Exception) -> None:
         logger.warning("Dhan WebSocket error: %s", error)
+        if self._engine_logger:
+            self._engine_logger.log(
+                "ws_error",
+                f"Dhan WebSocket error: {error}",
+                error=str(error),
+            )
         self._mark_failure(error)
 
     def _on_close(self, ws: websocket.WebSocketApp, close_status_code: Optional[int], close_msg: Optional[str]) -> None:
@@ -435,6 +482,13 @@ class DhanWebSocket:
             close_status_code,
             close_msg,
         )
+        if self._engine_logger:
+            self._engine_logger.log(
+                "ws_closed",
+                f"Dhan market WebSocket closed code={close_status_code} msg={close_msg}",
+                close_status_code=close_status_code,
+                close_msg=close_msg,
+            )
         self._mark_failure(close_msg)
 
     @staticmethod
@@ -458,6 +512,12 @@ class DhanWebSocket:
                 "Dhan market WS entered cooldown after 429 until %s",
                 time.strftime("%H:%M:%S", time.localtime(self._cooldown_until_ts)),
             )
+            if self._engine_logger:
+                self._engine_logger.log(
+                    "ws_cooldown",
+                    "Dhan market WS entered cooldown after 429",
+                    cooldown_until_ts=self._cooldown_until_ts,
+                )
             return
         if len(self._failure_timestamps) >= self._reconnect_guard_threshold:
             self._cooldown_until_ts = max(
@@ -468,6 +528,13 @@ class DhanWebSocket:
                 "Dhan market WS reconnect storm detected; cooling down until %s",
                 time.strftime("%H:%M:%S", time.localtime(self._cooldown_until_ts)),
             )
+            if self._engine_logger:
+                self._engine_logger.log(
+                    "ws_reconnect_storm",
+                    "Dhan market WS reconnect storm detected",
+                    cooldown_until_ts=self._cooldown_until_ts,
+                    failure_count=len(self._failure_timestamps),
+                )
 
     def connect(self) -> None:
         """Start background thread; reconnects with fresh socket and re-subscribes after each drop."""
@@ -487,9 +554,20 @@ class DhanWebSocket:
                 self._thread = None
 
     def _run_forever(self) -> None:
+        gate_exchange = None
+        try:
+            segments = {
+                str((inv or {}).get("ExchangeSegment") or "").strip().upper()
+                for inv in (self.instruments or [])
+            }
+            gate_exchange = "MCX" if "MCX_COMM" in segments else "INDEX"
+        except Exception:
+            gate_exchange = None
         while not self._stop.is_set():
-            if not is_dhan_market_open():
-                sleep_until_next_dhan_market_open(stop_event=self._stop, log=logger.info)
+            if not is_dhan_market_open(exchange=gate_exchange):
+                sleep_until_next_dhan_market_open(
+                    stop_event=self._stop, log=logger.info, exchange=gate_exchange
+                )
                 continue
             now = time.time()
             if now < self._cooldown_until_ts:
@@ -501,9 +579,21 @@ class DhanWebSocket:
             except Exception as e:
                 if not self._stop.is_set():
                     logger.warning("Dhan market WebSocket run_forever: %s", e)
+                    if self._engine_logger:
+                        self._engine_logger.log(
+                            "ws_run_forever_error",
+                            f"Dhan market WebSocket run_forever error: {e}",
+                            error=str(e),
+                        )
             if self._stop.is_set():
                 break
             logger.info("Dhan market WebSocket scheduling reconnect (jittered backoff)")
+            if self._engine_logger:
+                self._engine_logger.log(
+                    "ws_reconnect_scheduled",
+                    "Dhan market WebSocket scheduling reconnect",
+                    reconnect_backoff_sec=self._reconnect_backoff_sec,
+                )
             self._reconnect_backoff_sec = reconnect_sleep_with_jitter(
                 self._reconnect_backoff_sec, cap=self._reconnect_backoff_cap_sec
             )

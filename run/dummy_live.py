@@ -7,6 +7,8 @@ Usage examples:
     python3 -m run.dummy_live --job NiftyIntradayMagicalLine --stall-after 200 --stall-seconds 65
 
     python -m run.dummy_live --job dhan_leaps_rsi --symbols NIFTY --start-time "2026-04-25 09:15:00" --start-tz IST
+    python -m run.dummy_live --job dhan_oi_positional_buy --symbols NIFTY --start-time "2026-04-25 09:15:00" --start-tz IST
+    
 """
 
 from __future__ import annotations

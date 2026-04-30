@@ -9,10 +9,14 @@ Dhan Live Market Feed WebSocket implementing RealtimeFeed.
 
 import time
 import queue
+import logging
 from typing import Any, Dict, List, Optional
 
 from core.data.feeds.base_feed import RealtimeFeed
 from core.library.dhan_websocket import DhanWebSocket
+from core.utils.dhan_tick_time import repair_dhan_tick_unix_seconds, unix_epoch_to_ist_iso
+
+logger = logging.getLogger(__name__)
 
 
 class DhanWebSocketFeed(RealtimeFeed):
@@ -27,6 +31,8 @@ class DhanWebSocketFeed(RealtimeFeed):
         client_id: str,
         instruments: List[Dict[str, str]],
         engine_logger: Optional[Any] = None,
+        debug_mode: bool = False,
+        stall_timeout_seconds: Optional[float] = None,
     ):
         """
         instruments: list of {"ExchangeSegment": "NSE_EQ", "SecurityId": "11536", "symbol": "RELIANCE"}.
@@ -38,7 +44,9 @@ class DhanWebSocketFeed(RealtimeFeed):
         self._ws: Optional[DhanWebSocket] = None
         self._tick_queue: Optional[Any] = None
         self._engine_logger = engine_logger
+        self._debug_mode = bool(debug_mode)
         self._last_tick_ts_by_symbol: Dict[str, float] = {}
+        self._stall_timeout_seconds = stall_timeout_seconds
 
     def set_tick_queue(self, queue: Any) -> None:
         """Push normalized ticks to queue for CandleAggregator. Set before start()."""
@@ -52,14 +60,14 @@ class DhanWebSocketFeed(RealtimeFeed):
             if candidate > 1e12:
                 candidate = candidate / 1e3
             if candidate > 1e9:
-                ts = candidate
+                ts = repair_dhan_tick_unix_seconds(candidate)
 
         # Fallback for stale/invalid broker LTT:
         # - missing/invalid timestamp
         # - too old relative to wall clock
-        # - non-monotonic for this symbol (prevents bucket getting stuck)
+        # - strictly backward non-monotonic tick (allow equal/sub-second advances)
         last = float(self._last_tick_ts_by_symbol.get(symbol, 0.0) or 0.0)
-        if ts is None or (now - ts) > 3.0 or (last > 0 and ts <= last):
+        if ts is None or (now - ts) > 3.0 or (last > 0 and ts < last):
             ts = now
 
         self._last_tick_ts_by_symbol[symbol] = float(ts)
@@ -68,6 +76,7 @@ class DhanWebSocketFeed(RealtimeFeed):
     def _push_tick(self, symbol: str, data: Dict[str, Any]) -> None:
         if self._tick_queue is None:
             return
+        tick_payload: Optional[Dict[str, Any]] = None
         try:
             price = data.get("last_price")
             if price is None:
@@ -75,12 +84,23 @@ class DhanWebSocketFeed(RealtimeFeed):
             price = float(price)
             vol = float(data.get("volume") or data.get("last_traded_quantity") or 0)
             ts = self._normalized_tick_ts(symbol, data.get("last_trade_time"))
-            self._tick_queue.put_nowait({
+            tick_payload = {
                 "symbol": symbol,
                 "price": price,
                 "volume": vol,
                 "timestamp": float(ts),
-            })
+            }
+            self._tick_queue.put_nowait(tick_payload)
+            if self._engine_logger and self._debug_mode:
+                self._engine_logger.log(
+                    "tick_received",
+                    f"Tick received symbol={symbol} price={price}",
+                    symbol=symbol,
+                    price=price,
+                    volume=vol,
+                    tick_timestamp=float(ts),
+                    tick_timestamp_ist=unix_epoch_to_ist_iso(float(ts)),
+                )
         except queue.Full:
             if self._engine_logger:
                 self._engine_logger.log(
@@ -88,14 +108,26 @@ class DhanWebSocketFeed(RealtimeFeed):
                     f"Dhan tick dropped due to full queue symbol={symbol}",
                     symbol=symbol,
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            if self._engine_logger:
+                self._engine_logger.error(
+                    "tick_normalization_failed",
+                    f"Tick normalization failed for symbol={symbol}: {e}",
+                    symbol=symbol,
+                    error=str(e),
+                    raw_tick=str(data)[:300],
+                    normalized_tick=str(tick_payload)[:300] if tick_payload else None,
+                )
+            else:
+                logger.exception("Tick normalization failed for symbol=%s", symbol)
 
     def start(self) -> None:
         if self._ws:
             return
         if not self.instruments:
             return
+        # For some instruments (notably MCX), broker may predominantly emit ticker packets.
+        # Keep both callbacks wired so candle pipeline always receives ticks.
         on_ticker = (lambda s, d: self._push_tick(s, d)) if self._tick_queue else None
         on_quote = (lambda s, d: self._push_tick(s, d)) if self._tick_queue else None
         self._ws = DhanWebSocket(
@@ -104,6 +136,10 @@ class DhanWebSocketFeed(RealtimeFeed):
             instruments=self.instruments,
             on_ticker=on_ticker,
             on_quote=on_quote,
+            engine_logger=self._engine_logger,
+            stall_timeout_seconds=self._stall_timeout_seconds
+            if self._stall_timeout_seconds is not None
+            else 90.0,
         )
         self._ws.connect()
 
