@@ -17,7 +17,7 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     """
 
     name = "LEAPS_RSI"
-    timeframe = "5"
+    timeframe = "60"
     required_context = ["option_chain"]
     api = "DHAN"
     expiryType = "QUARTERLY"

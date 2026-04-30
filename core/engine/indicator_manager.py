@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
+import os
 import time
 from typing import Any, Dict
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
+IST = ZoneInfo("Asia/Kolkata")
 
 
 class IndicatorManager:
@@ -28,6 +32,8 @@ class IndicatorManager:
         # key: (symbol, timeframe, shared_signature, base_sig)
         self._indicator_cache: Dict[Any, Any] = {}
         self._startup_logged: bool = False
+        self._rsi_logged_keys = set()
+        self._rsi_log_root = "logs"
 
     def set_runtime_context(self, exchange: str, sector: str) -> None:
         self._live_exchange = str(exchange or "INDEX")
@@ -131,6 +137,63 @@ class IndicatorManager:
         except Exception:
             warmup = 0
         return max(150, warmup + 50)
+
+    @staticmethod
+    def _to_ist_iso(ts: Any) -> str:
+        try:
+            dt_ts = ts
+            if not isinstance(dt_ts, dt.datetime):
+                dt_ts = dt.datetime.fromisoformat(str(ts))
+            if dt_ts.tzinfo is None:
+                dt_ts = dt_ts.replace(tzinfo=dt.timezone.utc)
+            return dt_ts.astimezone(IST).isoformat()
+        except Exception:
+            return ""
+
+    def _append_rsi_history_log(
+        self,
+        strategy_id: str,
+        symbol: str,
+        tf: str,
+        df: Any,
+    ) -> None:
+        if df is None or len(df) == 0:
+            return
+        if "timestamp" not in df.columns or "rsi" not in df.columns:
+            return
+
+        strategy_dir = str(strategy_id or "GLOBAL").strip() or "GLOBAL"
+        log_dir = os.path.join(self._rsi_log_root, strategy_dir)
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, f"{strategy_dir}_rsi_history.log")
+
+        for _, row in df.iterrows():
+            ts = row.get("timestamp")
+            if ts is None:
+                continue
+            if hasattr(ts, "to_pydatetime"):
+                ts = ts.to_pydatetime()
+            ist_ts = self._to_ist_iso(ts)
+            if not ist_ts:
+                continue
+            key = (strategy_id, symbol, tf, ist_ts)
+            if key in self._rsi_logged_keys:
+                continue
+            self._rsi_logged_keys.add(key)
+            payload = {
+                "strategy_id": strategy_id,
+                "symbol": symbol,
+                "timeframe": tf,
+                "candle_timestamp_ist": ist_ts,
+                "rsi": row.get("rsi"),
+                "prev_rsi": row.get("prev_rsi"),
+            }
+            try:
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(payload, default=str) + "\n")
+            except Exception:
+                logger.exception("Failed writing RSI history log: %s", path)
+                return
 
     def _bootstrap_base_candle_state(
         self, symbol: str, tf: str, exchange: str, sector: str, window: int
@@ -338,6 +401,12 @@ class IndicatorManager:
             if self._strategy_requires_rsi(strategy):
                 period = getattr(strategy, "rsi_period", 14)
                 df = self._compute_rsi_columns(df, period=period)
+                self._append_rsi_history_log(
+                    strategy_id=str(getattr(strategy, "name", "unknown_strategy")),
+                    symbol=symbol,
+                    tf=tf,
+                    df=df,
+                )
             strategy_state = {"df": df, "base_sig": base_sig}
             self._strategy_indicator_state[strategy_key] = strategy_state
 

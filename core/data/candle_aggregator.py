@@ -18,6 +18,8 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from core.utils.dhan_tick_time import unix_epoch_to_ist_iso
+
 # Supported timeframes: 1m base; higher from closed 1m only.
 TIMEFRAME_SECONDS = {
     "1m": 60,
@@ -160,6 +162,8 @@ class CandleAggregator:
                     gap_sec=round(gap_sec, 3),
                     prev_tick_ts=prev_tick_ts,
                     tick_timestamp=ts,
+                    prev_tick_ts_ist=unix_epoch_to_ist_iso(prev_tick_ts),
+                    tick_timestamp_ist=unix_epoch_to_ist_iso(ts),
                 )
         self._last_tick_ts_by_symbol[symbol] = ts
 

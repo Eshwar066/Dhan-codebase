@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 
 from core.data.feeds.base_feed import RealtimeFeed
 from core.library.dhan_websocket import DhanWebSocket
+from core.utils.dhan_tick_time import repair_dhan_tick_unix_seconds, unix_epoch_to_ist_iso
 
 logger = logging.getLogger(__name__)
 
@@ -57,14 +58,14 @@ class DhanWebSocketFeed(RealtimeFeed):
             if candidate > 1e12:
                 candidate = candidate / 1e3
             if candidate > 1e9:
-                ts = candidate
+                ts = repair_dhan_tick_unix_seconds(candidate)
 
         # Fallback for stale/invalid broker LTT:
         # - missing/invalid timestamp
         # - too old relative to wall clock
-        # - non-monotonic for this symbol (prevents bucket getting stuck)
+        # - strictly backward non-monotonic tick (allow equal/sub-second advances)
         last = float(self._last_tick_ts_by_symbol.get(symbol, 0.0) or 0.0)
-        if ts is None or (now - ts) > 3.0 or (last > 0 and ts <= last):
+        if ts is None or (now - ts) > 3.0 or (last > 0 and ts < last):
             ts = now
 
         self._last_tick_ts_by_symbol[symbol] = float(ts)
@@ -96,6 +97,7 @@ class DhanWebSocketFeed(RealtimeFeed):
                     price=price,
                     volume=vol,
                     tick_timestamp=float(ts),
+                    tick_timestamp_ist=unix_epoch_to_ist_iso(float(ts)),
                 )
         except queue.Full:
             if self._engine_logger:
@@ -122,7 +124,9 @@ class DhanWebSocketFeed(RealtimeFeed):
             return
         if not self.instruments:
             return
-        on_ticker = (lambda s, d: self._push_tick(s, d)) if self._tick_queue else None
+        # Quote/full packets carry volume + LTT; ticker-only duplicates the stream and can
+        # alternate LTT interpretations vs quote on the same symbol (false tick gaps).
+        on_ticker = None
         on_quote = (lambda s, d: self._push_tick(s, d)) if self._tick_queue else None
         self._ws = DhanWebSocket(
             access_token=self.access_token,
