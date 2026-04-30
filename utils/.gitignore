@@ -36,6 +36,7 @@
 # Ignore CSV instrument dumps
 /*.csv
 /*.json
+
 /Dependencies/
 /data_cache/
 
@@ -51,3 +52,6 @@
 
 # Prevent duplicate root-level Graphify artifacts.
 ../graphify-out/
+
+# Ignore root runtime logs as well.
+../logs/
