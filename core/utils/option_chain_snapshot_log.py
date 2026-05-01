@@ -12,11 +12,13 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 _ROOT = Path(__file__).resolve().parents[2]
 _LOG_SUBDIR = "logs/option_chain_snapshots"
+IST = ZoneInfo("Asia/Kolkata")
 
 
 def _safe_filename_part(s: str, max_len: int = 64) -> str:
@@ -55,7 +57,8 @@ def log_option_chain_snapshot(
     except OSError:
         return
 
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    # Filename timestamp uses IST for easier local operations/debugging.
+    ts = datetime.now(IST).strftime("%Y%m%d_%H%M%S_%f")
     sym = _safe_filename_part(getattr(ctx, "symbol", None) or "UNK")
     strat = _safe_filename_part(strategy_name or "strategy")
 

@@ -971,6 +971,27 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             strategy_candle = self._enrich_candle_for_strategy(strategy, candle)
             if not strategy.should_evaluate(strategy_candle):
                 continue
+            # >>Signal Generation msg and logger print
+            if self.engine_logger:
+                strategy_id = str(getattr(strategy, "name", "unknown_strategy"))
+                sig_symbol = str(strategy_candle.get("symbol") or candle.get("symbol") or "")
+                try:
+                    sig_rsi = strategy_candle.get("rsi")
+                    sig_prev = strategy_candle.get("prev_rsi")
+                    msg = (
+                        "Signal condition met"
+                        f" rsi={sig_rsi} prev_rsi={sig_prev}"
+                        f" timeframe={getattr(strategy, 'timeframe', '')}"
+                    )
+                except Exception:
+                    msg = "Signal condition met"
+                self.engine_logger.log(
+                    "signal_generated",
+                    msg,
+                    strategy_id=strategy_id,
+                    symbol=sig_symbol,
+                    timeframe=str(getattr(strategy, "timeframe", "") or ""),
+                )
             self._ensure_strategy_worker(strategy)
             strategy_id = str(getattr(strategy, "name", "unknown_strategy"))
             task = {"candle": dict(strategy_candle), "response_q": response_q}
