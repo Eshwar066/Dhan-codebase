@@ -43,6 +43,10 @@ SECONDS_1M = 60
 MAX_CLOSED_LEN = 300
 IST_TZ = timezone(timedelta(hours=5, minutes=30))
 
+# MCX regular session (Asia/Kolkata), aligned with core/utils/session/market_calendar.MARKET_SESSIONS["MCX"].
+MCX_DEFAULT_SESSION_START_SEC = 9 * 3600
+MCX_DEFAULT_SESSION_END_SEC = (23 * 3600) + (30 * 60)
+
 
 def _resolution_to_seconds(resolution: Optional[str]) -> int:
     if resolution is None:
@@ -129,6 +133,74 @@ class CandleAggregator:
         self._higher_tf_seconds: List[int] = [300, 900, 1800, 3600, 7200, 14400, 86400]
         self._last_tick_ts_by_symbol: Dict[str, float] = {}
         self._tick_count_by_symbol_bucket: Dict[str, int] = {}
+        # symbol|YYYY-MM-DD (IST): session-end flush already applied for that local day.
+        self._mcx_session_flush_done: set[str] = set()
+
+    def _prune_mcx_session_flush_keys(self, dt_ist: datetime) -> None:
+        if len(self._mcx_session_flush_done) <= 400:
+            return
+        cutoff = (dt_ist.date() - timedelta(days=14)).isoformat()
+        stale = [k for k in self._mcx_session_flush_done if k.rsplit("|", 1)[-1] < cutoff]
+        for k in stale:
+            self._mcx_session_flush_done.discard(k)
+
+    def flush_mcx_session_end(self, symbol: str, now_unix: float) -> bool:
+        """
+        After MCX cash-session close (IST), finalize in-flight candles without waiting for a
+        post-session tick. Required because the last 1h bar may otherwise stay in ``current``
+        until the next bucket's first tick (often next session).
+
+        Idempotent per symbol per IST calendar day (23:30–23:59 same day). Marks finalized
+        rows with ``session_close_partial`` when the bar was forced at session end.
+        """
+        if self._session_start_sec is None or self._session_end_sec is None:
+            return False
+        sym = str(symbol).strip()
+        if not sym:
+            return False
+        dt_ist = datetime.fromtimestamp(now_unix, IST_TZ)
+        sod = dt_ist.hour * 3600 + dt_ist.minute * 60 + dt_ist.second
+        if sod < self._session_end_sec:
+            return False
+        day_key = dt_ist.strftime("%Y-%m-%d")
+        cache_key = f"{sym}|{day_key}"
+        if cache_key in self._mcx_session_flush_done:
+            return False
+
+        self._prune_mcx_session_flush_keys(dt_ist)
+
+        did_any = False
+        cell_1m = self._state.get(sym, {}).get(SECONDS_1M)
+        if cell_1m and cell_1m.get("current"):
+            closed_1m = dict(cell_1m["current"])
+            closed_1m["session_close_partial"] = True
+            cell_1m["closed"].append(closed_1m)
+            cell_1m["current"] = None
+            old_key = f"{sym}|{closed_1m.get('bucket_ts')}"
+            if old_key in self._tick_count_by_symbol_bucket:
+                del self._tick_count_by_symbol_bucket[old_key]
+            self._propagate_from_closed_1m(sym, closed_1m)
+            did_any = True
+
+        for tf_sec in self._higher_tf_seconds:
+            cell = self._state.get(sym, {}).get(tf_sec)
+            if not cell or not cell.get("current"):
+                continue
+            cur = dict(cell["current"])
+            cur["session_close_partial"] = True
+            cell["closed"].append(cur)
+            cell["current"] = None
+            did_any = True
+
+        self._mcx_session_flush_done.add(cache_key)
+        if did_any and self._engine_logger:
+            self._engine_logger.log(
+                "mcx_session_candle_flush",
+                f"Session-end candle flush symbol={sym} ist_day={day_key}",
+                symbol=sym,
+                ist_day=day_key,
+            )
+        return did_any
 
     def _ensure_symbol_tf(self, symbol: str, tf_seconds: int) -> Dict[str, Any]:
         if symbol not in self._state:

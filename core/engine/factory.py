@@ -31,7 +31,11 @@ from core.data.sources.dhan_source import DhanSource
 from core.data.sources.delta_source import DeltaSource, DELTA_BASE_URL_INDIA_TEST
 from core.data.datalayer import DhanDataProvider, DeltaDataProvider
 from core.data.candle_service import CandleService
-from core.data.candle_aggregator import CandleAggregator
+from core.data.candle_aggregator import (
+    CandleAggregator,
+    MCX_DEFAULT_SESSION_END_SEC,
+    MCX_DEFAULT_SESSION_START_SEC,
+)
 from core.data.feeds import DeltaWebSocketFeed, DhanWebSocketFeed
 from core.data.feeds.dhan_order_update_feed import DhanOrderUpdateFeed
 from core.broker import (
@@ -395,10 +399,11 @@ class EngineFactory:
                                 debug_mode=bool(getattr(config, "debug_mode", False)),
                             )
                         elif is_mcx:
-                            # Anchor hourly buckets at top-of-hour in IST (18:00-19:00, ...).
+                            # MCX regular session (09:00–23:30 IST): anchor intraday/hourly buckets to
+                            # session open; explicit session-end flush finalizes the last partial hour.
                             candle_aggregator = CandleAggregator(
-                                session_start_sec=0,
-                                session_end_sec=24 * 3600,
+                                session_start_sec=MCX_DEFAULT_SESSION_START_SEC,
+                                session_end_sec=MCX_DEFAULT_SESSION_END_SEC,
                                 engine_logger=engine_logger,
                                 debug_mode=bool(getattr(config, "debug_mode", False)),
                             )

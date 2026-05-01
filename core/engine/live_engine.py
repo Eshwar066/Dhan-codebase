@@ -828,6 +828,21 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     return out, f"aggregator_alias:{k}"
         return None, "aggregator:empty"
 
+    # >> Session end candle flush function
+    def _maybe_flush_mcx_session_end_candles(self) -> None:
+        """After MCX 23:30 IST, finalize partial 1h (and other TF) bars without a post-close tick."""
+        if self.market_exchange != "MCX":
+            return
+        ca = self.candle_aggregator
+        if ca is None or not hasattr(ca, "flush_mcx_session_end"):
+            return
+        now_unix = time.time()
+        for symbol in self.symbols:
+            try:
+                ca.flush_mcx_session_end(symbol, now_unix)
+            except Exception:
+                logger.exception("MCX session-end candle flush failed symbol=%s", symbol)
+
     def _enqueue_intent(
         self,
         *,
@@ -1208,6 +1223,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 )
                 if use_aggregator:
                     self._drain_tick_queue()
+                    self._maybe_flush_mcx_session_end_candles()
 
                 for symbol in self.symbols:
                     candle = None
