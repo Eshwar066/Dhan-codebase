@@ -181,7 +181,8 @@ class IndicatorManager:
             ist_ts = self._to_ist_iso(ts)
             if not ist_ts:
                 continue
-            key = (strategy_id, symbol, tf, ist_ts)
+            source = "live_append" if seeded else "historical_seed"
+            key = (strategy_id, symbol, tf, ist_ts, source)
             if key in self._rsi_logged_keys:
                 continue
             self._rsi_logged_keys.add(key)
@@ -189,7 +190,7 @@ class IndicatorManager:
                 # "strategy_id": strategy_id,
                 "symbol": symbol,
                 "timeframe": tf,
-                "source": "live_append" if seeded else "historical_seed",
+                "source": source,
                 "candle_timestamp_ist": ist_ts,
                 "open": row.get("open"),
                 "high": row.get("high"),
@@ -205,6 +206,100 @@ class IndicatorManager:
                 logger.exception("Failed writing RSI history log: %s", path)
                 return
         self._rsi_seeded_streams.add(stream_key)
+
+    def _load_today_live_candles(self, symbol: str, tf: str) -> Any:
+        import pandas as pd
+
+        symbol_u = str(symbol or "").strip().upper()
+        tf_s = str(tf or "").strip()
+        if not symbol_u or not tf_s:
+            return pd.DataFrame()
+
+        ist_today = dt.datetime.now(IST).date()
+        rows = []
+        try:
+            logs_root = self._rsi_log_root
+            if not os.path.isdir(logs_root):
+                return pd.DataFrame()
+            for root, _, files in os.walk(logs_root):
+                for name in files:
+                    if not name.endswith("_candles.log"):
+                        continue
+                    path = os.path.join(root, name)
+                    try:
+                        with open(path, "r", encoding="utf-8") as f:
+                            for line in f:
+                                s = line.strip()
+                                if not s:
+                                    continue
+                                try:
+                                    payload = json.loads(s)
+                                except Exception:
+                                    continue
+                                if str(payload.get("event_type") or "") != "candle_closed":
+                                    continue
+                                if str(payload.get("symbol") or "").strip().upper() != symbol_u:
+                                    continue
+                                if str(payload.get("timeframe") or "").strip() != tf_s:
+                                    continue
+                                bar_ist = payload.get("bar_timestamp_ist")
+                                if not bar_ist:
+                                    continue
+                                try:
+                                    bar_dt = dt.datetime.fromisoformat(str(bar_ist))
+                                except Exception:
+                                    continue
+                                if bar_dt.tzinfo is None:
+                                    bar_dt = bar_dt.replace(tzinfo=IST)
+                                if bar_dt.astimezone(IST).date() != ist_today:
+                                    continue
+                                rows.append(
+                                    {
+                                        "timestamp": bar_dt.astimezone(dt.timezone.utc),
+                                        "open": payload.get("open"),
+                                        "high": payload.get("high"),
+                                        "low": payload.get("low"),
+                                        "close": payload.get("close"),
+                                        "volume": payload.get("volume", 0),
+                                        "symbol": symbol,
+                                        "exchange": payload.get("exchange"),
+                                    }
+                                )
+                    except Exception:
+                        continue
+        except Exception:
+            return pd.DataFrame()
+        if not rows:
+            return pd.DataFrame()
+        out = pd.DataFrame(rows)
+        out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
+        out = out.dropna(subset=["timestamp"]).sort_values("timestamp")
+        out = out.drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
+        return out
+
+    def _merge_today_live_candles(self, df: Any, symbol: str, tf: str) -> Any:
+        import pandas as pd
+
+        if df is None or len(df) == 0 or "timestamp" not in df.columns:
+            return df
+        live_df = self._load_today_live_candles(symbol, tf)
+        if live_df is None or len(live_df) == 0:
+            return df
+
+        hist = df.copy()
+        hist["timestamp"] = pd.to_datetime(hist["timestamp"], utc=True, errors="coerce")
+        hist = hist.dropna(subset=["timestamp"])
+
+        # Live closed-candle log is source of truth for current-day candles.
+        merged = hist.set_index("timestamp")
+        live = live_df.set_index("timestamp")
+        merged.update(live)
+        live_only = live.loc[~live.index.isin(merged.index)]
+        if len(live_only) > 0:
+            merged = pd.concat([merged, live_only], axis=0)
+        merged = merged.reset_index().sort_values("timestamp")
+        merged = merged.drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
+        return merged
 
     def _bootstrap_base_candle_state(
         self, symbol: str, tf: str, exchange: str, sector: str, window: int
@@ -256,6 +351,7 @@ class IndicatorManager:
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
             df = df.dropna(subset=["timestamp"]).reset_index(drop=True)
+        df = self._merge_today_live_candles(df, symbol, tf)
         if "symbol" not in df.columns:
             df["symbol"] = symbol
         if "exchange" not in df.columns:
@@ -268,6 +364,7 @@ class IndicatorManager:
             "df": df,
             "last_bucket": None,
             "window": window,
+            "update_seq": 0,
         }
         self._base_candle_state[key] = state
         return state
@@ -318,13 +415,19 @@ class IndicatorManager:
 
             if len(base_df) > 0 and "timestamp" in base_df.columns:
                 last_hist_ts = pd.to_datetime(base_df.iloc[-1].get("timestamp"), utc=True, errors="coerce")
-                # Reject stale/duplicate live candle that is not strictly newer than history.
-                if not pd.isna(last_hist_ts) and row_ts <= last_hist_ts:
+                # Reject stale live candle older than history.
+                if not pd.isna(last_hist_ts) and row_ts < last_hist_ts:
                     base_state["last_bucket"] = bucket
                     return dict(candle)
-                # Detect duplicated append attempts from replay/re-entrant paths.
+                # If candle timestamp matches last history row, replace last row with live OHLC.
+                # This keeps continuity and fixes close/RSI drift on boundary buckets.
                 if not pd.isna(last_hist_ts) and last_hist_ts == row_ts:
+                    last_idx = base_df.index[-1]
+                    for col, value in row.items():
+                        base_df.at[last_idx, col] = value
+                    base_state["df"] = base_df
                     base_state["last_bucket"] = bucket
+                    base_state["update_seq"] = int(base_state.get("update_seq", 0)) + 1
                 else:
                     # One-shot continuity validation between bootstrap history and first live append.
                     if not base_state.get("continuity_checked", False):
@@ -358,6 +461,7 @@ class IndicatorManager:
                         base_df = base_df.iloc[-int(base_state.get("window") or window) :].reset_index(drop=True)
                     base_state["df"] = base_df
                     base_state["last_bucket"] = bucket
+                    base_state["update_seq"] = int(base_state.get("update_seq", 0)) + 1
             else:
                 base_df = pd.concat([base_df, pd.DataFrame([row])], ignore_index=True)
                 if len(base_df) > int(base_state.get("window") or window):
@@ -365,6 +469,7 @@ class IndicatorManager:
                 base_state["df"] = base_df
                 base_state["last_bucket"] = bucket
                 base_state["continuity_checked"] = True
+                base_state["update_seq"] = int(base_state.get("update_seq", 0)) + 1
 
         strategy_key = self._key_strategy_symbol_tf(strategy, symbol, tf)
         strategy_state = self._strategy_indicator_state.get(strategy_key)
@@ -372,7 +477,11 @@ class IndicatorManager:
         base_last_ts = None
         if base_df_for_sig is not None and len(base_df_for_sig) > 0 and "timestamp" in base_df_for_sig.columns:
             base_last_ts = base_df_for_sig.iloc[-1].get("timestamp")
-        base_sig = (base_state.get("last_bucket"), base_last_ts)
+        base_sig = (
+            base_state.get("last_bucket"),
+            base_last_ts,
+            int(base_state.get("update_seq", 0)),
+        )
         if strategy_state is None or strategy_state.get("base_sig") != base_sig:
             df = base_state.get("df")
             if df is None or len(df) == 0:
