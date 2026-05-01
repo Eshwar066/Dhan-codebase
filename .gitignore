@@ -2,7 +2,8 @@
 # Logs
 # ----------------------------
 /log_files/
-/*.log
+/*.logs
+
 # Runtime OMS snapshots (regenerated per engine; do not commit)
 /logs/order_state_delta_*.json
 
@@ -10,16 +11,19 @@
 # Python cache
 # ----------------------------
 /__pycache__/
+**/__pycache__/
 
 /*.pyc
 /*.pyo
+*.py[cod]
+*$py.class
 
 # ----------------------------
 # Environment / secrets
 # ----------------------------
-/.env
-/venv/
-/.venv/
+.env
+venv/
+.venv/
 /*.key
 /*.token
 
@@ -56,3 +60,4 @@
 
 # Ignore root runtime logs as well.
 ../logs/
+/logs/
