@@ -4,6 +4,7 @@ from typing import Any, Optional
 
 import pandas as pd
 
+from core.models.strategy_context import StrategyContext
 from core.strategies.IndiaMktMixins import IST, IndiaMktMixins
 from core.strategies.base import BaseStrategy
 
@@ -36,6 +37,38 @@ class OptionBuildup(IndiaMktMixins, BaseStrategy):
     def should_evaluate(self, candle: dict) -> bool:
         ts_ist = self._candle_ts_ist(candle)
         return int(ts_ist.minute) % 5 == 0
+
+    def run_snapshot_cycle(
+        self,
+        *,
+        symbol: str,
+        exchange: str,
+        spot_price: float,
+        ts_utc: Any,
+        option_chain_service: Any,
+    ) -> None:
+        """
+        Direct scheduler entrypoint: no engine candle/websocket dependency.
+        """
+        candle = {
+            "symbol": str(symbol),
+            "exchange": str(exchange),
+            "close": float(spot_price),
+            "timestamp": pd.Timestamp(ts_utc),
+        }
+        ctx = StrategyContext(
+            symbol=str(symbol),
+            exchange=str(exchange),
+            timestamp=pd.Timestamp(ts_utc).to_pydatetime(),
+            spot_price=float(spot_price),
+            instrument_store=None,
+            position_store=None,
+            option_chain_service=option_chain_service,
+        )
+        if not self.should_evaluate(candle):
+            return
+        self.get_option_chain_snapshot(candle, ctx, "CE")
+        self.get_option_chain_snapshot(candle, ctx, "PE")
 
 
     def _candle_ts_ist(self, candle: dict) -> pd.Timestamp:

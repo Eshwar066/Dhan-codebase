@@ -659,6 +659,48 @@ class IndiaMktMixins:
 
         return otm_strikes
 
+    def get_option_chain_snapshot(self, candle, ctx, option_type):
+        otm_strikes = self.fetch_option_chain(candle, ctx, option_type)
+        if not otm_strikes:
+            return None
+        params = {
+            "exchange": ctx.exchange,
+            "interval": self.timeframe,
+            "expiry_code": ctx.selected_expiry,
+            "instrument": "OPTIDX",
+            "expiry_flag": "MONTH",
+        }
+        if self.api != "DHAN":
+            strike_param = otm_strikes
+            if strike_param and isinstance(strike_param[0], (int, float)):
+                strike_param = [str(int(s)) for s in otm_strikes]
+            params.update(
+                {
+                    "strike": strike_param,
+                    "option_type": option_type,
+                    "exchangeSegment": "NSE_FNO",
+                    "securityId": "13",
+                }
+            )
+        extra_snapshot_params = self._find_strike_snapshot_params(
+            candle=candle, ctx=ctx, option_type=option_type
+        )
+        if isinstance(extra_snapshot_params, dict) and extra_snapshot_params:
+            params.update(extra_snapshot_params)
+        chain = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
+        if bool(params.get("snapshot", False)):
+            try:
+                log_option_chain_snapshot(
+                    chain,
+                    ctx=ctx,
+                    strategy_name=getattr(self, "name", "") or "",
+                    api=self.api,
+                    params=params,
+                )
+            except Exception:
+                pass
+        return chain
+
     def find_strike_in_premium_range(
         self,
         candle,

@@ -1,0 +1,70 @@
+# Python bytecode / cache
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+core/utils/instruments/__pycache__/base.cpython-314.pyc
+core/utils/__pycache__/lag_diag.cpython-314.pyc
+
+# JSON artifacts
+*.json
+
+
+# ----------------------------
+# Logs
+# ----------------------------
+/log_files/
+/logs/
+# Runtime OMS snapshots (regenerated per engine; do not commit)
+/logs/order_state_delta_*.json
+
+# ----------------------------
+# Python cache
+# ----------------------------
+/__pycache__/
+/*.pyc
+/*.pyo
+
+# ----------------------------
+# Environment / secrets
+# ----------------------------
+/.env
+/venv/
+/.venv/
+/*.key
+/*.token
+
+# ----------------------------
+# Excel temp files
+# ----------------------------
+/~$*.xlsx
+
+# ----------------------------
+# OS files
+# ----------------------------
+/.DS_Store
+/Thumbs.db
+
+# Ignore CSV instrument dumps
+/*.csv
+/*.json
+
+/Dependencies/
+/data_cache/
+
+# ----------------------------
+# Graphify (AST knowledge graph; regenerate from utils: graphify update .)
+# Ignore volatile/large artifacts. Safe to commit utils/graphify-out/GRAPH_REPORT.md (and wiki/ if present).
+# ----------------------------
+/graphify-out/cache/
+/graphify-out/graph.json
+/graphify-out/graph.html
+/logger/graphify-out/
+/logger/__pycache__/
+
+# Prevent duplicate root-level Graphify artifacts.
+../graphify-out/
+
+# Ignore root runtime logs as well.
+../logs/
