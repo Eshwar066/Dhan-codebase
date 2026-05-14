@@ -12,11 +12,18 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+try:
+    from core.utils.json_numeric import round_json_floats
+except ImportError:
+    round_json_floats = None  # type: ignore
+
 _ROOT = Path(__file__).resolve().parents[2]
 _LOG_SUBDIR = "logs/option_chain_snapshots"
+IST = ZoneInfo("Asia/Kolkata")
 _OPTION_BUILDUP_SUBDIR = "logs/option_buildup"
 
 
@@ -69,6 +76,11 @@ def log_option_chain_snapshot(
     except OSError:
         return
 
+    # Filename timestamp uses IST for easier local operations/debugging.
+    ts = datetime.now(IST).strftime("%Y%m%d_%H%M%S_%f")
+    sym = _safe_filename_part(getattr(ctx, "symbol", None) or "UNK")
+    strat = _safe_filename_part(strategy_name or "strategy")
+
     df: Optional[pd.DataFrame] = None
     meta: dict[str, Any] = {}
 
@@ -115,9 +127,9 @@ def log_option_chain_snapshot(
 
     try:
         if path.exists():
-            df_out.to_csv(path, index=False, encoding="utf-8", mode="a", header=False)
+            df_out.to_csv(path, index=False, encoding="utf-8", mode="a", header=False, float_format="%.2f")
         else:
-            df_out.to_csv(path, index=False, encoding="utf-8")
+            df_out.to_csv(path, index=False, encoding="utf-8", float_format="%.2f")
     except OSError:
         return
 
@@ -125,6 +137,7 @@ def log_option_chain_snapshot(
         try:
             ppath = path.with_suffix(".params.json")
             with open(ppath, "w", encoding="utf-8") as f:
-                json.dump(params, f, indent=2, default=str)
+                pout = round_json_floats(params) if round_json_floats else params
+                json.dump(pout, f, indent=2, default=str)
         except (OSError, TypeError):
             pass

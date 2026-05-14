@@ -5,6 +5,11 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 import pdb
 
+try:
+    from core.utils.json_numeric import round_json_floats
+except ImportError:
+    round_json_floats = None  # type: ignore
+
 BASE = "https://www.nseindia.com"
 EXPIRY_API = "/api/historicalOR/meta/foCPV/expireDts"
 HISTORICAL_API = "/api/historicalOR/foCPV"
@@ -45,7 +50,8 @@ class NSEClient:
         path = self._cache_path(name)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+            to_save = round_json_floats(data) if round_json_floats else data
+            json.dump(to_save, f, indent=2)
 
     # =========================================================
     # ✅ EXPIRIES

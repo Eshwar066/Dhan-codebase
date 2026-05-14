@@ -48,7 +48,7 @@ class DhanInstrumentProvider:
                     .str.strip()
                     .str.replace(r"\s+", " ", regex=True)
                 )
-            df.to_csv(self.csv_path, index=False)
+            df.to_csv(self.csv_path, index=False, float_format="%.2f")
         except Exception as e:
             logger.warning("Could not auto-download Dhan instrument master: %s", e)
 

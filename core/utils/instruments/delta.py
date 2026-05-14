@@ -78,7 +78,7 @@ class DeltaInstrumentStore(BaseInstrumentStore):
                         old.unlink()
                     except OSError:
                         pass
-                self.df.to_csv(cache, index=False)
+                self.df.to_csv(cache, index=False, float_format="%.2f")
         self._symbol_to_row = {}
         if not self.df.empty and "symbol" in self.df.columns:
             for idx, row in self.df.iterrows():

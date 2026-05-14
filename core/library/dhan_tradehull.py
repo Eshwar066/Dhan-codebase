@@ -553,7 +553,7 @@ class Tradehull:
                     .str.strip()
                     .str.replace(r"\s+", " ", regex=True)
                 )
-                instrument_df.to_csv("Dependencies\\" + expected_file)
+                instrument_df.to_csv("Dependencies\\" + expected_file, float_format="%.2f")
         else:
             # this will fetch instrument_df file from Dhan
             print("This BOT Is Picking New File From Dhan")
@@ -565,7 +565,7 @@ class Tradehull:
                 .str.strip()
                 .str.replace(r"\s+", " ", regex=True)
             )
-            instrument_df.to_csv("Dependencies\\" + expected_file)
+            instrument_df.to_csv("Dependencies\\" + expected_file, float_format="%.2f")
         return instrument_df
 
     def correct_step_df_creation(self):

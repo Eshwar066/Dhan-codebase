@@ -2,7 +2,7 @@
 Structured JSON logging per engine. One file per engine: logs/{engine_id}.log.
 Closed candles: logs/{engine_id}_candles.log (see candle_created).
 No print(); all events logged as one JSON object per line.
-Event ``timestamp`` field is Asia/Kolkata (IST, ISO-8601 with offset).
+For ``candle_closed`` rows, ``timestamp`` and ``bar_timestamp_ist`` use IST wall time as ``YYYY-MM-DD HH:MM`` (no seconds). Other events still use full ISO-8601 with offset in ``timestamp``.
 """
 
 import json
@@ -19,7 +19,13 @@ try:
 except ImportError:
     _resolution_to_seconds = None  # type: ignore
 
+try:
+    from core.utils.json_numeric import round_json_floats
+except ImportError:
+    round_json_floats = None  # type: ignore
+
 IST = ZoneInfo("Asia/Kolkata")
+IST_MINUTE_FMT = "%Y-%m-%d %H:%M"
 
 LOGS_DIR = "logs"
 REPORTS_DIR = "reports"
@@ -83,6 +89,7 @@ TELEGRAM_ALERT_EVENTS = {
     "order_rejected",
     "risk_block",
     "kill_switch",
+    "candle_closed",
 }
 
 
@@ -228,6 +235,8 @@ class EngineLogger:
             )
         payload = self._payload(event_type, message=message, **kwargs)
         self._validate_correlation(payload)
+        if round_json_floats is not None:
+            payload = round_json_floats(payload)
         line = json.dumps(payload, default=str) + "\n"
         with self._lock:
             os.makedirs(self._log_dir, exist_ok=True)
@@ -270,6 +279,27 @@ class EngineLogger:
         msg = str(payload.get("message") or "").strip()
         if msg:
             parts.append(f"msg={msg}")
+        if event_type == "candle_closed":
+            tf = payload.get("timeframe")
+            if tf is not None:
+                parts.append(f"tf={tf}")
+            bar_ist = payload.get("bar_timestamp_ist")
+            if bar_ist:
+                parts.append(f"bar={bar_ist}")
+            o, h, l, c = (
+                payload.get("open"),
+                payload.get("high"),
+                payload.get("low"),
+                payload.get("close"),
+            )
+            if any(v is not None for v in (o, h, l, c)):
+                parts.append(f"O={o} H={h} L={l} C={c}")
+            rsi = payload.get("rsi")
+            if rsi is not None:
+                parts.append(f"rsi={rsi}")
+            prev = payload.get("prev_rsi")
+            if prev is not None:
+                parts.append(f"prev_rsi={prev}")
         try:
             self._telegram_alert(" | ".join(parts))
         except Exception:
@@ -367,6 +397,28 @@ class EngineLogger:
         except Exception:
             return None
 
+    @staticmethod
+    def _to_ist_minute_str(dt_ist: datetime) -> str:
+        """IST wall time as ``YYYY-MM-DD HH:MM`` (no seconds, no offset)."""
+        return dt_ist.astimezone(IST).replace(second=0, microsecond=0).strftime(IST_MINUTE_FMT)
+
+    @staticmethod
+    def _bar_timestamp_to_ist_minute(ts: Any) -> Optional[str]:
+        """Bar open instant in IST, minute resolution (matches RSI history log style)."""
+        raw = EngineLogger._bar_timestamp_to_ist_iso(ts)
+        if not raw:
+            return None
+        try:
+            s = raw.strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            parsed = datetime.fromisoformat(s)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return EngineLogger._to_ist_minute_str(parsed)
+        except Exception:
+            return None
+
     def candle_created(
         self,
         candle: Dict[str, Any],
@@ -375,10 +427,6 @@ class EngineLogger:
     ) -> None:
         """Append one JSON line per closed candle to logs/{engine_id}_candles.log."""
         ts = candle.get("timestamp")
-        if isinstance(ts, datetime):
-            ts_out = ts.isoformat()
-        else:
-            ts_out = ts
         tf_sec = None
         if _resolution_to_seconds is not None and timeframe is not None:
             try:
@@ -391,19 +439,19 @@ class EngineLogger:
         bt = candle.get("bucket_ts")
         if bt is not None:
             try:
-                bar_ts_ist = self._bar_timestamp_to_ist_iso(float(bt))
+                bar_ts_ist = self._bar_timestamp_to_ist_minute(float(bt))
             except Exception:
                 bar_ts_ist = None
         if bar_ts_ist is None:
-            bar_ts_ist = self._bar_timestamp_to_ist_iso(ts)
+            bar_ts_ist = self._bar_timestamp_to_ist_minute(ts)
 
         payload = self._payload(
             "candle_closed",
             message="Closed candle",
             symbol=candle.get("symbol"),
             timeframe=timeframe,
-            tf_sec=tf_sec,
             source=source,
+            bar_timestamp_ist=bar_ts_ist,
             open=candle.get("open"),
             high=candle.get("high"),
             low=candle.get("low"),
@@ -412,13 +460,17 @@ class EngineLogger:
             bucket_ts=candle.get("bucket_ts"),
             rsi=candle.get("rsi"),
             prev_rsi=candle.get("prev_rsi"),
-            bar_timestamp_ist=bar_ts_ist,
-            exchange=candle.get("exchange"),
+            # tf_sec=tf_sec,
+            # exchange=candle.get("exchange"),
         )
+        payload["timestamp"] = self._to_ist_minute_str(datetime.now(IST))
+        if round_json_floats is not None:
+            payload = round_json_floats(payload)
         line = json.dumps(payload, default=str) + "\n"
         with self._lock:
             os.makedirs(self._log_dir, exist_ok=True)
             self._emit_line(self._candles_path, line)
+        self._send_telegram_alert(payload)
 
     def order_placed(
         self,

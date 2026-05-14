@@ -34,10 +34,10 @@ ENGINE_JOBS = [
         "run_mode": "PAPER",
         "capital": 200000,
         "ORDER_QTY_LOTS": 1,
-        # "symbols": ["NIFTY"],
-        # "exchange": "NSE",
-        "symbols": ["GOLD"],
-        "exchange": "MCX",
+        "symbols": ["NIFTY"],
+        "exchange": "NSE",
+        # "symbols": ["GOLD"],
+        # "exchange": "MCX",
         "market_ws_stall_timeout_seconds": 0,
         "telegram": {
             "bot_token": "8663481671:AAHY-OnE8OiaJmkOfXbwqoe4InosJVblAtM",
@@ -45,8 +45,8 @@ ENGINE_JOBS = [
         },
         
         "strategies": ["LEAPS_RSI",], #"NiftyIntradayMagicalLine"
-        # "live": {"exchange": "INDEX", "sector": "YES", "rsi": "YES"},
-        "live": {"exchange": "MCX", "sector": "NO", "rsi": "YES"},
+        "live": {"exchange": "INDEX", "sector": "YES", "rsi": "YES"},
+        # "live": {"exchange": "MCX", "sector": "NO", "rsi": "YES"},
         "backtest": {
             "start_date": "2026-04-24",
             "end_date": "2026-04-24",

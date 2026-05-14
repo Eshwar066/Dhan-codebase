@@ -6,6 +6,11 @@ import time
 from collections import deque
 from typing import Any, Callable, Dict, Optional, Tuple
 
+try:
+    from core.utils.json_numeric import round_json_floats
+except ImportError:
+    round_json_floats = None  # type: ignore
+
 
 class ExecutionEngine:
     """
@@ -172,8 +177,9 @@ class ExecutionEngine:
                 "status": status,
                 "execution_attempt_id": item.get("execution_attempt_id"),
             }
+            jl = round_json_floats(line) if round_json_floats else line
             with open(self._intent_journal_path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(line) + "\n")
+                fh.write(json.dumps(jl, default=str) + "\n")
         except Exception:
             pass
 

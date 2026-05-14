@@ -12,6 +12,11 @@ import datetime
 
 logger = logging.getLogger(__name__)
 
+try:
+    from core.utils.json_numeric import round_json_floats
+except ImportError:
+    round_json_floats = None  # type: ignore
+
 from core.orderExecution.intent_store import IntentStatus
 
 
@@ -155,8 +160,9 @@ class OrderRouter:
             }
             log = getattr(self, "_order_state_log", [])
             data = {"states": states, "log": log}
+            to_save = round_json_floats(data) if round_json_floats else data
             with open(self._order_state_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+                json.dump(to_save, f, indent=2)
         except OSError:
             pass
 

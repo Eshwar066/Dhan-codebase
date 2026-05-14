@@ -32,7 +32,7 @@ def get_provider_for_path(
             raw = delta.fetch_products()
             if not raw.empty:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                raw.to_csv(path, index=False)
+                raw.to_csv(path, index=False, float_format="%.2f")
         return delta
 
     if path.exists():
@@ -44,5 +44,5 @@ def get_provider_for_path(
         raw = delta.fetch_products()
         if not raw.empty:
             path.parent.mkdir(parents=True, exist_ok=True)
-            raw.to_csv(path, index=False)
+            raw.to_csv(path, index=False, float_format="%.2f")
     return delta

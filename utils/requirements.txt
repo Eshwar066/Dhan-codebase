@@ -2,6 +2,7 @@ python-dotenv
 requests
 pandas
 numpy
+yfinance
 TA-Lib
 websocket-client
 websockets

@@ -828,6 +828,26 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     return out, f"aggregator_alias:{k}"
         return None, "aggregator:empty"
 
+    # >> Session end candle flush function
+    def _maybe_flush_session_end_candles(self) -> None:
+        """
+        After configured session close (e.g. NSE 15:30 IST, MCX 23:30 IST), finalize in-flight
+        candles without waiting for a post-close tick. No-op when the aggregator has no session
+        bounds (``flush_session_end`` returns immediately).
+        """
+        ca = self.candle_aggregator
+        if ca is None:
+            return
+        flush_fn = getattr(ca, "flush_session_end", None) or getattr(ca, "flush_mcx_session_end", None)
+        if not callable(flush_fn):
+            return
+        now_unix = time.time()
+        for symbol in self.symbols:
+            try:
+                flush_fn(symbol, now_unix)
+            except Exception:
+                logger.exception("Session-end candle flush failed symbol=%s", symbol)
+
     def _enqueue_intent(
         self,
         *,
@@ -971,6 +991,27 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             strategy_candle = self._enrich_candle_for_strategy(strategy, candle)
             if not strategy.should_evaluate(strategy_candle):
                 continue
+            # >>Signal Generation msg and logger print
+            if self.engine_logger:
+                strategy_id = str(getattr(strategy, "name", "unknown_strategy"))
+                sig_symbol = str(strategy_candle.get("symbol") or candle.get("symbol") or "")
+                try:
+                    sig_rsi = strategy_candle.get("rsi")
+                    sig_prev = strategy_candle.get("prev_rsi")
+                    msg = (
+                        "Signal condition met"
+                        f" rsi={sig_rsi} prev_rsi={sig_prev}"
+                        f" timeframe={getattr(strategy, 'timeframe', '')}"
+                    )
+                except Exception:
+                    msg = "Signal condition met"
+                self.engine_logger.log(
+                    "signal_generated",
+                    msg,
+                    strategy_id=strategy_id,
+                    symbol=sig_symbol,
+                    timeframe=str(getattr(strategy, "timeframe", "") or ""),
+                )
             self._ensure_strategy_worker(strategy)
             strategy_id = str(getattr(strategy, "name", "unknown_strategy"))
             task = {"candle": dict(strategy_candle), "response_q": response_q}
@@ -1187,6 +1228,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 )
                 if use_aggregator:
                     self._drain_tick_queue()
+                    self._maybe_flush_session_end_candles()
 
                 for symbol in self.symbols:
                     candle = None
@@ -1544,8 +1586,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             {
                                 "symbol": sym,
                                 "qty": pos.net_qty,
-                                "avg_price": pos.avg_price,
-                                "realized_pnl": pos.realized_pnl,
+                                "avg_price": round(float(pos.avg_price), 2),
+                                "realized_pnl": round(float(pos.realized_pnl), 2),
                             }
                         )
         except Exception:
