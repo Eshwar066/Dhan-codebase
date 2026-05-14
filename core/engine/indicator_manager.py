@@ -176,13 +176,21 @@ class IndicatorManager:
             ts = row.get("timestamp")
             if ts is None:
                 continue
+
             if hasattr(ts, "to_pydatetime"):
                 ts = ts.to_pydatetime()
+
             ist_ts = self._to_ist_iso(ts)
+
             if not ist_ts:
                 continue
+
+            # remove seconds and timezone
+            ist_ts = datetime.fromisoformat(ist_ts).strftime("%Y-%m-%d %H:%M")
+
             source = "live_append" if seeded else "historical_seed"
             key = (strategy_id, symbol, tf, ist_ts, source)
+
             if key in self._rsi_logged_keys:
                 continue
             self._rsi_logged_keys.add(key)
@@ -192,9 +200,9 @@ class IndicatorManager:
                 "timeframe": tf,
                 "source": source,
                 "candle_timestamp_ist": ist_ts,
-                "open": row.get("open"),
-                "high": row.get("high"),
-                "low": row.get("low"),
+                # "open": row.get("open"),
+                # "high": row.get("high"),
+                # "low": row.get("low"),
                 "close": row.get("close"),
                 "rsi": row.get("rsi"),
                 "prev_rsi": row.get("prev_rsi"),

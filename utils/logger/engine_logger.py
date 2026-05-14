@@ -83,6 +83,7 @@ TELEGRAM_ALERT_EVENTS = {
     "order_rejected",
     "risk_block",
     "kill_switch",
+    "candle_closed",
 }
 
 
@@ -270,6 +271,27 @@ class EngineLogger:
         msg = str(payload.get("message") or "").strip()
         if msg:
             parts.append(f"msg={msg}")
+        if event_type == "candle_closed":
+            tf = payload.get("timeframe")
+            if tf is not None:
+                parts.append(f"tf={tf}")
+            bar_ist = payload.get("bar_timestamp_ist")
+            if bar_ist:
+                parts.append(f"bar={bar_ist}")
+            o, h, l, c = (
+                payload.get("open"),
+                payload.get("high"),
+                payload.get("low"),
+                payload.get("close"),
+            )
+            if any(v is not None for v in (o, h, l, c)):
+                parts.append(f"O={o} H={h} L={l} C={c}")
+            rsi = payload.get("rsi")
+            if rsi is not None:
+                parts.append(f"rsi={rsi}")
+            prev = payload.get("prev_rsi")
+            if prev is not None:
+                parts.append(f"prev_rsi={prev}")
         try:
             self._telegram_alert(" | ".join(parts))
         except Exception:
@@ -419,6 +441,7 @@ class EngineLogger:
         with self._lock:
             os.makedirs(self._log_dir, exist_ok=True)
             self._emit_line(self._candles_path, line)
+        self._send_telegram_alert(payload)
 
     def order_placed(
         self,
