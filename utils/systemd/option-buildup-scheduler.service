@@ -1,0 +1,21 @@
+[Unit]
+Description=Option buildup 5m scheduler (python -m run.option_buildup_scheduler)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/Dhan-codebase
+EnvironmentFile=-/root/Dhan-codebase/.env
+# Uses DHAN_CLIENT_CODE and DHAN_ACCESS_TOKEN from .env (see DhanSource).
+# Adjust --symbols / --exchange / add --all-day on the ExecStart line as needed.
+ExecStart=/root/Dhan-codebase/.venv/bin/python -m run.option_buildup_scheduler --symbols NIFTY --exchange NSE
+Restart=always
+RestartSec=20
+TimeoutStopSec=120
+StandardOutput=append:/root/Dhan-codebase/logs/option_buildup_scheduler.out.log
+StandardError=append:/root/Dhan-codebase/logs/option_buildup_scheduler.err.log
+
+[Install]
+WantedBy=multi-user.target
