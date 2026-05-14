@@ -1586,8 +1586,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             {
                                 "symbol": sym,
                                 "qty": pos.net_qty,
-                                "avg_price": pos.avg_price,
-                                "realized_pnl": pos.realized_pnl,
+                                "avg_price": round(float(pos.avg_price), 2),
+                                "realized_pnl": round(float(pos.realized_pnl), 2),
                             }
                         )
         except Exception:

@@ -14,6 +14,11 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
+try:
+    from core.utils.json_numeric import round_json_floats
+except ImportError:
+    round_json_floats = None  # type: ignore
+
 IST = ZoneInfo("Asia/Kolkata")
 
 def _parse_net_qty(raw: Optional[str]) -> int:
@@ -191,7 +196,8 @@ class OpenPositionsLogger:
         sm_obj = None
         if sm is not None and not isinstance(sm, str):
             sm_obj = sm
-            out["strategy_meta"] = json.dumps(sm, default=str)
+            sm_r = round_json_floats(sm) if round_json_floats else sm
+            out["strategy_meta"] = json.dumps(sm_r, default=str)
         elif isinstance(sm, str) and sm.strip():
             try:
                 sm_obj = json.loads(sm)
@@ -212,6 +218,11 @@ class OpenPositionsLogger:
                     )
                 if out.get("level", "") in ("", None):
                     out["level"] = odml.get("level", "")
+        if out.get("avg_price", "") not in ("", None):
+            try:
+                out["avg_price"] = round(float(out["avg_price"]), 2)
+            except (TypeError, ValueError):
+                pass
         return out
 
     def _read_open_snapshot(self, path: Optional[str] = None) -> Dict[str, Dict[str, Any]]:

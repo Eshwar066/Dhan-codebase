@@ -29,7 +29,7 @@ def download_scrip_master(dest_csv: Path) -> Path:
         df["SEM_CUSTOM_SYMBOL"] = (
             df["SEM_CUSTOM_SYMBOL"].astype(str).str.strip().str.replace(r"\s+", " ", regex=True)
         )
-    df.to_csv(dest_csv, index=False)
+    df.to_csv(dest_csv, index=False, float_format="%.2f")
     logger.info("Wrote Dhan scrip master: %s rows -> %s", len(df), dest_csv)
     return dest_csv
 

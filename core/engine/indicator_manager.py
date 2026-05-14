@@ -11,6 +11,11 @@ from zoneinfo import ZoneInfo
 logger = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
 
+try:
+    from core.utils.json_numeric import round_json_floats
+except ImportError:
+    round_json_floats = None  # type: ignore
+
 
 class IndicatorManager:
     """
@@ -465,8 +470,11 @@ class IndicatorManager:
                 "prev_rsi": row.get("prev_rsi"),
             }
             try:
+                pl = payload
+                if round_json_floats is not None:
+                    pl = round_json_floats(payload)
                 with open(path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(payload, default=str) + "\n")
+                    f.write(json.dumps(pl, default=str) + "\n")
             except Exception:
                 logger.exception("Failed writing RSI history log: %s", path)
                 return

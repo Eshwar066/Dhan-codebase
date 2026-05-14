@@ -16,6 +16,11 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+try:
+    from core.utils.json_numeric import round_json_floats
+except ImportError:
+    round_json_floats = None  # type: ignore
+
 _ROOT = Path(__file__).resolve().parents[2]
 _LOG_SUBDIR = "logs/option_chain_snapshots"
 IST = ZoneInfo("Asia/Kolkata")
@@ -101,7 +106,7 @@ def log_option_chain_snapshot(
     path = out_dir / fname
 
     try:
-        df_out.to_csv(path, index=False, encoding="utf-8")
+        df_out.to_csv(path, index=False, encoding="utf-8", float_format="%.2f")
     except OSError:
         return
 
@@ -109,6 +114,7 @@ def log_option_chain_snapshot(
         try:
             ppath = path.with_suffix(".params.json")
             with open(ppath, "w", encoding="utf-8") as f:
-                json.dump(params, f, indent=2, default=str)
+                pout = round_json_floats(params) if round_json_floats else params
+                json.dump(pout, f, indent=2, default=str)
         except (OSError, TypeError):
             pass

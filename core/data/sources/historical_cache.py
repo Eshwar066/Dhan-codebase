@@ -10,6 +10,11 @@ from pathlib import Path
 
 import pandas as pd
 
+try:
+    from core.utils.json_numeric import round_json_floats
+except ImportError:
+    round_json_floats = None  # type: ignore
+
 
 def _safe_key(*parts) -> str:
     """Build a safe cache key from parts (no path separators, short)."""
@@ -50,4 +55,5 @@ def save_df(cache_dir: Path, name: str, df: pd.DataFrame) -> None:
     if "time" in out.columns:
         out = out.assign(time=out["time"].astype(str))
     with open(path, "w") as f:
-        json.dump(out.to_dict(orient="records"), f, indent=0)
+        rec = out.to_dict(orient="records")
+        json.dump(round_json_floats(rec) if round_json_floats else rec, f, indent=0)

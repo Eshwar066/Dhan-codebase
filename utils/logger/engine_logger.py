@@ -19,6 +19,11 @@ try:
 except ImportError:
     _resolution_to_seconds = None  # type: ignore
 
+try:
+    from core.utils.json_numeric import round_json_floats
+except ImportError:
+    round_json_floats = None  # type: ignore
+
 IST = ZoneInfo("Asia/Kolkata")
 IST_MINUTE_FMT = "%Y-%m-%d %H:%M"
 
@@ -230,6 +235,8 @@ class EngineLogger:
             )
         payload = self._payload(event_type, message=message, **kwargs)
         self._validate_correlation(payload)
+        if round_json_floats is not None:
+            payload = round_json_floats(payload)
         line = json.dumps(payload, default=str) + "\n"
         with self._lock:
             os.makedirs(self._log_dir, exist_ok=True)
@@ -443,7 +450,6 @@ class EngineLogger:
             message="Closed candle",
             symbol=candle.get("symbol"),
             timeframe=timeframe,
-           
             source=source,
             bar_timestamp_ist=bar_ts_ist,
             open=candle.get("open"),
@@ -458,6 +464,8 @@ class EngineLogger:
             # exchange=candle.get("exchange"),
         )
         payload["timestamp"] = self._to_ist_minute_str(datetime.now(IST))
+        if round_json_floats is not None:
+            payload = round_json_floats(payload)
         line = json.dumps(payload, default=str) + "\n"
         with self._lock:
             os.makedirs(self._log_dir, exist_ok=True)
