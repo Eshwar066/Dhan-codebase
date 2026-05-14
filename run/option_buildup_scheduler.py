@@ -31,15 +31,22 @@ def _next_five_min_slot_ist(now_ist: datetime) -> datetime:
     base = now_ist.replace(second=0, microsecond=0)
     extra = (5 - (base.minute % 5)) % 5
     if extra == 0:
-        return base
+        return base + timedelta(minutes=5)
     return base + timedelta(minutes=extra)
 
 
-def _is_market_window_ist(ts_ist: datetime) -> bool:
+def _is_market_window_ist(ts_ist: datetime, exchange: str) -> bool:
     t = ts_ist.time().replace(second=0, microsecond=0)
-    return t >= datetime.strptime("09:15", "%H:%M").time() and t <= datetime.strptime(
-        "15:30", "%H:%M"
-    ).time()
+    ex = str(exchange or "").upper()
+    if ex == "MCX":
+        # Practical MCX window for scheduler usage.
+        open_t = datetime.strptime("09:00", "%H:%M").time()
+        close_t = datetime.strptime("23:30", "%H:%M").time()
+    else:
+        # NSE index/equity window.
+        open_t = datetime.strptime("09:15", "%H:%M").time()
+        close_t = datetime.strptime("15:30", "%H:%M").time()
+    return open_t <= t <= close_t
 
 
 def _extract_close(ohlc_payload: Any, symbol: str) -> Optional[float]:
@@ -78,6 +85,7 @@ def run_scheduler(
     print(
         f"[OptionBuildupScheduler] start symbols={symbols} exchange={exchange} market_window_only={market_window_only}"
     )
+    processed_slots: set[str] = set()
     while True:
         now_ist = datetime.now(IST)
         slot_ist = _next_five_min_slot_ist(now_ist)
@@ -86,7 +94,7 @@ def run_scheduler(
             time.sleep(wait_s)
         slot_ist = datetime.now(IST).replace(second=0, microsecond=0)
 
-        if market_window_only and not _is_market_window_ist(slot_ist):
+        if market_window_only and not _is_market_window_ist(slot_ist, exchange):
             time.sleep(max(0.2, float(sleep_step_seconds)))
             continue
 
@@ -94,6 +102,9 @@ def run_scheduler(
         ohlc = source.get_latest_candles(symbols, debug="NO")
         for sym in symbols:
             try:
+                slot_key = f"{sym}|{slot_ist.strftime('%Y-%m-%d|%H-%M')}"
+                if slot_key in processed_slots:
+                    continue
                 close = _extract_close(ohlc, sym)
                 if close is None:
                     print(
@@ -110,6 +121,7 @@ def run_scheduler(
                 print(
                     f"[OptionBuildupScheduler] ran symbol={sym} close={close} slot={slot_ist.strftime('%Y-%m-%d %H:%M')}"
                 )
+                processed_slots.add(slot_key)
             except Exception as exc:
                 print(f"[OptionBuildupScheduler] error symbol={sym}: {exc}")
 

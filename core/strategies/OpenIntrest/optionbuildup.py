@@ -68,7 +68,7 @@ class OptionBuildup(IndiaMktMixins, BaseStrategy):
         if not self.should_evaluate(candle):
             return
         self.get_option_chain_snapshot(candle, ctx, "CE")
-        self.get_option_chain_snapshot(candle, ctx, "PE")
+        # self.get_option_chain_snapshot(candle, ctx, "PE")
 
 
     def _candle_ts_ist(self, candle: dict) -> pd.Timestamp:
