@@ -8,13 +8,15 @@ This file documents the **current** execution flow using actual module names.
 flowchart TB
     subgraph Entry["Entry + Config"]
       A["run/main.py"]
-      B["run/config.py (STRATEGY_JOBS, RUN_MODE)"]
+      B["run/config.py (ENGINE_JOBS, RUN_MODE)"]
       C["run/engine_config.py (EngineConfig)"]
     end
 
     subgraph Orchestration["Engine Orchestration"]
       D["core/engine/factory.py"]
       E["core/engine/live_engine.py"]
+      EE["core/engine/execution_engine.py"]
+      IND["core/engine/indicator_manager.py"]
       F["core/engine/backtest_engine.py"]
       G["core/engine/base_engine.py"]
       H["core/engine/supervisor.py"]
@@ -29,6 +31,7 @@ flowchart TB
     subgraph Data["Data + Feeds"]
       L["core/data/sources/*"]
       M["core/data/datalayer/*"]
+      CS["core/data/candle_service.py"]
       N["core/data/candle_aggregator.py"]
       O["core/data/feeds/dhan_feed.py"]
       P["core/data/feeds/delta_feed.py"]
@@ -50,9 +53,9 @@ flowchart TB
     end
 
     subgraph Logs["Observability"]
-      Z["logger/engine_logger.py"]
-      ZA["logger/trade_logger.py"]
-      ZB["logger/open_positions_logger.py"]
+      Z["utils/logger/engine_logger.py"]
+      ZA["utils/logger/trade_logger.py"]
+      ZB["utils/logger/open_positions_logger.py"]
     end
 
     B --> A
@@ -63,6 +66,7 @@ flowchart TB
     D --> I
     D --> L
     D --> M
+    D --> CS
     D --> O
     D --> P
     D --> Q
@@ -71,7 +75,12 @@ flowchart TB
     D --> W
     D --> X
     D --> Y
+    E --> EE
+    E --> IND
+    EE --> V
+    IND --> M
     E --> N
+    E --> CS
     E --> K
     V --> R
     V --> S
@@ -80,6 +89,8 @@ flowchart TB
     E --> ZA
     E --> ZB
     D --> H
+    E --> G
+    F --> G
 ```
 
 ## 2) Live Runtime Flow (Feed-Driven)
@@ -102,13 +113,14 @@ flowchart TD
     L --> M["get last closed candle per symbol"]
     K -- no --> N["use feed candle/ticker snapshot path"]
 
-    M --> O["dispatch candle to per-strategy worker threads"]
+    M --> IM["IndicatorManager: enrich (log bootstrap + optional REST + TA-Lib)"]
+    IM --> O["dispatch candle to per-strategy worker threads"]
     N --> O
     O --> P["strategy.on_candle -> intents"]
     P --> Q["bounded intent_queue (non-blocking policy)"]
     Q --> R["AccountRouter.route(intent)"]
     R --> S["bounded queue per (account_id, symbol)"]
-    S --> T["OMS worker per key: token bucket + retry + per-account breaker"]
+    S --> T["ExecutionEngine OMS worker: token bucket + retry + per-account breaker"]
     T --> U["OrderRouter.process_intent()"]
     U --> V["Broker.place_order()"]
 
@@ -119,7 +131,9 @@ flowchart TD
     I --> Z["Structured logs + intent journal"]
 ```
 
-## 3) OMS Detail (Threaded Fanout)
+## 3) OMS Detail (ExecutionEngine + threaded fanout)
+
+`LiveEngine` delegates routing, per-account-symbol queues, OMS workers, token bucket, retries, and the watchdog to `core/engine/execution_engine.py`.
 
 ```mermaid
 flowchart LR
@@ -135,17 +149,21 @@ flowchart LR
 
 ## 4) Operational Boundaries
 
-- `run/` handles process entry, CLI and job -> `EngineConfig`.
-- `core/engine/` owns orchestration and lifecycle.
-- `core/data/` owns sources, providers, websocket feeds, candle aggregation.
+- `run/` handles process entry, CLI and job -> `EngineConfig` (`run/main.py` reads `ENGINE_JOBS` from `run/config.py`; `job_to_engine_config()` accepts the legacy multi-key job shape too).
+- `run/option_buildup_scheduler.py`, `run/dummy_live.py`, and `run/run_quarterly_report.py` are **standalone** entrypoints (not started by `run.main`).
+- `core/engine/` owns orchestration and lifecycle (`factory`, `live_engine`, `backtest_engine`, `execution_engine`, `indicator_manager`, `supervisor`).
+- `core/engine/base_engine.py` wires `DataRouter` + `OptionChainService` into `StrategyContext` for option-chain strategies.
+- `core/data/` owns sources, providers, websocket feeds, `CandleService`, and candle aggregation.
 - `core/strategies/` owns signal generation (`on_candle`).
 - `core/orderExecution/` owns intent lifecycle, risk, routing, position state.
 - `core/broker/internal/*` maps orders/fills to broker APIs.
-- `logger/` and `core/analytics/` handle telemetry and reporting.
+- `utils/logger/` and `core/analytics/` handle telemetry and reporting.
 
 ## 5) Current Notes
 
-- Live path is feed/aggregator-driven; no REST candle fallback in live loop.
+- Live **candle delivery** is feed- or aggregator-driven (`DhanWebSocketFeed` / `DeltaWebSocketFeed`, optional `tick_queue` + `CandleAggregator`). `core/data/feeds/dummy_feed.py` is used by `run/dummy_live.py`.
+- **`IndicatorManager`** (live) bootstraps history from engine `*_candles.log` when valid; if logs are missing, short, or invalid it may call **`IDataProvider.get_intraday`** (REST / broker historical path) before the first live bar — this is separate from the tick loop.
+- Optional **log-only bootstrap** for LEAPS-style setups: regenerate `logs/...` via `utils/seed_leaps_bootstrap_logs.py` (frozen Yahoo tail in `utils/leaps_bootstrap_yf_reference.py`); `utils/yfinance_nifty_rsi.py` is a manual fetch helper, not imported by the engine.
 - `PAPER` uses live data path with simulated execution.
 - Multi-strategy live mode runs one worker thread per strategy.
 - Queue growth is bounded at strategy, intent, and account-symbol stages.
@@ -156,12 +174,15 @@ flowchart LR
 sequenceDiagram
     participant LE as LiveEngine main loop
     participant CA as CandleAggregator
+    participant IM as IndicatorManager
     participant SW as StrategyWorker(strategy_id)
     participant SQ as strategy_queue[strategy_id]
     participant IQ as intent_queue
 
     LE->>CA: on_tick() / get_last_closed_candle(symbol, tf)
     CA-->>LE: closed candle
+    LE->>IM: enrich_candle_for_strategy (per strategy, main thread)
+    IM-->>LE: candle + indicators (RSI, etc.)
     LE->>SQ: enqueue {candle, response_q} (non-blocking)
     SQ->>SW: dequeue task
     SW->>SW: ctx = build_context_only(candle)
