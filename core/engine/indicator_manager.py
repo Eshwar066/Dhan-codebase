@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
@@ -17,8 +17,12 @@ class IndicatorManager:
     Shared indicator layer for live engine.
 
     Maintains per-(symbol,timeframe) base candle history and per-strategy enriched
-    indicator state. History fetch is done once per symbol/timeframe per day and
-    reused across strategies.
+    indicator state.
+
+    Bootstrap (L2 logs → L3 API only on failure):
+    - Primary: closed candles from ``*_candles.log`` under ``logs/`` (canonical OHLCV + IST bar open).
+    - In-process cache: reused until the dataframe cannot satisfy a larger ``window``; no UTC-midnight invalidation.
+    - ``get_intraday`` is used only when logs are missing, short, discontinuous, misaligned, or unreadable.
     """
 
     def __init__(self, data_provider: Any, engine_logger: Any = None):
@@ -36,6 +40,8 @@ class IndicatorManager:
         self._rsi_seeded_streams = set()
         self._rsi_log_root = "logs"
         self._rsi_debug_printed = False
+        # Extra bars loaded beyond strategy window for continuity / validation slack.
+        self._log_bootstrap_buffer = 50
 
     def set_runtime_context(self, exchange: str, sector: str) -> None:
         self._live_exchange = str(exchange or "INDEX")
@@ -152,6 +158,154 @@ class IndicatorManager:
         except Exception:
             return ""
 
+    def _collect_candle_closed_rows_from_logs(
+        self,
+        symbol_u: str,
+        tf_s: str,
+        ist_day: Optional[dt.date] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Scan ``logs/**/*.`` for ``*_candles.log`` JSON lines with event_type=candle_closed.
+        When ``ist_day`` is set, only rows whose bar open falls on that IST calendar date.
+        """
+        rows: List[Dict[str, Any]] = []
+        if not symbol_u or not tf_s:
+            return rows
+        try:
+            logs_root = self._rsi_log_root
+            if not os.path.isdir(logs_root):
+                return rows
+            for root, _, files in os.walk(logs_root):
+                for name in files:
+                    if not name.endswith("_candles.log"):
+                        continue
+                    path = os.path.join(root, name)
+                    try:
+                        with open(path, "r", encoding="utf-8") as f:
+                            for line in f:
+                                s = line.strip()
+                                if not s:
+                                    continue
+                                try:
+                                    payload = json.loads(s)
+                                except Exception:
+                                    continue
+                                if str(payload.get("event_type") or "") != "candle_closed":
+                                    continue
+                                if str(payload.get("symbol") or "").strip().upper() != symbol_u:
+                                    continue
+                                if str(payload.get("timeframe") or "").strip() != tf_s:
+                                    continue
+                                bar_ist = payload.get("bar_timestamp_ist")
+                                if not bar_ist:
+                                    continue
+                                try:
+                                    bar_dt = dt.datetime.fromisoformat(str(bar_ist))
+                                except Exception:
+                                    continue
+                                if bar_dt.tzinfo is None:
+                                    bar_dt = bar_dt.replace(tzinfo=IST)
+                                bar_dt = bar_dt.astimezone(IST)
+                                if ist_day is not None and bar_dt.date() != ist_day:
+                                    continue
+                                rows.append(
+                                    {
+                                        "timestamp": bar_dt.astimezone(dt.timezone.utc),
+                                        "open": payload.get("open"),
+                                        "high": payload.get("high"),
+                                        "low": payload.get("low"),
+                                        "close": payload.get("close"),
+                                        "volume": payload.get("volume", 0),
+                                        "symbol": symbol_u,
+                                        "exchange": payload.get("exchange"),
+                                    }
+                                )
+                    except Exception:
+                        continue
+        except Exception:
+            return rows
+        return rows
+
+    def _candle_rows_to_sorted_df(self, rows: List[Dict[str, Any]], symbol: str) -> Any:
+        import pandas as pd
+
+        if not rows:
+            return pd.DataFrame()
+        out = pd.DataFrame(rows)
+        out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
+        out = out.dropna(subset=["timestamp"]).sort_values("timestamp")
+        out = out.drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
+        if "symbol" in out.columns and out["symbol"].isna().all():
+            out["symbol"] = symbol
+        return out
+
+    def _load_candles_from_logs(self, symbol: str, tf: str, tail_rows: int) -> Any:
+        """Load the most recent ``tail_rows`` closed candles for symbol|timeframe from disk logs."""
+        import pandas as pd
+
+        symbol_u = str(symbol or "").strip().upper()
+        tf_s = str(tf or "").strip()
+        rows = self._collect_candle_closed_rows_from_logs(symbol_u, tf_s, ist_day=None)
+        out = self._candle_rows_to_sorted_df(rows, symbol)
+        if out is None or len(out) == 0:
+            return pd.DataFrame()
+        if len(out) > tail_rows:
+            out = out.iloc[-tail_rows:].reset_index(drop=True)
+        return out
+
+    def _validate_log_candles(
+        self,
+        df: Any,
+        tf: str,
+        exchange: str,
+        min_rows: int,
+    ) -> Tuple[bool, str]:
+        import pandas as pd
+
+        if df is None or len(df) < min_rows:
+            return False, "insufficient_bars"
+        if "timestamp" not in df.columns:
+            return False, "no_timestamp_column"
+        tss = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        if bool(tss.isna().any()):
+            return False, "invalid_timestamps"
+        if not bool(tss.is_monotonic_increasing):
+            return False, "timestamps_not_sorted"
+        if len(tss) != len(tss.unique()):
+            return False, "duplicate_timestamps"
+
+        tf_sec = float(self._timeframe_to_seconds(tf))
+        exu = str(exchange or "").upper()
+        strict_nse_index_session = tf_sec == 3600.0 and exu in ("INDEX", "NSE_INDEX", "NSE")
+        if strict_nse_index_session:
+            for idx, ts in enumerate(tss):
+                if pd.isna(ts):
+                    return False, "na_timestamp"
+                ist = pd.Timestamp(ts).tz_convert(IST)
+                if int(ist.minute) != 15 or int(ist.hour) < 9 or int(ist.hour) > 15:
+                    return False, f"nse_index_1h_bar_open idx={idx} ist={ist.isoformat()}"
+
+        tol = 120.0
+        for i in range(len(tss) - 1):
+            t1 = tss.iloc[i]
+            t2 = tss.iloc[i + 1]
+            delta = float((t2 - t1).total_seconds())
+            if delta <= 0:
+                return False, f"non_positive_delta row={i}"
+            d1 = pd.Timestamp(t1).tz_convert(IST).date()
+            d2 = pd.Timestamp(t2).tz_convert(IST).date()
+            if abs(delta - tf_sec) <= tol:
+                continue
+            if d1 == d2:
+                if strict_nse_index_session and delta > tf_sec * 1.5 and delta < 48 * 3600:
+                    return False, f"intra_session_gap row={i} delta_sec={delta:.0f}"
+                if delta < tf_sec - tol:
+                    return False, f"sub_tf_delta row={i} delta_sec={delta:.0f}"
+            else:
+                if delta < tf_sec - tol:
+                    return False, f"cross_day_short_delta row={i} delta_sec={delta:.0f}"
+        return True, ""
+
     def _append_rsi_history_log(
         self,
         strategy_id: str,
@@ -186,7 +340,7 @@ class IndicatorManager:
                 continue
 
             # remove seconds and timezone
-            ist_ts = datetime.fromisoformat(ist_ts).strftime("%Y-%m-%d %H:%M")
+            ist_ts = dt.datetime.fromisoformat(ist_ts).strftime("%Y-%m-%d %H:%M")
 
             source = "live_append" if seeded else "historical_seed"
             key = (strategy_id, symbol, tf, ist_ts, source)
@@ -222,68 +376,9 @@ class IndicatorManager:
         tf_s = str(tf or "").strip()
         if not symbol_u or not tf_s:
             return pd.DataFrame()
-
         ist_today = dt.datetime.now(IST).date()
-        rows = []
-        try:
-            logs_root = self._rsi_log_root
-            if not os.path.isdir(logs_root):
-                return pd.DataFrame()
-            for root, _, files in os.walk(logs_root):
-                for name in files:
-                    if not name.endswith("_candles.log"):
-                        continue
-                    path = os.path.join(root, name)
-                    try:
-                        with open(path, "r", encoding="utf-8") as f:
-                            for line in f:
-                                s = line.strip()
-                                if not s:
-                                    continue
-                                try:
-                                    payload = json.loads(s)
-                                except Exception:
-                                    continue
-                                if str(payload.get("event_type") or "") != "candle_closed":
-                                    continue
-                                if str(payload.get("symbol") or "").strip().upper() != symbol_u:
-                                    continue
-                                if str(payload.get("timeframe") or "").strip() != tf_s:
-                                    continue
-                                bar_ist = payload.get("bar_timestamp_ist")
-                                if not bar_ist:
-                                    continue
-                                try:
-                                    bar_dt = dt.datetime.fromisoformat(str(bar_ist))
-                                except Exception:
-                                    continue
-                                if bar_dt.tzinfo is None:
-                                    bar_dt = bar_dt.replace(tzinfo=IST)
-                                if bar_dt.astimezone(IST).date() != ist_today:
-                                    continue
-                                rows.append(
-                                    {
-                                        "timestamp": bar_dt.astimezone(dt.timezone.utc),
-                                        "open": payload.get("open"),
-                                        "high": payload.get("high"),
-                                        "low": payload.get("low"),
-                                        "close": payload.get("close"),
-                                        "volume": payload.get("volume", 0),
-                                        "symbol": symbol,
-                                        "exchange": payload.get("exchange"),
-                                    }
-                                )
-                    except Exception:
-                        continue
-        except Exception:
-            return pd.DataFrame()
-        if not rows:
-            return pd.DataFrame()
-        out = pd.DataFrame(rows)
-        out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
-        out = out.dropna(subset=["timestamp"]).sort_values("timestamp")
-        out = out.drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
-        return out
+        rows = self._collect_candle_closed_rows_from_logs(symbol_u, tf_s, ist_day=ist_today)
+        return self._candle_rows_to_sorted_df(rows, symbol)
 
     def _merge_today_live_candles(self, df: Any, symbol: str, tf: str) -> Any:
         import pandas as pd
@@ -314,48 +409,79 @@ class IndicatorManager:
     ) -> Dict[str, Any]:
         import pandas as pd
 
-        
         def _to_business_day(d: dt.date) -> dt.date:
-            # Move Sat/Sun to previous Friday so history requests stay on trading days.
             while d.weekday() >= 5:
                 d -= dt.timedelta(days=1)
             return d
 
         key = self._key_symbol_tf(symbol, tf)
         state = self._base_candle_state.get(key)
-        today = dt.datetime.utcnow().date().isoformat()
-        if state and state.get("date") == today:
-            return state
+        if state:
+            df0 = state.get("df")
+            prev_w = int(state.get("window") or 0)
+            if (
+                df0 is not None
+                and len(df0) > 0
+                and len(df0) >= window
+                and prev_w >= window
+            ):
+                return state
 
-        utc_today = dt.datetime.utcnow().date()
-        end_business_day = _to_business_day(utc_today)
-        start_business_day = _to_business_day(end_business_day - dt.timedelta(days=20))
-        start_date = start_business_day.strftime("%Y-%m-%d")
-        end_date = end_business_day.strftime("%Y-%m-%d")
-        df = None
-        try:
-            df = self.data.get_intraday(
-                symbol=symbol,
-                start_date=start_date,
-                end_date=end_date,
-                timeframe=tf,
-                exchange=exchange,
-                sector=sector,
-            )
-        except Exception:
-            df = None
+        buf = max(10, int(self._log_bootstrap_buffer))
+        need_tail = window + buf
+        df_log = self._load_candles_from_logs(symbol, tf, need_tail)
+        source = ""
+        df: Any = None
+
+        if len(df_log) > 0:
+            ok, reason = self._validate_log_candles(df_log, tf, exchange, window)
+            if ok:
+                df = df_log.copy()
+                source = "log"
+            else:
+                logger.info(
+                    "BOOTSTRAP_LOG_REJECT symbol=%s tf=%s exchange=%s reason=%s rows=%s need=%s",
+                    symbol,
+                    tf,
+                    exchange,
+                    reason,
+                    len(df_log),
+                    window,
+                )
+
+        if df is None:
+            ist_today = dt.datetime.now(IST).date()
+            end_business_day = _to_business_day(ist_today)
+            start_business_day = _to_business_day(end_business_day - dt.timedelta(days=20))
+            start_date = start_business_day.strftime("%Y-%m-%d")
+            end_date = end_business_day.strftime("%Y-%m-%d")
+            try:
+                df = self.data.get_intraday(
+                    symbol=symbol,
+                    start_date=start_date,
+                    end_date=end_date,
+                    timeframe=tf,
+                    exchange=exchange,
+                    sector=sector,
+                )
+            except Exception:
+                df = None
+            source = "api"
+            if df is not None and len(df) > 0:
+                df = df.copy()
 
         if df is None or len(df) == 0:
-            state = {
-                "date": today,
+            empty: Dict[str, Any] = {
                 "df": pd.DataFrame(),
                 "last_bucket": None,
                 "window": window,
+                "bootstrap_source": "none",
+                "bootstrap_source_detail": "log_invalid_or_missing_and_api_empty",
+                "update_seq": 0,
             }
-            self._base_candle_state[key] = state
-            return state
+            self._base_candle_state[key] = empty
+            return empty
 
-        df = df.copy()
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
             df = df.dropna(subset=["timestamp"]).reset_index(drop=True)
@@ -367,15 +493,25 @@ class IndicatorManager:
         if len(df) > window:
             df = df.iloc[-window:].reset_index(drop=True)
 
-        state = {
-            "date": today,
+        boot_ist = dt.datetime.now(IST).isoformat()
+        new_state: Dict[str, Any] = {
             "df": df,
             "last_bucket": None,
             "window": window,
+            "bootstrap_source": source,
+            "bootstrap_at_ist": boot_ist,
             "update_seq": 0,
         }
-        self._base_candle_state[key] = state
-        return state
+        self._base_candle_state[key] = new_state
+        if source == "log":
+            logger.info(
+                "BOOTSTRAP_PRIMARY_LOG symbol=%s tf=%s rows=%s window=%s",
+                symbol,
+                tf,
+                len(df),
+                window,
+            )
+        return new_state
 
     def enrich_candle_for_strategy(self, strategy: Any, candle: Dict[str, Any], candle_bucket_fn: Any) -> Dict[str, Any]:
         import pandas as pd
