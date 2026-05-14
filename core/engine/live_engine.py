@@ -829,19 +829,24 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         return None, "aggregator:empty"
 
     # >> Session end candle flush function
-    def _maybe_flush_mcx_session_end_candles(self) -> None:
-        """After MCX 23:30 IST, finalize partial 1h (and other TF) bars without a post-close tick."""
-        if self.market_exchange != "MCX":
-            return
+    def _maybe_flush_session_end_candles(self) -> None:
+        """
+        After configured session close (e.g. NSE 15:30 IST, MCX 23:30 IST), finalize in-flight
+        candles without waiting for a post-close tick. No-op when the aggregator has no session
+        bounds (``flush_session_end`` returns immediately).
+        """
         ca = self.candle_aggregator
-        if ca is None or not hasattr(ca, "flush_mcx_session_end"):
+        if ca is None:
+            return
+        flush_fn = getattr(ca, "flush_session_end", None) or getattr(ca, "flush_mcx_session_end", None)
+        if not callable(flush_fn):
             return
         now_unix = time.time()
         for symbol in self.symbols:
             try:
-                ca.flush_mcx_session_end(symbol, now_unix)
+                flush_fn(symbol, now_unix)
             except Exception:
-                logger.exception("MCX session-end candle flush failed symbol=%s", symbol)
+                logger.exception("Session-end candle flush failed symbol=%s", symbol)
 
     def _enqueue_intent(
         self,
@@ -1223,7 +1228,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 )
                 if use_aggregator:
                     self._drain_tick_queue()
-                    self._maybe_flush_mcx_session_end_candles()
+                    self._maybe_flush_session_end_candles()
 
                 for symbol in self.symbols:
                     candle = None

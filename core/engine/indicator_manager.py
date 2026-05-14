@@ -158,6 +158,113 @@ class IndicatorManager:
         except Exception:
             return ""
 
+    @staticmethod
+    def _parse_bar_timestamp_ist_to_aware(bar_ist: Any) -> Optional[dt.datetime]:
+        """Parse ``bar_timestamp_ist`` / ``candle_timestamp_ist`` from logs (ISO or ``YYYY-MM-DD HH:MM`` IST)."""
+        s = str(bar_ist).strip()
+        if not s:
+            return None
+        try:
+            if "T" in s:
+                t = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+                if t.tzinfo is None:
+                    t = t.replace(tzinfo=IST)
+                return t.astimezone(IST).replace(second=0, microsecond=0)
+            if len(s) >= 16 and s[4] == "-" and s[10] == " ":
+                t = dt.datetime.strptime(s[:16], "%Y-%m-%d %H:%M")
+                return t.replace(tzinfo=IST)
+        except Exception:
+            return None
+        return None
+
+    def _load_rsi_history_rows(
+        self, strategy_id: str, symbol: str, tf: str, max_rows: int
+    ) -> List[Dict[str, Any]]:
+        """Load recent rows from ``{strategy}_rsi_history.log`` for RSI warmup (close-only bars)."""
+        import math
+
+        sym_u = str(symbol or "").strip().upper()
+        tf_s = str(tf or "").strip()
+        sid = str(strategy_id or "GLOBAL").strip() or "GLOBAL"
+        path = os.path.join(self._rsi_log_root, sid, f"{sid}_rsi_history.log")
+        if not os.path.isfile(path):
+            return []
+        rows: List[Dict[str, Any]] = []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        payload = json.loads(s)
+                    except Exception:
+                        continue
+                    if str(payload.get("symbol") or "").strip().upper() != sym_u:
+                        continue
+                    if str(payload.get("timeframe") or "").strip() != tf_s:
+                        continue
+                    bar_dt = self._parse_bar_timestamp_ist_to_aware(payload.get("candle_timestamp_ist"))
+                    if bar_dt is None:
+                        continue
+                    close = payload.get("close")
+                    try:
+                        c = float(close)
+                        if math.isnan(c):
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                    ts_utc = bar_dt.astimezone(dt.timezone.utc)
+                    ex = str(payload.get("exchange") or self._live_exchange or "INDEX")
+                    rows.append(
+                        {
+                            "timestamp": ts_utc,
+                            "open": c,
+                            "high": c,
+                            "low": c,
+                            "close": c,
+                            "volume": 0.0,
+                            "symbol": sym_u,
+                            "exchange": ex,
+                        }
+                    )
+        except Exception:
+            logger.exception("Failed reading RSI history log: %s", path)
+            return []
+        rows.sort(key=lambda r: r["timestamp"])
+        if len(rows) > max_rows:
+            rows = rows[-max_rows:]
+        return rows
+
+    def _merge_rsi_history_into_base_df(
+        self,
+        df: Any,
+        strategy_id: str,
+        symbol: str,
+        tf: str,
+        max_rows: int = 400,
+    ) -> Any:
+        """Prepend close-only bars from RSI history so the first live bar of the day gets a valid RSI."""
+        import pandas as pd
+
+        if df is None or len(df) == 0:
+            return df
+        hist = self._load_rsi_history_rows(strategy_id, symbol, tf, max_rows=max_rows)
+        if not hist:
+            return df
+        hdf = pd.DataFrame(hist)
+        base = df.copy()
+        base["timestamp"] = pd.to_datetime(base["timestamp"], utc=True, errors="coerce")
+        base = base.dropna(subset=["timestamp"])
+        hdf["timestamp"] = pd.to_datetime(hdf["timestamp"], utc=True, errors="coerce")
+        hdf = hdf.dropna(subset=["timestamp"])
+        merged = pd.concat([hdf, base], ignore_index=True)
+        merged = merged.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+        cap = max(max_rows, len(base) + 80)
+        if len(merged) > cap:
+            merged = merged.iloc[-cap:].reset_index(drop=True)
+        return merged.reset_index(drop=True)
+
     def _collect_candle_closed_rows_from_logs(
         self,
         symbol_u: str,
@@ -199,13 +306,9 @@ class IndicatorManager:
                                 bar_ist = payload.get("bar_timestamp_ist")
                                 if not bar_ist:
                                     continue
-                                try:
-                                    bar_dt = dt.datetime.fromisoformat(str(bar_ist))
-                                except Exception:
+                                bar_dt = self._parse_bar_timestamp_ist_to_aware(bar_ist)
+                                if bar_dt is None:
                                     continue
-                                if bar_dt.tzinfo is None:
-                                    bar_dt = bar_dt.replace(tzinfo=IST)
-                                bar_dt = bar_dt.astimezone(IST)
                                 if ist_day is not None and bar_dt.date() != ist_day:
                                     continue
                                 rows.append(
@@ -642,10 +745,19 @@ class IndicatorManager:
 
             if not cache_hit:
                 compute_start = time.time()
+                work_df = df.copy()
+                if self._strategy_requires_rsi(strategy):
+                    work_df = self._merge_rsi_history_into_base_df(
+                        work_df,
+                        strategy_id=str(getattr(strategy, "name", "unknown_strategy")),
+                        symbol=symbol,
+                        tf=tf,
+                    )
                 try:
-                    df = strategy.prepare_indicators(df)
+                    work_df = strategy.prepare_indicators(work_df)
                 except Exception:
                     pass
+                df = work_df
                 compute_ms = (time.time() - compute_start) * 1000.0
                 if self.engine_logger:
                     try:

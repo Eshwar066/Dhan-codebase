@@ -134,24 +134,24 @@ class CandleAggregator:
         self._last_tick_ts_by_symbol: Dict[str, float] = {}
         self._tick_count_by_symbol_bucket: Dict[str, int] = {}
         # symbol|YYYY-MM-DD (IST): session-end flush already applied for that local day.
-        self._mcx_session_flush_done: set[str] = set()
+        self._session_end_flush_done: set[str] = set()
 
-    def _prune_mcx_session_flush_keys(self, dt_ist: datetime) -> None:
-        if len(self._mcx_session_flush_done) <= 400:
+    def _prune_session_end_flush_keys(self, dt_ist: datetime) -> None:
+        if len(self._session_end_flush_done) <= 400:
             return
         cutoff = (dt_ist.date() - timedelta(days=14)).isoformat()
-        stale = [k for k in self._mcx_session_flush_done if k.rsplit("|", 1)[-1] < cutoff]
+        stale = [k for k in self._session_end_flush_done if k.rsplit("|", 1)[-1] < cutoff]
         for k in stale:
-            self._mcx_session_flush_done.discard(k)
+            self._session_end_flush_done.discard(k)
 
-    def flush_mcx_session_end(self, symbol: str, now_unix: float) -> bool:
+    def flush_session_end(self, symbol: str, now_unix: float) -> bool:
         """
-        After MCX cash-session close (IST), finalize in-flight candles without waiting for a
-        post-session tick. Required because the last 1h bar may otherwise stay in ``current``
-        until the next bucket's first tick (often next session).
+        After configured session close (IST), finalize in-flight candles without waiting for a
+        post-session tick. Required because the last intraday bar (e.g. NSE 15:15–15:30 1h) may
+        otherwise stay in ``current`` until the next session's first tick.
 
-        Idempotent per symbol per IST calendar day (23:30–23:59 same day). Marks finalized
-        rows with ``session_close_partial`` when the bar was forced at session end.
+        Idempotent per symbol per IST calendar day. Marks finalized rows with
+        ``session_close_partial`` when the bar was forced at session end.
         """
         if self._session_start_sec is None or self._session_end_sec is None:
             return False
@@ -164,10 +164,10 @@ class CandleAggregator:
             return False
         day_key = dt_ist.strftime("%Y-%m-%d")
         cache_key = f"{sym}|{day_key}"
-        if cache_key in self._mcx_session_flush_done:
+        if cache_key in self._session_end_flush_done:
             return False
 
-        self._prune_mcx_session_flush_keys(dt_ist)
+        self._prune_session_end_flush_keys(dt_ist)
 
         did_any = False
         cell_1m = self._state.get(sym, {}).get(SECONDS_1M)
@@ -192,15 +192,19 @@ class CandleAggregator:
             cell["current"] = None
             did_any = True
 
-        self._mcx_session_flush_done.add(cache_key)
+        self._session_end_flush_done.add(cache_key)
         if did_any and self._engine_logger:
             self._engine_logger.log(
-                "mcx_session_candle_flush",
+                "session_end_candle_flush",
                 f"Session-end candle flush symbol={sym} ist_day={day_key}",
                 symbol=sym,
                 ist_day=day_key,
             )
         return did_any
+
+    def flush_mcx_session_end(self, symbol: str, now_unix: float) -> bool:
+        """Backward-compatible alias for :meth:`flush_session_end`."""
+        return self.flush_session_end(symbol, now_unix)
 
     def _ensure_symbol_tf(self, symbol: str, tf_seconds: int) -> Dict[str, Any]:
         if symbol not in self._state:
