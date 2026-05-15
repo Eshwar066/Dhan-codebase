@@ -662,13 +662,22 @@ class IndiaMktMixins:
     def get_option_chain_snapshot(self, candle, ctx, option_type):
         otm_strikes = self.fetch_option_chain(candle, ctx, option_type)
         if not otm_strikes:
+            if str(getattr(self, "name", "") or "") == "OptionBuildup":
+                logger.warning(
+                    "OptionBuildup snapshot: empty otm_strikes (sym=%s opt=%s)",
+                    getattr(ctx, "symbol", "?"),
+                    option_type,
+                )
             return None
+        strike_window = max(60, int(getattr(self, "otm_strike_count", 35)) * 2)
         params = {
             "exchange": ctx.exchange,
             "interval": self.timeframe,
             "expiry_code": ctx.selected_expiry,
             "instrument": "OPTIDX",
             "expiry_flag": "MONTH",
+            # DhanAdapter.get_option_chain uses this as num_strikes each side of ATM.
+            "strikes": strike_window,
         }
         if self.api != "DHAN":
             strike_param = otm_strikes
@@ -697,8 +706,10 @@ class IndiaMktMixins:
                     api=self.api,
                     params=params,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "log_option_chain_snapshot raised: %s", exc, exc_info=True
+                )
         return chain
 
     def find_strike_in_premium_range(
@@ -759,8 +770,10 @@ class IndiaMktMixins:
                     api=self.api,
                     params=params,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "log_option_chain_snapshot raised: %s", exc, exc_info=True
+                )
             
         if chain is None:
             print(">>no option chain data", ctx, params)

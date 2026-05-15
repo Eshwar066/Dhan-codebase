@@ -2773,6 +2773,17 @@ class Tradehull:
                     .sort_values(by="Strike Price")
                     .reset_index(drop=True)
                 )
+                # LTP-based ATM can disagree with chain strikes; empty window yields no CSVs.
+                if df.empty and not oc_df.empty:
+                    print(
+                        f"[get_option_chain] ATM window empty for {Underlying} "
+                        f"(atm_strike={atm_strike}, window={num_strikes}*{strike_step}); "
+                        "using full chain rows"
+                    )
+                    df = (
+                        oc_df.sort_values(by="Strike Price")
+                        .reset_index(drop=True)
+                    )
                 # pdb.set_trace()
                 return atm_strike, df, Expiry_date
             else:

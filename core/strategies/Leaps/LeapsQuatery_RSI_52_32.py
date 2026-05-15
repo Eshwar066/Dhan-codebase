@@ -6,10 +6,6 @@ from core.strategies.base import BaseStrategy
 from core.strategies.IndiaMktMixins import IndiaMktMixins
 from core.utils.expiry_resolver import ExpiryResolver
 
-
-VALID_TIMES = {"10:15", "11:15", "12:15", "13:15", "14:15", "15:15"}
-
-
 class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     """
     LEAPS Quarterly RSI Option Selling Strategy
@@ -21,7 +17,7 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     required_context = ["option_chain"]
     api = "DHAN"
     expiryType = "QUARTERLY"
-    valid_times = VALID_TIMES
+    
 
     # ==================================================
     # INDICATORS
@@ -52,9 +48,7 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     # ENTRY
     # ==================================================
     def on_candle(self, candle, ctx):
-        # ts = pd.to_datetime(candle["timestamp"])
-        # if not self._is_valid_time(ts, VALID_TIMES):
-        #     return None
+    
         
         rsi = candle["rsi"]
         if rsi < 32:
