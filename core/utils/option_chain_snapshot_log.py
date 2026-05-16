@@ -25,6 +25,7 @@ _ROOT = Path(__file__).resolve().parents[2]
 _LOG_SUBDIR = "logs/option_chain_snapshots"
 IST = ZoneInfo("Asia/Kolkata")
 _OPTION_BUILDUP_SUBDIR = "logs/option_buildup"
+_OI_POSITIONAL_BUY_SUBDIR = "logs/OIPositionalBuy"
 
 
 def _safe_filename_part(s: str, max_len: int = 64) -> str:
@@ -62,6 +63,8 @@ def log_option_chain_snapshot(
     target = str((params or {}).get("snapshot_target") or "").strip().lower()
     if target == "option_buildup":
         out_dir = _ROOT / _OPTION_BUILDUP_SUBDIR
+    elif target == "oi_positional_buy":
+        out_dir = _ROOT / _OI_POSITIONAL_BUY_SUBDIR
     else:
         out_dir = _ROOT / _LOG_SUBDIR
 
@@ -104,7 +107,7 @@ def log_option_chain_snapshot(
     n = len(df)
     prefix = pd.DataFrame(
         {
-            "_snapshot_utc": [snap] * n,
+            # "_snapshot_utc": [snap] * n,
             "_strategy": [strategy_name or ""] * n,
             "_api": [api or ""] * n,
             "_ctx_symbol": [getattr(ctx, "symbol", "") or ""] * n,
@@ -118,7 +121,7 @@ def log_option_chain_snapshot(
     df_out.insert(2, "_snapshot_slot", time_part)
 
     time_token = _safe_filename_part(time_part)
-    if target == "option_buildup":
+    if target in ("option_buildup", "oi_positional_buy"):
         fname = f"{time_token}.csv"
     else:
         exp_part = meta.get("snapshot_expiry") or "exp"

@@ -9,12 +9,16 @@ import pandas as pd
 from core.strategies.IndiaMktMixins import IST, IndiaMktMixins
 from core.strategies.base import BaseStrategy
 from core.utils.expiry_resolver import ExpiryResolver
+from core.utils.option_chain_snapshot_log import log_option_chain_snapshot
 from run.config import RUN_MODE, RunMode
 
 
 ENTRY_SNAPSHOT_TIME = time(9, 30)
 ENTRY_EVAL_TIME = time(10, 45)
 EOD_REVIEW_TIME = time(15, 15)
+REFERENCE_SNAPSHOT_TIMES = frozenset(
+    {ENTRY_SNAPSHOT_TIME, ENTRY_EVAL_TIME, EOD_REVIEW_TIME}
+)
 
 PREMIUM_MIN = 180
 PREMIUM_MAX = 220
@@ -76,6 +80,9 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
         self._pending_exit_sids: set[str] = set()
         self._exit_reason_by_sid: Dict[str, str] = {}
         self._pending_entry_by_exit_sid: Dict[str, PendingEntry] = {}
+        self._oi_snapshot_logged_slots: set[str] = set()
+        self._full_chain_cache: Any = None
+        self._full_chain_cache_key: Optional[tuple] = None
 
     def get_warmup_period(self):
         return 0
@@ -83,33 +90,133 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
     def should_evaluate(self, candle):
         return True
 
-    def _ist_time(self, candle: dict) -> time:
+    def _candle_timestamp_utc(self, candle: dict) -> pd.Timestamp:
+        bt = candle.get("bucket_ts")
+        if bt is not None:
+            return pd.Timestamp(int(bt), unit="s", tz="UTC")
         ts = pd.Timestamp(candle["timestamp"])
         if ts.tzinfo is None:
             ts = ts.tz_localize("UTC")
-        return ts.tz_convert(IST).time().replace(second=0, microsecond=0)
+        return ts.tz_convert("UTC")
+
+    def _bar_tf_minutes(self) -> int:
+        try:
+            return max(1, int(str(self.timeframe).strip()))
+        except (TypeError, ValueError):
+            return 15
+
+    def _ist_time(self, candle: dict) -> time:
+        """IST time at bar *close* (bucket open + timeframe minutes)."""
+        close_ist = self._candle_timestamp_utc(candle).tz_convert(IST) + pd.Timedelta(
+            minutes=self._bar_tf_minutes()
+        )
+        return close_ist.time().replace(second=0, microsecond=0)
 
     def _trade_date(self, candle: dict) -> date:
-        ts = pd.Timestamp(candle["timestamp"])
-        if ts.tzinfo is None:
-            ts = ts.tz_localize("UTC")
-        return ts.tz_convert(IST).date()
+        return self._candle_timestamp_utc(candle).tz_convert(IST).date()
 
-    def _snapshot_enabled_for_candle(self, candle: dict) -> bool:
-        t = self._ist_time(candle)
-        return t in {ENTRY_SNAPSHOT_TIME, ENTRY_EVAL_TIME, EOD_REVIEW_TIME}
+    def _candle_ts_ist(self, candle: dict) -> pd.Timestamp:
+        return self._candle_timestamp_utc(candle).tz_convert(IST)
 
-    def _snapshot_params(self, candle: dict) -> Dict[str, Any]:
-        ts = pd.Timestamp(candle["timestamp"])
-        if ts.tzinfo is None:
-            ts = ts.tz_localize("UTC")
-        ts_ist = ts.tz_convert(IST)
-        enabled = self._snapshot_enabled_for_candle(candle)
+    def _candle_close_ts_ist(self, candle: dict) -> pd.Timestamp:
+        return self._candle_ts_ist(candle) + pd.Timedelta(minutes=self._bar_tf_minutes())
+
+    def _find_strike_snapshot_params(
+        self, candle: dict, ctx: Any, option_type: str
+    ) -> Dict[str, Any]:
+        """One CSV snapshot per slot (DHAN chain has CE + PE columns in a single response)."""
+        _ = option_type
+        if self._ist_time(candle) not in REFERENCE_SNAPSHOT_TIMES:
+            return {}
+        ts_ist = self._candle_close_ts_ist(candle)
+        snapshot_date = ts_ist.strftime("%Y-%m-%d")
+        snapshot_time = ts_ist.strftime("%H-%M")
+        slot_key = "|".join(
+            [
+                str(getattr(ctx, "symbol", "") or ""),
+                snapshot_date,
+                snapshot_time,
+            ]
+        )
+        if slot_key in self._oi_snapshot_logged_slots:
+            return {}
+        self._oi_snapshot_logged_slots.add(slot_key)
         return {
-            "snapshot": enabled,
-            "snapshot_date": ts_ist.strftime("%Y-%m-%d"),
-            "snapshot_time": ts_ist.strftime("%H%M"),
+            "snapshot": True,
+            "snapshot_date": snapshot_date,
+            "snapshot_time": snapshot_time,
+            "snapshot_target": "oi_positional_buy",
         }
+
+    def _full_chain_cache_lookup(self, candle: dict) -> Optional[Any]:
+        key = (str(candle.get("symbol") or ""), candle.get("bucket_ts"), self._trade_date(candle))
+        if self._full_chain_cache_key == key and self._full_chain_cache is not None:
+            return self._full_chain_cache
+        return None
+
+    def _fetch_full_option_chain(
+        self, candle: dict, ctx: Any, *, log_snapshot: bool = False
+    ) -> Any:
+        """
+        Single option-chain request (DHAN returns CE + PE in one DataFrame).
+        Cached per symbol/bucket/trade-day for reuse within the same candle evaluation.
+        """
+        cached = self._full_chain_cache_lookup(candle)
+        if cached is not None:
+            return cached
+
+        strikes = self.fetch_option_chain(candle, ctx, "CE")
+        if not strikes:
+            return None
+
+        params: Dict[str, Any] = {
+            "exchange": ctx.exchange,
+            "interval": self.timeframe,
+            "expiry_code": ctx.selected_expiry,
+            "instrument": "OPTIDX",
+            "expiry_flag": "MONTH",
+        }
+        if self.api != "DHAN":
+            strike_param = [str(int(float(s))) for s in strikes]
+            params.update(
+                {
+                    "strike": strike_param,
+                    "option_type": "CE",
+                    "exchangeSegment": "NSE_FNO",
+                    "securityId": "13",
+                }
+            )
+
+        if log_snapshot:
+            snap = self._find_strike_snapshot_params(candle, ctx, "")
+            if snap:
+                params.update(snap)
+
+        chain = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
+        if log_snapshot and bool(params.get("snapshot", False)):
+            try:
+                log_option_chain_snapshot(
+                    chain,
+                    ctx=ctx,
+                    strategy_name=self.name,
+                    api=self.api,
+                    params=params,
+                )
+            except Exception:
+                pass
+
+        if chain is not None:
+            self._full_chain_cache = chain
+            self._full_chain_cache_key = (
+                str(candle.get("symbol") or ""),
+                candle.get("bucket_ts"),
+                self._trade_date(candle),
+            )
+        return chain
+
+    def _take_reference_snapshots(self, candle: dict, ctx: Any) -> None:
+        """Persist one combined CE+PE option-chain reference snapshot."""
+        self._fetch_full_option_chain(candle, ctx, log_snapshot=True)
 
     def _oi_column(self, df: pd.DataFrame, option_type: str) -> Optional[str]:
         opt = option_type.upper()
@@ -129,52 +236,40 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
         return None
 
     def _fetch_chain_df(self, candle: dict, ctx: Any, option_type: str) -> Optional[pd.DataFrame]:
-        strikes = self.fetch_option_chain(candle, ctx, option_type)
-        if not strikes:
-            return None
-        strike_param = [str(int(float(s))) for s in strikes]
-        params = {
-            "exchange": ctx.exchange,
-            "interval": self.timeframe,
-            "expiry_code": ctx.selected_expiry,
-            "strike": strike_param,
-            "option_type": option_type,
-            "instrument": "OPTIDX",
-            "exchangeSegment": "NSE_FNO",
-            "expiry_flag": "MONTH",
-            "securityId": "13",
-        }
-        params.update(self._snapshot_params(candle))
-        raw = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
-        df = raw.get("chain") if isinstance(raw, dict) else raw
+        _ = option_type
+        chain = self._fetch_full_option_chain(candle, ctx, log_snapshot=False)
+        return self._chain_df_from_response(chain, candle)
+
+    def _chain_df_from_response(
+        self, chain: Any, candle: dict
+    ) -> Optional[pd.DataFrame]:
+        df = chain.get("chain") if isinstance(chain, dict) else chain
         if not isinstance(df, pd.DataFrame) or df.empty:
             return None
         if "datetime" in df.columns:
             wall = pd.to_datetime(df["datetime"]).dt.strftime("%Y-%m-%d %H:%M")
-            wall_c = pd.Timestamp(candle["timestamp"]).tz_localize(None).strftime("%Y-%m-%d %H:%M")
+            ts_ist = self._candle_ts_ist(candle)
+            wall_c = ts_ist.strftime("%Y-%m-%d %H:%M")
             filt = df[wall == wall_c]
             if not filt.empty:
                 df = filt
         return df
 
-    def _extract_snapshots(
+    def _snapshots_from_df(
         self,
+        df: pd.DataFrame,
         candle: dict,
-        ctx: Any,
         option_type: str,
         strikes_filter: Optional[set[int]] = None,
         apply_premium_filter: bool = True,
     ) -> List[OISnapshot]:
-        df = self._fetch_chain_df(candle, ctx, option_type)
-        if df is None or df.empty:
-            return []
         strike_col = self._option_chain_strike_column(df)
         prem_col = self._option_chain_premium_column(df, option_type)
         oi_col = self._oi_column(df, option_type)
         if not strike_col or not prem_col or not oi_col:
             return []
         out: List[OISnapshot] = []
-        ts = pd.Timestamp(candle["timestamp"])
+        ts = self._candle_timestamp_utc(candle)
         for _, row in df.iterrows():
             try:
                 strike = int(float(row[strike_col]))
@@ -199,6 +294,36 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
             )
         return out
 
+    def _snapshots_from_chain(
+        self,
+        chain: Any,
+        candle: dict,
+        option_type: str,
+        strikes_filter: Optional[set[int]] = None,
+        apply_premium_filter: bool = True,
+    ) -> List[OISnapshot]:
+        df = self._chain_df_from_response(chain, candle)
+        if df is None:
+            return []
+        return self._snapshots_from_df(
+            df, candle, option_type, strikes_filter, apply_premium_filter
+        )
+
+    def _extract_snapshots(
+        self,
+        candle: dict,
+        ctx: Any,
+        option_type: str,
+        strikes_filter: Optional[set[int]] = None,
+        apply_premium_filter: bool = True,
+    ) -> List[OISnapshot]:
+        df = self._fetch_chain_df(candle, ctx, option_type)
+        if df is None or df.empty:
+            return []
+        return self._snapshots_from_df(
+            df, candle, option_type, strikes_filter, apply_premium_filter
+        )
+
     def _snapshot_for_strike(
         self, candle: dict, ctx: Any, option_type: str, strike: int
     ) -> Optional[OISnapshot]:
@@ -211,10 +336,11 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
         )
         return rows[0] if rows else None
 
-    def _capture_930_snapshot(self, candle: dict, ctx: Any):
+    def _capture_930_benchmark(self, candle: dict, ctx: Any) -> None:
+        """09:30: reference snapshots (CSV) + in-memory benchmark for 10:45 entry logic."""
         d = self._trade_date(candle)
         symbol = candle["symbol"]
-        data = {"CE": [], "PE": []}
+        data: Dict[str, List[OISnapshot]] = {"CE": [], "PE": []}
         open_main = [
             p
             for p in ctx.position_store.get_open_positions(underlying=symbol, strategy=self.name)
@@ -222,15 +348,19 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
         ]
         held = open_main[0] if open_main else None
 
+        chain = self._fetch_full_option_chain(candle, ctx, log_snapshot=True)
+        if chain is None:
+            return
+
         if held is not None:
             sid = held.structure_id
             meta = self._position_meta_by_sid.get(sid)
             held_opt = (held.instrument.option_type or "").upper()
             held_opt = "CE" if held_opt in ("CE", "CALL") else "PE"
             held_strike = int(float(held.instrument.strike))
-            held_row = self._extract_snapshots(
+            held_row = self._snapshots_from_chain(
+                chain,
                 candle,
-                ctx,
                 held_opt,
                 {held_strike},
                 apply_premium_filter=False,
@@ -238,13 +368,13 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
             if held_row:
                 data[held_opt] = held_row
             opposite = "PE" if held_opt == "CE" else "CE"
-            data[opposite] = self._extract_snapshots(candle, ctx, opposite)
+            data[opposite] = self._snapshots_from_chain(chain, candle, opposite)
             if meta:
                 meta.benchmark_premium = held_row[0].premium if held_row else meta.benchmark_premium
                 meta.benchmark_oi = held_row[0].oi if held_row else meta.benchmark_oi
         else:
-            data["CE"] = self._extract_snapshots(candle, ctx, "CE")
-            data["PE"] = self._extract_snapshots(candle, ctx, "PE")
+            data["CE"] = self._snapshots_from_chain(chain, candle, "CE")
+            data["PE"] = self._snapshots_from_chain(chain, candle, "PE")
 
         self._benchmarks_by_day[d] = data
 
@@ -410,11 +540,16 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
 
     def on_candle(self, candle: dict, ctx: Any):
         t = self._ist_time(candle)
+        import pdb
+        pdb.set_trace()
         if t == ENTRY_SNAPSHOT_TIME:
-            self._capture_930_snapshot(candle, ctx)
+            self._capture_930_benchmark(candle, ctx)
             return None
         if t == ENTRY_EVAL_TIME:
+            self._take_reference_snapshots(candle, ctx)
             return self._evaluate_entry_1045(candle, ctx)
+        if t == EOD_REVIEW_TIME:
+            self._take_reference_snapshots(candle, ctx)
         return None
 
     def should_exit(self, position: Any, candle: dict, ctx: Any = None) -> bool:

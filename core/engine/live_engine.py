@@ -835,6 +835,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         candles without waiting for a post-close tick. No-op when the aggregator has no session
         bounds (``flush_session_end`` returns immediately).
         """
+        if bool(getattr(self.realtime_feed, "is_dummy_feed", False)):
+            return
         ca = self.candle_aggregator
         if ca is None:
             return
@@ -1383,7 +1385,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             getattr(self.realtime_feed, "is_dummy_feed", False)
                         )
                         tf_sec = max(60, int(_resolution_to_seconds(tf)))
-                        if (
+                        if not is_dummy_feed and (
                             not self._first_live_alignment_done.get(symbol, False)
                             and eval_bucket is not None
                         ):
@@ -1408,6 +1410,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                                     aligned_first_live,
                                 )
                                 continue
+                        elif is_dummy_feed:
+                            self._first_live_alignment_done[symbol] = True
 
                         skip_bar, replay_bar = (False, False)
                         if not is_dummy_feed:

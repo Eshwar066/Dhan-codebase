@@ -158,7 +158,17 @@ def main() -> None:
             pass
 
     tick_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=10000)
-    aggregator = CandleAggregator()
+    live_cfg = config.live or {}
+    market_exchange = str(
+        getattr(config, "market_exchange", None) or live_cfg.get("exchange") or "INDEX"
+    ).upper()
+    if market_exchange in {"NSE", "INDEX", "NSE_INDEX"}:
+        aggregator = CandleAggregator(
+            session_start_sec=(9 * 3600) + (15 * 60),
+            session_end_sec=(15 * 3600) + (30 * 60),
+        )
+    else:
+        aggregator = CandleAggregator()
     dummy_feed = DummyRealtimeFeed(
         symbols=symbols,
         tick_interval_ms=args.tick_ms,
@@ -177,8 +187,10 @@ def main() -> None:
     engine.realtime_feed = dummy_feed
     engine.tick_queue = tick_queue
     engine.candle_aggregator = aggregator
+    indicator_manager = getattr(engine, "indicator_manager", None)
+    if indicator_manager is not None and hasattr(indicator_manager, "set_dummy_feed_mode"):
+        indicator_manager.set_dummy_feed_mode(True)
 
-    live_cfg = config.live or {}
     try:
         engine.start(
             exchange=live_cfg.get("exchange", "INDEX"),

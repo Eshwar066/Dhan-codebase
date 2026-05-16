@@ -332,8 +332,24 @@ class LiveEngineHelpersMixin:
             return parsed.astimezone(timezone.utc).replace(tzinfo=None)
         return self._dhan_repair_naive_as_ist_wallclock(parsed)
 
+    def _sync_candle_timestamp_from_bucket_ts(self, candle: Dict[str, Any]) -> None:
+        """Canonical bar open time from ``bucket_ts`` (aggregator / logs)."""
+        bt = candle.get("bucket_ts")
+        if bt is None:
+            return
+        try:
+            sec = int(float(bt))
+        except (TypeError, ValueError):
+            return
+        candle["timestamp"] = dt.datetime.fromtimestamp(sec, tz=timezone.utc).replace(
+            tzinfo=None
+        )
+
     def _normalize_candle_timestamp_utc_naive(self, candle: Dict[str, Any]) -> None:
         """Rewrite candle['timestamp'] to normalized naive UTC (DHAN IST fix included)."""
+        if candle.get("bucket_ts") is not None:
+            self._sync_candle_timestamp_from_bucket_ts(candle)
+            return
         raw = candle.get("timestamp")
         out = self._candle_timestamp_to_utc_naive(raw)
         if out is not None:
