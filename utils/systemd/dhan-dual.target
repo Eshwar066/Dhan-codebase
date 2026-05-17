@@ -1,0 +1,6 @@
+[Unit]
+Description=Dhan dual engines: LEAPS_RSI (LIVE) + OIPositionalBuy (PAPER)
+Wants=dhan-leaps-rsi.service dhan-oi-positional-buy.service
+
+[Install]
+WantedBy=multi-user.target

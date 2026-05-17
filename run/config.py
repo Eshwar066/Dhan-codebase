@@ -1,3 +1,4 @@
+import os
 from enum import Enum
 
 
@@ -27,11 +28,12 @@ DEBUG_MODE = False
 # Each engine job shares venue/broker/risk/pipeline settings, and strategy list defines
 # what the engine loads concurrently.
 ENGINE_JOBS = [
+    # LIVE
     {
         "engine_id": "dhan_leaps_rsi",
         "venue": "DHAN",
         "enabled": True,
-        "run_mode": "PAPER",
+        "run_mode": "LIVE",
         "capital": 200000,
         "ORDER_QTY_LOTS": 1,
         "symbols": ["NIFTY"],
@@ -40,8 +42,11 @@ ENGINE_JOBS = [
         # "exchange": "MCX",
         "market_ws_stall_timeout_seconds": 0,
         "telegram": {
-            "bot_token": "8663481671:AAHY-OnE8OiaJmkOfXbwqoe4InosJVblAtM",
-            "chat_id": "1021479950",
+            "bot_token": os.getenv(
+                "TELEGRAM_LEAPS_BOT_TOKEN",
+                "8663481671:AAHY-OnE8OiaJmkOfXbwqoe4InosJVblAtM",
+            ),
+            "chat_id": os.getenv("TELEGRAM_LEAPS_CHAT_ID", "1021479950"),
         },
         
         "strategies": ["LEAPS_RSI",], #"NiftyIntradayMagicalLine"
@@ -55,17 +60,25 @@ ENGINE_JOBS = [
             "sector": "YES",
         },
     },
+    # PAPER
     {
         "engine_id": "dhan_oi_positional_buy",
         "venue": "DHAN",
         "enabled": True,
-        "run_mode": "LIVE",
+        "run_mode": "PAPER",
         "capital": 200000,
         "ORDER_QTY_LOTS": 1,
         "symbols": ["NIFTY"],
         "exchange": "NSE",
         "strategies": ["OIPositionalBuy"],
         "live": {"exchange": "INDEX", "sector": "YES"},
+        "telegram": {
+            "bot_token": os.getenv(
+                "TELEGRAM_OI_BOT_TOKEN",
+                "8892391321:AAHOxQ2vRrXEe0Pz5Rn7hJRHX-GWYrbUOh4",
+            ),
+            "chat_id": os.getenv("TELEGRAM_OI_CHAT_ID", "1021479950"),
+        },
         "backtest": {
             "start_date": "2026-04-01",
             "end_date": "2026-04-28",

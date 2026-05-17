@@ -5,6 +5,10 @@ Single process, single venue (filter by --venue):
     python -m run.main --venue DHAN
     python -m run.main --venue DELTA
 
+One process per engine (recommended for mixed LIVE + PAPER on DHAN):
+    python -m run.main --engine-id dhan_leaps_rsi
+    python -m run.main --engine-id dhan_oi_positional_buy
+
 Two processes (parallel Dhan + Delta):
     Process 1: python -m run.main --venue DHAN
     Process 2: python -m run.main --venue DELTA
@@ -137,6 +141,24 @@ def run_engine(config: EngineConfig) -> None:
         )
 
 
+def _select_jobs(engine_id: str | None, venue: str | None) -> list[dict]:
+    jobs = list(ENGINE_JOBS)
+    if engine_id:
+        needle = engine_id.strip().lower()
+        jobs = [j for j in jobs if str(j.get("engine_id", "")).strip().lower() == needle]
+        if not jobs:
+            print(f"No ENGINE_JOBS entry with engine_id={engine_id!r}")
+            sys.exit(1)
+        return jobs
+    jobs = [j for j in jobs if j.get("enabled", True)]
+    if venue:
+        jobs = [j for j in jobs if str(j.get("venue", "")).upper() == venue.upper()]
+        if not jobs:
+            print(f"No enabled jobs for venue {venue}")
+            sys.exit(0)
+    return jobs
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Multi-venue trading: Dhan (India) + Delta (Crypto)"
@@ -145,22 +167,34 @@ def main():
         "--venue",
         choices=["DHAN", "DELTA"],
         default=None,
-        help="Run only jobs for this venue. If omitted, run all jobs (each with its own isolated engine).",
+        help="Run only enabled jobs for this venue.",
+    )
+    parser.add_argument(
+        "--engine-id",
+        dest="engine_id",
+        default=None,
+        metavar="ENGINE_ID",
+        help=(
+            "Run a single engine job by engine_id (e.g. dhan_leaps_rsi). "
+            "Runs even if enabled=False. Use one OS process per engine-id."
+        ),
     )
     args = parser.parse_args()
 
-    configs = [job_to_engine_config(job) for job in ENGINE_JOBS]
-    if args.venue:
-        configs = [c for c in configs if c.broker_name == args.venue]
-        if not configs:
-            configure_process_logging(None)
-            logger.warning("No enabled jobs for venue %s", args.venue)
-            print(f"No enabled jobs for venue {args.venue}")
-            sys.exit(0)
+    jobs = _select_jobs(args.engine_id, args.venue)
+    configs = [job_to_engine_config(job) for job in jobs]
+    if args.engine_id:
+        for config in configs:
+            config.enabled = True
+    if not configs:
+        configure_process_logging(None)
+        sys.exit(0)
 
-    configure_process_logging(configs[0] if configs else None)
+    configure_process_logging(configs[0])
 
-    mode_summary = ", ".join(f"{c.strategy_name}({c.run_mode.value})" for c in configs)
+    mode_summary = ", ".join(
+        f"{c.engine_id or c.strategy_name}({c.run_mode.value})" for c in configs
+    )
     print(f"Default run mode: {RUN_MODE.value} | Jobs: {mode_summary}")
     for config in configs:
         run_engine(config)
