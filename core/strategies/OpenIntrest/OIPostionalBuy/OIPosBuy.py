@@ -155,6 +155,29 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
             return self._full_chain_cache
         return None
 
+    def _ist_log_slot_for_candle(self, candle: dict) -> Optional[str]:
+        t = self._ist_time(candle)
+        if t in REFERENCE_SNAPSHOT_TIMES:
+            return f"{t.hour:02d}-{t.minute:02d}"
+        return None
+
+    def _chain_from_oi_logs(
+        self, candle: dict, ctx: Any, trade_date: date
+    ) -> Optional[Any]:
+        slot = self._ist_log_slot_for_candle(candle)
+        if slot is None:
+            return None
+        df = self._read_oi_log_chain_df(trade_date, slot)
+        if df is None:
+            return None
+        return {
+            "symbol": candle.get("symbol"),
+            "exchange": getattr(ctx, "exchange", None) or "INDEX",
+            "chain": df,
+            "atm_strike": None,
+            "expiry": self._read_oi_log_chain_expiry(trade_date, slot),
+        }
+
     def _fetch_full_option_chain(
         self, candle: dict, ctx: Any, *, log_snapshot: bool = False
     ) -> Any:
@@ -165,6 +188,31 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
         cached = self._full_chain_cache_lookup(candle)
         if cached is not None:
             return cached
+
+        trade_date = self._trade_date(candle)
+        log_chain = self._chain_from_oi_logs(candle, ctx, trade_date)
+        if log_chain is not None:
+            self._ensure_selected_expiry(candle, ctx, log_chain)
+            self._full_chain_cache = log_chain
+            self._full_chain_cache_key = (
+                str(candle.get("symbol") or ""),
+                candle.get("bucket_ts"),
+                trade_date,
+            )
+            if log_snapshot:
+                snap = self._find_strike_snapshot_params(candle, ctx, "")
+                if snap:
+                    try:
+                        log_option_chain_snapshot(
+                            log_chain,
+                            ctx=ctx,
+                            strategy_name=self.name,
+                            api=self.api,
+                            params={**snap, "snapshot_target": "oi_positional_buy"},
+                        )
+                    except Exception:
+                        pass
+            return log_chain
 
         strikes = self.fetch_option_chain(candle, ctx, "CE")
         if not strikes:
@@ -361,7 +409,7 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
         out["timestamp"] = bucket_ts
         return out
 
-    def _read_oi_log_chain_df(self, trade_date: date, slot: str) -> Optional[pd.DataFrame]:
+    def _oi_log_csv_path(self, trade_date: date, slot: str) -> Optional[Path]:
         day_dir = self._oi_logs_day_dir(trade_date)
         if not day_dir.is_dir():
             return None
@@ -374,7 +422,24 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
         if path is None:
             matches = sorted(day_dir.glob(f"*{token}*.csv"))
             path = matches[0] if matches else None
-        if path is None or not path.is_file():
+        return path if path is not None and path.is_file() else None
+
+    def _read_oi_log_chain_expiry(self, trade_date: date, slot: str) -> Optional[Any]:
+        path = self._oi_log_csv_path(trade_date, slot)
+        if path is None:
+            return None
+        try:
+            meta = pd.read_csv(path, usecols=lambda c: str(c) == "_chain_expiry")
+        except (OSError, ValueError, pd.errors.EmptyDataError):
+            return None
+        if meta.empty or "_chain_expiry" not in meta.columns:
+            return None
+        val = meta["_chain_expiry"].iloc[0]
+        return None if pd.isna(val) else val
+
+    def _read_oi_log_chain_df(self, trade_date: date, slot: str) -> Optional[pd.DataFrame]:
+        path = self._oi_log_csv_path(trade_date, slot)
+        if path is None:
             return None
         try:
             df = pd.read_csv(path)
@@ -385,7 +450,22 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
         drop_cols = [c for c in df.columns if str(c).startswith("_")]
         if drop_cols:
             df = df.drop(columns=drop_cols, errors="ignore")
+        if "Strike Price" in df.columns:
+            df = df.drop_duplicates(subset=["Strike Price"], keep="last")
         return df if not df.empty else None
+
+    def _ensure_selected_expiry(self, candle: dict, ctx: Any, chain: Any = None) -> None:
+        if getattr(ctx, "selected_expiry", None) is not None:
+            return
+        cal_exp = chain.get("expiry") if isinstance(chain, dict) else None
+        if cal_exp is None:
+            slot = self._ist_log_slot_for_candle(candle)
+            if slot:
+                cal_exp = self._read_oi_log_chain_expiry(self._trade_date(candle), slot)
+        if cal_exp is not None:
+            ctx.selected_expiry = pd.Timestamp(cal_exp).date()
+            return
+        self.fetch_option_chain(candle, ctx, "CE")
 
     def _benchmark_data_from_chain_df(
         self, df: pd.DataFrame, bench_candle: dict
@@ -410,8 +490,6 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
     def _ensure_benchmark(
         self, candle: dict, ctx: Any, trade_date: date
     ) -> Optional[Dict[str, List[OISnapshot]]]:
-        import pdb
-        pdb.set_trace()
         bench = self._benchmarks_by_day.get(trade_date)
         if bench:
             return bench
@@ -496,6 +574,7 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
         bench: OISnapshot,
         structure_id: str,
     ) -> Optional[Any]:
+        self._ensure_selected_expiry(candle, ctx)
         expiry = self._build_symbol_from_ctx_expiry(candle, ctx, snap.strike, snap.option_type)
         if expiry is None:
             return None

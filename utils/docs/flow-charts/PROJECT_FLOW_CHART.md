@@ -270,3 +270,25 @@ flowchart TD
     G --> A
     H --> A
 ```
+
+sequenceDiagram
+    participant Main as Main loop
+    participant SW as strategy_worker
+    participant RS as _run_strategy
+    participant PE as _process_entry_like_intent
+    participant Q as intent_queue
+    participant Router as route_intents_worker
+    participant OMS as account_symbol OMS worker
+    participant Broker as order_router / broker
+
+    Main->>SW: task on strategy queue
+    SW->>SW: on_candle → [OrderIntent]
+    SW->>Main: response_q.put(intent, ctx, ...)
+    Main->>RS: _run_strategy(...)
+    RS->>PE: for each entry intent
+    PE->>PE: risk, hours, dedupe, depth price
+    PE->>Q: _enqueue_intent
+    Router->>OMS: route by account/symbol
+    OMS->>Broker: process_intent (LIMIT BUY)
+    Broker-->>Main: fill → position_manager
+
