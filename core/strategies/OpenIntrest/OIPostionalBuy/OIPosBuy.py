@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
@@ -336,6 +337,89 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
         )
         return rows[0] if rows else None
 
+    def _oi_logs_day_dir(self, trade_date: date) -> Path:
+        root = Path(__file__).resolve().parents[4]
+        return root / "logs" / "OIPositionalBuy" / trade_date.isoformat()
+
+    def _benchmark_log_slot(self) -> str:
+        """CSV filename token for 09:30 bar close (matches snapshot_time in logs)."""
+        return ENTRY_SNAPSHOT_TIME.strftime("%H-%M")
+
+    def _benchmark_candle_for_date(self, candle: dict, trade_date: date) -> dict:
+        close_ist = pd.Timestamp(
+            year=trade_date.year,
+            month=trade_date.month,
+            day=trade_date.day,
+            hour=ENTRY_SNAPSHOT_TIME.hour,
+            minute=ENTRY_SNAPSHOT_TIME.minute,
+            tz=IST,
+        )
+        open_ist = close_ist - pd.Timedelta(minutes=self._bar_tf_minutes())
+        bucket_ts = int(open_ist.tz_convert("UTC").timestamp())
+        out = dict(candle)
+        out["bucket_ts"] = bucket_ts
+        out["timestamp"] = bucket_ts
+        return out
+
+    def _read_oi_log_chain_df(self, trade_date: date, slot: str) -> Optional[pd.DataFrame]:
+        day_dir = self._oi_logs_day_dir(trade_date)
+        if not day_dir.is_dir():
+            return None
+        token = slot.strip().replace(":", "-")
+        candidates = [
+            day_dir / f"{token}.csv",
+            day_dir / f"{token.replace('-', '')}.csv",
+        ]
+        path = next((p for p in candidates if p.is_file()), None)
+        if path is None:
+            matches = sorted(day_dir.glob(f"*{token}*.csv"))
+            path = matches[0] if matches else None
+        if path is None or not path.is_file():
+            return None
+        try:
+            df = pd.read_csv(path)
+        except (OSError, ValueError, pd.errors.EmptyDataError):
+            return None
+        if df.empty:
+            return None
+        drop_cols = [c for c in df.columns if str(c).startswith("_")]
+        if drop_cols:
+            df = df.drop(columns=drop_cols, errors="ignore")
+        return df if not df.empty else None
+
+    def _benchmark_data_from_chain_df(
+        self, df: pd.DataFrame, bench_candle: dict
+    ) -> Dict[str, List[OISnapshot]]:
+        return {
+            "CE": self._snapshots_from_df(df, bench_candle, "CE"),
+            "PE": self._snapshots_from_df(df, bench_candle, "PE"),
+        }
+
+    def _load_benchmark_from_logs(
+        self, candle: dict, trade_date: date
+    ) -> Optional[Dict[str, List[OISnapshot]]]:
+        df = self._read_oi_log_chain_df(trade_date, self._benchmark_log_slot())
+        if df is None:
+            return None
+        bench_candle = self._benchmark_candle_for_date(candle, trade_date)
+        data = self._benchmark_data_from_chain_df(df, bench_candle)
+        if not data.get("CE") and not data.get("PE"):
+            return None
+        return data
+
+    def _ensure_benchmark(
+        self, candle: dict, ctx: Any, trade_date: date
+    ) -> Optional[Dict[str, List[OISnapshot]]]:
+        import pdb
+        pdb.set_trace()
+        bench = self._benchmarks_by_day.get(trade_date)
+        if bench:
+            return bench
+        bench = self._load_benchmark_from_logs(candle, trade_date)
+        if bench:
+            self._benchmarks_by_day[trade_date] = bench
+        return bench
+
     def _capture_930_benchmark(self, candle: dict, ctx: Any) -> None:
         """09:30: reference snapshots (CSV) + in-memory benchmark for 10:45 entry logic."""
         d = self._trade_date(candle)
@@ -350,6 +434,9 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
 
         chain = self._fetch_full_option_chain(candle, ctx, log_snapshot=True)
         if chain is None:
+            bench = self._load_benchmark_from_logs(candle, d)
+            if bench:
+                self._benchmarks_by_day[d] = bench
             return
 
         if held is not None:
@@ -458,13 +545,14 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
             return None
         if getattr(ctx, "intent_store", None) and ctx.intent_store.has_pending_intent(
             strategy=self.name,
+            structure_id=f"{self.name}:{symbol}",
             tags=["MAIN", "MAIN_EXIT"],
             actions=["ENTRY", "EXIT"],
         ):
             return None
         if self._open_main_positions(ctx, symbol):
             return None
-        bench = self._benchmarks_by_day.get(d)
+        bench = self._ensure_benchmark(candle, ctx, d)
         if not bench:
             return None
 
@@ -517,7 +605,7 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
             return "TARGET"
         if self._ist_time(candle) == EOD_REVIEW_TIME:
             d = self._trade_date(candle)
-            bench = self._benchmarks_by_day.get(d, {})
+            bench = self._ensure_benchmark(candle, ctx, d) or {}
             bmap = {(b.option_type, b.strike): b for b in bench.get(meta.option_type, [])}
             b = bmap.get((meta.option_type, meta.strike))
             if b is None:
@@ -540,8 +628,6 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
 
     def on_candle(self, candle: dict, ctx: Any):
         t = self._ist_time(candle)
-        import pdb
-        pdb.set_trace()
         if t == ENTRY_SNAPSHOT_TIME:
             self._capture_930_benchmark(candle, ctx)
             return None
