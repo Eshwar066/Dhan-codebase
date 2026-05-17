@@ -14,6 +14,7 @@ python -m run.option_buildup_scheduler --symbols GOLD --exchange MCX
 from __future__ import annotations
 
 import argparse
+import logging
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -148,6 +149,10 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
     run_scheduler(
         symbols=[str(s).strip().upper() for s in args.symbols if str(s).strip()],
         exchange=str(args.exchange or "NSE").strip().upper(),

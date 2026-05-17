@@ -465,9 +465,30 @@ class DhanSource:
         # Optional: sort just in case
         expiries = sorted(expiries)
 
-        if not expiries or expiry_index >= len(expiries):
+        if not expiries:
+            logger.warning(
+                "get_live_option_chain: no expiries for symbol=%s exchange=%s expiry_flag=%s",
+                symbol,
+                exchange,
+                expiry_flag,
+            )
             return None
-        expiry = expiries[expiry_index]
+
+        ei = int(expiry_index) if expiry_index is not None else 0
+        if ei < 0:
+            ei = 0
+        if ei >= len(expiries):
+            logger.warning(
+                "get_live_option_chain: expiry_index=%s out of range len=%s; "
+                "clamping to %s (symbol=%s exchange=%s)",
+                ei,
+                len(expiries),
+                len(expiries) - 1,
+                symbol,
+                exchange,
+            )
+            ei = len(expiries) - 1
+        expiry = expiries[ei]
         if hasattr(expiry, "strftime"):
             expiry_date = expiry
         else:

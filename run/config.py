@@ -8,7 +8,7 @@ class RunMode(str, Enum):
 
 
 # 🔁 Default run mode when a job does not specify "run_mode".
-RUN_MODE = RunMode.LIVE
+RUN_MODE = RunMode.PAPER
 
 # Global fallback: entry quantity in lots (used when a job does not override).
 ORDER_QTY_LOTS = 1
@@ -30,7 +30,7 @@ ENGINE_JOBS = [
     {
         "engine_id": "dhan_leaps_rsi",
         "venue": "DHAN",
-        "enabled": False,
+        "enabled": True,
         "run_mode": "PAPER",
         "capital": 200000,
         "ORDER_QTY_LOTS": 1,
