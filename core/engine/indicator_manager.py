@@ -24,10 +24,12 @@ class IndicatorManager:
     Maintains per-(symbol,timeframe) base candle history and per-strategy enriched
     indicator state.
 
-    Bootstrap (L2 logs → L3 API only on failure):
-    - Primary: closed candles from ``*_candles.log`` under ``logs/`` (canonical OHLCV + IST bar open).
-    - In-process cache: reused until the dataframe cannot satisfy a larger ``window``; no UTC-midnight invalidation.
-    - ``get_intraday`` is used only when logs are missing, short, discontinuous, misaligned, or unreadable.
+    Bootstrap (L2 candles log → L2b RSI history → L3 API):
+    - Primary: closed candles from ``logs/{strategy}/{engine_id}_candles.log`` (single append-only file).
+    - Secondary: close-only bars from ``{strategy}_rsi_history.log`` when the candle log is short.
+    - ``get_intraday`` only when both logs are missing or insufficient; same-day API rows are stripped
+      so today's OHLC comes only from closed ``*_candles.log`` lines.
+    - RSI history on disk is treated as already seeded on restart (append-only ``live_append``).
     """
 
     def __init__(self, data_provider: Any, engine_logger: Any = None):
@@ -43,6 +45,7 @@ class IndicatorManager:
         self._startup_logged: bool = False
         self._rsi_logged_keys = set()
         self._rsi_seeded_streams = set()
+        self._rsi_session_hydrated: set = set()
         self._rsi_log_root = "logs"
         self._rsi_debug_printed = False
         # Extra bars loaded beyond strategy window for continuity / validation slack.
@@ -164,6 +167,37 @@ class IndicatorManager:
             return ""
 
     @staticmethod
+    def _safe_strategy_dir(strategy_id: str) -> str:
+        raw = str(strategy_id or "GLOBAL").strip() or "GLOBAL"
+        return raw.replace("/", "_").replace("\\", "_").replace(" ", "_")
+
+    @staticmethod
+    def _is_candles_log_filename(name: str) -> bool:
+        """Single append-only ``{engine_id}_candles.log`` (excludes old ``*.log.YYYY-MM-DD`` rotators)."""
+        return name.endswith("_candles.log") and "_candles.log." not in name
+
+    def _list_candles_log_paths(self, strategy_id: Optional[str] = None) -> List[str]:
+        logs_root = self._rsi_log_root
+        paths: List[str] = []
+        if strategy_id:
+            scan_dirs = [os.path.join(logs_root, self._safe_strategy_dir(strategy_id))]
+        else:
+            scan_dirs = [logs_root]
+        for scan_dir in scan_dirs:
+            if not os.path.isdir(scan_dir):
+                continue
+            if strategy_id:
+                for name in sorted(os.listdir(scan_dir)):
+                    if self._is_candles_log_filename(name):
+                        paths.append(os.path.join(scan_dir, name))
+            else:
+                for root, _, files in os.walk(scan_dir):
+                    for name in sorted(files):
+                        if self._is_candles_log_filename(name):
+                            paths.append(os.path.join(root, name))
+        return paths
+
+    @staticmethod
     def _parse_bar_timestamp_ist_to_aware(bar_ist: Any) -> Optional[dt.datetime]:
         """Parse ``bar_timestamp_ist`` / ``candle_timestamp_ist`` from logs (ISO or ``YYYY-MM-DD HH:MM`` IST)."""
         s = str(bar_ist).strip()
@@ -182,6 +216,70 @@ class IndicatorManager:
             return None
         return None
 
+    def _rsi_history_path(self, strategy_id: str) -> str:
+        sid = str(strategy_id or "GLOBAL").strip() or "GLOBAL"
+        return os.path.join(self._rsi_log_root, sid, f"{sid}_rsi_history.log")
+
+    @staticmethod
+    def _dedupe_rows_by_timestamp(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Keep the last row per ``timestamp`` (handles duplicate log lines on restart)."""
+        if not rows:
+            return rows
+        by_ts: Dict[Any, Dict[str, Any]] = {}
+        for row in rows:
+            ts = row.get("timestamp")
+            if ts is not None:
+                by_ts[ts] = row
+        out = list(by_ts.values())
+        out.sort(key=lambda r: r["timestamp"])
+        return out
+
+    def _hydrate_rsi_session_state_from_disk(
+        self, strategy_id: str, symbol: str, tf: str
+    ) -> None:
+        """Mark RSI history streams that already exist on disk so restarts only append new bars."""
+        stream_key = (strategy_id, symbol, tf)
+        if stream_key in self._rsi_session_hydrated:
+            return
+        self._rsi_session_hydrated.add(stream_key)
+
+        path = self._rsi_history_path(strategy_id)
+        if not os.path.isfile(path):
+            return
+
+        sym_u = str(symbol or "").strip().upper()
+        tf_s = str(tf or "").strip()
+        found = 0
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        payload = json.loads(s)
+                    except Exception:
+                        continue
+                    if str(payload.get("symbol") or "").strip().upper() != sym_u:
+                        continue
+                    if str(payload.get("timeframe") or "").strip() != tf_s:
+                        continue
+                    ist_ts = str(payload.get("candle_timestamp_ist") or "").strip()
+                    if not ist_ts:
+                        continue
+                    if "T" in ist_ts:
+                        ist_ts = ist_ts.replace("T", " ")[:16]
+                    source = str(payload.get("source") or "historical_seed")
+                    key = (strategy_id, symbol, tf, ist_ts, source)
+                    self._rsi_logged_keys.add(key)
+                    found += 1
+        except Exception:
+            logger.exception("Failed hydrating RSI session state: %s", path)
+            return
+
+        if found > 0:
+            self._rsi_seeded_streams.add(stream_key)
+
     def _load_rsi_history_rows(
         self, strategy_id: str, symbol: str, tf: str, max_rows: int
     ) -> List[Dict[str, Any]]:
@@ -190,8 +288,7 @@ class IndicatorManager:
 
         sym_u = str(symbol or "").strip().upper()
         tf_s = str(tf or "").strip()
-        sid = str(strategy_id or "GLOBAL").strip() or "GLOBAL"
-        path = os.path.join(self._rsi_log_root, sid, f"{sid}_rsi_history.log")
+        path = self._rsi_history_path(strategy_id)
         if not os.path.isfile(path):
             return []
         rows: List[Dict[str, Any]] = []
@@ -236,10 +333,18 @@ class IndicatorManager:
         except Exception:
             logger.exception("Failed reading RSI history log: %s", path)
             return []
-        rows.sort(key=lambda r: r["timestamp"])
+        rows = self._dedupe_rows_by_timestamp(rows)
         if len(rows) > max_rows:
             rows = rows[-max_rows:]
         return rows
+
+    def _load_candles_from_rsi_history(
+        self, strategy_id: str, symbol: str, tf: str, tail_rows: int
+    ) -> Any:
+        """Bootstrap OHLC frame from deduped RSI history closes when candle logs are short."""
+        rows = self._load_rsi_history_rows(strategy_id, symbol, tf, max_rows=tail_rows)
+        out = self._candle_rows_to_sorted_df(rows, symbol)
+        return self._strip_same_day_bars(out)
 
     def _merge_rsi_history_into_base_df(
         self,
@@ -275,62 +380,64 @@ class IndicatorManager:
         symbol_u: str,
         tf_s: str,
         ist_day: Optional[dt.date] = None,
+        strategy_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Scan ``logs/**/*.`` for ``*_candles.log`` JSON lines with event_type=candle_closed.
+        Scan strategy ``logs/{strategy}/{engine_id}_candles.log`` (append-only).
+
+        When ``strategy_id`` is omitted, scans all strategies under ``logs/``.
         When ``ist_day`` is set, only rows whose bar open falls on that IST calendar date.
         """
         rows: List[Dict[str, Any]] = []
         if not symbol_u or not tf_s:
             return rows
         try:
-            logs_root = self._rsi_log_root
-            if not os.path.isdir(logs_root):
-                return rows
-            for root, _, files in os.walk(logs_root):
-                for name in files:
-                    if not name.endswith("_candles.log"):
-                        continue
-                    path = os.path.join(root, name)
-                    try:
-                        with open(path, "r", encoding="utf-8") as f:
-                            for line in f:
-                                s = line.strip()
-                                if not s:
-                                    continue
-                                try:
-                                    payload = json.loads(s)
-                                except Exception:
-                                    continue
-                                if str(payload.get("event_type") or "") != "candle_closed":
-                                    continue
-                                if str(payload.get("symbol") or "").strip().upper() != symbol_u:
-                                    continue
-                                if str(payload.get("timeframe") or "").strip() != tf_s:
-                                    continue
-                                bar_ist = payload.get("bar_timestamp_ist")
-                                if not bar_ist:
-                                    continue
-                                bar_dt = self._parse_bar_timestamp_ist_to_aware(bar_ist)
-                                if bar_dt is None:
-                                    continue
-                                if ist_day is not None and bar_dt.date() != ist_day:
-                                    continue
-                                rows.append(
-                                    {
-                                        "timestamp": bar_dt.astimezone(dt.timezone.utc),
-                                        "open": payload.get("open"),
-                                        "high": payload.get("high"),
-                                        "low": payload.get("low"),
-                                        "close": payload.get("close"),
-                                        "volume": payload.get("volume", 0),
-                                        "symbol": symbol_u,
-                                        "exchange": payload.get("exchange"),
-                                    }
-                                )
-                    except Exception:
-                        continue
+            for path in self._list_candles_log_paths(strategy_id):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            s = line.strip()
+                            if not s:
+                                continue
+                            try:
+                                payload = json.loads(s)
+                            except Exception:
+                                continue
+                            if str(payload.get("event_type") or "") != "candle_closed":
+                                continue
+                            if str(payload.get("symbol") or "").strip().upper() != symbol_u:
+                                continue
+                            if str(payload.get("timeframe") or "").strip() != tf_s:
+                                continue
+                            bar_ist = payload.get("bar_timestamp_ist")
+                            if not bar_ist:
+                                continue
+                            bar_dt = self._parse_bar_timestamp_ist_to_aware(bar_ist)
+                            if bar_dt is None:
+                                continue
+                            if ist_day is not None and bar_dt.date() != ist_day:
+                                continue
+                            rows.append(
+                                {
+                                    "timestamp": bar_dt.astimezone(dt.timezone.utc),
+                                    "open": payload.get("open"),
+                                    "high": payload.get("high"),
+                                    "low": payload.get("low"),
+                                    "close": payload.get("close"),
+                                    "volume": payload.get("volume", 0),
+                                    "symbol": symbol_u,
+                                    "exchange": payload.get("exchange"),
+                                }
+                            )
+                except Exception:
+                    continue
         except Exception:
+            logger.exception(
+                "Failed collecting candle rows symbol=%s tf=%s strategy=%s",
+                symbol_u,
+                tf_s,
+                strategy_id,
+            )
             return rows
         return rows
 
@@ -347,13 +454,17 @@ class IndicatorManager:
             out["symbol"] = symbol
         return out
 
-    def _load_candles_from_logs(self, symbol: str, tf: str, tail_rows: int) -> Any:
+    def _load_candles_from_logs(
+        self, symbol: str, tf: str, tail_rows: int, strategy_id: Optional[str] = None
+    ) -> Any:
         """Load the most recent ``tail_rows`` closed candles for symbol|timeframe from disk logs."""
         import pandas as pd
 
         symbol_u = str(symbol or "").strip().upper()
         tf_s = str(tf or "").strip()
-        rows = self._collect_candle_closed_rows_from_logs(symbol_u, tf_s, ist_day=None)
+        rows = self._collect_candle_closed_rows_from_logs(
+            symbol_u, tf_s, ist_day=None, strategy_id=strategy_id
+        )
         out = self._candle_rows_to_sorted_df(rows, symbol)
         if out is None or len(out) == 0:
             return pd.DataFrame()
@@ -426,12 +537,15 @@ class IndicatorManager:
         if "timestamp" not in df.columns or "rsi" not in df.columns:
             return
 
+        self._hydrate_rsi_session_state_from_disk(strategy_id, symbol, tf)
+
         strategy_dir = str(strategy_id or "GLOBAL").strip() or "GLOBAL"
         log_dir = os.path.join(self._rsi_log_root, strategy_dir)
         os.makedirs(log_dir, exist_ok=True)
         path = os.path.join(log_dir, f"{strategy_dir}_rsi_history.log")
         stream_key = (strategy_id, symbol, tf)
         seeded = stream_key in self._rsi_seeded_streams
+        # After hydration, only append the latest bar (never re-dump full history on restart).
         rows = [df.iloc[-1]] if seeded else [r for _, r in df.iterrows()]
 
         for row in rows:
@@ -480,7 +594,9 @@ class IndicatorManager:
                 return
         self._rsi_seeded_streams.add(stream_key)
 
-    def _load_today_live_candles(self, symbol: str, tf: str) -> Any:
+    def _load_today_live_candles(
+        self, symbol: str, tf: str, strategy_id: Optional[str] = None
+    ) -> Any:
         import pandas as pd
 
         symbol_u = str(symbol or "").strip().upper()
@@ -488,15 +604,19 @@ class IndicatorManager:
         if not symbol_u or not tf_s:
             return pd.DataFrame()
         ist_today = dt.datetime.now(IST).date()
-        rows = self._collect_candle_closed_rows_from_logs(symbol_u, tf_s, ist_day=ist_today)
+        rows = self._collect_candle_closed_rows_from_logs(
+            symbol_u, tf_s, ist_day=ist_today, strategy_id=strategy_id
+        )
         return self._candle_rows_to_sorted_df(rows, symbol)
 
-    def _merge_today_live_candles(self, df: Any, symbol: str, tf: str) -> Any:
+    def _merge_today_live_candles(
+        self, df: Any, symbol: str, tf: str, strategy_id: Optional[str] = None
+    ) -> Any:
         import pandas as pd
 
         if df is None or len(df) == 0 or "timestamp" not in df.columns:
             return df
-        live_df = self._load_today_live_candles(symbol, tf)
+        live_df = self._load_today_live_candles(symbol, tf, strategy_id=strategy_id)
         if live_df is None or len(live_df) == 0:
             return df
 
@@ -515,8 +635,43 @@ class IndicatorManager:
         merged = merged.drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
         return merged
 
+    @staticmethod
+    def _strip_same_day_bars(df: Any) -> Any:
+        """Remove today's rows from API bootstrap; today's OHLC comes from closed-candle logs."""
+        import pandas as pd
+
+        if df is None or len(df) == 0 or "timestamp" not in df.columns:
+            return df
+        ist_today = dt.datetime.now(IST).date()
+        ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        mask = ts.dt.tz_convert(IST).dt.date < ist_today
+        out = df.loc[mask].reset_index(drop=True)
+        return out
+
+    @staticmethod
+    def _indicator_row_for_candle(df: Any, row_ts: Any) -> Any:
+        """Return the indicator dataframe row matching the live candle bar open time."""
+        import pandas as pd
+
+        if df is None or len(df) == 0:
+            return None
+        target = pd.to_datetime(row_ts, utc=True, errors="coerce")
+        if pd.isna(target):
+            return df.iloc[-1]
+        tss = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        matches = df.loc[tss == target]
+        if len(matches) > 0:
+            return matches.iloc[-1]
+        return df.iloc[-1]
+
     def _bootstrap_base_candle_state(
-        self, symbol: str, tf: str, exchange: str, sector: str, window: int
+        self,
+        symbol: str,
+        tf: str,
+        exchange: str,
+        sector: str,
+        window: int,
+        strategy_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         import pandas as pd
 
@@ -540,7 +695,7 @@ class IndicatorManager:
 
         buf = max(10, int(self._log_bootstrap_buffer))
         need_tail = window + buf
-        df_log = self._load_candles_from_logs(symbol, tf, need_tail)
+        df_log = self._load_candles_from_logs(symbol, tf, need_tail, strategy_id=strategy_id)
         source = ""
         df: Any = None
 
@@ -559,6 +714,26 @@ class IndicatorManager:
                     len(df_log),
                     window,
                 )
+
+        if df is None and strategy_id:
+            df_rsi = self._load_candles_from_rsi_history(
+                strategy_id, symbol, tf, need_tail
+            )
+            if len(df_rsi) > 0:
+                ok, reason = self._validate_log_candles(df_rsi, tf, exchange, window)
+                if ok:
+                    df = df_rsi.copy()
+                    source = "rsi_history"
+                else:
+                    logger.info(
+                        "BOOTSTRAP_RSI_HISTORY_REJECT symbol=%s tf=%s strategy=%s reason=%s rows=%s need=%s",
+                        symbol,
+                        tf,
+                        strategy_id,
+                        reason,
+                        len(df_rsi),
+                        window,
+                    )
 
         if df is None:
             ist_today = dt.datetime.now(IST).date()
@@ -579,7 +754,7 @@ class IndicatorManager:
                 df = None
             source = "api"
             if df is not None and len(df) > 0:
-                df = df.copy()
+                df = self._strip_same_day_bars(df.copy())
 
         if df is None or len(df) == 0:
             empty: Dict[str, Any] = {
@@ -596,7 +771,7 @@ class IndicatorManager:
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
             df = df.dropna(subset=["timestamp"]).reset_index(drop=True)
-        df = self._merge_today_live_candles(df, symbol, tf)
+        df = self._merge_today_live_candles(df, symbol, tf, strategy_id=strategy_id)
         if "symbol" not in df.columns:
             df["symbol"] = symbol
         if "exchange" not in df.columns:
@@ -622,6 +797,15 @@ class IndicatorManager:
                 len(df),
                 window,
             )
+        elif source == "rsi_history":
+            logger.info(
+                "BOOTSTRAP_PRIMARY_RSI_HISTORY symbol=%s tf=%s strategy=%s rows=%s window=%s",
+                symbol,
+                tf,
+                strategy_id,
+                len(df),
+                window,
+            )
         return new_state
 
     def enrich_candle_for_strategy(self, strategy: Any, candle: Dict[str, Any], candle_bucket_fn: Any) -> Dict[str, Any]:
@@ -637,8 +821,13 @@ class IndicatorManager:
 
         exchange = str(candle.get("exchange") or self._live_exchange or "INDEX")
         sector = str(self._live_sector or "NO")
+        strategy_id = str(getattr(strategy, "name", "unknown_strategy"))
         window = self.indicator_window_size(strategy)
-        base_state = self._bootstrap_base_candle_state(symbol, tf, exchange, sector, window)
+        if self._strategy_requires_rsi(strategy):
+            self._hydrate_rsi_session_state_from_disk(strategy_id, symbol, tf)
+        base_state = self._bootstrap_base_candle_state(
+            symbol, tf, exchange, sector, window, strategy_id=strategy_id
+        )
         base_df = base_state.get("df")
         if base_df is None:
             return dict(candle)
@@ -670,10 +859,26 @@ class IndicatorManager:
 
             if len(base_df) > 0 and "timestamp" in base_df.columns:
                 last_hist_ts = pd.to_datetime(base_df.iloc[-1].get("timestamp"), utc=True, errors="coerce")
-                # Reject stale live candle older than history.
+                # Reject stale live candle older than history (skip when same IST day — partial bootstrap).
                 if not pd.isna(last_hist_ts) and row_ts < last_hist_ts:
-                    base_state["last_bucket"] = bucket
-                    return dict(candle)
+                    same_ist_day = (
+                        pd.Timestamp(row_ts).tz_convert(IST).date()
+                        == pd.Timestamp(last_hist_ts).tz_convert(IST).date()
+                    )
+                    if not same_ist_day:
+                        base_state["last_bucket"] = bucket
+                        return dict(candle)
+                    # Same-day rows from logs/API ahead of this close are dropped.
+                    tss = pd.to_datetime(base_df["timestamp"], utc=True, errors="coerce")
+                    row_ist_date = pd.Timestamp(row_ts).tz_convert(IST).date()
+                    keep = (tss.dt.tz_convert(IST).dt.date != row_ist_date) | (tss <= row_ts)
+                    base_df = base_df.loc[keep].reset_index(drop=True)
+                    base_state["df"] = base_df
+                    last_hist_ts = (
+                        pd.to_datetime(base_df.iloc[-1].get("timestamp"), utc=True, errors="coerce")
+                        if len(base_df) > 0
+                        else pd.NaT
+                    )
                 # If candle timestamp matches last history row, replace last row with live OHLC.
                 # This keeps continuity and fixes close/RSI drift on boundary buckets.
                 if not pd.isna(last_hist_ts) and last_hist_ts == row_ts:
@@ -832,8 +1037,16 @@ class IndicatorManager:
         if len(df) <= warmup:
             return out
 
-        latest = df.iloc[-1].to_dict()
-        for k, v in latest.items():
+        bar_row_ts = None
+        if bucket is not None:
+            bar_row_ts = pd.to_datetime(bucket, unit="s", utc=True, errors="coerce")
+        if bar_row_ts is None or pd.isna(bar_row_ts):
+            bar_row_ts = pd.to_datetime(candle.get("timestamp"), utc=True, errors="coerce")
+        latest = self._indicator_row_for_candle(df, bar_row_ts)
+        if latest is None:
+            return out
+        latest_dict = latest.to_dict() if hasattr(latest, "to_dict") else dict(latest)
+        for k, v in latest_dict.items():
             if k in ("symbol", "exchange"):
                 continue
             out[k] = v

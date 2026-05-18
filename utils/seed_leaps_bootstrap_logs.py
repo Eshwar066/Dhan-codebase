@@ -160,9 +160,28 @@ def main() -> None:
         if x["candle_timestamp_ist"] >= "2026-05-12 09:15"
     ]
 
+    # Keep any live-session closes already on disk (today onward) after the seeded block.
+    live_tail: list[str] = []
+    if os.path.isfile(candle_path):
+        for ln in open(candle_path, encoding="utf-8"):
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                j = json.loads(ln)
+            except Exception:
+                continue
+            bar = str(j.get("bar_timestamp_ist") or "")
+            if "T" in bar:
+                bar = bar.replace("T", " ")[:16]
+            if bar >= "2026-05-15 09:15":
+                live_tail.append(ln)
+
     with open(candle_path, "w", encoding="utf-8") as f:
         for pl in candles:
             f.write(json.dumps(pl, default=str) + "\n")
+        for ln in live_tail:
+            f.write(ln + "\n")
 
     with open(hist_path, "w", encoding="utf-8") as f:
         for ln in head:

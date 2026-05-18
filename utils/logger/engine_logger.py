@@ -1,6 +1,7 @@
 """
 Structured JSON logging per engine. One file per engine: logs/{engine_id}.log.
-Closed candles: logs/{engine_id}_candles.log (see candle_created).
+Closed candles: logs/{strategy}/{engine_id}_candles.log — single append-only file (see candle_created).
+Engine events in logs/{strategy}/{engine_id}.log still rotate daily at midnight UTC.
 No print(); all events logged as one JSON object per line.
 For ``candle_closed`` rows, ``timestamp`` and ``bar_timestamp_ist`` use IST wall time as ``YYYY-MM-DD HH:MM`` (no seconds). Other events still use full ISO-8601 with offset in ``timestamp``.
 """
@@ -154,6 +155,12 @@ class EngineLogger:
             exc_info=None,
         )
         handler.emit(record)
+
+    def _append_line(self, path: str, line: str) -> None:
+        """Append one line to a non-rotating log file (used for closed-candle history)."""
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line if line.endswith("\n") else line + "\n")
 
     @staticmethod
     def _is_missing(value: Any) -> bool:
@@ -425,7 +432,7 @@ class EngineLogger:
         timeframe: Optional[str] = None,
         source: str = "live",
     ) -> None:
-        """Append one JSON line per closed candle to logs/{engine_id}_candles.log."""
+        """Append one JSON line per closed candle to logs/{strategy}/{engine_id}_candles.log."""
         ts = candle.get("timestamp")
         tf_sec = None
         if _resolution_to_seconds is not None and timeframe is not None:
@@ -468,8 +475,7 @@ class EngineLogger:
             payload = round_json_floats(payload)
         line = json.dumps(payload, default=str) + "\n"
         with self._lock:
-            os.makedirs(self._log_dir, exist_ok=True)
-            self._emit_line(self._candles_path, line)
+            self._append_line(self._candles_path, line)
         self._send_telegram_alert(payload)
 
     def order_placed(

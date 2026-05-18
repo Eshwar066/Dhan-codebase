@@ -304,12 +304,14 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self, symbol: str, tf: str, exchange: str, sector: str
     ) -> Optional[int]:
         try:
+            strategy_id = str(getattr(self.strategy, "name", "") or "")
             state = self.indicator_manager._bootstrap_base_candle_state(
                 symbol=symbol,
                 tf=tf,
                 exchange=exchange,
                 sector=sector,
                 window=self.indicator_manager.indicator_window_size(self.strategy),
+                strategy_id=strategy_id or None,
             )
             df = state.get("df")
             if df is None or len(df) == 0 or "timestamp" not in df.columns:
@@ -1398,7 +1400,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             aligned_first_live = self._align_first_live_bar(
                                 int(eval_bucket), last_hist_ts, tf_sec
                             )
-                            self._first_live_alignment_done[symbol] = True
                             if (
                                 aligned_first_live is not None
                                 and eval_bucket < aligned_first_live
@@ -1410,6 +1411,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                                     aligned_first_live,
                                 )
                                 continue
+                            self._first_live_alignment_done[symbol] = True
                         elif is_dummy_feed:
                             self._first_live_alignment_done[symbol] = True
 
