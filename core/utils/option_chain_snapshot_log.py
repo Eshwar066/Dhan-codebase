@@ -165,7 +165,16 @@ def log_option_chain_snapshot(
 
     try:
         if path.exists():
-            df_out.to_csv(path, index=False, encoding="utf-8", mode="a", header=False, float_format="%.2f")
+            if target in ("option_buildup", "oi_positional_buy"):
+                return True
+            df_out.to_csv(
+                path,
+                index=False,
+                encoding="utf-8",
+                mode="a",
+                header=False,
+                float_format="%.2f",
+            )
         else:
             df_out.to_csv(path, index=False, encoding="utf-8", float_format="%.2f")
     except OSError as exc:
