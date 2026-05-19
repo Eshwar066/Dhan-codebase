@@ -21,7 +21,7 @@ REFERENCE_SNAPSHOT_TIMES = frozenset(
     {ENTRY_SNAPSHOT_TIME, ENTRY_EVAL_TIME, EOD_REVIEW_TIME}
 )
 
-PREMIUM_MIN = 180
+PREMIUM_MIN = 170
 PREMIUM_MAX = 220
 PREMIUM_CHANGE_LIMIT_PCT = 80
 TARGET_MULTIPLIER = 1.5
@@ -141,9 +141,6 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
         )
         if slot_key in self._oi_snapshot_logged_slots:
             return {}
-        if self._has_oi_log_for_candle(candle):
-            self._oi_snapshot_logged_slots.add(slot_key)
-            return {}
         self._oi_snapshot_logged_slots.add(slot_key)
         return {
             "snapshot": True,
@@ -158,19 +155,17 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
             return self._full_chain_cache
         return None
 
-    def _log_slot_for_candle(self, candle: dict) -> str:
-        """CSV filename token for this bar's IST close (e.g. 10-45)."""
-        return self._candle_close_ts_ist(candle).strftime("%H-%M")
+    def _ist_log_slot_for_candle(self, candle: dict) -> Optional[str]:
+        t = self._ist_time(candle)
+        if t in REFERENCE_SNAPSHOT_TIMES:
+            return f"{t.hour:02d}-{t.minute:02d}"
+        return None
 
-    def _has_oi_log_for_candle(self, candle: dict, trade_date: Optional[date] = None) -> bool:
-        d = trade_date if trade_date is not None else self._trade_date(candle)
-        return self._oi_log_csv_path(d, self._log_slot_for_candle(candle)) is not None
-
-    def _load_chain_from_oi_log(
+    def _chain_from_oi_logs(
         self, candle: dict, ctx: Any, trade_date: date
     ) -> Optional[Any]:
-        slot = self._log_slot_for_candle(candle)
-        if not self._oi_log_csv_path(trade_date, slot):
+        slot = self._ist_log_slot_for_candle(candle)
+        if slot is None:
             return None
         df = self._read_oi_log_chain_df(trade_date, slot)
         if df is None:
@@ -188,7 +183,6 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
     ) -> Any:
         """
         Single option-chain request (DHAN returns CE + PE in one DataFrame).
-        Uses logs/OIPositionalBuy/<date>/<slot>.csv when present; otherwise live API.
         Cached per symbol/bucket/trade-day for reuse within the same candle evaluation.
         """
         cached = self._full_chain_cache_lookup(candle)
@@ -196,17 +190,29 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
             return cached
 
         trade_date = self._trade_date(candle)
-        if self._has_oi_log_for_candle(candle, trade_date):
-            log_chain = self._load_chain_from_oi_log(candle, ctx, trade_date)
-            if log_chain is not None:
-                self._ensure_selected_expiry(candle, ctx, log_chain)
-                self._full_chain_cache = log_chain
-                self._full_chain_cache_key = (
-                    str(candle.get("symbol") or ""),
-                    candle.get("bucket_ts"),
-                    trade_date,
-                )
-                return log_chain
+        log_chain = self._chain_from_oi_logs(candle, ctx, trade_date)
+        if log_chain is not None:
+            self._ensure_selected_expiry(candle, ctx, log_chain)
+            self._full_chain_cache = log_chain
+            self._full_chain_cache_key = (
+                str(candle.get("symbol") or ""),
+                candle.get("bucket_ts"),
+                trade_date,
+            )
+            if log_snapshot:
+                snap = self._find_strike_snapshot_params(candle, ctx, "")
+                if snap:
+                    try:
+                        log_option_chain_snapshot(
+                            log_chain,
+                            ctx=ctx,
+                            strategy_name=self.name,
+                            api=self.api,
+                            params={**snap, "snapshot_target": "oi_positional_buy"},
+                        )
+                    except Exception:
+                        pass
+            return log_chain
 
         strikes = self.fetch_option_chain(candle, ctx, "CE")
         if not strikes:
@@ -258,10 +264,7 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
         return chain
 
     def _take_reference_snapshots(self, candle: dict, ctx: Any) -> None:
-        """Persist one combined CE+PE option-chain reference snapshot (skip if CSV exists)."""
-        if self._has_oi_log_for_candle(candle):
-            self._fetch_full_option_chain(candle, ctx, log_snapshot=False)
-            return
+        """Persist one combined CE+PE option-chain reference snapshot."""
         self._fetch_full_option_chain(candle, ctx, log_snapshot=True)
 
     def _oi_column(self, df: pd.DataFrame, option_type: str) -> Optional[str]:
@@ -455,10 +458,10 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
         if getattr(ctx, "selected_expiry", None) is not None:
             return
         cal_exp = chain.get("expiry") if isinstance(chain, dict) else None
-        if cal_exp is None and self._has_oi_log_for_candle(candle):
-            cal_exp = self._read_oi_log_chain_expiry(
-                self._trade_date(candle), self._log_slot_for_candle(candle)
-            )
+        if cal_exp is None:
+            slot = self._ist_log_slot_for_candle(candle)
+            if slot:
+                cal_exp = self._read_oi_log_chain_expiry(self._trade_date(candle), slot)
         if cal_exp is not None:
             ctx.selected_expiry = pd.Timestamp(cal_exp).date()
             return
@@ -507,9 +510,7 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
         ]
         held = open_main[0] if open_main else None
 
-        chain = self._fetch_full_option_chain(
-            candle, ctx, log_snapshot=not self._has_oi_log_for_candle(candle, d)
-        )
+        chain = self._fetch_full_option_chain(candle, ctx, log_snapshot=True)
         if chain is None:
             bench = self._load_benchmark_from_logs(candle, d)
             if bench:
@@ -617,6 +618,8 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
         ]
 
     def _evaluate_entry_1045(self, candle: dict, ctx: Any) -> Optional[List[Any]]:
+        import pdb
+        pdb.set_trace
         symbol = candle["symbol"]
         d = self._trade_date(candle)
         if self._sl_blocked_day_by_symbol.get(symbol) == d:

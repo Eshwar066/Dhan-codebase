@@ -659,6 +659,10 @@ class IndiaMktMixins:
 
         return otm_strikes
 
+    def _find_strike_snapshot_params(self, candle, ctx, option_type):
+        """Override in strategy to set params['snapshot']=True for chain CSV logging."""
+        return {}
+
     def get_option_chain_snapshot(self, candle, ctx, option_type):
         otm_strikes = self.fetch_option_chain(candle, ctx, option_type)
         if not otm_strikes:
@@ -759,6 +763,11 @@ class IndiaMktMixins:
             "expiry_flag": "MONTH",
             "securityId": "13",
         }
+        extra_snapshot_params = self._find_strike_snapshot_params(
+            candle=candle, ctx=ctx, option_type=option_type
+        )
+        if isinstance(extra_snapshot_params, dict) and extra_snapshot_params:
+            params.update(extra_snapshot_params)
 
         chain = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
         if bool(params.get("snapshot", False)):

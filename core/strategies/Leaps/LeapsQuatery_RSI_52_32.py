@@ -3,7 +3,7 @@ import talib
 
 from run.config import RUN_MODE, RunMode
 from core.strategies.base import BaseStrategy
-from core.strategies.IndiaMktMixins import IndiaMktMixins
+from core.strategies.IndiaMktMixins import IST, IndiaMktMixins
 from core.utils.expiry_resolver import ExpiryResolver
 
 class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
@@ -17,7 +17,10 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     required_context = ["option_chain"]
     api = "DHAN"
     expiryType = "QUARTERLY"
-    
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._leaps_snapshot_logged_slots: set[str] = set()
 
     # ==================================================
     # INDICATORS
@@ -32,6 +35,39 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
 
     def requires_live_rsi_patch(self) -> bool:
         return True
+
+    #option chain snapshot
+    def _candle_close_ts_ist(self, candle: dict) -> pd.Timestamp:
+        ts = pd.Timestamp(candle["timestamp"])
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(IST)
+        else:
+            ts = ts.tz_convert(IST)
+        bar_minutes = int(self.timeframe) if str(self.timeframe).isdigit() else 60
+        return ts + pd.Timedelta(minutes=bar_minutes)
+
+      #option chain snapshot
+    def _find_strike_snapshot_params(self, candle, ctx, option_type):
+        ts_ist = self._candle_close_ts_ist(candle)
+        snapshot_date = ts_ist.strftime("%Y-%m-%d")
+        snapshot_time = ts_ist.strftime("%H-%M")
+        slot_key = "|".join(
+            [
+                str(getattr(ctx, "symbol", "") or ""),
+                str(option_type or ""),
+                snapshot_date,
+                snapshot_time,
+            ]
+        )
+        if slot_key in self._leaps_snapshot_logged_slots:
+            return {}
+        self._leaps_snapshot_logged_slots.add(slot_key)
+        return {
+            "snapshot": True,
+            "snapshot_date": snapshot_date,
+            "snapshot_time": snapshot_time,
+            "snapshot_target": "leaps_rsi",
+        }
 
     # ==================================================
     # SHOULD EVALUATE
@@ -48,8 +84,6 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     # ENTRY
     # ==================================================
     def on_candle(self, candle, ctx):
-    
-        
         rsi = candle["rsi"]
         if rsi < 32:
             option_type = "CALL"
