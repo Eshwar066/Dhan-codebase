@@ -70,6 +70,8 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
     required_context = ["option_chain"]
     api = "DHAN"
     expiryType = "MONTHLY"
+    # DHAN expiry_code 0 = current month, 1 = next month when trade_date.day > this day.
+    dhan_monthly_rollover_after_calendar_day = 16
     otm_strike_step = 100
     otm_strike_count = 30
 
@@ -454,17 +456,26 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
             df = df.drop_duplicates(subset=["Strike Price"], keep="last")
         return df if not df.empty else None
 
+    def _dhan_monthly_expiry_index(self, trade_date: date) -> int:
+        """Day 1–16 → current month (0); day 17+ → next month (1)."""
+        rollover = getattr(self, "dhan_monthly_rollover_after_calendar_day", 16)
+        return ExpiryResolver._derive_monthly_series(
+            trade_date, calendar_rollover_day=rollover
+        )
+
     def _ensure_selected_expiry(self, candle: dict, ctx: Any, chain: Any = None) -> None:
         if getattr(ctx, "selected_expiry", None) is not None:
             return
+        trade_date = self._trade_date(candle)
         cal_exp = chain.get("expiry") if isinstance(chain, dict) else None
         if cal_exp is None:
             slot = self._ist_log_slot_for_candle(candle)
             if slot:
-                cal_exp = self._read_oi_log_chain_expiry(self._trade_date(candle), slot)
+                cal_exp = self._read_oi_log_chain_expiry(trade_date, slot)
         if cal_exp is not None:
             ctx.selected_expiry = pd.Timestamp(cal_exp).date()
             return
+        ctx.selected_expiry = self._dhan_monthly_expiry_index(trade_date)
         self.fetch_option_chain(candle, ctx, "CE")
 
     def _benchmark_data_from_chain_df(
