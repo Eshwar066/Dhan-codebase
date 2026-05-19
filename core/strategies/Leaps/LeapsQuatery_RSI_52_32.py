@@ -114,15 +114,11 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         if not strike:
             return None
 
-        expiry = ctx.selected_expiry
-        trade_date = pd.to_datetime(candle["timestamp"]).date()
-        expiry_for_symbol = expiry
-        # DHAN option-chain flow stores expiry as rolling series index (0/1/..).
-        # Convert to calendar date before building option symbol.
-        if isinstance(expiry, (int, float)):
-            expiry_for_symbol = ExpiryResolver.dhan_expiry_index_to_date(
-                trade_date, int(expiry)
-            )
+        expiry_for_symbol = self._expiry_from_option_chain()
+        if expiry_for_symbol is None:
+            print(f"⚠️ No expiry on option chain at {candle['timestamp']}")
+            return None
+
         # Build the trading symbol
         trading_symbol = ExpiryResolver.build_option_symbol(
             self,

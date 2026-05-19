@@ -183,6 +183,18 @@ class ExpiryResolver:
         return ExpiryResolver.next_month_expiry(trade_date)
 
     @staticmethod
+    def quarterly_target_expiry_date(trade_date) -> dt.date:
+        """
+        LEAPS / QUARTERLY calendar fallback: last Thursday of the quarter month from
+        ``_select_expiry_month``. Live DHAN option chains usually set ``chain['expiry']``
+        from ``get_live_option_chain`` (monthly expiry list indexed by
+        ``_derive_quarterly_series``); prefer that date on ``ctx.selected_expiry`` when set.
+        """
+        td = pd.Timestamp(trade_date).date()
+        q_month, q_year = ExpiryResolver._select_expiry_month(td)
+        return ExpiryResolver._last_thursday(q_year, q_month)
+
+    @staticmethod
     def dhan_calendar_expiry_to_index(trade_date, calendar_expiry) -> int:
         """
         Inverse of ``dhan_expiry_index_to_date``: map a calendar expiry to DHAN ``expiry_code``

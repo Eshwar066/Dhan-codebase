@@ -659,6 +659,20 @@ class IndiaMktMixins:
 
         return otm_strikes
 
+    def _expiry_from_option_chain(self, chain: Any = None) -> Optional[date]:
+        """Calendar expiry from DHAN chain dict (same as snapshot ``_chain_expiry``)."""
+        if chain is None:
+            chain = getattr(self, "_last_option_chain", None)
+        if not isinstance(chain, dict):
+            return None
+        exp = chain.get("expiry")
+        if exp is None or (isinstance(exp, float) and pd.isna(exp)):
+            return None
+        try:
+            return pd.Timestamp(exp).date()
+        except (TypeError, ValueError):
+            return None
+
     def _find_strike_snapshot_params(self, candle, ctx, option_type):
         """Override in strategy to set params['snapshot']=True for chain CSV logging."""
         return {}
@@ -770,6 +784,7 @@ class IndiaMktMixins:
             params.update(extra_snapshot_params)
 
         chain = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
+        self._last_option_chain = chain
         if bool(params.get("snapshot", False)):
             try:
                 log_option_chain_snapshot(
@@ -783,7 +798,7 @@ class IndiaMktMixins:
                 logger.warning(
                     "log_option_chain_snapshot raised: %s", exc, exc_info=True
                 )
-            
+
         if chain is None:
             print(">>no option chain data", ctx, params)
             return None
@@ -813,6 +828,7 @@ class IndiaMktMixins:
             if premium_col is None or strike_col is None:
                 return None
 
+            #this gets printed
             live_df = live_df[
                 live_df[strike_col].apply(self._strike_on_hundred_point_grid)
             ]
@@ -977,6 +993,7 @@ class IndiaMktMixins:
                 out_row = row.iloc[0]
             else:
                 out_row = row
+
             return selected_strike, premium, out_row
 
         return None
