@@ -159,6 +159,110 @@ core/data/
   - `reports/{engine_id}_*.csv`
   - intent journal files in `logs/`
 
+## Systemd services
+
+Unit files live in `utils/systemd/`. They assume the repo at `/root/Dhan-codebase`, a `.env` in that directory, and Python in `.venv` (except `delta.service`, which uses `venv`).
+
+### One-time install
+
+```bash
+cd /root/Dhan-codebase
+
+sudo cp utils/systemd/dhan-leaps-rsi.service /etc/systemd/system/
+sudo cp utils/systemd/dhan-oi-positional-buy.service /etc/systemd/system/
+sudo cp utils/systemd/dhan-dual.target /etc/systemd/system/
+sudo cp utils/systemd/option-buildup-scheduler.service /etc/systemd/system/
+# Optional / legacy:
+sudo cp utils/systemd/dhan-trading.service /etc/systemd/system/
+sudo cp utils/systemd/delta.service /etc/systemd/system/
+
+sudo systemctl daemon-reload
+```
+
+If your virtualenv is `venv` instead of `.venv`, edit the `ExecStart=` lines in `/etc/systemd/system/` before running `daemon-reload`.
+
+### Both Dhan engines (recommended)
+
+Starts **LEAPS RSI** (LIVE) and **OI positional buy** (PAPER) together via `dhan-dual.target`.
+
+```bash
+sudo systemctl enable dhan-dual.target
+sudo systemctl start dhan-dual.target
+
+sudo systemctl status dhan-dual.target
+sudo systemctl status dhan-leaps-rsi.service dhan-oi-positional-buy.service
+
+tail -f /root/dhan-leaps-rsi.log /root/dhan-leaps-rsi.err.log
+tail -f /root/dhan-oi-positional-buy.log /root/dhan-oi-positional-buy.err.log
+
+sudo systemctl stop dhan-dual.target
+```
+
+| Unit | Command |
+|------|---------|
+| `dhan-leaps-rsi.service` | `python -m run.main --engine-id dhan_leaps_rsi` (LIVE) |
+| `dhan-oi-positional-buy.service` | `python -m run.main --engine-id dhan_oi_positional_buy` (PAPER) |
+
+### Individual Dhan services
+
+```bash
+sudo systemctl enable --now dhan-leaps-rsi.service
+sudo systemctl status dhan-leaps-rsi.service
+sudo systemctl stop dhan-leaps-rsi.service
+
+sudo systemctl enable --now dhan-oi-positional-buy.service
+sudo systemctl status dhan-oi-positional-buy.service
+sudo systemctl stop dhan-oi-positional-buy.service
+```
+
+### Option buildup scheduler
+
+Requires `DHAN_CLIENT_CODE` and `DHAN_ACCESS_TOKEN` in `.env`.
+
+```bash
+sudo systemctl enable --now option-buildup-scheduler.service
+sudo systemctl status option-buildup-scheduler.service
+sudo journalctl -u option-buildup-scheduler.service -f
+sudo systemctl stop option-buildup-scheduler.service
+```
+
+Runs `run/option_buildup_scheduler.py --symbols NIFTY --exchange NSE` (adjust flags in the unit file as needed).
+
+### Delta engine
+
+```bash
+sudo systemctl enable --now delta.service
+sudo systemctl status delta.service
+tail -f /root/delta.log /root/delta.err.log
+sudo systemctl stop delta.service
+```
+
+Runs `python -m run.main --venue DELTA`.
+
+### Legacy unit
+
+`dhan-trading.service` is a legacy alias for LEAPS RSI only. Prefer `dhan-dual.target` or the two separate services above.
+
+### Run without systemd (same as the units)
+
+```bash
+cd /root/Dhan-codebase
+source .venv/bin/activate   # or: source venv/bin/activate for delta
+
+python -m run.main --engine-id dhan_leaps_rsi
+python -m run.main --engine-id dhan_oi_positional_buy
+PYTHONPATH=/root/Dhan-codebase python run/option_buildup_scheduler.py --symbols NIFTY --exchange NSE
+python -m run.main --venue DELTA
+```
+
+### Maintenance
+
+```bash
+sudo systemctl daemon-reload          # after editing unit files
+sudo systemctl restart dhan-leaps-rsi.service
+sudo systemctl list-units 'dhan*' 'option-buildup*' 'delta*'
+```
+
 ## Notes
 
 - Live candle evaluation is feed/aggregator-based.

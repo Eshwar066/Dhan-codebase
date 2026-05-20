@@ -687,15 +687,13 @@ class IndiaMktMixins:
                     option_type,
                 )
             return None
-        strike_window = max(60, int(getattr(self, "otm_strike_count", 35)) * 2)
         params = {
             "exchange": ctx.exchange,
             "interval": self.timeframe,
             "expiry_code": ctx.selected_expiry,
             "instrument": "OPTIDX",
             "expiry_flag": "MONTH",
-            # DhanAdapter.get_option_chain uses this as num_strikes each side of ATM.
-            "strikes": strike_window,
+            "strikes": 60,
         }
         if self.api != "DHAN":
             strike_param = otm_strikes
@@ -762,26 +760,42 @@ class IndiaMktMixins:
         # When delta bounds are set and the chain has a delta column, strike selection uses
         # |delta| only — no min_prem/max_prem filtering or final premium check.
 
+        extra_snapshot_params = self._find_strike_snapshot_params(
+            candle=candle, ctx=ctx, option_type=option_type
+        )
+        snapshot_mode = isinstance(extra_snapshot_params, dict) and bool(
+            extra_snapshot_params.get("snapshot")
+        )
+
         strike_param = otm_strikes
         if strike_param and isinstance(strike_param[0], (int, float)):
             strike_param = [str(int(s)) for s in otm_strikes]
 
-        params = {
-            "exchange": ctx.exchange,
-            "interval": self.timeframe,
-            "expiry_code": ctx.selected_expiry,
-            "strike": strike_param,
-            "option_type": option_type,
-            "instrument": "OPTIDX",
-            "exchangeSegment": "NSE_FNO",
-            "expiry_flag": "MONTH",
-            "securityId": "13",
-        }
-        extra_snapshot_params = self._find_strike_snapshot_params(
-            candle=candle, ctx=ctx, option_type=option_type
-        )
-        if isinstance(extra_snapshot_params, dict) and extra_snapshot_params:
+        if snapshot_mode and str(self.api or "").upper() == "DHAN":
+            # Log ±60 strikes around ATM from Dhan (not the 4-strike OTM ladder).
+            params = {
+                "exchange": ctx.exchange,
+                "interval": self.timeframe,
+                "expiry_code": ctx.selected_expiry,
+                "instrument": "OPTIDX",
+                "expiry_flag": "MONTH",
+                "strikes": 60,
+            }
             params.update(extra_snapshot_params)
+        else:
+            params = {
+                "exchange": ctx.exchange,
+                "interval": self.timeframe,
+                "expiry_code": ctx.selected_expiry,
+                "strike": strike_param,
+                "option_type": option_type,
+                "instrument": "OPTIDX",
+                "exchangeSegment": "NSE_FNO",
+                "expiry_flag": "MONTH",
+                "securityId": "13",
+            }
+            if isinstance(extra_snapshot_params, dict) and extra_snapshot_params:
+                params.update(extra_snapshot_params)
 
         chain = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
         self._last_option_chain = chain

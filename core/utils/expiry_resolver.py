@@ -1,7 +1,9 @@
-import pandas as pd
 import datetime as dt
 import calendar
 import math
+from typing import Any
+
+import pandas as pd
 
 
 class ExpiryResolver:
@@ -31,6 +33,14 @@ class ExpiryResolver:
         if api.upper() == "NSE":
             if not expiry_list:
                 return None
+            if expiry_pref == "LEAPS_ROLL":
+                return ExpiryResolver._select_nse_expiry(
+                    expiry_list,
+                    trade_date,
+                    target_month_year=ExpiryResolver._leaps_rollover_month_year(
+                        trade_date
+                    ),
+                )
             return ExpiryResolver._select_nse_expiry(expiry_list, trade_date)
 
         # ---------- DHAN path ----------
@@ -40,7 +50,9 @@ class ExpiryResolver:
                     trade_date, calendar_rollover_day=dhan_calendar_rollover_day
                 )
             elif expiry_pref == "QUARTERLY":
-                return ExpiryResolver._derive_quarterly_series(trade_date)
+                return ExpiryResolver.quarterly_target_expiry_date(trade_date)
+            elif expiry_pref == "LEAPS_ROLL":
+                return ExpiryResolver.leaps_rollover_target_expiry_date(trade_date)
 
         raise ValueError(f"Unsupported api={api}, expiry_pref={expiry_pref}")
 
@@ -125,12 +137,15 @@ class ExpiryResolver:
         return ExpiryResolver.last_thursday(trade_date.year, trade_date.month + 1)
 
     @staticmethod
-    def _select_nse_expiry(expiry_list, trade_date):
+    def _select_nse_expiry(expiry_list, trade_date, *, target_month_year=None):
         # NSE will check later-->Pending
         """
         Select last expiry of target month/year.
         """
-        target_month, target_year = ExpiryResolver._select_expiry_month(trade_date)
+        if target_month_year is None:
+            target_month, target_year = ExpiryResolver._select_expiry_month(trade_date)
+        else:
+            target_month, target_year = target_month_year
 
         expiry_dates = [pd.to_datetime(e).date() for e in expiry_list]
 
@@ -167,32 +182,138 @@ class ExpiryResolver:
         return 0
 
     @staticmethod
-    def dhan_expiry_index_to_date(trade_date, expiry_index: int):
+    def is_calendar_expiry(value: Any) -> bool:
+        if value is None or isinstance(value, bool):
+            return False
+        if isinstance(value, (int, float)):
+            try:
+                import numpy as np
+
+                if isinstance(value, np.integer):
+                    return False
+            except ImportError:
+                pass
+            return False
+        if isinstance(value, (dt.date, dt.datetime)):
+            return True
+        if isinstance(value, str) and not str(value).strip().isdigit():
+            try:
+                pd.to_datetime(value)
+                return True
+            except (TypeError, ValueError):
+                return False
+        return hasattr(value, "year") and hasattr(value, "month")
+
+    @staticmethod
+    def as_calendar_date(value: Any) -> dt.date:
+        if isinstance(value, dt.datetime):
+            return value.date()
+        if isinstance(value, dt.date):
+            return value
+        return pd.Timestamp(value).date()
+
+    @staticmethod
+    def index_in_expiry_list(expiries, target_date) -> int:
         """
-        Map DHAN ``expiry_code`` (0 = front monthly, 1 = next monthly) to a calendar expiry date
-        (last Thursday of that month). Used for ``build_option_symbol`` / instrument store while
-        ``ctx.selected_expiry`` remains an int for the rolling-option API.
+        Index of ``target_date`` in a sorted Dhan expiry list (exact match, else nearest
+        same-or-later date, else last entry).
         """
+        if not expiries:
+            return 0
+        target = ExpiryResolver.as_calendar_date(target_date)
+        parsed: list[tuple[int, dt.date]] = []
+        for i, raw in enumerate(expiries):
+            try:
+                parsed.append((i, ExpiryResolver.as_calendar_date(raw)))
+            except (TypeError, ValueError):
+                continue
+        if not parsed:
+            return 0
+        for i, d in parsed:
+            if d == target:
+                return i
+        future = [(i, d) for i, d in parsed if d >= target]
+        if future:
+            return min(future, key=lambda x: x[1])[0]
+        return max(parsed, key=lambda x: x[1])[0]
+
+    @staticmethod
+    def dhan_expiry_index_to_date(trade_date, expiry_index: Any):
+        """
+        Map DHAN ``expiry_code`` / ``ctx.selected_expiry`` to a calendar expiry date.
+
+        - ``0`` / ``1``: front / next monthly (last Thursday)
+        - ``date`` / ISO string: returned as-is
+        - legacy int ``> 1``: quarterly target for ``trade_date`` (old month-offset series)
+        """
+        if ExpiryResolver.is_calendar_expiry(expiry_index):
+            return ExpiryResolver.as_calendar_date(expiry_index)
         if isinstance(trade_date, dt.datetime):
             trade_date = trade_date.date()
         elif isinstance(trade_date, str):
             trade_date = pd.to_datetime(trade_date).date()
         idx = int(expiry_index)
-        if idx == 0:
-            return ExpiryResolver.current_month_expiry(trade_date)
-        return ExpiryResolver.next_month_expiry(trade_date)
+        if idx <= 1:
+            if idx == 0:
+                return ExpiryResolver.current_month_expiry(trade_date)
+            return ExpiryResolver.next_month_expiry(trade_date)
+        return ExpiryResolver.quarterly_target_expiry_date(trade_date)
 
     @staticmethod
     def quarterly_target_expiry_date(trade_date) -> dt.date:
         """
-        LEAPS / QUARTERLY calendar fallback: last Thursday of the quarter month from
-        ``_select_expiry_month``. Live DHAN option chains usually set ``chain['expiry']``
-        from ``get_live_option_chain`` (monthly expiry list indexed by
-        ``_derive_quarterly_series``); prefer that date on ``ctx.selected_expiry`` when set.
+        Legacy QUARTERLY: last Tuesday of the target quarter month from
+        ``_select_expiry_month``. Prefer ``LEAPS_ROLL`` for LEAPS_RSI.
         """
         td = pd.Timestamp(trade_date).date()
         q_month, q_year = ExpiryResolver._select_expiry_month(td)
-        return ExpiryResolver._last_thursday(q_year, q_month)
+        return ExpiryResolver._last_tuesday(q_year, q_month)
+
+    @staticmethod
+    def _leaps_rollover_month_year(trade_date) -> tuple[int, int]:
+        """
+        LEAPS RSI monthly rollover: 1–15 vs 16–end of month maps to target expiry month.
+
+        Jan–Dec rules per strategy spec; Nov/Dec second half and all of Dec 16–31
+        can roll into Jan/Feb of the next calendar year.
+        """
+        td = pd.Timestamp(trade_date).date()
+        month = td.month
+        day = td.day
+        year = td.year
+        after_mid = day >= 16
+
+        # (target if day 1–15, target if day 16–31)
+        roll = {
+            1: (2, 3),
+            2: (3, 4),
+            3: (4, 5),
+            4: (5, 6),
+            5: (6, 7),
+            6: (7, 8),
+            7: (8, 9),
+            8: (9, 10),
+            9: (10, 11),
+            10: (11, 12),
+            11: (12, 1),
+            12: (1, 2),
+        }
+        lo, hi = roll[month]
+        target_m = hi if after_mid else lo
+        target_y = year
+        if month >= 11 and after_mid:
+            target_y = year + 1
+        elif month == 12:
+            target_y = year + 1
+        return target_m, target_y
+
+    @staticmethod
+    def leaps_rollover_target_expiry_date(trade_date) -> dt.date:
+        """
+        LEAPS_RSI: last Tuesday of the rollover target month from ``_leaps_rollover_month_year``.
+        """
+        m, y = ExpiryResolver._leaps_rollover_month_year(trade_date)
+        return ExpiryResolver._last_tuesday(y, m)
 
     @staticmethod
     def dhan_calendar_expiry_to_index(trade_date, calendar_expiry) -> int:
@@ -214,21 +335,35 @@ class ExpiryResolver:
     @staticmethod
     def coerce_to_dhan_expiry_index(trade_date, value) -> int:
         """
-        Normalize values from ``params['expiry_code']`` / ``ctx.selected_expiry``: DHAN index,
-        numpy int, or calendar expiry (date/datetime/str).
+        Normalize values from ``params['expiry_code']`` / ``ctx.selected_expiry`` to a DHAN
+        monthly index (0/1) for expired-chain APIs. Calendar dates are mapped via
+        ``dhan_calendar_expiry_to_index``; use ``dhan_expiry_index_to_date`` when you need the
+        actual expiry date (including QUARTERLY).
         """
         td = pd.Timestamp(trade_date).date()
         if value is None:
             return ExpiryResolver._derive_monthly_series(td)
         if isinstance(value, bool):
             return ExpiryResolver._derive_monthly_series(td)
+        if ExpiryResolver.is_calendar_expiry(value):
+            return ExpiryResolver.dhan_calendar_expiry_to_index(td, value)
         if isinstance(value, (int, float)):
-            return int(value)
+            idx = int(value)
+            if idx > 1:
+                return ExpiryResolver.dhan_calendar_expiry_to_index(
+                    td, ExpiryResolver.quarterly_target_expiry_date(td)
+                )
+            return idx
         try:
             import numpy as np
 
             if isinstance(value, np.integer):
-                return int(value)
+                v = int(value)
+                if v > 1:
+                    return ExpiryResolver.dhan_calendar_expiry_to_index(
+                        td, ExpiryResolver.quarterly_target_expiry_date(td)
+                    )
+                return v
         except ImportError:
             pass
         return ExpiryResolver.dhan_calendar_expiry_to_index(td, value)
@@ -241,12 +376,22 @@ class ExpiryResolver:
         ]
         return dt.date(year, month, thursdays[-1])
 
+    @staticmethod
+    def _last_tuesday(year, month):
+        cal = calendar.monthcalendar(year, month)
+        tuesdays = [
+            week[calendar.TUESDAY] for week in cal if week[calendar.TUESDAY] != 0
+        ]
+        return dt.date(year, month, tuesdays[-1])
+
     # ============================================================================================
     # Below functions are used for Leaps RSI 53,32
     @staticmethod
     def _derive_quarterly_series(trade_date):
         """
-        Quarterly expiry label (future use).
+        Legacy month-offset index (deprecated for live chain fetch).
+
+        Prefer ``quarterly_target_expiry_date`` / ``resolve(..., QUARTERLY)`` calendar dates.
         """
         q_month, q_year = ExpiryResolver._select_expiry_month(trade_date)
 

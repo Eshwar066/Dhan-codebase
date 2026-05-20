@@ -16,20 +16,26 @@ class DhanAdapter(BaseAdapter):
         return expiries
 
     def get_option_chain(self, ctx: StrategyContext, params: dict):
-        expiry_index = ctx.get_selected_expiry()
-        if expiry_index is None:
-            expiry_index = 0
-        if isinstance(expiry_index, (int, float)):
-            expiry_index = int(expiry_index)
-        else:
-            expiry_index = 0
+        sel = ctx.get_selected_expiry()
+        expiry_date = None
+        expiry_index = 0
+        if ExpiryResolver.is_calendar_expiry(sel):
+            expiry_date = ExpiryResolver.as_calendar_date(sel)
+        elif sel is not None:
+            try:
+                expiry_index = int(sel)
+            except (TypeError, ValueError):
+                expiry_index = 0
+
+        strikes = int(params.get("strikes", 60) or 60)
 
         return self.data.get_live_option_chain(
             symbol=ctx.symbol,
             exchange=ctx.exchange or "",
             expiry_index=expiry_index,
-            strikes_around_atm=params.get("strikes", 30),
+            strikes_around_atm=strikes,
             expiry_flag=params.get("expiry_flag", "MONTH"),
+            expiry_date=expiry_date,
         )
 
     def get_historical_option_chain(self, ctx: StrategyContext, params: dict):

@@ -8,7 +8,7 @@ from core.utils.expiry_resolver import ExpiryResolver
 
 class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     """
-    LEAPS Quarterly RSI Option Selling Strategy
+    LEAPS RSI option selling (monthly rollover expiry, 15th cutoff).
     SIGNAL + HEDGE
     """
 
@@ -16,7 +16,8 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     timeframe = "60"
     required_context = ["option_chain"]
     api = "DHAN"
-    expiryType = "QUARTERLY"
+    # Monthly rollover table (not Mar/Jun/Sep/Dec quarterly); see ExpiryResolver.LEAPS_ROLL.
+    expiryType = "LEAPS_ROLL"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

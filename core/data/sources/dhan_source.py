@@ -453,16 +453,26 @@ class DhanSource:
 
         return sorted(monthly.values())
 
-    def get_live_option_chain(self, symbol, exchange, expiry_index, strikes_around_atm,expiry_flag):
+    def get_live_option_chain(
+        self,
+        symbol,
+        exchange,
+        expiry_index,
+        strikes_around_atm,
+        expiry_flag,
+        expiry_date=None,
+    ):
         """
-        Engine-friendly option chain. expiry_index indexes into get_live_expiry() list.
-        Returns { "symbol", "exchange", "chain": DataFrame } or None.
+        Engine-friendly option chain.
+
+        ``expiry_index`` indexes into the sorted expiry list when ``expiry_date`` is None.
+        When ``expiry_date`` is set (e.g. LEAPS QUARTERLY calendar expiry), that date is
+        resolved to the matching list index instead of treating ``expiry_index`` as a slot.
         """
         expiries = self.tsl.get_expiry_list(Underlying=symbol, exchange=exchange)
-        if(expiry_flag == "MONTH"):
+        if expiry_flag == "MONTH":
             expiries = self.filter_monthly_expiries(expiries)
 
-        # Optional: sort just in case
         expiries = sorted(expiries)
 
         if not expiries:
@@ -474,20 +484,35 @@ class DhanSource:
             )
             return None
 
-        ei = int(expiry_index) if expiry_index is not None else 0
-        if ei < 0:
-            ei = 0
-        if ei >= len(expiries):
-            logger.warning(
-                "get_live_option_chain: expiry_index=%s out of range len=%s; "
-                "clamping to %s (symbol=%s exchange=%s)",
-                ei,
-                len(expiries),
-                len(expiries) - 1,
-                symbol,
-                exchange,
-            )
-            ei = len(expiries) - 1
+        if expiry_date is not None:
+            ei = ExpiryResolver.index_in_expiry_list(expiries, expiry_date)
+            resolved = ExpiryResolver.as_calendar_date(expiries[ei])
+            target = ExpiryResolver.as_calendar_date(expiry_date)
+            if resolved != target:
+                logger.warning(
+                    "get_live_option_chain: expiry_date=%s resolved to list[%s]=%s "
+                    "(symbol=%s exchange=%s)",
+                    target,
+                    ei,
+                    resolved,
+                    symbol,
+                    exchange,
+                )
+        else:
+            ei = int(expiry_index) if expiry_index is not None else 0
+            if ei < 0:
+                ei = 0
+            if ei >= len(expiries):
+                logger.warning(
+                    "get_live_option_chain: expiry_index=%s out of range len=%s; "
+                    "clamping to %s (symbol=%s exchange=%s)",
+                    ei,
+                    len(expiries),
+                    len(expiries) - 1,
+                    symbol,
+                    exchange,
+                )
+                ei = len(expiries) - 1
         expiry = expiries[ei]
         if hasattr(expiry, "strftime"):
             expiry_date = expiry
@@ -545,10 +570,10 @@ class DhanSource:
         if trade_dt is None:
             return None
 
+        cal_exp = ExpiryResolver.dhan_expiry_index_to_date(trade_dt, expiry_code)
         ec = ExpiryResolver.coerce_to_dhan_expiry_index(
             pd.Timestamp(from_date), expiry_code
         )
-        cal_exp = ExpiryResolver.dhan_expiry_index_to_date(trade_dt, ec)
         sym = (symbol or "NIFTY").upper()
         sp = float(spot_price or 0.0)
         strikes = strike if isinstance(strike, (list, tuple)) else [strike]

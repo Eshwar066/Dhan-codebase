@@ -83,6 +83,7 @@ class DhanDataProvider(IDataProvider):
         expiry_index: int,
         strikes_around_atm: int,
         expiry_flag: str,
+        expiry_date=None,
     ) -> Optional[dict]:
         return self._source.get_live_option_chain(
             symbol=symbol,
@@ -90,6 +91,7 @@ class DhanDataProvider(IDataProvider):
             expiry_index=expiry_index,
             strikes_around_atm=strikes_around_atm,
             expiry_flag=expiry_flag,
+            expiry_date=expiry_date,
         )
 
     def get_expired_optionchain(
