@@ -10,9 +10,10 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import pandas as pd
 
@@ -31,6 +32,40 @@ _NAMED_SNAPSHOT_TARGETS = frozenset(
 )
 
 logger = logging.getLogger(__name__)
+
+# Wall-clock retry policy for oi_positional_buy reference snapshots (not tied to candle bars).
+OI_SNAPSHOT_RETRY_INTERVAL_SEC = float(
+    os.getenv("OI_SNAPSHOT_RETRY_INTERVAL_SEC", "60")
+)
+OI_SNAPSHOT_RETRY_MAX_WINDOW_SEC = float(
+    os.getenv("OI_SNAPSHOT_RETRY_MAX_WINDOW_SEC", str(45 * 60))
+)
+
+
+def snapshot_retry_should_attempt(
+    last_attempt_unix: float,
+    first_attempt_unix: float,
+    *,
+    now_unix: Optional[float] = None,
+) -> Tuple[bool, str]:
+    """
+    Whether another snapshot fetch/write should run now.
+
+    Returns (should_attempt, reason). Reasons include ``first_attempt``,
+    ``interval_elapsed``, ``wait_<N>s``, and ``max_window_expired``.
+    """
+    now = time.time() if now_unix is None else float(now_unix)
+    if first_attempt_unix <= 0:
+        return True, "first_attempt"
+    if now - first_attempt_unix > OI_SNAPSHOT_RETRY_MAX_WINDOW_SEC:
+        return False, "max_window_expired"
+    if last_attempt_unix <= 0:
+        return True, "first_attempt"
+    elapsed = now - last_attempt_unix
+    if elapsed >= OI_SNAPSHOT_RETRY_INTERVAL_SEC:
+        return True, "interval_elapsed"
+    wait = OI_SNAPSHOT_RETRY_INTERVAL_SEC - elapsed
+    return False, f"wait_{wait:.0f}s"
 
 
 def _option_buildup_snapshot(params: Optional[dict]) -> bool:
@@ -80,9 +115,11 @@ def log_option_chain_snapshot(
     if isinstance(params, dict) and not bool(params.get("snapshot", False)):
         return False
     if chain is None:
-        if _option_buildup_snapshot(params if isinstance(params, dict) else None):
+        target = str((params or {}).get("snapshot_target") or "").strip().lower()
+        if target in ("option_buildup", "oi_positional_buy"):
             logger.warning(
-                "option_buildup snapshot skipped: chain=None (sym=%s date=%s time=%s)",
+                "%s snapshot skipped: chain=None (sym=%s date=%s time=%s)",
+                target,
                 getattr(ctx, "symbol", "?"),
                 (params or {}).get("snapshot_date"),
                 (params or {}).get("snapshot_time"),
@@ -120,10 +157,11 @@ def log_option_chain_snapshot(
         df = chain.copy()
 
     if df is None or df.empty:
-        if target == "option_buildup":
+        if target in ("option_buildup", "oi_positional_buy"):
             logger.warning(
-                "option_buildup snapshot skipped: empty or non-DataFrame chain "
+                "%s snapshot skipped: empty or non-DataFrame chain "
                 "(sym=%s date=%s time=%s chain_type=%s)",
+                target,
                 getattr(ctx, "symbol", "?"),
                 (params or {}).get("snapshot_date"),
                 (params or {}).get("snapshot_time"),
@@ -199,8 +237,11 @@ def log_option_chain_snapshot(
         except (OSError, TypeError):
             pass
 
-    if target == "option_buildup":
+    if target in ("option_buildup", "oi_positional_buy"):
         logger.info(
-            "option_buildup snapshot written sym=%s -> %s", getattr(ctx, "symbol", "?"), path
+            "%s snapshot written sym=%s -> %s",
+            target,
+            getattr(ctx, "symbol", "?"),
+            path,
         )
     return True

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+import threading
+import time
 from dataclasses import dataclass
 from datetime import date, time
 from pathlib import Path
@@ -10,7 +13,10 @@ import pandas as pd
 from core.strategies.IndiaMktMixins import IST, IndiaMktMixins
 from core.strategies.base import BaseStrategy
 from core.utils.expiry_resolver import ExpiryResolver
-from core.utils.option_chain_snapshot_log import log_option_chain_snapshot
+from core.utils.option_chain_snapshot_log import (
+    log_option_chain_snapshot,
+    snapshot_retry_should_attempt,
+)
 from run.config import RUN_MODE, RunMode
 
 
@@ -20,6 +26,8 @@ EOD_REVIEW_TIME = time(15, 15)
 REFERENCE_SNAPSHOT_TIMES = frozenset(
     {ENTRY_SNAPSHOT_TIME, ENTRY_EVAL_TIME, EOD_REVIEW_TIME}
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 PREMIUM_MIN = 170
 PREMIUM_MAX = 220
@@ -54,6 +62,17 @@ class PendingEntry:
     entry_intent: Any
 
 
+@dataclass
+class _PendingReferenceSnapshot:
+    symbol: str
+    trade_date: date
+    target: time
+    attempts: int = 0
+    last_error: str = ""
+    first_attempt_unix: float = 0.0
+    last_attempt_unix: float = 0.0
+
+
 class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
     """
     OI Positional Buy for Dhan
@@ -83,7 +102,14 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
         self._pending_exit_sids: set[str] = set()
         self._exit_reason_by_sid: Dict[str, str] = {}
         self._pending_entry_by_exit_sid: Dict[str, PendingEntry] = {}
-        self._oi_snapshot_logged_slots: set[str] = set()
+        self._oi_snapshot_completed_slots: set[str] = set()
+        self._oi_snapshot_pending: Dict[str, _PendingReferenceSnapshot] = {}
+        self._snapshot_retry_lock = threading.Lock()
+        self._snapshot_retry_candle: Optional[dict] = None
+        self._snapshot_retry_ctx: Any = None
+        self._snapshot_retry_thread: Optional[threading.Thread] = None
+        self._defer_eod_review: bool = False
+        self._eod_review_candle: Optional[dict] = None
         self._full_chain_cache: Any = None
         self._full_chain_cache_key: Optional[tuple] = None
 
@@ -127,29 +153,289 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
     def _find_strike_snapshot_params(
         self, candle: dict, ctx: Any, option_type: str
     ) -> Dict[str, Any]:
-        """One CSV snapshot per slot (DHAN chain has CE + PE columns in a single response)."""
-        _ = option_type
-        if self._ist_time(candle) not in REFERENCE_SNAPSHOT_TIMES:
-            return {}
-        ts_ist = self._candle_close_ts_ist(candle)
-        snapshot_date = ts_ist.strftime("%Y-%m-%d")
-        snapshot_time = ts_ist.strftime("%H-%M")
-        slot_key = "|".join(
-            [
-                str(getattr(ctx, "symbol", "") or ""),
-                snapshot_date,
-                snapshot_time,
-            ]
-        )
-        if slot_key in self._oi_snapshot_logged_slots:
-            return {}
-        self._oi_snapshot_logged_slots.add(slot_key)
+        """Mixin hook; OIPositionalBuy writes snapshots via _persist_reference_snapshot."""
+        _ = (candle, ctx, option_type)
+        return {}
+
+    def _target_time_to_slot(self, target: time) -> str:
+        return target.strftime("%H-%M")
+
+    def _snapshot_slot_key(self, symbol: str, trade_date: date, target: time) -> str:
+        return "|".join([str(symbol or ""), trade_date.isoformat(), self._target_time_to_slot(target)])
+
+    def _snapshot_on_disk(self, trade_date: date, target: time) -> bool:
+        path = self._oi_log_csv_path(trade_date, self._target_time_to_slot(target))
+        if path is None:
+            return False
+        try:
+            return path.stat().st_size > 0
+        except OSError:
+            return False
+
+    def _mark_snapshot_complete(self, slot_key: str, *, target: Optional[time] = None) -> None:
+        self._oi_snapshot_completed_slots.add(slot_key)
+        self._oi_snapshot_pending.pop(slot_key, None)
+        if target == EOD_REVIEW_TIME:
+            _LOGGER.info(
+                "oi_positional_buy 15:15 snapshot complete; deferred EOD exit review "
+                "can proceed on next position check"
+            )
+
+    def _update_snapshot_retry_context(self, candle: dict, ctx: Any) -> None:
+        with self._snapshot_retry_lock:
+            self._snapshot_retry_candle = dict(candle)
+            self._snapshot_retry_ctx = ctx
+
+    def _ensure_snapshot_retry_worker(self) -> None:
+        with self._snapshot_retry_lock:
+            if not self._oi_snapshot_pending:
+                return
+            t = self._snapshot_retry_thread
+            if t is not None and t.is_alive():
+                return
+            self._snapshot_retry_thread = threading.Thread(
+                target=self._snapshot_retry_worker_loop,
+                name="oi_pos_snapshot_retry",
+                daemon=True,
+            )
+            self._snapshot_retry_thread.start()
+
+    def _snapshot_retry_worker_loop(self) -> None:
+        """Wall-clock retries (e.g. every 60s), independent of 15m candle closes."""
+        while True:
+            time.sleep(1.0)
+            with self._snapshot_retry_lock:
+                if not self._oi_snapshot_pending:
+                    self._snapshot_retry_thread = None
+                    return
+                candle = self._snapshot_retry_candle
+                ctx = self._snapshot_retry_ctx
+            if candle is None or ctx is None:
+                continue
+            now = time.time()
+            for slot_key in list(self._oi_snapshot_pending.keys()):
+                pending = self._oi_snapshot_pending.get(slot_key)
+                if pending is None:
+                    continue
+                should, reason = snapshot_retry_should_attempt(
+                    pending.last_attempt_unix,
+                    pending.first_attempt_unix,
+                    now_unix=now,
+                )
+                if not should:
+                    if reason == "max_window_expired":
+                        _LOGGER.error(
+                            "oi_positional_buy snapshot retry expired sym=%s slot=%s "
+                            "attempts=%s last_error=%s",
+                            pending.symbol,
+                            self._target_time_to_slot(pending.target),
+                            pending.attempts,
+                            pending.last_error,
+                        )
+                        self._oi_snapshot_pending.pop(slot_key, None)
+                    continue
+                _LOGGER.info(
+                    "oi_positional_buy snapshot retry (wall-clock) sym=%s slot=%s "
+                    "reason=%s attempt=%s",
+                    pending.symbol,
+                    self._target_time_to_slot(pending.target),
+                    reason,
+                    pending.attempts + 1,
+                )
+                pending.last_attempt_unix = now
+                self._attempt_reference_snapshot(candle, ctx, pending.target)
+
+    def _snapshot_params_for_target(
+        self, candle: dict, ctx: Any, target: time
+    ) -> Dict[str, Any]:
+        trade_date = self._trade_date(candle)
         return {
+            "exchange": getattr(ctx, "exchange", None) or "INDEX",
+            "interval": self.timeframe,
+            "expiry_code": getattr(ctx, "selected_expiry", None),
+            "instrument": "OPTIDX",
+            "expiry_flag": "MONTH",
             "snapshot": True,
-            "snapshot_date": snapshot_date,
-            "snapshot_time": snapshot_time,
+            "snapshot_date": trade_date.isoformat(),
+            "snapshot_time": self._target_time_to_slot(target),
             "snapshot_target": "oi_positional_buy",
+            "api": self.api,
         }
+
+    def _invalidate_full_chain_cache(self) -> None:
+        self._full_chain_cache = None
+        self._full_chain_cache_key = None
+
+    def _fetch_chain_for_snapshot_write(self, candle: dict, ctx: Any) -> Any:
+        """Live option-chain fetch for CSV snapshot (never read from existing log files)."""
+        self._invalidate_full_chain_cache()
+        strikes = self.fetch_option_chain(candle, ctx, "CE")
+        if not strikes:
+            return None
+        params: Dict[str, Any] = {
+            "exchange": ctx.exchange,
+            "interval": self.timeframe,
+            "expiry_code": ctx.selected_expiry,
+            "instrument": "OPTIDX",
+            "expiry_flag": "MONTH",
+        }
+        if self.api != "DHAN":
+            strike_param = [str(int(float(s))) for s in strikes]
+            params.update(
+                {
+                    "strike": strike_param,
+                    "option_type": "CE",
+                    "exchangeSegment": "NSE_FNO",
+                    "securityId": "13",
+                }
+            )
+        chain = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
+        if chain is not None:
+            self._full_chain_cache = chain
+            self._full_chain_cache_key = (
+                str(candle.get("symbol") or ""),
+                candle.get("bucket_ts"),
+                self._trade_date(candle),
+            )
+        return chain
+
+    def _attempt_reference_snapshot(
+        self,
+        candle: dict,
+        ctx: Any,
+        target: time,
+        *,
+        params_extra: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Fetch chain and write CSV (no wall-clock throttle; caller gates retries)."""
+        symbol = str(candle.get("symbol") or getattr(ctx, "symbol", "") or "")
+        trade_date = self._trade_date(candle)
+        slot = self._target_time_to_slot(target)
+        slot_key = self._snapshot_slot_key(symbol, trade_date, target)
+        eval_close = self._candle_close_ts_ist(candle).strftime("%Y-%m-%d %H:%M")
+
+        params = self._snapshot_params_for_target(candle, ctx, target)
+        if params_extra:
+            params.update(params_extra)
+
+        try:
+            self._ensure_selected_expiry(candle, ctx)
+            chain = self._fetch_chain_for_snapshot_write(candle, ctx)
+            if chain is None:
+                raise RuntimeError("option chain API returned None")
+            if isinstance(chain, dict):
+                inner = chain.get("chain")
+                if inner is None or (hasattr(inner, "empty") and inner.empty):
+                    raise RuntimeError("option chain DataFrame empty")
+            elif hasattr(chain, "empty") and chain.empty:
+                raise RuntimeError("option chain DataFrame empty")
+
+            ok = log_option_chain_snapshot(
+                chain,
+                ctx=ctx,
+                strategy_name=self.name,
+                api=self.api,
+                params=params,
+            )
+            if not ok:
+                raise RuntimeError("log_option_chain_snapshot returned False")
+        except Exception as exc:
+            now = time.time()
+            pending = self._oi_snapshot_pending.get(slot_key)
+            if pending is None:
+                pending = _PendingReferenceSnapshot(
+                    symbol=symbol,
+                    trade_date=trade_date,
+                    target=target,
+                    first_attempt_unix=now,
+                    last_attempt_unix=now,
+                )
+            else:
+                pending.last_attempt_unix = now
+            pending.attempts += 1
+            pending.last_error = f"{type(exc).__name__}: {exc}"
+            self._oi_snapshot_pending[slot_key] = pending
+            self._update_snapshot_retry_context(candle, ctx)
+            self._ensure_snapshot_retry_worker()
+            _LOGGER.warning(
+                "oi_positional_buy snapshot failed sym=%s slot=%s eval_close=%s "
+                "attempt=%s err=%s (retry worker active)",
+                symbol,
+                slot,
+                eval_close,
+                pending.attempts,
+                pending.last_error,
+                exc_info=True,
+            )
+            return False
+
+        self._mark_snapshot_complete(slot_key, target=target)
+        _LOGGER.info(
+            "oi_positional_buy snapshot written sym=%s slot=%s eval_close=%s",
+            symbol,
+            slot,
+            eval_close,
+        )
+        return True
+
+    def _write_reference_snapshot(
+        self,
+        candle: dict,
+        ctx: Any,
+        target: time,
+        *,
+        params_extra: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        symbol = str(candle.get("symbol") or getattr(ctx, "symbol", "") or "")
+        trade_date = self._trade_date(candle)
+        slot = self._target_time_to_slot(target)
+        slot_key = self._snapshot_slot_key(symbol, trade_date, target)
+
+        if self._snapshot_on_disk(trade_date, target):
+            self._mark_snapshot_complete(slot_key, target=target)
+            _LOGGER.info(
+                "oi_positional_buy snapshot already on disk sym=%s slot=%s path_exists",
+                symbol,
+                slot,
+            )
+            return True
+        if slot_key in self._oi_snapshot_completed_slots:
+            return True
+
+        pending = self._oi_snapshot_pending.get(slot_key)
+        if pending is not None:
+            should, reason = snapshot_retry_should_attempt(
+                pending.last_attempt_unix,
+                pending.first_attempt_unix,
+            )
+            if not should:
+                if reason == "max_window_expired":
+                    _LOGGER.error(
+                        "oi_positional_buy snapshot give up sym=%s slot=%s attempts=%s",
+                        symbol,
+                        slot,
+                        pending.attempts,
+                    )
+                    self._oi_snapshot_pending.pop(slot_key, None)
+                else:
+                    _LOGGER.debug(
+                        "oi_positional_buy snapshot throttle sym=%s slot=%s %s",
+                        symbol,
+                        slot,
+                        reason,
+                    )
+                return False
+            pending.last_attempt_unix = time.time()
+
+        return self._attempt_reference_snapshot(
+            candle, ctx, target, params_extra=params_extra
+        )
+
+    def _persist_reference_snapshot(
+        self, candle: dict, ctx: Any, target: time
+    ) -> bool:
+        """Write logs/OIPositionalBuy/<date>/<slot>.csv for a reference bar close time."""
+        return self._write_reference_snapshot(candle, ctx, target)
 
     def _full_chain_cache_lookup(self, candle: dict) -> Optional[Any]:
         key = (str(candle.get("symbol") or ""), candle.get("bucket_ts"), self._trade_date(candle))
@@ -180,9 +466,7 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
             "expiry": self._read_oi_log_chain_expiry(trade_date, slot),
         }
 
-    def _fetch_full_option_chain(
-        self, candle: dict, ctx: Any, *, log_snapshot: bool = False
-    ) -> Any:
+    def _fetch_full_option_chain(self, candle: dict, ctx: Any) -> Any:
         """
         Single option-chain request (DHAN returns CE + PE in one DataFrame).
         Cached per symbol/bucket/trade-day for reuse within the same candle evaluation.
@@ -201,19 +485,6 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
                 candle.get("bucket_ts"),
                 trade_date,
             )
-            if log_snapshot:
-                snap = self._find_strike_snapshot_params(candle, ctx, "")
-                if snap:
-                    try:
-                        log_option_chain_snapshot(
-                            log_chain,
-                            ctx=ctx,
-                            strategy_name=self.name,
-                            api=self.api,
-                            params={**snap, "snapshot_target": "oi_positional_buy"},
-                        )
-                    except Exception:
-                        pass
             return log_chain
 
         strikes = self.fetch_option_chain(candle, ctx, "CE")
@@ -238,23 +509,7 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
                 }
             )
 
-        if log_snapshot:
-            snap = self._find_strike_snapshot_params(candle, ctx, "")
-            if snap:
-                params.update(snap)
-
         chain = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
-        if log_snapshot and bool(params.get("snapshot", False)):
-            try:
-                log_option_chain_snapshot(
-                    chain,
-                    ctx=ctx,
-                    strategy_name=self.name,
-                    api=self.api,
-                    params=params,
-                )
-            except Exception:
-                pass
 
         if chain is not None:
             self._full_chain_cache = chain
@@ -265,9 +520,9 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
             )
         return chain
 
-    def _take_reference_snapshots(self, candle: dict, ctx: Any) -> None:
-        """Persist one combined CE+PE option-chain reference snapshot."""
-        self._fetch_full_option_chain(candle, ctx, log_snapshot=True)
+    def _take_reference_snapshots(self, candle: dict, ctx: Any, target: time) -> bool:
+        """Persist one combined CE+PE option-chain reference snapshot for *target* bar close."""
+        return self._persist_reference_snapshot(candle, ctx, target)
 
     def _oi_column(self, df: pd.DataFrame, option_type: str) -> Optional[str]:
         opt = option_type.upper()
@@ -288,7 +543,7 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
 
     def _fetch_chain_df(self, candle: dict, ctx: Any, option_type: str) -> Optional[pd.DataFrame]:
         _ = option_type
-        chain = self._fetch_full_option_chain(candle, ctx, log_snapshot=False)
+        chain = self._fetch_full_option_chain(candle, ctx)
         return self._chain_df_from_response(chain, candle)
 
     def _chain_df_from_response(
@@ -521,7 +776,8 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
         ]
         held = open_main[0] if open_main else None
 
-        chain = self._fetch_full_option_chain(candle, ctx, log_snapshot=True)
+        self._persist_reference_snapshot(candle, ctx, ENTRY_SNAPSHOT_TIME)
+        chain = self._fetch_full_option_chain(candle, ctx)
         if chain is None:
             bench = self._load_benchmark_from_logs(candle, d)
             if bench:
@@ -719,15 +975,22 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
         return None
 
     def on_candle(self, candle: dict, ctx: Any):
+        self._update_snapshot_retry_context(candle, ctx)
         t = self._ist_time(candle)
         if t == ENTRY_SNAPSHOT_TIME:
             self._capture_930_benchmark(candle, ctx)
             return None
         if t == ENTRY_EVAL_TIME:
-            self._take_reference_snapshots(candle, ctx)
+            self._take_reference_snapshots(candle, ctx, ENTRY_EVAL_TIME)
             return self._evaluate_entry_1045(candle, ctx)
         if t == EOD_REVIEW_TIME:
-            self._take_reference_snapshots(candle, ctx)
+            ok = self._take_reference_snapshots(candle, ctx, EOD_REVIEW_TIME)
+            if not ok:
+                self._defer_eod_review = True
+                self._eod_review_candle = dict(candle)
+                _LOGGER.warning(
+                    "oi_positional_buy 15:15 snapshot pending; EOD exit review deferred"
+                )
         return None
 
     def should_exit(self, position: Any, candle: dict, ctx: Any = None) -> bool:
@@ -736,7 +999,18 @@ class OIPositionalBuy(IndiaMktMixins, BaseStrategy):
         sid = position.structure_id
         if sid in self._pending_exit_sids:
             return False
-        reason = self._reason_to_exit(position, candle, ctx)
+        exit_candle = candle
+        if self._defer_eod_review:
+            trade_date = self._trade_date(candle)
+            if not self._snapshot_on_disk(trade_date, EOD_REVIEW_TIME):
+                return False
+            exit_candle = self._eod_review_candle or candle
+            self._defer_eod_review = False
+            self._eod_review_candle = None
+            _LOGGER.info(
+                "oi_positional_buy running deferred 15:15 EOD exit review"
+            )
+        reason = self._reason_to_exit(position, exit_candle, ctx)
         if reason:
             self._exit_reason_by_sid[sid] = reason
             return True
