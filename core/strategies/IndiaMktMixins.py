@@ -463,12 +463,44 @@ class IndiaMktMixins:
         return None
 
     @staticmethod
-    def _strike_on_hundred_point_grid(val) -> bool:
-        """OPTIDX live/paper: only 100-point strikes (exclude 50-step e.g. 25250, 25350)."""
+    def _strike_on_strike_grid(val, step: int = 100) -> bool:
+        """Keep only strikes on ``step`` grid (e.g. 500 → 22000, 22500; 100 → exclude 25250)."""
         try:
-            return int(round(float(val))) % 100 == 0
+            s = int(step)
+            if s <= 0:
+                return True
+            return int(round(float(val))) % s == 0
         except (TypeError, ValueError):
             return False
+
+    @staticmethod
+    def _strike_on_hundred_point_grid(val) -> bool:
+        return IndiaMktMixins._strike_on_strike_grid(val, 100)
+
+    def _option_chain_strike_grid_step(self) -> int:
+        return int(getattr(self, "option_chain_strike_step", 100) or 100)
+
+    def _filter_option_chain_strike_grid(
+        self, df: pd.DataFrame, strike_col: str
+    ) -> pd.DataFrame:
+        step = self._option_chain_strike_grid_step()
+        if step <= 0 or strike_col not in df.columns:
+            return df
+        mask = df[strike_col].apply(lambda v: self._strike_on_strike_grid(v, step))
+        return df.loc[mask]
+
+    def _sort_rows_by_ideal_premium(
+        self, row: pd.DataFrame, premium_col: str
+    ) -> pd.DataFrame:
+        ideal = getattr(self, "option_chain_ideal_premium", None)
+        if ideal is None or not isinstance(row, pd.DataFrame) or len(row) <= 1:
+            return row
+        prem_num = pd.to_numeric(row[premium_col], errors="coerce")
+        return (
+            row.assign(_prem_dist=(prem_num - float(ideal)).abs())
+            .sort_values("_prem_dist")
+            .drop(columns=["_prem_dist"])
+        )
 
     @staticmethod
     def _option_chain_delta_column(df: pd.DataFrame, option_type: str) -> Optional[str]:
@@ -842,10 +874,7 @@ class IndiaMktMixins:
             if premium_col is None or strike_col is None:
                 return None
 
-            #this gets printed
-            live_df = live_df[
-                live_df[strike_col].apply(self._strike_on_hundred_point_grid)
-            ]
+            live_df = self._filter_option_chain_strike_grid(live_df, strike_col)
             if live_df.empty:
                 return None
 
@@ -907,6 +936,7 @@ class IndiaMktMixins:
             if row.empty:
                 return None
 
+            row = self._sort_rows_by_ideal_premium(row, premium_col)
             r0 = row.iloc[0]
             premium = float(pd.to_numeric(r0[premium_col], errors="coerce") or 0.0)
             selected_strike = r0[strike_col]
@@ -941,6 +971,12 @@ class IndiaMktMixins:
 
             if premium_col is None:
                 return None
+
+            strike_col_bt = self._option_chain_strike_column(chain)
+            if strike_col_bt:
+                chain = self._filter_option_chain_strike_grid(chain, strike_col_bt)
+                if chain.empty:
+                    return None
 
             dcol_bt = self._option_chain_delta_column(chain, option_type)
             delta_in_chain = dcol_bt is not None and dcol_bt in chain.columns
@@ -998,6 +1034,7 @@ class IndiaMktMixins:
             strike_col = self._option_chain_strike_column(row)
             if strike_col is None:
                 return None
+            row = self._sort_rows_by_ideal_premium(row, premium_col)
             r0 = row.iloc[0]
             selected_strike = r0[strike_col]
             premium = float(r0[premium_col])

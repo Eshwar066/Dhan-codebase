@@ -18,6 +18,9 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     api = "DHAN"
     # Monthly rollover table (not Mar/Jun/Sep/Dec quarterly); see ExpiryResolver.LEAPS_ROLL.
     expiryType = "LEAPS_ROLL"
+    # NIFTY LEAPS: 22000, 22500, 23000, … (not 50/100-step strikes).
+    option_chain_strike_step = 500
+    option_chain_ideal_premium = 350
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -105,8 +108,15 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         ):
             return None
 
-        # Find strike in premium range
-        result = self.find_strike_in_premium_range(candle, ctx, option_type)
+        # Find strike in premium range (500-point grid; CALL 300–400 / PUT 200–400).
+        opt_u = option_type.upper()
+        if opt_u in ("CE", "CALL"):
+            min_prem, max_prem = 200, 400
+        else:
+            min_prem, max_prem = 200, 400
+        result = self.find_strike_in_premium_range(
+            candle, ctx, option_type, min_prem=min_prem, max_prem=max_prem
+        )
         if result is None:
             print(f"⚠️ No valid strike found at {candle['timestamp']}")
             return None
