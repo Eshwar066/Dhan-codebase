@@ -5,6 +5,9 @@ Usage examples:
     python3 -m run.dummy_live
     python3 -m run.dummy_live --job SignalFloodTest --symbols NIFTY --tick-ms 200
     python3 -m run.dummy_live --job NiftyIntradayMagicalLine --stall-after 200 --stall-seconds 65
+    python3 -m run.dummy_live --job dhan_oi_positional_buy --symbols NIFTY --start-time "2026-04-25 09:15:00" --start-tz IST
+
+    source .venv/bin/activate
 
     python -m run.dummy_live --job dhan_leaps_rsi --symbols NIFTY --start-time "2026-04-25 09:15:00" --start-tz IST
     python -m run.dummy_live --job dhan_oi_positional_buy --symbols NIFTY --start-time "2026-04-25 09:15:00" --start-tz IST
