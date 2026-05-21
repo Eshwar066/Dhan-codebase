@@ -112,6 +112,57 @@ class ExecutionEngine:
                 symbol=payload.get("symbol"),
             )
 
+    def enqueue_intent_bundle(
+        self,
+        *,
+        strategy: Any,
+        intents: list,
+        price_map: Dict[str, float],
+        structure_id: str,
+        idempotency_key: Optional[str] = None,
+        strategy_time_ms: Optional[float] = None,
+    ) -> None:
+        """Enqueue hedge+main (or other multi-leg) as one OMS unit for combined margin."""
+        if not intents:
+            return
+        primary = intents[0]
+        payload = {
+            "intent_bundle": list(intents),
+            "intent": primary,
+            "strategy": strategy,
+            "strategy_id": getattr(strategy, "name", "unknown_strategy"),
+            "intent_id": getattr(primary, "intent_id", ""),
+            "structure_id": structure_id,
+            "is_bundle": True,
+            "created_at": time.time(),
+            "price_map": dict(price_map or {}),
+            "idempotency_key": idempotency_key,
+            "strategy_time_ms": float(strategy_time_ms or 0.0),
+            "symbol": getattr(primary, "symbol", None)
+            or getattr(getattr(primary, "instrument", None), "trading_symbol", None)
+            or "",
+        }
+        if not self.safe_queue_put(
+            self.intent_queue,
+            payload,
+            queue_name="intent_queue",
+            queue_key="global",
+        ):
+            return
+        if self.engine_logger:
+            leg_ids = ",".join(
+                str(getattr(i, "intent_id", "")) for i in intents if getattr(i, "intent_id", None)
+            )
+            self.engine_logger.log(
+                "intent_created",
+                f"CREATED bundle structure_id={structure_id} legs={len(intents)} "
+                f"intent_ids={leg_ids} strategy_id={payload['strategy_id']}",
+                intent_id=payload["intent_id"],
+                strategy_id=payload["strategy_id"],
+                symbol=payload.get("symbol"),
+                structure_id=structure_id,
+            )
+
     def safe_queue_put(
         self, q: "queue.Queue[Dict[str, Any]]", item: Dict[str, Any], queue_name: str, queue_key: Any
     ) -> bool:
@@ -165,7 +216,9 @@ class ExecutionEngine:
         events.append(now)
         return True
 
-    def _append_intent_journal(self, item: Dict[str, Any], status: str) -> None:
+    def _append_intent_journal(
+        self, item: Dict[str, Any], status: str, **extra: Any
+    ) -> None:
         try:
             os.makedirs(os.path.dirname(self._intent_journal_path), exist_ok=True)
             line = {
@@ -176,12 +229,67 @@ class ExecutionEngine:
                 "symbol": item.get("symbol"),
                 "status": status,
                 "execution_attempt_id": item.get("execution_attempt_id"),
+                "oms_step": extra.get("oms_step"),
+                "reason": extra.get("reason"),
+                "required_margin": extra.get("required_margin"),
+                "available": extra.get("available"),
+                "shortfall": extra.get("shortfall"),
+                "error": extra.get("error"),
             }
             jl = round_json_floats(line) if round_json_floats else line
             with open(self._intent_journal_path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(jl, default=str) + "\n")
         except Exception:
             pass
+
+    def _log_oms_pipeline(
+        self,
+        step: str,
+        item: Dict[str, Any],
+        *,
+        ok: bool = True,
+        message: str = "",
+        **extra: Any,
+    ) -> None:
+        if not self.engine_logger:
+            return
+        intent_id = item.get("intent_id")
+        parts = [
+            f"OMS pipeline step={step}",
+            f"ok={ok}",
+            f"intent_id={intent_id}",
+        ]
+        account_id = item.get("account_id")
+        if account_id:
+            parts.append(f"account_id={account_id}")
+        symbol = item.get("symbol")
+        if symbol:
+            parts.append(f"symbol={symbol}")
+        if message:
+            parts.append(f"msg={message}")
+        for key in (
+            "reason",
+            "attempt",
+            "required_margin",
+            "available",
+            "shortfall",
+            "structure_id",
+            "hedge_benefit",
+        ):
+            val = extra.get(key)
+            if val is not None:
+                parts.append(f"{key}={val}")
+        self.engine_logger.log(
+            "oms",
+            " | ".join(parts),
+            intent_id=intent_id,
+            strategy_id=item.get("strategy_id"),
+            account_id=account_id,
+            symbol=symbol,
+            oms_step=step,
+            oms_ok=ok,
+            **{k: v for k, v in extra.items() if v is not None},
+        )
 
     def _token_bucket_wait(self, account_id: str) -> None:
         lock = self._account_bucket_locks.setdefault(account_id, threading.Lock())
@@ -226,30 +334,92 @@ class ExecutionEngine:
     def _process_intent_with_retry(self, item: Dict[str, Any]) -> bool:
         attempts = self._oms_retry_max_attempts
         base_delay = self._oms_retry_base_delay_seconds
+        last_reason = "unknown"
         for attempt in range(attempts):
             try:
                 item["execution_attempt_id"] = f"{item.get('intent_id')}-{attempt + 1}"
-                result = self.order_router.process_intent(
-                    item["intent"],
-                    item.get("price_map") or {},
-                    idempotency_key=item.get("idempotency_key"),
-                    raise_on_retryable_failure=True,
+                self._log_oms_pipeline(
+                    "process_attempt",
+                    item,
+                    ok=True,
+                    message="Calling order_router.process_intent",
+                    attempt=f"{attempt + 1}/{attempts}",
                 )
+                if item.get("is_bundle") and item.get("intent_bundle"):
+                    result = self.order_router.process_intent_bundle(
+                        item,
+                        raise_on_retryable_failure=True,
+                    )
+                else:
+                    result = self.order_router.process_intent(
+                        item["intent"],
+                        item.get("price_map") or {},
+                        idempotency_key=item.get("idempotency_key"),
+                        raise_on_retryable_failure=True,
+                    )
                 broker_sent_ts = (result or {}).get("broker_sent_ts") or time.time()
                 item["broker_sent_ts"] = broker_sent_ts
-                return bool((result or {}).get("ok", True))
+                ok = bool((result or {}).get("ok", True))
+                last_reason = str((result or {}).get("reason") or ("ok" if ok else "failed"))
+                if ok:
+                    self._log_oms_pipeline(
+                        "process_attempt",
+                        item,
+                        ok=True,
+                        reason=last_reason,
+                        attempt=f"{attempt + 1}/{attempts}",
+                    )
+                    return True
+                self._log_oms_pipeline(
+                    "process_attempt",
+                    item,
+                    ok=False,
+                    reason=last_reason,
+                    attempt=f"{attempt + 1}/{attempts}",
+                )
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "order_failed",
+                        f"ORDER_FAILED intent_id={item.get('intent_id')} retryable=False "
+                        f"attempt={attempt + 1}/{attempts} reason={last_reason}",
+                        intent_id=item.get("intent_id"),
+                        strategy_id=item.get("strategy_id"),
+                        account_id=item.get("account_id"),
+                        symbol=item.get("symbol"),
+                    )
+                self._append_intent_journal(
+                    item, status="FAILED", oms_step="process_attempt", reason=last_reason
+                )
+                return False
             except Exception as exc:
                 retryable = self._is_retryable_intent_error(exc)
+                last_reason = str(exc)
+                self._log_oms_pipeline(
+                    "process_attempt",
+                    item,
+                    ok=False,
+                    message=str(exc),
+                    reason=last_reason,
+                    attempt=f"{attempt + 1}/{attempts}",
+                )
                 if not retryable or attempt >= attempts - 1:
                     if self.engine_logger:
                         self.engine_logger.log(
                             "order_failed",
-                            f"ORDER_FAILED intent_id={item.get('intent_id')} retryable={retryable} attempt={attempt + 1}/{attempts} error={exc}",
+                            f"ORDER_FAILED intent_id={item.get('intent_id')} retryable={retryable} "
+                            f"attempt={attempt + 1}/{attempts} error={exc}",
                             intent_id=item.get("intent_id"),
                             strategy_id=item.get("strategy_id"),
                             account_id=item.get("account_id"),
                             symbol=item.get("symbol"),
                         )
+                    self._append_intent_journal(
+                        item,
+                        status="FAILED",
+                        oms_step="process_attempt",
+                        reason=last_reason,
+                        error=str(exc),
+                    )
                     return False
                 backoff = base_delay * (2 ** attempt)
                 time.sleep(backoff)
@@ -275,14 +445,35 @@ class ExecutionEngine:
                 q.task_done()
                 continue
             item["oms_start_ts"] = time.time()
+            self._log_oms_pipeline(
+                "worker_dequeued",
+                item,
+                ok=True,
+                message="Intent dequeued for execution",
+            )
             self._token_bucket_wait(account_id)
+            self._log_oms_pipeline(
+                "rate_limit_ready",
+                item,
+                ok=True,
+                message="Token bucket ready",
+            )
             try:
                 ok = self._process_intent_with_retry(item)
                 if ok:
-                    processed.add(intent_id)
-                    self._executed_intent_ids.add(intent_id)
+                    if item.get("is_bundle") and item.get("intent_bundle"):
+                        for leg in item["intent_bundle"]:
+                            lid = getattr(leg, "intent_id", None)
+                            if lid:
+                                processed.add(lid)
+                                self._executed_intent_ids.add(lid)
+                    else:
+                        processed.add(intent_id)
+                        self._executed_intent_ids.add(intent_id)
                     self._account_failure_counts[account_id] = 0
-                    self._append_intent_journal(item, status="SENT")
+                    self._append_intent_journal(
+                        item, status="SENT", oms_step="process_complete"
+                    )
                     created_at = float(item.get("created_at") or time.time())
                     routed_ts = float(item.get("routed_ts") or created_at)
                     oms_start_ts = float(item.get("oms_start_ts") or routed_ts)
@@ -334,6 +525,12 @@ class ExecutionEngine:
                     ):
                         self._on_latency_critical()
                 else:
+                    self._log_oms_pipeline(
+                        "process_complete",
+                        item,
+                        ok=False,
+                        message="Intent processing failed (see order_failed / margin_check)",
+                    )
                     self._account_failure_counts[account_id] = (
                         self._account_failure_counts.get(account_id, 0) + 1
                     )
@@ -359,7 +556,16 @@ class ExecutionEngine:
             except queue.Empty:
                 continue
             intent_id = item.get("intent_id")
-            if intent_id in self._routed_intent_ids:
+            bundle_ids = [
+                str(getattr(i, "intent_id", ""))
+                for i in (item.get("intent_bundle") or [])
+                if getattr(i, "intent_id", None)
+            ]
+            if bundle_ids:
+                if all(iid in self._routed_intent_ids for iid in bundle_ids):
+                    self.intent_queue.task_done()
+                    continue
+            elif intent_id in self._routed_intent_ids:
                 self.intent_queue.task_done()
                 continue
             accounts = self.account_router.route(item.get("intent"))
@@ -406,7 +612,11 @@ class ExecutionEngine:
                         account_id=account_id,
                         symbol=item.get("symbol"),
                     )
-            self._routed_intent_ids.add(intent_id)
+            if bundle_ids:
+                for iid in bundle_ids:
+                    self._routed_intent_ids.add(iid)
+            else:
+                self._routed_intent_ids.add(intent_id)
             self.intent_queue.task_done()
 
     def _watchdog_loop(self) -> None:

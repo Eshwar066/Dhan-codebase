@@ -114,6 +114,68 @@ class OrderRouter:
         """Call when starting a new trading session (same process) to tighten orphan fill acceptance."""
         self._oms_session_start_unix = time.time()
 
+    def _log_oms_step(
+        self,
+        step: str,
+        intent: Any,
+        *,
+        ok: bool = True,
+        message: str = "",
+        intent_strategy_id: Optional[str] = None,
+        account_id: Optional[str] = None,
+        **extra: Any,
+    ) -> None:
+        """Structured OMS pipeline step for engine JSON log (event_type=oms)."""
+        if not self.engine_logger:
+            return
+        sym = ""
+        if getattr(intent, "instrument", None) is not None:
+            sym = getattr(intent.instrument, "trading_symbol", None) or ""
+        intent_id = getattr(intent, "intent_id", None)
+        strategy_id = intent_strategy_id or self.strategy_id
+        parts = [
+            f"OMS step={step}",
+            f"ok={ok}",
+            f"intent_id={intent_id}",
+        ]
+        if sym:
+            parts.append(f"symbol={sym}")
+        tag = getattr(intent, "tag", None)
+        if tag:
+            parts.append(f"tag={tag}")
+        action = getattr(intent, "action", None)
+        if action:
+            parts.append(f"action={action}")
+        side = getattr(intent, "side", None)
+        if side:
+            parts.append(f"side={side}")
+        if message:
+            parts.append(f"msg={message}")
+        for key in (
+            "required_margin",
+            "available",
+            "shortfall",
+            "span_margin",
+            "exec_price",
+            "qty",
+            "reason",
+            "order_id",
+            "attempt",
+        ):
+            if key in extra and extra[key] is not None:
+                parts.append(f"{key}={extra[key]}")
+        self.engine_logger.log(
+            "oms",
+            " | ".join(parts),
+            intent_id=intent_id,
+            strategy_id=strategy_id,
+            account_id=account_id,
+            symbol=sym or None,
+            oms_step=step,
+            oms_ok=ok,
+            **{k: v for k, v in extra.items() if v is not None},
+        )
+
     def _load_order_state(self) -> None:
         """Load intent_id -> OrderState and optional action log from logs/order_state_{engine_id}.json."""
         if (
@@ -244,16 +306,69 @@ class OrderRouter:
         )
         return any(token in msg for token in retry_tokens)
 
+    @staticmethod
+    def _coerce_positive_exec_price(price: Any) -> Optional[float]:
+        if price is None:
+            return None
+        try:
+            p = float(price)
+        except (TypeError, ValueError):
+            return None
+        if p != p or p <= 0:
+            return None
+        return p
+
     def process_intent(
         self,
         intent,
         price_map,
         idempotency_key=None,
         raise_on_retryable_failure: bool = False,
+        skip_margin_check: bool = False,
+        bundle_margin_result: Optional[Dict[str, Any]] = None,
     ):
+        intent_engine_id = getattr(intent, "engine_id", None) or self.engine_id
+        intent_strategy_id = (
+            getattr(intent, "strategy_id", None)
+            or getattr(intent, "strategy_name", None)
+            or getattr(intent, "strategy", None)
+            or self.strategy_id
+        )
+        sym = (
+            getattr(intent.instrument, "trading_symbol", None)
+            if getattr(intent, "instrument", None)
+            else ""
+        )
+        side = getattr(intent, "side", "")
+        qty_lots = int(getattr(intent, "qty", 0) or 0)
+        lot_size = int(
+            getattr(getattr(intent, "instrument", None), "lot_size", 0) or 0
+        ) or 1
+        qty_units = qty_lots * lot_size
+        qty = qty_lots  # intent + logs use lots; Dhan maps to qty_units at broker
+        action = getattr(intent, "action", "ENTRY")
+
+        self._log_oms_step(
+            "process_start",
+            intent,
+            ok=True,
+            intent_strategy_id=intent_strategy_id,
+            qty=qty_lots,
+            qty_units=qty_units,
+            lot_size=lot_size,
+        )
+
         if not self.risk.allow_intent(
             intent, price_map, candle_ts=getattr(intent, "candle_ts", None)
         ):
+            self._log_oms_step(
+                "risk_check",
+                intent,
+                ok=False,
+                message="Risk manager did not allow intent",
+                intent_strategy_id=intent_strategy_id,
+                reason="risk_rejected",
+            )
             self.intent_store.update(
                 intent.intent_id, IntentStatus.REJECTED, order_state=OrderState.REJECTED
             )
@@ -263,16 +378,25 @@ class OrderRouter:
                 action="risk_rejected",
                 message="Risk manager did not allow intent",
             )
+            if self.engine_logger:
+                self.engine_logger.log(
+                    "order_failed",
+                    f"ORDER_FAILED intent_id={intent.intent_id} reason=risk_rejected",
+                    intent_id=intent.intent_id,
+                    strategy_id=intent_strategy_id,
+                    symbol=sym,
+                    side=side,
+                    qty=qty,
+                )
             return {"ok": False, "retryable": False, "reason": "risk_rejected"}
+        self._log_oms_step(
+            "risk_check",
+            intent,
+            ok=True,
+            intent_strategy_id=intent_strategy_id,
+        )
 
         # Fix 3: Intent Deduplication (scoped by engine_id + strategy_id to support multi-engine/multi-strategy)
-        intent_engine_id = getattr(intent, "engine_id", None) or self.engine_id
-        intent_strategy_id = (
-            getattr(intent, "strategy_id", None)
-            or getattr(intent, "strategy_name", None)
-            or getattr(intent, "strategy", None)
-            or self.strategy_id
-        )
         if getattr(intent, "action", "") == "EXIT":
             pending = self.intent_store.list_by_status(
                 IntentStatus.SENT
@@ -290,53 +414,136 @@ class OrderRouter:
                     and p_payload.get("engine_id") == intent_engine_id
                     and p_payload.get("strategy_id") == intent_strategy_id
                 ):
-                    if self.engine_logger:
-                        self.engine_logger.log(
-                            "oms",
-                            f"Exit intent for {symbol} already in flight; skipping",
-                        )
+                    self._log_oms_step(
+                        "duplicate_exit_skip",
+                        intent,
+                        ok=True,
+                        message=f"Exit for {symbol} already in flight",
+                        intent_strategy_id=intent_strategy_id,
+                        reason="duplicate_exit",
+                    )
                     return {"ok": True, "retryable": False, "reason": "duplicate_exit"}
 
         # Resolve execution price: always prefer price_map (engine updates it with best bid/ask)
-        sym = (
-            getattr(intent.instrument, "trading_symbol", None)
-            if getattr(intent, "instrument", None)
-            else None
-        )
         exec_price = None
-        
-        if price_map and sym is not None:
+
+        if price_map and sym:
             exec_price = price_map.get(sym)
         if exec_price is None:
             exec_price = intent.price
+        exec_price = self._coerce_positive_exec_price(exec_price)
         if exec_price is None:
+            self._log_oms_step(
+                "price_resolve",
+                intent,
+                ok=False,
+                message=f"No price for {sym!r}",
+                intent_strategy_id=intent_strategy_id,
+                reason="no_price",
+            )
             raise ValueError(
                 f"No price available for intent {intent.intent_id} (price_map has no "
-                f"entry for {sym!r} and intent.price is None)"
+                f"positive entry for {sym!r} and intent.price is missing or <= 0)"
             )
 
         exec_price = self.slippage_model(exec_price)
-        sym = intent.instrument.trading_symbol if hasattr(intent, "instrument") else ""
-        side = getattr(intent, "side", "")
-        qty = getattr(intent, "qty", 0)
-        action = getattr(intent, "action", "ENTRY")
+        sym = intent.instrument.trading_symbol if hasattr(intent, "instrument") else sym
+        self._log_oms_step(
+            "price_resolve",
+            intent,
+            ok=True,
+            intent_strategy_id=intent_strategy_id,
+            exec_price=exec_price,
+            qty=qty,
+        )
 
         # ENTRY → check margin. EXIT / FORCE_EXIT → NEVER check margin (otherwise you cannot close positions).
         if action not in ("EXIT", "FORCE_EXIT"):
-            funds_check = getattr(
-                self.broker, "check_funds_before_order", lambda _i, _p: None
-            )(intent, exec_price)
-            if funds_check is not None and funds_check.get("ok") is False:
+            if skip_margin_check and bundle_margin_result is not None:
+                funds_check = bundle_margin_result
+                self._log_oms_step(
+                    "margin_check",
+                    intent,
+                    ok=True,
+                    message=f"Bundle margin pre-approved ({funds_check.get('message') or 'ok'})",
+                    intent_strategy_id=intent_strategy_id,
+                    exec_price=exec_price,
+                    qty=qty_lots,
+                    qty_units=qty_units,
+                    lot_size=lot_size,
+                    required_margin=funds_check.get("required_margin"),
+                    available=funds_check.get("available"),
+                    shortfall=0,
+                    span_margin=funds_check.get("span_margin"),
+                )
+            elif skip_margin_check:
+                funds_check = None
+                self._log_oms_step(
+                    "margin_check",
+                    intent,
+                    ok=True,
+                    message="Margin check skipped (bundle pre-approved)",
+                    intent_strategy_id=intent_strategy_id,
+                    exec_price=exec_price,
+                    qty=qty,
+                )
+            else:
+                funds_check = getattr(
+                    self.broker, "check_funds_before_order", lambda _i, _p: None
+                )(intent, exec_price)
+                if funds_check is None:
+                    self._log_oms_step(
+                        "margin_check",
+                        intent,
+                        ok=True,
+                        message="Margin check skipped (broker returned None)",
+                        intent_strategy_id=intent_strategy_id,
+                        exec_price=exec_price,
+                        qty=qty,
+                    )
+                else:
+                    margin_ok = bool(funds_check.get("ok", True))
+                    margin_msg = funds_check.get("message") or ""
+                    self._log_oms_step(
+                        "margin_check",
+                        intent,
+                        ok=margin_ok,
+                        message=margin_msg or ("margin_ok" if margin_ok else "insufficient_funds"),
+                        intent_strategy_id=intent_strategy_id,
+                        exec_price=exec_price,
+                        qty=qty_lots,
+                        qty_units=qty_units,
+                        lot_size=lot_size,
+                        required_margin=funds_check.get("required_margin"),
+                        available=funds_check.get("available"),
+                        shortfall=funds_check.get("shortfall"),
+                        span_margin=funds_check.get("span_margin"),
+                        reason="insufficient_funds" if not margin_ok else None,
+                    )
+            if (
+                not skip_margin_check
+                and funds_check is not None
+                and funds_check.get("ok") is False
+            ):
                 shortfall = funds_check.get("shortfall", 0)
                 msg = funds_check.get("message") or "Insufficient funds"
+                req = funds_check.get("required_margin")
+                avail = funds_check.get("available")
                 if self.engine_logger:
                     self.engine_logger.log(
                         "order_failed",
-                        f"Funds check failed: {msg} (shortfall={shortfall})",
+                        f"ORDER_FAILED intent_id={intent.intent_id} reason=insufficient_funds "
+                        f"required_margin={req} available={avail} shortfall={shortfall} | {msg}",
                         symbol=sym,
                         side=side,
                         qty=qty,
+                        intent_id=intent.intent_id,
                         strategy_id=intent_strategy_id,
+                        required_margin=req,
+                        available=avail,
+                        shortfall=shortfall,
+                        span_margin=funds_check.get("span_margin"),
+                        exec_price=exec_price,
                     )
                 self.intent_store.update(
                     intent.intent_id, IntentStatus.REJECTED, order_state=OrderState.REJECTED
@@ -348,6 +555,15 @@ class OrderRouter:
                     message=msg,
                 )
                 return {"ok": False, "retryable": False, "reason": "insufficient_funds"}
+        else:
+            self._log_oms_step(
+                "margin_check",
+                intent,
+                ok=True,
+                message="Margin check skipped for EXIT/FORCE_EXIT",
+                intent_strategy_id=intent_strategy_id,
+                exec_price=exec_price,
+            )
 
         # Ensure intent exists in store (for fill sync and stale exit refresh)
         if not self.intent_store.exists(intent.intent_id):
@@ -403,16 +619,41 @@ class OrderRouter:
 
         # Fix 1: Persistence Before Flight
         self.intent_store.update(intent.intent_id, IntentStatus.VALIDATED)
+        self._log_oms_step(
+            "intent_validated",
+            intent,
+            ok=True,
+            intent_strategy_id=intent_strategy_id,
+            exec_price=exec_price,
+            qty=qty,
+        )
 
+        self._log_oms_step(
+            "place_order_start",
+            intent,
+            ok=True,
+            intent_strategy_id=intent_strategy_id,
+            exec_price=exec_price,
+            qty=qty,
+        )
         try:
             order_id = self.broker.place_order(intent, execution_price=exec_price)
         except Exception as e:
             retryable = self._is_retryable_broker_error(e)
             self._consecutive_failures += 1
+            self._log_oms_step(
+                "place_order",
+                intent,
+                ok=False,
+                message=str(e),
+                intent_strategy_id=intent_strategy_id,
+                exec_price=exec_price,
+                reason="broker_error",
+            )
             if self.engine_logger:
                 self.engine_logger.log(
                     "order_failed",
-                    f"Broker place_order failed: {e}",
+                    f"ORDER_FAILED intent_id={intent.intent_id} reason=broker_error error={e}",
                     symbol=sym,
                     side=side,
                     qty=qty,
@@ -443,10 +684,19 @@ class OrderRouter:
 
         if order_id is None:
             self._consecutive_failures += 1
+            self._log_oms_step(
+                "place_order",
+                intent,
+                ok=False,
+                message="Broker place_order returned None",
+                intent_strategy_id=intent_strategy_id,
+                exec_price=exec_price,
+                reason="no_order_id",
+            )
             if self.engine_logger:
                 self.engine_logger.log(
                     "order_failed",
-                    "Broker place_order returned None",
+                    f"ORDER_FAILED intent_id={intent.intent_id} reason=no_order_id",
                     symbol=sym,
                     side=side,
                     qty=qty,
@@ -478,6 +728,15 @@ class OrderRouter:
             return {"ok": False, "retryable": True, "reason": "no_order_id"}
 
         self._consecutive_failures = 0
+        self._log_oms_step(
+            "place_order",
+            intent,
+            ok=True,
+            intent_strategy_id=intent_strategy_id,
+            exec_price=exec_price,
+            order_id=order_id,
+            reason="order_placed",
+        )
         # Paper/sim broker may call process_fill inside place_order, so intent can already be FILLED.
         # Do not overwrite terminal status with SENT so has_pending_intent stays correct.
         rec = self.intent_store.get(intent.intent_id)
@@ -538,6 +797,134 @@ class OrderRouter:
             "reason": "order_placed",
             "broker_sent_ts": broker_sent_ts,
         }
+
+    def process_intent_bundle(
+        self,
+        bundle_item: Dict[str, Any],
+        raise_on_retryable_failure: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Process multiple ENTRY legs (e.g. hedge + main) with one multi-order margin check.
+        """
+        legs = bundle_item.get("intent_bundle") or []
+        if not legs:
+            return {"ok": False, "retryable": False, "reason": "empty_bundle"}
+
+        price_map = dict(bundle_item.get("price_map") or {})
+        idempotency_key = bundle_item.get("idempotency_key")
+        resolved: List[Tuple[Any, float]] = []
+
+        for intent in legs:
+            sym = (
+                getattr(intent.instrument, "trading_symbol", None)
+                if getattr(intent, "instrument", None)
+                else ""
+            )
+            exec_price = price_map.get(sym) if sym else None
+            if exec_price is None:
+                exec_price = getattr(intent, "price", None)
+            exec_price = self._coerce_positive_exec_price(exec_price)
+            if exec_price is None:
+                return {
+                    "ok": False,
+                    "retryable": False,
+                    "reason": "no_price",
+                }
+            exec_price = self.slippage_model(exec_price)
+            if sym:
+                price_map[sym] = exec_price
+            resolved.append((intent, exec_price))
+
+        actions = {
+            str(getattr(i, "action", "ENTRY") or "ENTRY").upper() for i, _ in resolved
+        }
+        bundle_margin: Optional[Dict[str, Any]] = None
+        if actions <= {"ENTRY"} and len(resolved) > 1:
+            multi_check = getattr(
+                self.broker, "check_funds_before_orders", None
+            )
+            if multi_check:
+                bundle_margin = multi_check(resolved)
+                if bundle_margin is not None:
+                    margin_ok = bool(bundle_margin.get("ok", True))
+                    primary = resolved[0][0]
+                    self._log_oms_step(
+                        "margin_check",
+                        primary,
+                        ok=margin_ok,
+                        message=bundle_margin.get("message")
+                        or ("margin_ok" if margin_ok else "insufficient_funds"),
+                        intent_strategy_id=getattr(primary, "strategy_id", None)
+                        or bundle_item.get("strategy_id"),
+                        required_margin=bundle_margin.get("required_margin"),
+                        available=bundle_margin.get("available"),
+                        shortfall=bundle_margin.get("shortfall"),
+                        span_margin=bundle_margin.get("span_margin"),
+                        reason="insufficient_funds" if not margin_ok else None,
+                    )
+                    if self.engine_logger:
+                        self.engine_logger.log(
+                            "oms",
+                            (
+                                f"Bundle margin_check legs={len(resolved)} "
+                                f"ok={margin_ok} required={bundle_margin.get('required_margin')} "
+                                f"available={bundle_margin.get('available')} "
+                                f"hedge_benefit={bundle_margin.get('hedge_benefit')}"
+                            ),
+                            strategy_id=bundle_item.get("strategy_id"),
+                            structure_id=bundle_item.get("structure_id"),
+                        )
+                    if not margin_ok:
+                        msg = bundle_margin.get("message") or "Insufficient funds"
+                        for intent, _ in resolved:
+                            self.intent_store.update(
+                                intent.intent_id,
+                                IntentStatus.REJECTED,
+                                order_state=OrderState.REJECTED,
+                            )
+                            self._set_order_state(
+                                intent.intent_id,
+                                OrderState.REJECTED,
+                                action="insufficient_funds",
+                                message=msg,
+                            )
+                            if self.engine_logger:
+                                self.engine_logger.log(
+                                    "order_failed",
+                                    f"ORDER_FAILED intent_id={intent.intent_id} "
+                                    f"reason=insufficient_funds bundle=true | {msg}",
+                                    intent_id=intent.intent_id,
+                                    strategy_id=bundle_item.get("strategy_id"),
+                                    structure_id=bundle_item.get("structure_id"),
+                                    required_margin=bundle_margin.get("required_margin"),
+                                    available=bundle_margin.get("available"),
+                                    shortfall=bundle_margin.get("shortfall"),
+                                )
+                        return {
+                            "ok": False,
+                            "retryable": False,
+                            "reason": "insufficient_funds",
+                        }
+
+        last_result: Dict[str, Any] = {"ok": True, "retryable": False, "reason": "bundle_placed"}
+        broker_sent_ts = None
+        for intent, _ in resolved:
+            result = self.process_intent(
+                intent,
+                price_map,
+                idempotency_key=idempotency_key,
+                raise_on_retryable_failure=raise_on_retryable_failure,
+                skip_margin_check=bool(bundle_margin),
+                bundle_margin_result=bundle_margin,
+            )
+            last_result = result
+            if not result.get("ok", True):
+                return result
+            broker_sent_ts = result.get("broker_sent_ts") or broker_sent_ts
+
+        if broker_sent_ts is not None:
+            last_result["broker_sent_ts"] = broker_sent_ts
+        return last_result
 
     # working
     def refresh_stale_exit_orders(

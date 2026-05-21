@@ -65,18 +65,34 @@ class IndiaMktMixins:
         self.rolled_hedges = set()
 
     def _entry_order_qty(self, inst) -> int:
-        lot = int(getattr(inst, "lot_size", 0) or 0)
+        """Lots to trade (Dhan broker sends quantity = lots × lot_size to the exchange)."""
         lots = int(getattr(self, "order_qty_lots", ORDER_QTY_LOTS) or 1)
-        return max(1, lot * max(1, lots))
+        return max(1, lots)
+
+    @staticmethod
+    def _order_qty_in_lots(inst, qty: Any) -> int:
+        """Normalize qty to whole lots: values ≥ lot_size that divide evenly are treated as units."""
+        lot = int(getattr(inst, "lot_size", 0) or 0) or 1
+        try:
+            q = int(qty)
+        except (TypeError, ValueError):
+            return 1
+        if q <= 0:
+            return 1
+        if lot > 1 and q >= lot and q % lot == 0:
+            return max(1, q // lot)
+        return max(1, q)
+
+    @staticmethod
+    def order_qty_units(inst, qty_lots: int) -> int:
+        """Exchange quantity (units) for a given lot count."""
+        lot = int(getattr(inst, "lot_size", 0) or 0) or 1
+        return max(1, int(qty_lots)) * lot
 
     def _normalize_order_qty(self, inst, qty) -> int:
         if qty is None:
             return self._entry_order_qty(inst)
-        try:
-            q = int(qty)
-        except (TypeError, ValueError):
-            return self._entry_order_qty(inst)
-        return q if q > 0 else self._entry_order_qty(inst)
+        return self._order_qty_in_lots(inst, qty)
 
     # ==================================================
     # DHAN EXPIRED OPTION CSV (BACKTEST) — same layout as data/dhan_expired_option_chain download scripts
@@ -1274,9 +1290,17 @@ class IndiaMktMixins:
         option_type = inst.option_type
 
         if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
-            ltp = ltp_from_strike_row_live(strike_row)
+            ltp = self._execution_price_from_chain_row(
+                strike_row, option_type, side
+            )
+            if ltp is None or ltp <= 0:
+                ltp = ltp_from_strike_row_live(
+                    strike_row, option_type=option_type, side=side
+                )
         else:
             ltp = self._ltp_from_strike_row_backtest(strike_row, option_type)
+        if ltp is not None and float(ltp) <= 0:
+            ltp = None
 
         assert inst.trading_symbol
         assert inst.custom_symbol

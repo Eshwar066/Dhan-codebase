@@ -144,9 +144,10 @@ class RiskManager:
 
         symbol = intent.instrument.trading_symbol
         side = intent.side
-        qty = intent.qty
+        qty_lots = int(intent.qty or 0)
+        lot_size = int(getattr(intent.instrument, "lot_size", 1) or 1)
+        qty = qty_lots * lot_size
         price = intent.price or 0
-        lot_size = intent.instrument.lot_size
         strategy = getattr(intent, "strategy", None)
         structure_id = getattr(intent, "structure_id", None)
         tag = getattr(intent, "tag", None)

@@ -869,6 +869,114 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             strategy_time_ms=strategy_time_ms,
         )
 
+    def _enqueue_intent_bundle(
+        self,
+        *,
+        strategy,
+        intents: list,
+        price_map: Dict[str, float],
+        structure_id: str,
+        strategy_time_ms: Optional[float] = None,
+    ) -> None:
+        self.execution_engine.enqueue_intent_bundle(
+            strategy=strategy,
+            intents=intents,
+            price_map=price_map,
+            structure_id=structure_id,
+            strategy_time_ms=strategy_time_ms,
+        )
+
+    def _resolve_entry_price_map(
+        self, single_intent, symbol: str, candle
+    ) -> Optional[Dict[str, float]]:
+        """Best bid/ask (or fallbacks) for one ENTRY intent."""
+        side = str(getattr(single_intent, "side", "") or "").upper()
+        is_buy = side == "BUY"
+        trading_sym = getattr(
+            getattr(single_intent, "instrument", None), "trading_symbol", symbol
+        )
+        if trading_sym:
+            exec_price = self._positive_price(
+                self._entry_price_from_depth(trading_sym, is_buy)
+            )
+            if exec_price is None:
+                exec_price = self._positive_price(getattr(single_intent, "price", None))
+        else:
+            exec_price = self._positive_price(
+                self._entry_price_from_depth(symbol, is_buy)
+            ) or self._positive_price(getattr(single_intent, "price", None))
+        if exec_price is None:
+            return None
+        trading_sym = getattr(
+            getattr(single_intent, "instrument", None), "trading_symbol", symbol
+        )
+        return {trading_sym: exec_price}
+
+    def _enqueue_entry_intents_grouped(
+        self,
+        entry_intents: list,
+        strategy,
+        symbol: str,
+        candle,
+        strategy_time_ms: Optional[float],
+        timeframe: Optional[str],
+        risk_manager,
+    ) -> None:
+        """Group same-structure ENTRY legs and enqueue as bundle for hedge-aware margin."""
+        singles: list = []
+        bundles: Dict[str, list] = {}
+        for single_intent in entry_intents:
+            action = str(getattr(single_intent, "action", "ENTRY") or "ENTRY").upper()
+            stid = getattr(single_intent, "structure_id", None)
+            if action in ("EXIT", "FORCE_EXIT") or not stid:
+                singles.append(single_intent)
+            else:
+                bundles.setdefault(str(stid), []).append(single_intent)
+
+        for stid, group in bundles.items():
+            if len(group) > 1:
+                merged_map: Dict[str, float] = {}
+                valid_group = []
+                for intent in group:
+                    if risk_manager and risk_manager.is_engine_blocked():
+                        return
+                    pm = self._resolve_entry_price_map(intent, symbol, candle)
+                    if pm is None:
+                        valid_group = []
+                        break
+                    trading_sym = next(iter(pm))
+                    self._validate_lot_size(intent, trading_sym)
+                    merged_map.update(pm)
+                    valid_group.append(intent)
+                if len(valid_group) > 1:
+                    self._enqueue_intent_bundle(
+                        strategy=strategy,
+                        intents=valid_group,
+                        price_map=merged_map,
+                        structure_id=stid,
+                        strategy_time_ms=strategy_time_ms,
+                    )
+                    if self.engine_logger and strategy_time_ms is not None:
+                        self.engine_logger.latency(
+                            strategy_time_ms=strategy_time_ms,
+                            broker_latency_ms=0.0,
+                            total_latency_ms=strategy_time_ms,
+                        )
+                    continue
+                group = valid_group if valid_group else group
+            singles.extend(group)
+
+        for single_intent in singles:
+            self._process_entry_like_intent(
+                single_intent,
+                strategy,
+                symbol,
+                candle,
+                strategy_time_ms,
+                timeframe,
+                risk_manager,
+            )
+
     def _safe_queue_put(
         self, q: "queue.Queue[Dict[str, Any]]", item: Dict[str, Any], queue_name: str, queue_key: Any
     ) -> bool:
@@ -1694,20 +1802,15 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         )
 
         if trading_sym:
-            exec_price = self._entry_price_from_depth(trading_sym, is_buy)
-
-            if exec_price is None:
-                exec_price = getattr(single_intent, "price", None)
-
-            if exec_price is None:
-                exec_price = candle.get("close")
-
-        else:
-            exec_price = (
-                self._entry_price_from_depth(symbol, is_buy)
-                or getattr(single_intent, "price", None)
-                or candle.get("close")
+            exec_price = self._positive_price(
+                self._entry_price_from_depth(trading_sym, is_buy)
             )
+            if exec_price is None:
+                exec_price = self._positive_price(getattr(single_intent, "price", None))
+        else:
+            exec_price = self._positive_price(
+                self._entry_price_from_depth(symbol, is_buy)
+            ) or self._positive_price(getattr(single_intent, "price", None))
         if exec_price is not None:
             trading_sym = getattr(
                 getattr(single_intent, "instrument", None), "trading_symbol", symbol
@@ -1834,17 +1937,15 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             if intent is not None and not isinstance(intent, list)
             else (intent or [])
         )
-        # pdb.set_trace()
-        for single_intent in entry_intents:
-            self._process_entry_like_intent(
-                single_intent,
-                strategy,
-                symbol,
-                candle,
-                strategy_time_ms,
-                timeframe,
-                risk_manager,
-            )
+        self._enqueue_entry_intents_grouped(
+            entry_intents,
+            strategy,
+            symbol,
+            candle,
+            strategy_time_ms,
+            timeframe,
+            risk_manager,
+        )
 
     def update_risk_metrics(self, symbol, ltp):
         pos = self.position_manager.positions.get(symbol)

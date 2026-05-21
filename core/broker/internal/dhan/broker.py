@@ -3,7 +3,7 @@
 import logging
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +110,28 @@ class DhanBroker(BaseBroker):
             "usd_available": None,
         }
 
+    @staticmethod
+    def _parse_margin_shortfall(
+        available: float, required_margin: float, insufficient_balance: float
+    ) -> Tuple[bool, float]:
+        """
+        Dhan insufficientBalance = available - totalMargin (negative => shortfall).
+        """
+        if insufficient_balance < 0:
+            return False, abs(insufficient_balance)
+        if available < required_margin:
+            return False, required_margin - available
+        return True, 0.0
+
+    def _get_available_balance(self) -> Optional[float]:
+        source = getattr(self.api, "_source", None)
+        if source is None:
+            return None
+        try:
+            return float(getattr(source, "get_balance", lambda: 0)())
+        except Exception:
+            return None
+
     def check_funds_before_order(
         self,
         intent: Any,
@@ -124,14 +146,10 @@ class DhanBroker(BaseBroker):
             payload = self._build_payload(intent, execution_price)
         except Exception:
             return None
-        source = getattr(self.api, "_source", None)
-        if source is None:
+        available = self._get_available_balance()
+        if available is None:
             return None
-        try:
-            available = float(getattr(source, "get_balance", lambda: 0)())
-        except Exception:
-            return None
-        tsl = getattr(source, "tsl", None)
+        tsl = getattr(getattr(self.api, "_source", None), "tsl", None)
         required_margin = None
         span_margin = None
         if tsl and getattr(tsl, "margin_calculator", None):
@@ -146,22 +164,32 @@ class DhanBroker(BaseBroker):
                     trigger_price=payload["trigger_price"],
                 )
                 if isinstance(oc, dict):
-                    required_margin = float(oc.get("totalMargin") or oc.get("total_margin") or 0)
+                    required_margin = float(
+                        oc.get("totalMargin") or oc.get("total_margin") or 0
+                    )
                     span_margin = float(oc.get("spanMargin") or oc.get("span_margin") or 0)
-                    # API can return availableBalance from margin response
                     if "availableBalance" in oc or "available_balance" in oc:
-                        available = float(oc.get("availableBalance") or oc.get("available_balance") or available)
-                    insufficient = float(oc.get("insufficientBalance") or oc.get("insufficient_balance") or 0)
-                    if insufficient > 0:
+                        available = float(
+                            oc.get("availableBalance")
+                            or oc.get("available_balance")
+                            or available
+                        )
+                    insufficient = float(
+                        oc.get("insufficientBalance") or oc.get("insufficient_balance") or 0
+                    )
+                    ok, shortfall = self._parse_margin_shortfall(
+                        available, required_margin, insufficient
+                    )
+                    if not ok:
                         return {
                             "ok": False,
                             "available": available,
                             "required_margin": required_margin,
                             "span_margin": span_margin if span_margin else None,
-                            "shortfall": insufficient,
+                            "shortfall": shortfall,
                             "message": (
                                 f"Available={available:.2f}, required_margin={required_margin:.2f}, "
-                                f"SPAN={span_margin:.2f}; shortfall={insufficient:.2f}"
+                                f"SPAN={span_margin:.2f}; shortfall={shortfall:.2f}"
                             ),
                         }
                     return {
@@ -176,8 +204,8 @@ class DhanBroker(BaseBroker):
                 pass
         if required_margin is None:
             required_margin = payload["price"] * payload["quantity"]
-        if available < required_margin:
-            shortfall = required_margin - available
+        ok, shortfall = self._parse_margin_shortfall(available, required_margin, 0)
+        if not ok:
             return {
                 "ok": False,
                 "available": available,
@@ -195,6 +223,100 @@ class DhanBroker(BaseBroker):
             "span_margin": span_margin,
             "shortfall": 0,
             "message": "",
+        }
+
+    def check_funds_before_orders(
+        self,
+        legs: Sequence[Tuple[Any, Optional[float]]],
+        *,
+        include_position: bool = True,
+        include_orders: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Multi-leg margin (hedge benefit) for same-structure ENTRY legs.
+        ``legs``: list of (intent, execution_price).
+        """
+        if not legs:
+            return None
+        if len(legs) == 1:
+            return self.check_funds_before_order(legs[0][0], legs[0][1])
+
+        payloads: List[Dict[str, Any]] = []
+        for intent, execution_price in legs:
+            try:
+                payloads.append(self._build_payload(intent, execution_price))
+            except Exception:
+                return None
+
+        available = self._get_available_balance()
+        if available is None:
+            return None
+
+        tsl = getattr(getattr(self.api, "_source", None), "tsl", None)
+        if not tsl or not getattr(tsl, "margin_calculator_multi", None):
+            total_required = 0.0
+            for intent, execution_price in legs:
+                single = self.check_funds_before_order(intent, execution_price)
+                if single is None:
+                    return None
+                if not single.get("ok", True):
+                    return single
+                total_required += float(single.get("required_margin") or 0)
+            ok, shortfall = self._parse_margin_shortfall(available, total_required, 0)
+            return {
+                "ok": ok,
+                "available": available,
+                "required_margin": total_required,
+                "span_margin": None,
+                "shortfall": shortfall,
+                "hedge_benefit": None,
+                "leg_count": len(legs),
+                "message": (
+                    f"Multi-leg (sum of singles): available={available:.2f} "
+                    f"required={total_required:.2f} shortfall={shortfall:.2f}"
+                ),
+            }
+
+        try:
+            oc = tsl.margin_calculator_multi(
+                payloads,
+                include_position=include_position,
+                include_orders=include_orders,
+            )
+        except Exception as exc:
+            logger.warning("margin_calculator_multi failed: %s", exc)
+            return None
+
+        if not isinstance(oc, dict):
+            return None
+
+        required_margin = float(
+            oc.get("total_margin")
+            or oc.get("totalMargin")
+            or oc.get("total_margin_required")
+            or 0
+        )
+        span_margin = float(oc.get("span_margin") or oc.get("spanMargin") or 0) or None
+        hedge_benefit = oc.get("hedge_benefit") or oc.get("hedgeBenefit")
+        ok, shortfall = self._parse_margin_shortfall(available, required_margin, 0)
+        msg = (
+            f"Multi-leg margin: available={available:.2f} required={required_margin:.2f} "
+            f"legs={len(legs)}"
+        )
+        if hedge_benefit not in (None, ""):
+            msg += f" hedge_benefit={hedge_benefit}"
+        if not ok:
+            msg += f"; shortfall={shortfall:.2f}"
+
+        return {
+            "ok": ok,
+            "available": available,
+            "required_margin": required_margin,
+            "span_margin": span_margin,
+            "shortfall": shortfall,
+            "hedge_benefit": hedge_benefit,
+            "leg_count": len(legs),
+            "message": msg,
         }
 
     def place_order(self, intent, execution_price=None, retries=2):
