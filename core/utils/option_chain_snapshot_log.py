@@ -13,7 +13,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
 
@@ -79,6 +79,121 @@ def _option_buildup_snapshot(params: Optional[dict]) -> bool:
 def _safe_filename_part(s: str, max_len: int = 64) -> str:
     t = re.sub(r"[^\w\-.]+", "_", str(s).strip())
     return (t[:max_len] if t else "na").strip("_") or "na"
+
+
+def _snapshot_out_dir(snapshot_target: str) -> Path:
+    target = str(snapshot_target or "").strip().lower()
+    if target == "option_buildup":
+        return _ROOT / _OPTION_BUILDUP_SUBDIR
+    if target == "oi_positional_buy":
+        return _ROOT / _OI_POSITIONAL_BUY_SUBDIR
+    if target == "leaps_rsi":
+        return _ROOT / _LEAPS_RSI_SUBDIR
+    return _ROOT / _LOG_SUBDIR
+
+
+def resolve_option_chain_snapshot_path(
+    *,
+    snapshot_date: str,
+    snapshot_time: str,
+    snapshot_target: str = "leaps_rsi",
+) -> Optional[Path]:
+    """Resolve ``{out_dir}/{date}/{HH-MM}.csv`` for a logged chain snapshot."""
+    date_part = str(snapshot_date or "").strip()
+    time_part = str(snapshot_time or "").strip().replace(":", "-")
+    if not date_part or not time_part:
+        return None
+    day_dir = _snapshot_out_dir(snapshot_target) / _safe_filename_part(date_part)
+    if not day_dir.is_dir():
+        return None
+    token = _safe_filename_part(time_part)
+    for candidate in (
+        day_dir / f"{token}.csv",
+        day_dir / f"{token.replace('-', '')}.csv",
+    ):
+        if candidate.is_file():
+            return candidate
+    matches = sorted(day_dir.glob(f"*{token}*.csv"))
+    return matches[0] if matches else None
+
+
+def load_option_chain_snapshot_csv(
+    path: Path,
+    *,
+    ctx_symbol: str = "",
+    ctx_exchange: str = "",
+) -> Optional[Dict[str, Any]]:
+    """
+    Rebuild a DHAN-style chain dict from a snapshot CSV written by ``log_option_chain_snapshot``.
+
+    Returns ``{symbol, exchange, chain: DataFrame, atm_strike, expiry}`` or None.
+    """
+    try:
+        raw = pd.read_csv(path)
+    except (OSError, ValueError, pd.errors.EmptyDataError):
+        return None
+    if raw.empty:
+        return None
+
+    meta_cols = [c for c in raw.columns if str(c).startswith("_")]
+    expiry = None
+    atm = None
+    sym = ctx_symbol or ""
+    ex = ctx_exchange or ""
+    if meta_cols:
+        if "_chain_expiry" in raw.columns:
+            val = raw["_chain_expiry"].iloc[0]
+            if val is not None and not (isinstance(val, float) and pd.isna(val)):
+                try:
+                    expiry = pd.Timestamp(val).date()
+                except (TypeError, ValueError):
+                    expiry = val
+        if "_atm_strike" in raw.columns:
+            aval = raw["_atm_strike"].iloc[0]
+            if aval is not None and not (isinstance(aval, float) and pd.isna(aval)):
+                try:
+                    atm = float(aval)
+                except (TypeError, ValueError):
+                    atm = aval
+        if "_ctx_symbol" in raw.columns and not sym:
+            sym = str(raw["_ctx_symbol"].iloc[0] or "").strip()
+        if "_ctx_exchange" in raw.columns and not ex:
+            ex = str(raw["_ctx_exchange"].iloc[0] or "").strip()
+
+    df = raw.drop(columns=meta_cols, errors="ignore")
+    if "Strike Price" in df.columns:
+        df = df.drop_duplicates(subset=["Strike Price"], keep="last")
+    if df.empty:
+        return None
+
+    return {
+        "symbol": sym,
+        "exchange": ex,
+        "chain": df,
+        "atm_strike": atm,
+        "expiry": expiry,
+    }
+
+
+def load_option_chain_snapshot(
+    *,
+    snapshot_date: str,
+    snapshot_time: str,
+    snapshot_target: str = "leaps_rsi",
+    ctx_symbol: str = "",
+    ctx_exchange: str = "",
+) -> Optional[Dict[str, Any]]:
+    """Load chain dict from on-disk snapshot if the CSV exists."""
+    path = resolve_option_chain_snapshot_path(
+        snapshot_date=snapshot_date,
+        snapshot_time=snapshot_time,
+        snapshot_target=snapshot_target,
+    )
+    if path is None:
+        return None
+    return load_option_chain_snapshot_csv(
+        path, ctx_symbol=ctx_symbol, ctx_exchange=ctx_exchange
+    )
 
 
 def log_option_chain_snapshot(
