@@ -161,6 +161,8 @@ class OrderRouter:
             "reason",
             "order_id",
             "attempt",
+            "broker_error",
+            "broker_payload",
         ):
             if key in extra and extra[key] is not None:
                 parts.append(f"{key}={extra[key]}")
@@ -684,24 +686,35 @@ class OrderRouter:
 
         if order_id is None:
             self._consecutive_failures += 1
+            broker_fail = getattr(self.broker, "_last_place_order_failure", None) or {}
+            fail_detail = broker_fail.get("message") or "Broker place_order returned None"
+            fail_payload = broker_fail.get("payload")
+            fail_msg = (
+                f"{fail_detail}"
+                + (f" | payload={fail_payload}" if fail_payload else "")
+            )
             self._log_oms_step(
                 "place_order",
                 intent,
                 ok=False,
-                message="Broker place_order returned None",
+                message=fail_msg,
                 intent_strategy_id=intent_strategy_id,
                 exec_price=exec_price,
                 reason="no_order_id",
+                broker_error=fail_detail,
+                broker_payload=fail_payload,
             )
             if self.engine_logger:
                 self.engine_logger.log(
                     "order_failed",
-                    f"ORDER_FAILED intent_id={intent.intent_id} reason=no_order_id",
+                    f"ORDER_FAILED intent_id={intent.intent_id} reason=no_order_id error={fail_detail}",
                     symbol=sym,
                     side=side,
                     qty=qty,
                     intent_id=getattr(intent, "intent_id", None),
                     strategy_id=intent_strategy_id,
+                    broker_payload=fail_payload,
+                    broker_error=fail_detail,
                 )
             else:
                 logger.warning("Broker place_order returned None for %s %s qty=%s", sym, side, qty)

@@ -853,6 +853,25 @@ class Tradehull:
                 raise Exception("Check the Tradingsymbol")
             security_id = security_check.iloc[-1]["SEM_SMST_SECURITY_ID"]
             corr = correlation_id if correlation_id is not None and str(correlation_id).strip() != "" else tag
+            api_payload = {
+                "tradingsymbol": tradingsymbol,
+                "exchange": exchange,
+                "security_id": str(security_id),
+                "exchange_segment": str(exchangeSegment),
+                "transaction_type": str(transaction_type).upper(),
+                "quantity": int(quantity),
+                "order_type": order_type.upper() if isinstance(order_type, str) else str(order_type),
+                "product_type": trade_type.upper(),
+                "price": float(price),
+                "trigger_price": float(trigger_price),
+                "disclosed_quantity": int(disclosed_quantity),
+                "after_market_order": bool(after_market_order),
+                "validity": validity.upper(),
+                "amo_time": amo_time,
+                "correlation_id": str(corr) if corr is not None else None,
+            }
+            req_json = json.dumps(api_payload, default=str)
+            self.logger.info("Dhan place_order API request: %s", req_json)
             # dhanhq: tag → JSON correlationId (see dhanhq._order.place_order)
             order = self.Dhan.place_order(
                 security_id=str(security_id),
@@ -872,14 +891,42 @@ class Tradehull:
                 tag=corr,
             )
 
-            if order["status"] == "failure":
+            if order.get("status") == "failure":
+                self.logger.warning(
+                    "Dhan place_order API failure request=%s response=%s",
+                    req_json,
+                    json.dumps(order, default=str),
+                )
                 raise Exception(order)
 
             orderid = order["data"]["orderId"]
-
+            self.logger.info(
+                "Dhan place_order API success request=%s order_id=%s",
+                req_json,
+                orderid,
+            )
             return str(orderid)
         except Exception as e:
-            print(f"'Got exception in place_order as {e}")
+            req_hint = locals().get("req_json") or json.dumps(
+                {
+                    "tradingsymbol": locals().get("tradingsymbol"),
+                    "exchange": locals().get("exchange"),
+                    "quantity": locals().get("quantity"),
+                    "price": locals().get("price"),
+                    "order_type": locals().get("order_type"),
+                    "transaction_type": locals().get("transaction_type"),
+                    "trade_type": locals().get("trade_type"),
+                    "tag": locals().get("tag"),
+                    "correlation_id": locals().get("correlation_id"),
+                },
+                default=str,
+            )
+            self.logger.warning(
+                "Dhan place_order exception request=%s error=%s",
+                req_hint,
+                e,
+                exc_info=True,
+            )
             return None
 
     def modify_order(
