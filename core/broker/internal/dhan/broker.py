@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 
 from core.broker.base import BaseBroker
 from core.broker.internal.dhan import mappings as dhan_mappings
+from core.broker.internal.dhan.mappings import dhan_correlation_id
 from core.utils.global_rate_limiter import DHAN_ORDER_API, GlobalRateLimiter
 
 
@@ -24,7 +25,7 @@ def _order_intent_to_payload(intent, execution_price=None):
     lot_size = int(getattr(inst, "lot_size", 1))
     total_qty = int(qty) * lot_size
     return {
-        "tradingsymbol": inst.trading_symbol,
+        "tradingsymbol": inst.place_order_symbol(),
         "exchange": exchange,
         "quantity": total_qty,
         "price": float(price),
@@ -38,9 +39,9 @@ def _order_intent_to_payload(intent, execution_price=None):
         "amo_time": "OPEN",
         "bo_profit_value": None,
         "bo_stop_loss_value": None,
-        "tag": intent.intent_id,
+        "tag": dhan_correlation_id(intent.intent_id),
         "intent_id": intent.intent_id,
-        "correlation_id": intent.intent_id,
+        "correlation_id": dhan_correlation_id(intent.intent_id),
     }
 
 
@@ -403,8 +404,11 @@ class DhanBroker(BaseBroker):
 
     def find_order_by_client_id(self, client_order_id):
         orders = self.api.get_order_list() or []
+        cid = str(client_order_id or "").strip()
+        dhan_cid = dhan_correlation_id(cid)
         for o in orders:
-            if o.get("tag") == client_order_id:
+            tag = str(o.get("tag") or o.get("correlationId") or "").strip()
+            if tag == cid or tag == dhan_cid:
                 return o
         return None
 
@@ -425,8 +429,10 @@ class DhanBroker(BaseBroker):
         For trade-led OMS: do not assume filled with price=0 when order is missing.
         """
         fills = self.get_recent_fills(page_size=page_size)
+        dhan_cid = dhan_correlation_id(client_order_id)
         for f in fills:
-            if (f.get("client_order_id") or f.get("tag")) == client_order_id:
+            fcid = str(f.get("client_order_id") or f.get("tag") or "").strip()
+            if fcid == client_order_id or fcid == dhan_cid:
                 price = float(f.get("price") or 0)
                 size = float(f.get("size") or 0)
                 if price > 0 and size > 0:

@@ -54,6 +54,16 @@ class Instrument:
             f")"
         )
 
+    def place_order_symbol(self) -> str:
+        """
+        Symbol string for broker order/margin APIs.
+        Dhan: SEM_CUSTOM_SYMBOL (e.g. ``NIFTY 28 JUL 22500 PUT``), not compact SEM_TRADING_SYMBOL.
+        """
+        custom = (self.custom_symbol or "").strip()
+        if custom:
+            return custom
+        return (self.trading_symbol or "").strip()
+
     @property
     def contract_key(self):
         """Uniquely identifies a tradable contract (netting, hedges, rollovers)."""

@@ -130,9 +130,22 @@ def to_broker_place_order_payload(intent_dict: Dict[str, Any]) -> Dict[str, Any]
         "after_market_order": bool(intent_dict.get("after_market_order", False)),
         "validity": val,
         "amo_time": intent_dict.get("amo_time") or "OPEN",
-        "tag": str(intent_id) if intent_id is not None else "",
-        "correlation_id": str(intent_id) if intent_id is not None else "",
+        "tag": dhan_correlation_id(str(intent_id)) if intent_id is not None else "",
+        "correlation_id": dhan_correlation_id(str(intent_id)) if intent_id is not None else "",
     }
+
+
+DHAN_CORRELATION_ID_MAX_LEN = 30
+
+
+def dhan_correlation_id(intent_id: Optional[str]) -> str:
+    """
+    Dhan REST/WS ``correlationId``: max 30 chars, allowed ``[a-zA-Z0-9 _-]``.
+    Full ``intent_id`` (32-char hex uuid) causes DH-905 on place order.
+    """
+    raw = str(intent_id or "").strip()
+    cleaned = "".join(c for c in raw if c.isalnum() or c in " _-")
+    return cleaned[:DHAN_CORRELATION_ID_MAX_LEN]
 
 
 def from_broker_error(response: Any) -> Tuple[str, Optional[str], Optional[str]]:

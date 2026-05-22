@@ -853,6 +853,12 @@ class Tradehull:
                 raise Exception("Check the Tradingsymbol")
             security_id = security_check.iloc[-1]["SEM_SMST_SECURITY_ID"]
             corr = correlation_id if correlation_id is not None and str(correlation_id).strip() != "" else tag
+            try:
+                from core.broker.internal.dhan.mappings import dhan_correlation_id
+
+                corr_dhan = dhan_correlation_id(corr)
+            except ImportError:
+                corr_dhan = str(corr or "")[:30]
             api_payload = {
                 "tradingsymbol": tradingsymbol,
                 "exchange": exchange,
@@ -868,28 +874,35 @@ class Tradehull:
                 "after_market_order": bool(after_market_order),
                 "validity": validity.upper(),
                 "amo_time": amo_time,
-                "correlation_id": str(corr) if corr is not None else None,
+                "correlation_id": corr_dhan or None,
             }
             req_json = json.dumps(api_payload, default=str)
             self.logger.info("Dhan place_order API request: %s", req_json)
-            # dhanhq: tag → JSON correlationId (see dhanhq._order.place_order)
-            order = self.Dhan.place_order(
-                security_id=str(security_id),
-                exchange_segment=exchangeSegment,
-                transaction_type=order_side,
-                quantity=int(quantity),
-                order_type=order_type,
-                product_type=product_Type,
-                price=float(price),
-                trigger_price=float(trigger_price),
-                disclosed_quantity=int(disclosed_quantity),
-                after_market_order=after_market_order,
-                validity=time_in_force,
-                amo_time=amo_time,
-                bo_profit_value=bo_profit_value,
-                bo_stop_loss_Value=bo_stop_loss_Value,
-                tag=corr,
-            )
+            # Dhan v2: correlationId max 30 chars; omit null BO fields (DH-905 if sent as null).
+            rest_payload = {
+                "transactionType": order_side,
+                "exchangeSegment": exchangeSegment,
+                "productType": product_Type,
+                "orderType": order_type,
+                "validity": time_in_force,
+                "securityId": str(security_id),
+                "quantity": int(quantity),
+                "disclosedQuantity": int(disclosed_quantity),
+                "price": float(price),
+                "afterMarketOrder": bool(after_market_order),
+                "triggerPrice": float(trigger_price),
+            }
+            if corr_dhan:
+                rest_payload["correlationId"] = corr_dhan
+            if after_market_order and amo_time:
+                rest_payload["amoTime"] = (
+                    amo_time.upper() if isinstance(amo_time, str) else amo_time
+                )
+            if bo_profit_value is not None:
+                rest_payload["boProfitValue"] = float(bo_profit_value)
+            if bo_stop_loss_Value is not None:
+                rest_payload["boStopLossValue"] = float(bo_stop_loss_Value)
+            order = self.Dhan.dhan_http.post("/orders", rest_payload)
 
             if order.get("status") == "failure":
                 self.logger.warning(
@@ -3113,21 +3126,17 @@ class Tradehull:
                         "triggerPrice": float(scrip.get("trigger_price", 0) or 0),
                     }
                 )
-            url = self.Dhan.base_url + "/margincalculator/multi"
             payload = {
                 "includePosition": bool(include_position),
                 "includeOrders": bool(include_orders),
                 "scripList": api_scripts,
             }
-            if getattr(self.Dhan, "client_id", None):
-                payload["dhanClientId"] = self.Dhan.client_id
-            response = self.Dhan.session.post(
-                url,
-                headers=self.Dhan.header,
-                timeout=self.Dhan.timeout,
-                data=json.dumps(payload),
-            )
-            parsed = self.Dhan._parse_response(response)
+            http = getattr(self.Dhan, "dhan_http", None)
+            if http is None:
+                raise AttributeError(
+                    "dhanhq client has no dhan_http; upgrade dhanhq or use margin_calculator per leg"
+                )
+            parsed = http.post("/margincalculator/multi", payload)
             if debug.upper() == "YES":
                 print(parsed)
             if parsed.get("status") == "success":

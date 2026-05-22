@@ -66,6 +66,17 @@ class LiveEngineHelpersMixin:
 
     # ---------- Market data helpers ----------
 
+    @staticmethod
+    def _intent_place_order_symbol(intent: Any, fallback: str = "") -> str:
+        """Dhan order/depth symbol: SEM_CUSTOM_SYMBOL when set on Instrument."""
+        inst = getattr(intent, "instrument", None)
+        if inst is not None and hasattr(inst, "place_order_symbol"):
+            sym = inst.place_order_symbol()
+            if sym:
+                return sym
+        ts = getattr(inst, "trading_symbol", None) if inst is not None else None
+        return (ts or fallback or "").strip()
+
     def _get_bid_ask(self, symbol: str) -> Tuple[Optional[float], Optional[float]]:
         """Return (best_bid, best_ask) for symbol from feed; (None, None) if unavailable."""
         if self.realtime_feed and hasattr(self.realtime_feed, "get_best_bid"):

@@ -173,6 +173,34 @@ class DhanWebSocketFeed(RealtimeFeed):
     def last_market_tick_ts(self) -> float:
         return float(self._ws.last_market_tick_ts) if self._ws else 0.0
 
+    def get_best_bid(self, symbol: str) -> Optional[float]:
+        """Best bid from last quote/full packet depth (only if symbol is subscribed)."""
+        if not self._ws:
+            return None
+        raw = self._ws.get_last_quote(symbol.upper()) or self._ws.get_last_ticker(symbol.upper())
+        if not raw:
+            return None
+        depth = raw.get("depth") or []
+        if depth:
+            bp = depth[0].get("bid_price")
+            if bp is not None and float(bp) > 0:
+                return float(bp)
+        return None
+
+    def get_best_ask(self, symbol: str) -> Optional[float]:
+        """Best ask from last quote/full packet depth (only if symbol is subscribed)."""
+        if not self._ws:
+            return None
+        raw = self._ws.get_last_quote(symbol.upper()) or self._ws.get_last_ticker(symbol.upper())
+        if not raw:
+            return None
+        depth = raw.get("depth") or []
+        if depth:
+            ap = depth[0].get("ask_price")
+            if ap is not None and float(ap) > 0:
+                return float(ap)
+        return None
+
     def get_last_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
         if not self._ws:
             return None

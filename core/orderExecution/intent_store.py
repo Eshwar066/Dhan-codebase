@@ -121,6 +121,24 @@ class IntentStore:
     def get(self, intent_id):
         return self.intents.get(intent_id)
 
+    def resolve_intent_id(self, key: Optional[str]) -> Optional[str]:
+        """
+        Resolve full intent_id from store key or Dhan correlationId (max 30 chars).
+        """
+        if not key:
+            return None
+        k = str(key).strip()
+        if k in self.intents:
+            return k
+        try:
+            from core.broker.internal.dhan.mappings import dhan_correlation_id
+        except ImportError:
+            return None
+        for iid in self.intents:
+            if dhan_correlation_id(iid) == k:
+                return iid
+        return None
+
     # -------------------------
     # UPDATE STATUS
     # -------------------------

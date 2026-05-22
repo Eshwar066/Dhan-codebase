@@ -1829,6 +1829,10 @@ class OrderRouter:
         if not trade_id or trade_id in getattr(self, "_processed_trade_ids", set()):
             return False
         intent_id = trade.get("intent_id") or trade.get("client_order_id") or trade.get("tag")
+        if intent_id and self.intent_store and hasattr(self.intent_store, "resolve_intent_id"):
+            resolved = self.intent_store.resolve_intent_id(intent_id)
+            if resolved:
+                intent_id = resolved
         if not intent_id:
             if self.engine_logger:
                 self.engine_logger.log(

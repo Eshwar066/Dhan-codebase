@@ -646,6 +646,12 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             return None
         correlation_id = str(payload.get("correlation_id") or "").strip()
         intent_id = correlation_id or None
+        if intent_id and getattr(self.order_router, "intent_store", None):
+            store = self.order_router.intent_store
+            if hasattr(store, "resolve_intent_id"):
+                resolved = store.resolve_intent_id(intent_id)
+                if resolved:
+                    intent_id = resolved
         if not intent_id and hasattr(self.order_router, "resolve_intent_id_by_broker_order_id"):
             try:
                 intent_id = self.order_router.resolve_intent_id_by_broker_order_id(order_no)
@@ -892,9 +898,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         """Best bid/ask (or fallbacks) for one ENTRY intent."""
         side = str(getattr(single_intent, "side", "") or "").upper()
         is_buy = side == "BUY"
-        trading_sym = getattr(
-            getattr(single_intent, "instrument", None), "trading_symbol", symbol
-        )
+        trading_sym = self._intent_place_order_symbol(single_intent, symbol)
         if trading_sym:
             exec_price = self._positive_price(
                 self._entry_price_from_depth(trading_sym, is_buy)
@@ -907,9 +911,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             ) or self._positive_price(getattr(single_intent, "price", None))
         if exec_price is None:
             return None
-        trading_sym = getattr(
-            getattr(single_intent, "instrument", None), "trading_symbol", symbol
-        )
+        trading_sym = self._intent_place_order_symbol(single_intent, symbol)
         return {trading_sym: exec_price}
 
     def _enqueue_entry_intents_grouped(
@@ -1760,10 +1762,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         side = str(getattr(single_intent, "side", "") or "").upper()
         tag = str(getattr(single_intent, "tag", "") or "").upper()
         intent_id = str(getattr(single_intent, "intent_id", "") or "")
-        trading_sym = str(
-            getattr(getattr(single_intent, "instrument", None), "trading_symbol", symbol)
-            or symbol
-        )
+        trading_sym = self._intent_place_order_symbol(single_intent, symbol)
         # Make dedupe key intent-specific so MAIN/HEDGE on same candle are both allowed.
         # Keep action as base "signal kind", and extend with intent discriminators.
         signal_kind_ext = f"{signal_kind}|{trading_sym}|{side}|{tag}"
@@ -1797,9 +1796,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         side = getattr(single_intent, "side", "").upper()
         is_buy = side == "BUY"
 
-        trading_sym = getattr(
-            getattr(single_intent, "instrument", None), "trading_symbol", symbol
-        )
+        trading_sym = self._intent_place_order_symbol(single_intent, symbol)
 
         if trading_sym:
             exec_price = self._positive_price(
@@ -1812,9 +1809,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 self._entry_price_from_depth(symbol, is_buy)
             ) or self._positive_price(getattr(single_intent, "price", None))
         if exec_price is not None:
-            trading_sym = getattr(
-                getattr(single_intent, "instrument", None), "trading_symbol", symbol
-            )
+            trading_sym = self._intent_place_order_symbol(single_intent, symbol)
             self._validate_lot_size(single_intent, trading_sym)
             self._last_signal_hash_per_symbol[symbol] = signal_hash
             price_map = {trading_sym: exec_price}
@@ -1906,8 +1901,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             qty_fallback=abs(position.net_qty),
                         )
                         # Exit price from depth by intent's instrument and position direction (correct bid/ask for this contract)
-                        trading_sym = getattr(
-                            exit_intent.instrument, "trading_symbol", symbol
+                        trading_sym = self._intent_place_order_symbol(
+                            exit_intent, symbol
                         )
                         exit_price = (
                             self._exit_price_from_depth(trading_sym, is_sell)
