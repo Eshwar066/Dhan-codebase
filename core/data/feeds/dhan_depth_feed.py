@@ -74,6 +74,30 @@ class DhanDepthFeed(RealtimeFeed):
     def is_warm(self) -> bool:
         return bool(self._ws and self._ws.is_warm)
 
+    def get_best_bid(self, symbol: str) -> Optional[float]:
+        depth = self.get_market_depth(symbol)
+        if not depth:
+            return None
+        bids = depth.get("bids") or []
+        if not bids:
+            return None
+        try:
+            return float(bids[0]["price"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def get_best_ask(self, symbol: str) -> Optional[float]:
+        depth = self.get_market_depth(symbol)
+        if not depth:
+            return None
+        asks = depth.get("asks") or []
+        if not asks:
+            return None
+        try:
+            return float(asks[0]["price"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
     def get_market_depth(self, symbol: str) -> Optional[Dict[str, Any]]:
         """
         Return latest market depth for symbol: {symbol, bids: [{price, quantity, num_orders}, ...], asks: [...]}.

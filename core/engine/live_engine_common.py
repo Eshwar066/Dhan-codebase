@@ -108,6 +108,19 @@ class LiveEngineHelpersMixin:
 
     # ---------- Execution helpers ----------
 
+    @staticmethod
+    def _positive_price(price: Optional[float]) -> Optional[float]:
+        """Return price only if it is a finite number strictly greater than zero."""
+        if price is None:
+            return None
+        try:
+            p = float(price)
+        except (TypeError, ValueError):
+            return None
+        if p != p or p <= 0:  # NaN or non-positive
+            return None
+        return p
+
     def _entry_price_from_depth(self, symbol: str, is_buy: bool):
         bid, ask = self._get_bid_ask(symbol)
 
@@ -151,7 +164,8 @@ class LiveEngineHelpersMixin:
         return spread <= bid * max_spread_pct
 
     def _validate_lot_size(self, intent: Any, trading_sym: str) -> None:
-        """Raise ValueError if intent.qty is not a multiple of instrument lot size."""
+        """Raise ValueError if intent.qty (lots) is invalid for the instrument."""
+        inst = getattr(intent, "instrument", None)
         lot = 1
         if self.instrument_store and hasattr(self.instrument_store, "get_lot_size"):
             try:
@@ -159,11 +173,18 @@ class LiveEngineHelpersMixin:
             except Exception:
                 pass
         if lot is None:
-            lot = getattr(getattr(intent, "instrument", None), "lot_size", 1) or 1
-        qty = getattr(intent, "qty", 0)
-        if lot and qty % lot != 0:
+            lot = getattr(inst, "lot_size", 1) or 1
+        lot = int(lot or 1)
+        qty_lots = int(getattr(intent, "qty", 0) or 0)
+        if qty_lots < 1:
             raise ValueError(
-                f"Invalid lot size: qty {qty} not multiple of lot {lot} for {trading_sym}"
+                f"Invalid order qty: need at least 1 lot, got qty={qty_lots} for {trading_sym}"
+            )
+        units = qty_lots * lot
+        if units % lot != 0:
+            raise ValueError(
+                f"Invalid lot size: qty={qty_lots} lots ({units} units) "
+                f"not multiple of lot {lot} for {trading_sym}"
             )
 
     # ---------- Signal logging (entry and exit) ----------

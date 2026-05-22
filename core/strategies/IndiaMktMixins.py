@@ -36,7 +36,10 @@ from core.utils.dhan_expired_option_chain_files import (
     atm_label_from_spot_strike,
     load_expired_option_chain_from_files,
 )
-from core.utils.option_chain_snapshot_log import log_option_chain_snapshot
+from core.utils.option_chain_snapshot_log import (
+    load_option_chain_snapshot,
+    log_option_chain_snapshot,
+)
 
 
 class IndiaMktMixins:
@@ -62,18 +65,34 @@ class IndiaMktMixins:
         self.rolled_hedges = set()
 
     def _entry_order_qty(self, inst) -> int:
-        lot = int(getattr(inst, "lot_size", 0) or 0)
+        """Lots to trade (Dhan broker sends quantity = lots × lot_size to the exchange)."""
         lots = int(getattr(self, "order_qty_lots", ORDER_QTY_LOTS) or 1)
-        return max(1, lot * max(1, lots))
+        return max(1, lots)
+
+    @staticmethod
+    def _order_qty_in_lots(inst, qty: Any) -> int:
+        """Normalize qty to whole lots: values ≥ lot_size that divide evenly are treated as units."""
+        lot = int(getattr(inst, "lot_size", 0) or 0) or 1
+        try:
+            q = int(qty)
+        except (TypeError, ValueError):
+            return 1
+        if q <= 0:
+            return 1
+        if lot > 1 and q >= lot and q % lot == 0:
+            return max(1, q // lot)
+        return max(1, q)
+
+    @staticmethod
+    def order_qty_units(inst, qty_lots: int) -> int:
+        """Exchange quantity (units) for a given lot count."""
+        lot = int(getattr(inst, "lot_size", 0) or 0) or 1
+        return max(1, int(qty_lots)) * lot
 
     def _normalize_order_qty(self, inst, qty) -> int:
         if qty is None:
             return self._entry_order_qty(inst)
-        try:
-            q = int(qty)
-        except (TypeError, ValueError):
-            return self._entry_order_qty(inst)
-        return q if q > 0 else self._entry_order_qty(inst)
+        return self._order_qty_in_lots(inst, qty)
 
     # ==================================================
     # DHAN EXPIRED OPTION CSV (BACKTEST) — same layout as data/dhan_expired_option_chain download scripts
@@ -262,6 +281,13 @@ class IndiaMktMixins:
                 return float(px)
             except (TypeError, ValueError):
                 return None
+
+        if str(getattr(self, "api", "") or "").upper() == "DHAN":
+            cached_px = self._option_price_from_resolved_chain(
+                candle, ctx, strike, option_type
+            )
+            if cached_px is not None and cached_px > 0:
+                return cached_px
 
         params = {
             "exchange": ctx.exchange,
@@ -463,12 +489,44 @@ class IndiaMktMixins:
         return None
 
     @staticmethod
-    def _strike_on_hundred_point_grid(val) -> bool:
-        """OPTIDX live/paper: only 100-point strikes (exclude 50-step e.g. 25250, 25350)."""
+    def _strike_on_strike_grid(val, step: int = 100) -> bool:
+        """Keep only strikes on ``step`` grid (e.g. 500 → 22000, 22500; 100 → exclude 25250)."""
         try:
-            return int(round(float(val))) % 100 == 0
+            s = int(step)
+            if s <= 0:
+                return True
+            return int(round(float(val))) % s == 0
         except (TypeError, ValueError):
             return False
+
+    @staticmethod
+    def _strike_on_hundred_point_grid(val) -> bool:
+        return IndiaMktMixins._strike_on_strike_grid(val, 100)
+
+    def _option_chain_strike_grid_step(self) -> int:
+        return int(getattr(self, "option_chain_strike_step", 100) or 100)
+
+    def _filter_option_chain_strike_grid(
+        self, df: pd.DataFrame, strike_col: str
+    ) -> pd.DataFrame:
+        step = self._option_chain_strike_grid_step()
+        if step <= 0 or strike_col not in df.columns:
+            return df
+        mask = df[strike_col].apply(lambda v: self._strike_on_strike_grid(v, step))
+        return df.loc[mask]
+
+    def _sort_rows_by_ideal_premium(
+        self, row: pd.DataFrame, premium_col: str
+    ) -> pd.DataFrame:
+        ideal = getattr(self, "option_chain_ideal_premium", None)
+        if ideal is None or not isinstance(row, pd.DataFrame) or len(row) <= 1:
+            return row
+        prem_num = pd.to_numeric(row[premium_col], errors="coerce")
+        return (
+            row.assign(_prem_dist=(prem_num - float(ideal)).abs())
+            .sort_values("_prem_dist")
+            .drop(columns=["_prem_dist"])
+        )
 
     @staticmethod
     def _option_chain_delta_column(df: pd.DataFrame, option_type: str) -> Optional[str]:
@@ -673,6 +731,149 @@ class IndiaMktMixins:
         except (TypeError, ValueError):
             return None
 
+    def _option_chain_df(self, chain: Any) -> Optional[pd.DataFrame]:
+        if chain is None:
+            return None
+        if isinstance(chain, dict):
+            inner = chain.get("chain")
+            return inner if isinstance(inner, pd.DataFrame) else None
+        if isinstance(chain, pd.DataFrame):
+            return chain
+        return None
+
+    def _snapshot_slot_from_candle(self, candle: dict) -> Tuple[str, str]:
+        """IST wall-clock slot ``(YYYY-MM-DD, HH-MM)`` at bar close (for snapshot CSV lookup)."""
+        ts = pd.Timestamp(candle["timestamp"])
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(IST)
+        else:
+            ts = ts.tz_convert(IST)
+        bar_minutes = int(self.timeframe) if str(self.timeframe).isdigit() else 60
+        close_ts = ts + pd.Timedelta(minutes=bar_minutes)
+        return close_ts.strftime("%Y-%m-%d"), close_ts.strftime("%H-%M")
+
+    def _remember_option_chain_snapshot_slot(
+        self, extra_snapshot_params: Optional[dict]
+    ) -> None:
+        if not isinstance(extra_snapshot_params, dict):
+            return
+        snap_date = extra_snapshot_params.get("snapshot_date")
+        snap_time = extra_snapshot_params.get("snapshot_time")
+        if snap_date and snap_time:
+            self._last_option_chain_snapshot_slot = (str(snap_date), str(snap_time))
+        target = extra_snapshot_params.get("snapshot_target")
+        if target:
+            self._last_option_chain_snapshot_target = str(target).strip().lower()
+
+    def _resolve_option_chain_data(self, candle, ctx) -> Optional[dict]:
+        """
+        Option chain for the current bar: in-memory cache from main strike selection,
+        else the LEAPS (or other) snapshot CSV for the same slot — no extra API call.
+        """
+        cached = getattr(self, "_last_option_chain", None)
+        df = self._option_chain_df(cached)
+        if df is not None and not df.empty:
+            return cached
+
+        slot = getattr(self, "_last_option_chain_snapshot_slot", None)
+        if not slot:
+            slot = self._snapshot_slot_from_candle(candle)
+        snap_date, snap_time = slot
+        target = (
+            getattr(self, "_last_option_chain_snapshot_target", None) or "leaps_rsi"
+        )
+        loaded = load_option_chain_snapshot(
+            snapshot_date=snap_date,
+            snapshot_time=snap_time,
+            snapshot_target=str(target),
+            ctx_symbol=str(getattr(ctx, "symbol", "") or ""),
+            ctx_exchange=str(getattr(ctx, "exchange", "") or ""),
+        )
+        if loaded is not None:
+            self._last_option_chain = loaded
+        return loaded
+
+    def _strike_row_from_chain(
+        self, chain: Any, strike: Union[int, float], option_type: str
+    ) -> Optional[pd.Series]:
+        df = self._option_chain_df(chain)
+        if df is None or df.empty:
+            return None
+        strike_col = self._option_chain_strike_column(df)
+        if strike_col is None:
+            return None
+        try:
+            strike_f = float(strike)
+        except (TypeError, ValueError):
+            return None
+        sp = pd.to_numeric(df[strike_col], errors="coerce")
+        rows = df[sp == strike_f]
+        if rows.empty:
+            return None
+        return rows.iloc[0]
+
+    def _execution_price_from_chain_row(
+        self,
+        row: Any,
+        option_type: str,
+        side: str,
+    ) -> Optional[float]:
+        """BUY → ask (then LTP); SELL → bid (then LTP) from a chain snapshot row."""
+        if row is None:
+            return None
+        opt_u = str(option_type or "").upper()
+        is_put = opt_u in ("PE", "PUT")
+        buy = str(side or "").upper() == "BUY"
+        if is_put:
+            primary, secondary = "PE Ask", "PE LTP"
+            if not buy:
+                primary, secondary = "PE Bid", "PE LTP"
+        else:
+            primary, secondary = "CE Ask", "CE LTP"
+            if not buy:
+                primary, secondary = "CE Bid", "CE LTP"
+
+        for col in (primary, secondary):
+            try:
+                if isinstance(row, pd.Series):
+                    if col not in row.index:
+                        continue
+                    val = row[col]
+                elif isinstance(row, dict):
+                    if col not in row:
+                        continue
+                    val = row[col]
+                else:
+                    continue
+                if val is None or (isinstance(val, float) and pd.isna(val)):
+                    continue
+                px = float(val.iloc[0] if isinstance(val, pd.Series) else val)
+                if px > 0:
+                    return px
+            except (KeyError, TypeError, ValueError):
+                continue
+        return self._ltp_from_strike_row_backtest(row, opt_u) or None
+
+    def _option_price_from_resolved_chain(
+        self,
+        candle,
+        ctx,
+        strike,
+        option_type,
+        *,
+        side: Optional[str] = None,
+    ) -> Optional[float]:
+        chain = self._resolve_option_chain_data(candle, ctx)
+        if chain is None:
+            return None
+        row = self._strike_row_from_chain(chain, strike, option_type)
+        if row is None:
+            return None
+        px = self._execution_price_from_chain_row(row, option_type, side or "BUY")
+        if px is not None and px > 0:
+            return px
+        return None
+
     def _find_strike_snapshot_params(self, candle, ctx, option_type):
         """Override in strategy to set params['snapshot']=True for chain CSV logging."""
         return {}
@@ -710,9 +911,11 @@ class IndiaMktMixins:
         extra_snapshot_params = self._find_strike_snapshot_params(
             candle=candle, ctx=ctx, option_type=option_type
         )
+        self._remember_option_chain_snapshot_slot(extra_snapshot_params)
         if isinstance(extra_snapshot_params, dict) and extra_snapshot_params:
             params.update(extra_snapshot_params)
         chain = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
+        self._last_option_chain = chain
         if bool(params.get("snapshot", False)):
             try:
                 log_option_chain_snapshot(
@@ -763,6 +966,7 @@ class IndiaMktMixins:
         extra_snapshot_params = self._find_strike_snapshot_params(
             candle=candle, ctx=ctx, option_type=option_type
         )
+        self._remember_option_chain_snapshot_slot(extra_snapshot_params)
         snapshot_mode = isinstance(extra_snapshot_params, dict) and bool(
             extra_snapshot_params.get("snapshot")
         )
@@ -842,10 +1046,7 @@ class IndiaMktMixins:
             if premium_col is None or strike_col is None:
                 return None
 
-            #this gets printed
-            live_df = live_df[
-                live_df[strike_col].apply(self._strike_on_hundred_point_grid)
-            ]
+            live_df = self._filter_option_chain_strike_grid(live_df, strike_col)
             if live_df.empty:
                 return None
 
@@ -907,6 +1108,7 @@ class IndiaMktMixins:
             if row.empty:
                 return None
 
+            row = self._sort_rows_by_ideal_premium(row, premium_col)
             r0 = row.iloc[0]
             premium = float(pd.to_numeric(r0[premium_col], errors="coerce") or 0.0)
             selected_strike = r0[strike_col]
@@ -941,6 +1143,12 @@ class IndiaMktMixins:
 
             if premium_col is None:
                 return None
+
+            strike_col_bt = self._option_chain_strike_column(chain)
+            if strike_col_bt:
+                chain = self._filter_option_chain_strike_grid(chain, strike_col_bt)
+                if chain.empty:
+                    return None
 
             dcol_bt = self._option_chain_delta_column(chain, option_type)
             delta_in_chain = dcol_bt is not None and dcol_bt in chain.columns
@@ -998,6 +1206,7 @@ class IndiaMktMixins:
             strike_col = self._option_chain_strike_column(row)
             if strike_col is None:
                 return None
+            row = self._sort_rows_by_ideal_premium(row, premium_col)
             r0 = row.iloc[0]
             selected_strike = r0[strike_col]
             premium = float(r0[premium_col])
@@ -1081,9 +1290,17 @@ class IndiaMktMixins:
         option_type = inst.option_type
 
         if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
-            ltp = ltp_from_strike_row_live(strike_row)
+            ltp = self._execution_price_from_chain_row(
+                strike_row, option_type, side
+            )
+            if ltp is None or ltp <= 0:
+                ltp = ltp_from_strike_row_live(
+                    strike_row, option_type=option_type, side=side
+                )
         else:
             ltp = self._ltp_from_strike_row_backtest(strike_row, option_type)
+        if ltp is not None and float(ltp) <= 0:
+            ltp = None
 
         assert inst.trading_symbol
         assert inst.custom_symbol
@@ -1154,7 +1371,10 @@ class IndiaMktMixins:
     # ==================================================
     # HEDGE ENTRY / EXIT
     # ==================================================
-    def resolve_hedge_expiry(self, trade_date):
+    def resolve_hedge_expiry(self, trade_date, parent_expiry=None):
+        """Hedge expiry: same calendar expiry as the main leg when known, else monthly rule."""
+        if parent_expiry is not None:
+            return pd.Timestamp(parent_expiry).date()
         return (
             ExpiryResolver.current_month_expiry(trade_date)
             if trade_date.day < 15
@@ -1168,7 +1388,10 @@ class IndiaMktMixins:
 
     def create_hedge_intent(self, parent_sell_intent, candle, ctx):
         trade_date = pd.to_datetime(candle["timestamp"]).date()
-        hedge_expiry = self.resolve_hedge_expiry(trade_date)
+        parent_expiry = getattr(
+            getattr(parent_sell_intent, "instrument", None), "expiry", None
+        )
+        hedge_expiry = self.resolve_hedge_expiry(trade_date, parent_expiry=parent_expiry)
 
         hedge_strike = self.calculate_hedge_strike(
             parent_sell_intent.instrument.strike,
@@ -1193,17 +1416,24 @@ class IndiaMktMixins:
         if inst is None:
             return None
 
-        hedge_price = (
-            self.get_option_price_at_candle(
-                candle,
-                ctx,
-                hedge_strike,
-                parent_sell_intent.instrument.option_type,
-                hedge_expiry,
-            )
-            if RUN_MODE == RunMode.BACKTEST
-            else 0
+        hedge_price = self._option_price_from_resolved_chain(
+            candle,
+            ctx,
+            hedge_strike,
+            parent_sell_intent.instrument.option_type,
+            side="BUY",
         )
+        if hedge_price is None or hedge_price <= 0:
+            if RUN_MODE == RunMode.BACKTEST:
+                hedge_price = self.get_option_price_at_candle(
+                    candle,
+                    ctx,
+                    hedge_strike,
+                    parent_sell_intent.instrument.option_type,
+                    hedge_expiry,
+                )
+            else:
+                hedge_price = 0
 
         return self.create_order_intent(
             inst=inst,

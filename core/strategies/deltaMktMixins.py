@@ -104,10 +104,14 @@ def delta_option_trading_symbol(
     return f"{letter}-BTC-{int(float(strike))}-{expiry_ddmmyy}"
 
 
-def ltp_from_strike_row_live(strike_row) -> float:
+def ltp_from_strike_row_live(
+    strike_row,
+    option_type: Optional[str] = None,
+    side: Optional[str] = None,
+) -> float:
     """
     Live/paper option LTP from a strike row (DataFrame row or Series).
-    Dhan chains use ``close``; Delta tick rows use ``price``.
+    Delta tick rows use ``price``; Dhan chains use ``PE LTP`` / ``CE LTP`` (or close).
     """
     if strike_row is None:
         return 0.0
@@ -118,10 +122,57 @@ def ltp_from_strike_row_live(strike_row) -> float:
         and len(strike_row) > 0
         else strike_row
     )
-    if isinstance(row, pd.Series):
-        for key in ("price", "close", "mark_price"):
-            if key in row.index and pd.notna(row.get(key)):
-                return float(row[key])
+    if not isinstance(row, pd.Series):
+        return 0.0
+
+    for key in ("price", "close", "mark_price"):
+        if key in row.index and pd.notna(row.get(key)):
+            val = float(row[key])
+            if val > 0:
+                return val
+
+    opt_u = str(option_type or "").upper()
+    is_put = opt_u in ("PE", "PUT")
+    is_buy = str(side or "").upper() == "BUY"
+    if is_put:
+        cols = (
+            ("PE Ask", "PE LTP", "PE Bid")
+            if is_buy
+            else ("PE Bid", "PE LTP", "PE Ask")
+        )
+    elif opt_u in ("CE", "CALL"):
+        cols = (
+            ("CE Ask", "CE LTP", "CE Bid")
+            if is_buy
+            else ("CE Bid", "CE LTP", "CE Ask")
+        )
+    else:
+        cols = ()
+
+    for col in cols:
+        if col not in row.index:
+            continue
+        val = row.get(col)
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            continue
+        try:
+            px = float(val.iloc[0] if isinstance(val, pd.Series) else val)
+            if px > 0:
+                return px
+        except (TypeError, ValueError):
+            continue
+
+    for c in row.index:
+        cu = str(c).upper()
+        if "LTP" in cu and (not opt_u or opt_u[:2] in cu or "PE" in cu or "CE" in cu):
+            val = row.get(c)
+            if val is not None and pd.notna(val):
+                try:
+                    px = float(val)
+                    if px > 0:
+                        return px
+                except (TypeError, ValueError):
+                    pass
     return 0.0
 
 

@@ -2982,6 +2982,114 @@ class Tradehull:
             print(f"Error at getting response from msrgin calculator as {e}")
             return 0
 
+    def margin_calculator_multi(
+        self,
+        scrip_list,
+        include_position=True,
+        include_orders=True,
+        debug="NO",
+    ):
+        """
+        Multi-leg margin (hedge benefit). Each scrip dict:
+        tradingsymbol, exchange, transaction_type, quantity, trade_type, price, trigger_price.
+        """
+        try:
+            if not scrip_list:
+                return 0
+            instrument_df = self.instrument_df.copy()
+            script_exchange = {
+                "NSE": self.Dhan.NSE,
+                "NFO": self.Dhan.NSE_FNO,
+                "BFO": self.Dhan.BSE_FNO,
+                "CUR": self.Dhan.CUR,
+                "BSE": self.Dhan.BSE,
+                "MCX": self.Dhan.MCX,
+                "INDEX": self.Dhan.INDEX,
+            }
+            instrument_exchange = {
+                "NSE": "NSE",
+                "BSE": "BSE",
+                "NFO": "NSE",
+                "BFO": "BSE",
+                "MCX": "MCX",
+                "CUR": "NSE",
+            }
+            product = {
+                "MIS": self.Dhan.INTRA,
+                "MARGIN": self.Dhan.MARGIN,
+                "MTF": self.Dhan.MTF,
+                "CO": self.Dhan.CO,
+                "BO": self.Dhan.BO,
+                "CNC": self.Dhan.CNC,
+            }
+            transactiontype = {"BUY": self.Dhan.BUY, "SELL": self.Dhan.SELL}
+            sym_u = (
+                instrument_df["SEM_TRADING_SYMBOL"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.upper()
+            )
+            cust_u = (
+                instrument_df["SEM_CUSTOM_SYMBOL"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.upper()
+            )
+            api_scripts = []
+            for scrip in scrip_list:
+                ts_key = str(scrip.get("tradingsymbol", "")).strip().upper()
+                exchange = str(scrip.get("exchange", "NFO")).upper()
+                if exchange not in script_exchange:
+                    raise Exception(f"Unsupported exchange {exchange}")
+                security_check = instrument_df[
+                    ((sym_u == ts_key) | (cust_u == ts_key))
+                    & (
+                        instrument_df["SEM_EXM_EXCH_ID"]
+                        == instrument_exchange[exchange]
+                    )
+                ]
+                if security_check.empty:
+                    raise Exception(f"Check the Tradingsymbol {ts_key}")
+                security_id = security_check.iloc[-1]["SEM_SMST_SECURITY_ID"]
+                trade_type = str(scrip.get("trade_type", "MARGIN")).upper()
+                txn = str(scrip.get("transaction_type", "BUY")).upper()
+                api_scripts.append(
+                    {
+                        "exchangeSegment": script_exchange[exchange],
+                        "transactionType": transactiontype[txn],
+                        "quantity": int(scrip.get("quantity", 0)),
+                        "productType": product[trade_type],
+                        "securityId": str(security_id),
+                        "price": float(scrip.get("price", 0) or 0),
+                        "triggerPrice": float(scrip.get("trigger_price", 0) or 0),
+                    }
+                )
+            url = self.Dhan.base_url + "/margincalculator/multi"
+            payload = {
+                "includePosition": bool(include_position),
+                "includeOrders": bool(include_orders),
+                "scripList": api_scripts,
+            }
+            if getattr(self.Dhan, "client_id", None):
+                payload["dhanClientId"] = self.Dhan.client_id
+            response = self.Dhan.session.post(
+                url,
+                headers=self.Dhan.header,
+                timeout=self.Dhan.timeout,
+                data=json.dumps(payload),
+            )
+            parsed = self.Dhan._parse_response(response)
+            if debug.upper() == "YES":
+                print(parsed)
+            if parsed.get("status") == "success":
+                return parsed.get("data") or parsed
+            raise Exception(parsed)
+        except Exception as e:
+            print(f"Error at margin_calculator_multi: {e}")
+            return 0
+
     def get_quote_data(self, names, debug="NO"):
         try:
             instrument_df = self.instrument_df.copy()

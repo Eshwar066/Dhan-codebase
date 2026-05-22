@@ -275,3 +275,9 @@ sudo systemctl list-units 'dhan*' 'option-buildup*' 'delta*'
 - `docs/PRODUCTION_UPGRADES.md`
 - `core/engine/factory.py`
 - `core/engine/live_engine.py`
+
+## most repeated
+sudo systemctl daemon-reload
+sudo systemctl start dhan-oi-positional-buy.service
+sudo systemctl start dhan-leaps-rsi.service
+sudo systemctl enable option-buildup-scheduler.service

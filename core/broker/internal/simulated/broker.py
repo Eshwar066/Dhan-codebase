@@ -103,11 +103,14 @@ class SimulatedBroker(BaseBroker):
             )
             return order_id
 
+        lot_size = int(getattr(instrument, "lot_size", 1) or 1)
+        fill_units = max(1, int(getattr(intent, "qty", 1) or 1)) * lot_size
+
         if self.order_router:
             self.order_router.process_fill(
                 instrument=instrument,
                 side=intent.side,
-                qty=intent.qty,
+                qty=fill_units,
                 price=float(execution_price),
                 expected_price=getattr(intent, "price", None),
                 order_id=order_id,
@@ -122,7 +125,7 @@ class SimulatedBroker(BaseBroker):
             self.position_manager.on_fill(
                 instrument=instrument,
                 side=intent.side,
-                qty=intent.qty,
+                qty=fill_units,
                 price=float(execution_price),
                 intent_id=intent.intent_id,
                 order_id=order_id,
