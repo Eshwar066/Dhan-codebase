@@ -8,7 +8,8 @@ Compact map of the current repository layout and runtime ownership.
 Algo/
 ├── README.md
 ├── PROJECT_STRUCTURE.md
-├── PROJECT_FLOW_CHART.md
+├── PROJECT_FLOW_CHART.md          # pointer → docs/
+├── docs/                          # runtime_flow, oms_flow, module_map, …
 ├── run/
 │   ├── main.py
 │   ├── config.py
@@ -122,4 +123,4 @@ WebSocket Feed -> Tick Queue -> CandleAggregator -> Strategy Worker(s)
 ## Notes
 
 - Use `README.md` for the concise project overview.
-- Use `PROJECT_FLOW_CHART.md` for HLD + LLD execution diagrams.
+- Use `docs/` (see `docs/README.md`) for HLD + LLD execution diagrams; `PROJECT_FLOW_CHART.md` is a pointer.
