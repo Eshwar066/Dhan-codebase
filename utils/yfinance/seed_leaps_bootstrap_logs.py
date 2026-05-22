@@ -9,7 +9,7 @@ Tail OHLC/RSI values are aligned to Yahoo ``^NSEI`` 60m (see YF table in source)
 
 Usage (from repo root, inside venv)::
 
-    python3 utils/seed_leaps_bootstrap_logs.py
+    python3 utils/yfinance/seed_leaps_bootstrap_logs.py
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ def _row_date_key(ln: str) -> str:
 
 
 def main() -> None:
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     log_dir = os.path.join(root, "logs", "LEAPS_RSI")
     os.makedirs(log_dir, exist_ok=True)
     candle_path = os.path.join(log_dir, "dhan_leaps_rsi_candles.log")
