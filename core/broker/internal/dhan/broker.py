@@ -54,6 +54,7 @@ class DhanBroker(BaseBroker):
         super().__init__(position_manager=position_manager, intent_store=intent_store)
         self.api = api
         self._dhan_modify_counts: Dict[str, int] = {}
+        self._last_place_order_failure: Optional[Dict[str, Any]] = None
 
     def _build_payload(self, intent, execution_price=None):
         if hasattr(intent, "instrument"):
@@ -322,9 +323,17 @@ class DhanBroker(BaseBroker):
     def place_order(self, intent, execution_price=None, retries=2):
         order_payload = self._build_payload(intent, execution_price)
         intent_id = order_payload["intent_id"]
+        self._last_place_order_failure = None
         for attempt in range(retries + 1):
             try:
                 GlobalRateLimiter.instance().acquire(DHAN_ORDER_API, 0.11)
+                logger.info(
+                    "Dhan place_order attempt=%s/%s intent_id=%s payload=%s",
+                    attempt + 1,
+                    retries + 1,
+                    intent_id,
+                    order_payload,
+                )
                 resp = self.api.place_order(
                     tradingsymbol=order_payload["tradingsymbol"],
                     exchange=order_payload["exchange"],
@@ -346,7 +355,20 @@ class DhanBroker(BaseBroker):
                 if not isinstance(resp, dict):
                     raise Exception(f"Invalid broker response: {resp}")
                 if resp.get("status") != "success":
-                    logger.warning("Dhan broker rejection: %s", resp)
+                    fail_msg = resp.get("message") or str(resp)
+                    self._last_place_order_failure = {
+                        "message": fail_msg,
+                        "payload": resp.get("payload") or order_payload,
+                        "response": resp,
+                        "attempt": attempt + 1,
+                    }
+                    logger.warning(
+                        "Dhan broker place_order rejected intent_id=%s attempt=%s payload=%s response=%s",
+                        intent_id,
+                        attempt + 1,
+                        order_payload,
+                        resp,
+                    )
                     return None
                 order_id = resp.get("order_id")
                 if order_id:
@@ -362,7 +384,20 @@ class DhanBroker(BaseBroker):
                     raise Exception("Order failed after retries")
                 time.sleep(0.4)
             except Exception as e:
-                logger.warning("Dhan place_order exception: %s", e, exc_info=True)
+                self._last_place_order_failure = {
+                    "message": str(e),
+                    "payload": order_payload,
+                    "response": None,
+                    "attempt": attempt + 1,
+                }
+                logger.warning(
+                    "Dhan place_order exception intent_id=%s attempt=%s payload=%s error=%s",
+                    intent_id,
+                    attempt + 1,
+                    order_payload,
+                    e,
+                    exc_info=True,
+                )
                 return None
         return None
 

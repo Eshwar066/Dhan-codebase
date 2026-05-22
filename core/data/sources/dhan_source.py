@@ -847,10 +847,28 @@ class DhanSource:
         Place order via Tradehull. Used only by broker layer (DhanBrokerApi).
         Dhan REST maps the same string to JSON ``correlationId`` (via dhanhq ``tag``).
         Pass intent_id as both tag and correlation_id for WS order_alert CorrelationId parity.
-        Returns dict with "status" ("success" | "error") and "order_id".
+        Returns dict with "status" ("success" | "error"), "order_id", and on failure
+        "message" + "payload" for OMS/engine logs.
         """
+        request_payload = {
+            "tradingsymbol": tradingsymbol,
+            "exchange": str(exchange).upper(),
+            "quantity": int(quantity),
+            "price": int(price) if price else 0,
+            "trigger_price": int(trigger_price) if trigger_price else 0,
+            "order_type": str(order_type).upper(),
+            "transaction_type": str(transaction_type).upper(),
+            "trade_type": str(trade_type).upper(),
+            "disclosed_quantity": int(disclosed_quantity),
+            "after_market_order": bool(after_market_order),
+            "validity": validity,
+            "amo_time": amo_time,
+            "tag": tag or "",
+            "correlation_id": correlation_id if correlation_id is not None else tag,
+        }
         try:
             cid = correlation_id if correlation_id is not None else tag
+            logger.info("Dhan place_order request payload=%s", request_payload)
             result = self.tsl.order_placement(
                 tradingsymbol=tradingsymbol,
                 exchange=exchange.upper(),
@@ -870,11 +888,30 @@ class DhanSource:
                 correlation_id=cid,
             )
             if result is not None and isinstance(result, str):
-                return {"status": "success", "order_id": result}
-            return {"status": "error", "order_id": None}
+                return {"status": "success", "order_id": result, "payload": request_payload}
+            logger.warning(
+                "Dhan place_order returned no order_id payload=%s",
+                request_payload,
+            )
+            return {
+                "status": "error",
+                "order_id": None,
+                "message": "order_placement returned None (see tradehull logs for API response)",
+                "payload": request_payload,
+            }
         except Exception as e:
-            logger.warning("Dhan place_order exception: %s", e, exc_info=True)
-            return {"status": "error", "order_id": None}
+            logger.warning(
+                "Dhan place_order exception payload=%s error=%s",
+                request_payload,
+                e,
+                exc_info=True,
+            )
+            return {
+                "status": "error",
+                "order_id": None,
+                "message": str(e),
+                "payload": request_payload,
+            }
 
     def cancel_order(self, order_id):
         """Cancel a single order."""
