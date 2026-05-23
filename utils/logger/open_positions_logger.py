@@ -166,6 +166,9 @@ class OpenPositionsLogger:
             return
         with self._lock:
             snap = self._read_open_snapshot()
+            for row in snap.values():
+                if row.get("timestamp"):
+                    row["timestamp"] = self._format_timestamp(row["timestamp"])
             self._write_snapshot(snap)
 
     def _ensure_csv_schema(self) -> None:
@@ -187,11 +190,34 @@ class OpenPositionsLogger:
                     row["magicalLine"] = r["ml1"]
                 w.writerow(row)
 
+    @staticmethod
+    def _format_timestamp(value: Any = None) -> str:
+        """IST date + time only, e.g. 2026-05-22 22:48:23 (no timezone / microseconds)."""
+        if value is None or value == "":
+            return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+        if isinstance(value, datetime):
+            dt = value.astimezone(IST) if value.tzinfo else value.replace(tzinfo=IST)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        s = str(value).strip()
+        if not s:
+            return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=IST)
+            else:
+                dt = dt.astimezone(IST)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return s[:19] if len(s) >= 19 else s
+
     def _now(self) -> str:
-        return datetime.now(IST).isoformat()
+        return self._format_timestamp()
 
     def _finalize_row_for_csv(self, row: dict) -> Dict[str, Any]:
         out = {k: row.get(k, "") for k in FIELDNAMES}
+        if out.get("timestamp"):
+            out["timestamp"] = self._format_timestamp(out["timestamp"])
         sm = out.get("strategy_meta")
         sm_obj = None
         if sm is not None and not isinstance(sm, str):

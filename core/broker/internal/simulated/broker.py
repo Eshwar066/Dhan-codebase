@@ -75,11 +75,15 @@ class SimulatedBroker(BaseBroker):
                 or 0.0
             )
             strat = getattr(intent, "strategy", None) or "GLOBAL"
+            side_u = str(getattr(intent, "side", "") or "").upper()
+            # Short option cover: BUY SL when premium >= trigger. Long exit: SELL SL when premium <= trigger.
+            trigger_when = "lte" if side_u == "SELL" else "gte"
             self._pending_sl[stid] = {
                 "intent": intent,
                 "trigger_price": trig,
                 "instrument": instrument,
                 "strategy": strat,
+                "trigger_when": trigger_when,
             }
             ts = getattr(intent, "candle_ts", None)
             ts_s = (
@@ -179,8 +183,8 @@ class SimulatedBroker(BaseBroker):
         candle_ts: Any,
     ) -> None:
         """
-        For short options, SL triggers when option premium (LTP) >= trigger (stop on premium rise).
-        Call each bar from backtest/paper with option LTPs in price_map.
+        SL triggers when LTP crosses trigger: gte for short-cover stops (BUY SL-M),
+        lte for long exits (SELL SL-M on bought options).
         """
         if not order_router or not price_map or not self._pending_sl:
             return
@@ -191,7 +195,12 @@ class SimulatedBroker(BaseBroker):
             if ltp is None:
                 continue
             trig = float(rec["trigger_price"])
-            if float(ltp) + 1e-12 < trig:
+            when = str(rec.get("trigger_when") or "gte")
+            ltp_f = float(ltp)
+            if when == "lte":
+                if ltp_f > trig + 1e-12:
+                    continue
+            elif ltp_f + 1e-12 < trig:
                 continue
             intent = rec["intent"]
             del self._pending_sl[stid]

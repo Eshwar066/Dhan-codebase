@@ -3,13 +3,14 @@ OI Positional Buy — rules in readme.md
 
 09:30  benchmark chain
 10:45 / 15:15  snapshot + OI review vs 09:30 + entry if flat
-Intraday  TP 1.5x (+50%) → exit then re-enter near old premium; SL 40% (no re-entry)
+Intraday  TP 1.5x (+50%) → exit then re-enter near old premium; SL 40% via MAIN_SL SL-M after fill
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import date, time
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
@@ -305,6 +306,61 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
         )
         return intent
 
+    def _build_main_sl_intent(
+        self, entry_ref: Any, trigger_price: float, candle_ts: Any, symbol: str
+    ) -> Any:
+        """Long option: SELL stop when premium falls to trigger (40% below entry)."""
+        return self.create_order_intent(
+            inst=entry_ref.instrument,
+            side="SELL",
+            qty=entry_ref.qty,
+            price=float(trigger_price),
+            order_type="SL-M",
+            strategy=self.name,
+            candle_ts=candle_ts,
+            structure_id=entry_ref.structure_id,
+            tag="MAIN_SL",
+            symbol=symbol,
+            action="FORCE_EXIT",
+            parent_intent_id=entry_ref.intent_id,
+            trigger_price=float(trigger_price),
+        )
+
+    def on_main_entry_filled(
+        self,
+        *,
+        ctx: Any,
+        instrument: Any,
+        structure_id: Optional[str],
+        intent_id: Optional[str],
+        candle_ts: Any,
+        price: Any = None,
+        metadata_extras: Any = None,
+        **kw: Any,
+    ) -> List[Any]:
+        """After MAIN BUY fill, arm broker SL-M at 40% below entry premium."""
+        del ctx, metadata_extras
+        if not structure_id or not intent_id:
+            return []
+        meta = self._position_meta_by_sid.get(str(structure_id))
+        if meta is None:
+            return []
+        entry_px = float(price if price is not None else meta.entry_premium)
+        sl_trigger = float(entry_px * (1.0 - STOP_LOSS_FRAC))
+        ref = SimpleNamespace(
+            instrument=instrument,
+            structure_id=str(structure_id),
+            intent_id=intent_id,
+            qty=self._normalize_order_qty(instrument, kw.get("qty")),
+        )
+        _LOGGER.info(
+            "oi_pos MAIN_SL armed sid=%s trigger=%.2f (entry=%.2f -40%%)",
+            structure_id,
+            sl_trigger,
+            entry_px,
+        )
+        return [self._build_main_sl_intent(ref, sl_trigger, candle_ts, meta.symbol)]
+
     # ------------------------------------------------------------------
     # Exits
     # ------------------------------------------------------------------
@@ -342,8 +398,7 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
         px = self._position_premium(candle, ctx, pos)
         if px is None:
             return None
-        if px <= meta.entry_premium * (1.0 - STOP_LOSS_FRAC):
-            return "SL"
+        # SL: resting MAIN_SL SL-M (see on_main_entry_filled); avoid double exit in paper/live.
         if px >= meta.entry_premium * TARGET_MULT:
             return "TARGET"
 
@@ -428,11 +483,6 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
         reason = self._exit_reason_by_sid.get(sid, "")
         symbol = candle["symbol"]
 
-        if reason == "SL":
-            self._sl_blocked_day_by_symbol[symbol] = self._trade_date(candle)
-            _LOGGER.info("oi_pos SL exit sym=%s — no re-entry today", symbol)
-            return [intent]
-
         meta = self._position_meta_by_sid.get(sid)
         if reason == "TARGET" and meta is not None:
             self._reentry_near_premium[symbol] = meta.entry_premium
@@ -451,8 +501,26 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
 
         return [intent]
 
+    def _block_sl_reentry(self, symbol: str, candle_ts: Any) -> None:
+        if not symbol or candle_ts is None:
+            return
+        self._sl_blocked_day_by_symbol[symbol] = self._trade_date(
+            {"timestamp": candle_ts, "symbol": symbol}
+        )
+        _LOGGER.info("oi_pos SL exit sym=%s — no re-entry today", symbol)
+
     def on_main_exit_filled(self, **kwargs: Any):
         sid = str(kwargs.get("structure_id") or "")
+        tag = str(kwargs.get("tag") or "").upper()
+        if tag == "MAIN_SL":
+            meta = self._position_meta_by_sid.get(sid)
+            sym = meta.symbol if meta else str(kwargs.get("symbol") or "")
+            self._block_sl_reentry(sym, kwargs.get("candle_ts"))
+            self._pending_exit_sids.discard(sid)
+            self._exit_reason_by_sid.pop(sid, None)
+            self._pending_entry_by_exit_sid.pop(sid, None)
+            return []
+
         pending = self._pending_entry_by_exit_sid.pop(sid, None)
         return (
             [(pending.entry_intent, {"timestamp": kwargs.get("candle_ts")})]
@@ -464,14 +532,12 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
         sid = str(kwargs.get("structure_id") or "")
         if not sid:
             return
+        tag = str(kwargs.get("tag") or "").upper()
         reason = str(kwargs.get("exit_reason") or kwargs.get("execution_source") or "").upper()
-        if reason == "SL":
-            symbol = kwargs.get("symbol")
-            ts = kwargs.get("candle_ts") or kwargs.get("timestamp")
-            if symbol and ts is not None:
-                self._sl_blocked_day_by_symbol[symbol] = self._trade_date(
-                    {"timestamp": ts, "symbol": symbol}
-                )
+        if tag == "MAIN_SL" or reason == "SL":
+            meta = self._position_meta_by_sid.get(sid)
+            sym = meta.symbol if meta else str(kwargs.get("symbol") or "")
+            self._block_sl_reentry(sym, kwargs.get("candle_ts") or kwargs.get("timestamp"))
         self._pending_entry_by_exit_sid.pop(sid, None)
         self._pending_exit_sids.discard(sid)
         self._exit_reason_by_sid.pop(sid, None)
