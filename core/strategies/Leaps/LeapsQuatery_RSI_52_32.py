@@ -1,5 +1,6 @@
 import pandas as pd
 import talib
+from datetime import date
 
 from run.config import RUN_MODE, RunMode
 from core.strategies.base import BaseStrategy
@@ -21,6 +22,8 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     # NIFTY LEAPS: 22000, 22500, 23000, … (not 50/100-step strikes).
     option_chain_strike_step = 500
     option_chain_ideal_premium = 350
+    # Monthly hedge expiry cutoff (readme): before 15th → current month; on/after 15th → next month.
+    hedge_monthly_rollover_after_calendar_day = 15
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -39,6 +42,18 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
 
     def requires_live_rsi_patch(self) -> bool:
         return True
+
+    def resolve_hedge_expiry(self, trade_date: date, parent_expiry=None):
+        """
+        Hedge is a monthly option (not LEAPS quarterly).
+        readme: current-month expiry if trade before 15th; next month if on/after 15th.
+        Ignores parent_expiry from the sold LEAPS leg.
+        """
+        _ = parent_expiry
+        cutoff = int(getattr(self, "hedge_monthly_rollover_after_calendar_day", 15) or 15)
+        if trade_date.day < cutoff:
+            return ExpiryResolver.current_month_expiry(trade_date)
+        return ExpiryResolver.next_month_expiry(trade_date)
 
     #option chain snapshot
     def _candle_close_ts_ist(self, candle: dict) -> pd.Timestamp:
@@ -79,10 +94,10 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     def should_evaluate(self, candle):
         rsi = candle.get("rsi")
         prev = candle.get("prev_rsi")
-        # return True
-        if pd.isna(rsi) or pd.isna(prev):
-            return False
-        return (prev >= 32 and rsi < 32) or (prev <= 52 and rsi > 52)
+        return True
+        # if pd.isna(rsi) or pd.isna(prev):
+        #     return False
+        # return (prev >= 32 and rsi < 32) or (prev <= 52 and rsi > 52)
 
     # ==================================================
     # ENTRY
@@ -96,9 +111,9 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             option_type = "PUT"
             regime = "RSI_GT_52"
         else:
-            # option_type = "CALL"
-            # regime = "RSI_LT_32"
-            return None
+            option_type = "PUT"
+            regime = "RSI_GT_52"
+            # return None
 
         structure_id = self.build_structure_id(candle, regime)
 
