@@ -17,6 +17,7 @@ try:
 except ImportError:
     round_json_floats = None  # type: ignore
 
+from core.orderExecution.bracket_orders import BRACKET_TAGS, BracketLegRegistry
 from core.orderExecution.intent_store import IntentStatus
 
 
@@ -109,6 +110,7 @@ class OrderRouter:
         self._rebuild_order_state_cache()
         # Fills before this instant are ignored for orphan EXTERNAL_CLOSE / LIQUIDATION / ADL paths.
         self._oms_session_start_unix = time.time()
+        self.bracket_registry = BracketLegRegistry()
 
     def reset_oms_session_boundary(self) -> None:
         """Call when starting a new trading session (same process) to tighten orphan fill acceptance."""
@@ -638,6 +640,15 @@ class OrderRouter:
             exec_price=exec_price,
             qty=qty,
         )
+        tag_bracket = str(getattr(intent, "tag", "") or "").upper()
+        stid_bracket = getattr(intent, "structure_id", None)
+        if tag_bracket == "MAIN_EXIT" and stid_bracket:
+            self.bracket_registry.cancel_all_for_structure(
+                str(stid_bracket),
+                broker=self.broker,
+                order_router=self,
+                reason="MAIN_EXIT",
+            )
         try:
             order_id = self.broker.place_order(intent, execution_price=exec_price)
         except Exception as e:
@@ -750,6 +761,14 @@ class OrderRouter:
             order_id=order_id,
             reason="order_placed",
         )
+        if stid_bracket and tag_bracket in BRACKET_TAGS:
+            self.bracket_registry.register_structure(str(stid_bracket))
+            self.bracket_registry.link_leg(
+                str(stid_bracket),
+                tag_bracket,
+                intent_id=intent.intent_id,
+                broker_order_id=str(order_id),
+            )
         # Paper/sim broker may call process_fill inside place_order, so intent can already be FILLED.
         # Do not overwrite terminal status with SENT so has_pending_intent stays correct.
         rec = self.intent_store.get(intent.intent_id)
@@ -1788,6 +1807,26 @@ class OrderRouter:
         )
         if position_closed and realized_pnl is not None:
             self.risk.record_realized_pnl(realized_pnl)
+        tag_fill = str(tag or "").upper()
+        stid_fill = structure_id
+        if not stid_fill and intent_id and self.intent_store:
+            _rec_fill = self.intent_store.get(intent_id) or {}
+            stid_fill = _rec_fill.get("structure_id") or (_rec_fill.get("payload") or {}).get(
+                "structure_id"
+            )
+        if (
+            position_closed
+            and stid_fill
+            and tag_fill in BRACKET_TAGS
+        ):
+            self.bracket_registry.cancel_sibling(
+                str(stid_fill),
+                tag_fill,
+                broker=self.broker,
+                order_router=self,
+                reason="sibling_fill",
+            )
+            self.bracket_registry.clear_structure(str(stid_fill))
         sym = self._instrument_trading_symbol(instrument)
         self.report_fill(
             sym,

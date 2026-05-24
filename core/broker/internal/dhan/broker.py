@@ -321,7 +321,38 @@ class DhanBroker(BaseBroker):
             "message": msg,
         }
 
+    def cancel_order_by_id(
+        self,
+        order_id: str,
+        *,
+        intent_id: Optional[str] = None,
+        reason: str = "",
+    ) -> bool:
+        _ = intent_id, reason
+        source = getattr(self.api, "_source", None)
+        if source is None or not hasattr(source, "cancel_order"):
+            return False
+        try:
+            source.cancel_order(str(order_id))
+            return True
+        except Exception as exc:
+            logger.warning("Dhan cancel_order failed order_id=%s: %s", order_id, exc)
+            return False
+
     def place_order(self, intent, execution_price=None, retries=2):
+        tag_u = str(getattr(intent, "tag", "") or "").upper()
+        act_u = str(getattr(intent, "action", "") or "").upper()
+        stid = getattr(intent, "structure_id", None)
+        if tag_u == "MAIN_EXIT" and act_u == "EXIT" and stid:
+            reg = getattr(getattr(self, "order_router", None), "bracket_registry", None)
+            if reg is not None:
+                reg.cancel_all_for_structure(
+                    str(stid),
+                    broker=self,
+                    order_router=self.order_router,
+                    reason="MAIN_EXIT",
+                )
+
         order_payload = self._build_payload(intent, execution_price)
         intent_id = order_payload["intent_id"]
         self._last_place_order_failure = None

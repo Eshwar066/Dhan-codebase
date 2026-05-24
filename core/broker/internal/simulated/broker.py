@@ -19,8 +19,9 @@ class SimulatedBroker(BaseBroker):
     def __init__(self, position_manager=None, intent_store=None, latency_ms=20):
         super().__init__(position_manager=position_manager, intent_store=intent_store)
         self.latency_ms = latency_ms
-        # structure_id -> pending MAIN_SL (resting stop; evaluated via evaluate_pending_stops)
+        # structure_id -> pending MAIN_SL / MAIN_TARGET (resting; evaluate_pending_stops)
         self._pending_sl: Dict[str, Dict[str, Any]] = {}
+        self._pending_target: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
     def _sl_orders_log_path(strategy: str) -> str:
@@ -63,7 +64,7 @@ class SimulatedBroker(BaseBroker):
         if _tag_m == "MAIN_EXIT" and _act_m == "EXIT":
             _sid_m = getattr(intent, "structure_id", None)
             if _sid_m:
-                self.cancel_pending_sl(str(_sid_m))
+                self.cancel_pending_bracket(str(_sid_m), reason="MAIN_EXIT")
 
         tag_u = str(getattr(intent, "tag", "") or "").upper()
         act_u = str(getattr(intent, "action", "") or "").upper()
@@ -107,6 +108,45 @@ class SimulatedBroker(BaseBroker):
             )
             return order_id
 
+        if tag_u == "MAIN_TARGET" and act_u == "FORCE_EXIT":
+            stid = str(getattr(intent, "structure_id", "") or "")
+            trig = float(
+                getattr(intent, "trigger_price", None)
+                or getattr(intent, "price", None)
+                or 0.0
+            )
+            strat = getattr(intent, "strategy", None) or "GLOBAL"
+            side_u = str(getattr(intent, "side", "") or "").upper()
+            trigger_when = "gte" if side_u == "SELL" else "lte"
+            self._pending_target[stid] = {
+                "intent": intent,
+                "trigger_price": trig,
+                "instrument": instrument,
+                "strategy": strat,
+                "trigger_when": trigger_when,
+            }
+            ts = getattr(intent, "candle_ts", None)
+            ts_s = (
+                ts.strftime("%Y-%m-%d %H:%M:%S")
+                if isinstance(ts, datetime)
+                else (str(ts) if ts is not None else "")
+            )
+            self._append_sl_order_event(
+                strat,
+                {
+                    "event": "ARMED",
+                    "timestamp": ts_s,
+                    "structure_id": stid,
+                    "strategy": strat,
+                    "symbol": instrument.trading_symbol,
+                    "trigger_price": trig,
+                    "intent_id": getattr(intent, "intent_id", ""),
+                    "fill_price": "",
+                    "detail": "simulated resting TARGET",
+                },
+            )
+            return order_id
+
         lot_size = int(getattr(instrument, "lot_size", 1) or 1)
         fill_units = max(1, int(getattr(intent, "qty", 1) or 1)) * lot_size
 
@@ -143,12 +183,28 @@ class SimulatedBroker(BaseBroker):
                 self.intent_store.update(intent.intent_id, "FILLED")
         return order_id
 
-    def cancel_pending_sl(self, structure_id: str) -> None:
-        """Remove resting MAIN_SL when the main position exits via MAIN_EXIT (normal exit)."""
+    def cancel_pending_sl(self, structure_id: str, *, detail: str = "MAIN_EXIT") -> None:
+        """Remove resting MAIN_SL (OCO sibling fill or MAIN_EXIT)."""
         sid = str(structure_id)
         rec = self._pending_sl.pop(sid, None)
         if not rec:
             return
+        self._cancel_bracket_record(rec, sid, detail=detail)
+
+    def cancel_pending_target(self, structure_id: str, *, detail: str = "MAIN_EXIT") -> None:
+        """Remove resting MAIN_TARGET (OCO sibling fill or MAIN_EXIT)."""
+        sid = str(structure_id)
+        rec = self._pending_target.pop(sid, None)
+        if not rec:
+            return
+        self._cancel_bracket_record(rec, sid, detail=detail)
+
+    def cancel_pending_bracket(self, structure_id: str, *, reason: str = "MAIN_EXIT") -> None:
+        sid = str(structure_id)
+        self.cancel_pending_sl(sid, detail=reason)
+        self.cancel_pending_target(sid, detail=reason)
+
+    def _cancel_bracket_record(self, rec: Dict[str, Any], sid: str, *, detail: str) -> None:
         intent = rec["intent"]
         strat = rec.get("strategy") or getattr(intent, "strategy", None) or "GLOBAL"
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -163,7 +219,7 @@ class SimulatedBroker(BaseBroker):
                 "trigger_price": rec.get("trigger_price", ""),
                 "intent_id": getattr(intent, "intent_id", ""),
                 "fill_price": "",
-                "detail": "MAIN_EXIT",
+                "detail": detail,
             },
         )
         if self.intent_store and getattr(intent, "intent_id", None):
@@ -183,12 +239,43 @@ class SimulatedBroker(BaseBroker):
         candle_ts: Any,
     ) -> None:
         """
-        SL triggers when LTP crosses trigger: gte for short-cover stops (BUY SL-M),
-        lte for long exits (SELL SL-M on bought options).
+        Resting MAIN_SL / MAIN_TARGET: SL lte/gte per side; target profit gte for long SELL.
         """
-        if not order_router or not price_map or not self._pending_sl:
+        if not order_router or not price_map:
             return
-        for stid, rec in list(self._pending_sl.items()):
+        self._evaluate_pending_book(
+            order_router,
+            price_map,
+            candle_ts,
+            book=self._pending_sl,
+            fill_prefix="SIM-SL",
+            exit_reason="SL",
+            on_hit=lambda stid: self.cancel_pending_target(stid, detail="SL_hit"),
+        )
+        self._evaluate_pending_book(
+            order_router,
+            price_map,
+            candle_ts,
+            book=self._pending_target,
+            fill_prefix="SIM-TGT",
+            exit_reason="TARGET",
+            on_hit=lambda stid: self.cancel_pending_sl(stid, detail="TARGET_hit"),
+        )
+
+    def _evaluate_pending_book(
+        self,
+        order_router: Any,
+        price_map: Dict[str, float],
+        candle_ts: Any,
+        *,
+        book: Dict[str, Dict[str, Any]],
+        fill_prefix: str,
+        exit_reason: str,
+        on_hit,
+    ) -> None:
+        if not book:
+            return
+        for stid, rec in list(book.items()):
             inst = rec["instrument"]
             sym = inst.trading_symbol
             ltp = price_map.get(sym)
@@ -203,7 +290,9 @@ class SimulatedBroker(BaseBroker):
             elif ltp_f + 1e-12 < trig:
                 continue
             intent = rec["intent"]
-            del self._pending_sl[stid]
+            del book[stid]
+            if on_hit:
+                on_hit(stid)
             strat = rec.get("strategy") or getattr(intent, "strategy", None) or "GLOBAL"
             ts = candle_ts
             ts_s = (
@@ -222,10 +311,10 @@ class SimulatedBroker(BaseBroker):
                     "trigger_price": trig,
                     "intent_id": getattr(intent, "intent_id", ""),
                     "fill_price": float(ltp),
-                    "detail": "stop hit",
+                    "detail": f"{exit_reason} hit",
                 },
             )
-            oid = f"SIM-SL-{uuid.uuid4().hex[:10]}"
+            oid = f"{fill_prefix}-{uuid.uuid4().hex[:10]}"
             order_router.process_fill(
                 instrument=inst,
                 side=intent.side,
@@ -239,8 +328,8 @@ class SimulatedBroker(BaseBroker):
                 tag=getattr(intent, "tag", None),
                 structure_id=getattr(intent, "structure_id", None),
                 action=getattr(intent, "action", None),
-                exit_reason="SL",
-                execution_source="SL",
+                exit_reason=exit_reason,
+                execution_source=exit_reason,
             )
 
     def get_positions_for_recon(self):

@@ -3,7 +3,7 @@ OI Positional Buy — rules in readme.md
 
 09:30  benchmark chain
 10:45 / 15:15  snapshot + OI review vs 09:30 + entry if flat
-Intraday  TP 1.5x (+50%) → exit then re-enter near old premium; SL 40% via MAIN_SL SL-M after fill
+Intraday  TP 1.5x via MAIN_TARGET SL-M; SL 40% via MAIN_SL SL-M — armed after MAIN fill (OCO)
 """
 
 from __future__ import annotations
@@ -326,6 +326,26 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
             trigger_price=float(trigger_price),
         )
 
+    def _build_main_target_intent(
+        self, entry_ref: Any, trigger_price: float, candle_ts: Any, symbol: str
+    ) -> Any:
+        """Long option: SELL when premium rises to target (1.5x entry)."""
+        return self.create_order_intent(
+            inst=entry_ref.instrument,
+            side="SELL",
+            qty=entry_ref.qty,
+            price=float(trigger_price),
+            order_type="SL-M",
+            strategy=self.name,
+            candle_ts=candle_ts,
+            structure_id=entry_ref.structure_id,
+            tag="MAIN_TARGET",
+            symbol=symbol,
+            action="FORCE_EXIT",
+            parent_intent_id=entry_ref.intent_id,
+            trigger_price=float(trigger_price),
+        )
+
     def on_main_entry_filled(
         self,
         *,
@@ -338,7 +358,7 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
         metadata_extras: Any = None,
         **kw: Any,
     ) -> List[Any]:
-        """After MAIN BUY fill, arm broker SL-M at 40% below entry premium."""
+        """After MAIN BUY fill, arm SL-M (40% down) and TARGET SL-M (1.5x entry)."""
         del ctx, metadata_extras
         if not structure_id or not intent_id:
             return []
@@ -347,6 +367,7 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
             return []
         entry_px = float(price if price is not None else meta.entry_premium)
         sl_trigger = float(entry_px * (1.0 - STOP_LOSS_FRAC))
+        target_trigger = float(entry_px * TARGET_MULT)
         ref = SimpleNamespace(
             instrument=instrument,
             structure_id=str(structure_id),
@@ -354,12 +375,16 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
             qty=self._normalize_order_qty(instrument, kw.get("qty")),
         )
         _LOGGER.info(
-            "oi_pos MAIN_SL armed sid=%s trigger=%.2f (entry=%.2f -40%%)",
+            "oi_pos bracket armed sid=%s entry=%.2f SL=%.2f TARGET=%.2f",
             structure_id,
-            sl_trigger,
             entry_px,
+            sl_trigger,
+            target_trigger,
         )
-        return [self._build_main_sl_intent(ref, sl_trigger, candle_ts, meta.symbol)]
+        return [
+            self._build_main_sl_intent(ref, sl_trigger, candle_ts, meta.symbol),
+            self._build_main_target_intent(ref, target_trigger, candle_ts, meta.symbol),
+        ]
 
     # ------------------------------------------------------------------
     # Exits
@@ -398,9 +423,7 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
         px = self._position_premium(candle, ctx, pos)
         if px is None:
             return None
-        # SL: resting MAIN_SL SL-M (see on_main_entry_filled); avoid double exit in paper/live.
-        if px >= meta.entry_premium * TARGET_MULT:
-            return "TARGET"
+        # SL / TARGET: resting MAIN_SL + MAIN_TARGET (on_main_entry_filled); OI slot review only here.
 
         t = self._ist_time(candle)
         if t in SLOT_TIMES:
@@ -483,18 +506,7 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
         reason = self._exit_reason_by_sid.get(sid, "")
         symbol = candle["symbol"]
 
-        meta = self._position_meta_by_sid.get(sid)
-        if reason == "TARGET" and meta is not None:
-            self._reentry_near_premium[symbol] = meta.entry_premium
-            re = self._try_entry(candle, ctx, skip_open_check=True)
-            if re:
-                self._pending_entry_by_exit_sid[sid] = PendingEntry(re[0])
-                _LOGGER.info(
-                    "oi_pos TARGET rotate queued sym=%s near prem=%.1f",
-                    symbol,
-                    meta.entry_premium,
-                )
-        elif reason == "OI_EXIT" and self._ist_time(candle) in SLOT_TIMES:
+        if reason == "OI_EXIT" and self._ist_time(candle) in SLOT_TIMES:
             re = self._try_entry(candle, ctx)
             if re:
                 self._pending_entry_by_exit_sid[sid] = PendingEntry(re[0])
@@ -521,6 +533,28 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
             self._pending_entry_by_exit_sid.pop(sid, None)
             return []
 
+        if tag == "MAIN_TARGET":
+            meta = self._position_meta_by_sid.get(sid)
+            sym = meta.symbol if meta else str(kwargs.get("symbol") or "")
+            self._pending_exit_sids.discard(sid)
+            self._exit_reason_by_sid.pop(sid, None)
+            if meta is None:
+                return []
+            self._reentry_near_premium[sym] = meta.entry_premium
+            candle = {"symbol": sym, "timestamp": kwargs.get("candle_ts")}
+            ctx_stub = kwargs.get("ctx")
+            if ctx_stub is None:
+                return []
+            re = self._try_entry(candle, ctx_stub, skip_open_check=True)
+            if not re:
+                return []
+            _LOGGER.info(
+                "oi_pos TARGET rotate sym=%s near prem=%.1f",
+                sym,
+                meta.entry_premium,
+            )
+            return [(re[0], candle)]
+
         pending = self._pending_entry_by_exit_sid.pop(sid, None)
         return (
             [(pending.entry_intent, {"timestamp": kwargs.get("candle_ts")})]
@@ -534,10 +568,11 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
             return
         tag = str(kwargs.get("tag") or "").upper()
         reason = str(kwargs.get("exit_reason") or kwargs.get("execution_source") or "").upper()
-        if tag == "MAIN_SL" or reason == "SL":
+        if tag in ("MAIN_SL", "MAIN_TARGET") or reason in ("SL", "TARGET"):
             meta = self._position_meta_by_sid.get(sid)
             sym = meta.symbol if meta else str(kwargs.get("symbol") or "")
-            self._block_sl_reentry(sym, kwargs.get("candle_ts") or kwargs.get("timestamp"))
+            if tag == "MAIN_SL" or reason == "SL":
+                self._block_sl_reentry(sym, kwargs.get("candle_ts") or kwargs.get("timestamp"))
         self._pending_entry_by_exit_sid.pop(sid, None)
         self._pending_exit_sids.discard(sid)
         self._exit_reason_by_sid.pop(sid, None)

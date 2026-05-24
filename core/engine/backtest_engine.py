@@ -74,7 +74,20 @@ class BacktestEngine(BaseEngine):
         fn = getattr(self.strategy, "on_main_exit_filled", None)
         if not callable(fn):
             return
-        pairs = fn(**kwargs) or []
+        inst = kwargs.get("instrument")
+        sym = None
+        if inst is not None:
+            sym = getattr(inst, "underlying_symbol", None) or getattr(
+                inst, "symbol", None
+            )
+        ts = kwargs.get("candle_ts")
+        candle_stub = {"symbol": sym or "", "timestamp": ts, "close": 0.0}
+        ctx = (
+            self.build_context(candle_stub)
+            if sym and callable(getattr(self, "build_context", None))
+            else None
+        )
+        pairs = fn(ctx=ctx, **kwargs) or []
         for intent, candle in pairs:
             sym = candle.get("symbol")
             if not sym:

@@ -1,6 +1,6 @@
 Strikes in 100s
 
-Expiry: before 15th this month expiry , after 15th nex month expiry
+Expiry: before 16th this month expiry , after 15th nex month expiry
 
 09:30:
     capture full option chain snapshot
@@ -34,3 +34,6 @@ INTRADAY LOOP:
 		If it is short buildup or long unwinding --> exit positions
 	3. If no position exits or just exited positions:
 		Check CE and PE in premium in range 170-220 --> select a strike and compare that with 9:30 option chain for both CE and PE, if it comes out to be  long buildup or short covering and premium is <80per  from 9:30 premium--> enter the position 
+
+
+ 

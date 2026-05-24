@@ -377,7 +377,27 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         fn = getattr(self.strategy, "on_main_exit_filled", None)
         if not callable(fn):
             return
-        pairs = fn(**kwargs) or []
+        meta_ex = kwargs.get("metadata_extras")
+        sym = self._underlying_from_strategy_meta(meta_ex)
+        inst = kwargs.get("instrument")
+        if not sym and inst is not None:
+            sym = getattr(inst, "underlying_symbol", None) or getattr(
+                inst, "symbol", None
+            )
+        if not sym and self.symbols:
+            sym = self.symbols[0]
+        ts = kwargs.get("candle_ts")
+        if ts is None:
+            ts = dt.datetime.utcnow()
+        spot = self.get_price_map(sym) if sym else None
+        candle_stub = {
+            "symbol": sym or "",
+            "timestamp": ts,
+            "close": float(spot if spot is not None else 0.0),
+            "exchange": None,
+        }
+        ctx = self.build_context_only(candle_stub) if sym else None
+        pairs = fn(ctx=ctx, **kwargs) or []
         risk_manager = getattr(self.order_router, "risk", None)
         for intent, candle in pairs:
             sym = candle.get("symbol")
