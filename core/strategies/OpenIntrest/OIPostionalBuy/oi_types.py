@@ -18,6 +18,9 @@ REFERENCE_SNAPSHOT_TIMES = frozenset(
 PREMIUM_MIN = 170
 PREMIUM_MAX = 220
 
+# strategy_meta payload key (persisted on MAIN ENTRY for restart)
+OI_POS_META_KEY = "oi_positional_buy"
+
 
 @dataclass(frozen=True)
 class OISnapshot:

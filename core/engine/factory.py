@@ -133,6 +133,12 @@ class EngineFactory:
         broker.set_order_router(order_router)
         position_manager.rebuild_position_metadata_from_intent_store(intent_store)
         position_manager.rebuild_structure_slices_from_intent_store(intent_store)
+        position_manager.rebuild_position_metadata_from_open_positions_csv()
+        exchange = getattr(config, "exchange", None) or "NSE"
+        position_manager.rebuild_open_positions_from_open_positions_csv(
+            instrument_store,
+            exchange=exchange,
+        )
 
         # ---------- Universe (DHAN equity strategies only) ----------
         universe_service = EngineFactory._universe_service(
@@ -294,6 +300,11 @@ class EngineFactory:
         position_manager.rebuild_position_metadata_from_intent_store(intent_store)
         position_manager.rebuild_structure_slices_from_intent_store(intent_store)
         position_manager.rebuild_position_metadata_from_open_positions_csv()
+        exchange = getattr(config, "exchange", None) or "NSE"
+        position_manager.rebuild_open_positions_from_open_positions_csv(
+            instrument_store,
+            exchange=exchange,
+        )
 
         # ---------- Delta: set leverage from config (live only; skip for SimulatedBroker e.g. PAPER) ----------
         if (

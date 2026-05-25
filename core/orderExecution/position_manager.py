@@ -702,6 +702,88 @@ class PositionManager:
         with self._lock:
             self._merge_open_positions_csv_dict(file_meta)
 
+    def rebuild_open_positions_from_open_positions_csv(
+        self,
+        instrument_store: Any,
+        *,
+        exchange: str = "NSE",
+    ) -> int:
+        """
+        After restart, restore open legs into PM from the open-positions CSV snapshot
+        when PM is flat but the log still shows an OPEN row (typical PAPER restart).
+        """
+        path = self.open_positions_csv_path
+        if not path or not instrument_store:
+            return 0
+        try:
+            from logger.open_positions_logger import read_open_positions_snapshot
+        except ImportError:
+            return 0
+        snap = read_open_positions_snapshot(path)
+        if not snap:
+            return 0
+        restored = 0
+        with self._lock:
+            for sym, row in snap.items():
+                try:
+                    nq = int(float(row.get("net_qty") or 0))
+                except (TypeError, ValueError):
+                    continue
+                if nq == 0:
+                    continue
+                cur = self.positions.get(sym)
+                if cur is not None and int(cur.net_qty or 0) != 0:
+                    continue
+                inst = instrument_store.intent_creation_details(
+                    sym, exchange, None, None, None
+                )
+                if inst is None:
+                    logger.warning(
+                        "oi_pos CSV restore: cannot resolve instrument for %s", sym
+                    )
+                    continue
+                try:
+                    avg = float(row.get("avg_price") or 0)
+                except (TypeError, ValueError):
+                    avg = 0.0
+                pos = Position(inst)
+                pos.net_qty = nq
+                pos.avg_price = avg
+                pos.entry_price = avg
+                pos.strategy = (row.get("strategy") or "").strip() or None
+                pos.tag = (row.get("tag") or "").strip() or "MAIN"
+                pos.structure_id = (row.get("structure_id") or "").strip() or None
+                pos.intent_id = (row.get("intent_id") or "").strip() or None
+                self.positions[sym] = pos
+                sm_raw = (row.get("strategy_meta") or "").strip()
+                strategy_meta = None
+                if sm_raw:
+                    try:
+                        import json
+
+                        strategy_meta = json.loads(sm_raw)
+                    except json.JSONDecodeError:
+                        strategy_meta = None
+                self._merge_position_metadata(
+                    sym,
+                    strategy=pos.strategy,
+                    structure_id=pos.structure_id,
+                    tag=pos.tag,
+                    intent_id=pos.intent_id,
+                    metadata_extras=strategy_meta,
+                )
+                if pos.strategy:
+                    self.strategy_pos[pos.strategy][sym] = int(nq)
+                if pos.structure_id and str(pos.tag or "").upper() == "MAIN":
+                    d = self._structure_slices.setdefault(sym, {})
+                    d[str(pos.structure_id)] = nq
+                restored += 1
+        if restored:
+            logger.info(
+                "Restored %s open position(s) from %s", restored, path
+            )
+        return restored
+
     def has_open_structure(self, strategy: str, structure_id: str, tag: str) -> bool:
         tag_u = str(tag or "").upper()
         sid = str(structure_id)

@@ -119,6 +119,36 @@ def load_position_metadata_from_csv(csv_path: str) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def read_open_positions_snapshot(csv_path: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Last open leg per trading symbol from {engine_id}_open_positions.csv.
+    Returns symbol -> row dict (net_qty, avg_price, structure_id, strategy_meta, …).
+    """
+    if not csv_path or not os.path.isfile(csv_path):
+        return {}
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            return {}
+        rows = list(reader)
+    last_by_sym: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        sym = (row.get("symbol") or "").strip()
+        if sym:
+            last_by_sym[sym] = row
+    open_rows: Dict[str, Dict[str, Any]] = {}
+    for sym, row in last_by_sym.items():
+        nq = _parse_net_qty(str(row.get("net_qty") or ""))
+        ev = (row.get("event") or "").strip()
+        src = (row.get("source") or "").strip()
+        if nq == 0:
+            continue
+        if src == "fill" and ev == "CLOSE":
+            continue
+        open_rows[sym] = row
+    return open_rows
+
+
 class OpenPositionsLogger:
     """
     - Fills (paper + live): updates that symbol's row when qty changes; removes the row on full exit.

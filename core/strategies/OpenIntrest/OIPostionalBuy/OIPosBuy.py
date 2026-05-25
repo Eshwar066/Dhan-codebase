@@ -25,6 +25,7 @@ from .oi_types import (
     ENTRY_EVAL_TIME,
     ENTRY_SNAPSHOT_TIME,
     EOD_REVIEW_TIME,
+    OI_POS_META_KEY,
     OISnapshot,
     PendingEntry,
     PositionMeta,
@@ -117,6 +118,215 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
         )
         pat, oi_pct, pr_pct, _ = self._oi_pattern(cur, b)
         return pat, oi_pct, pr_pct
+
+    # ------------------------------------------------------------------
+    # PositionMeta persistence (restart / reconcile)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _position_meta_to_dict(meta: PositionMeta) -> dict:
+        return {
+            "symbol": meta.symbol,
+            "option_type": meta.option_type,
+            "strike": int(meta.strike),
+            "benchmark_premium": float(meta.benchmark_premium),
+            "benchmark_oi": float(meta.benchmark_oi),
+            "entry_premium": float(meta.entry_premium),
+            "entry_date": meta.entry_date.isoformat(),
+            "structure_id": meta.structure_id,
+        }
+
+    @classmethod
+    def _position_meta_from_dict(cls, raw: dict) -> Optional[PositionMeta]:
+        if not isinstance(raw, dict):
+            return None
+        try:
+            ed = raw.get("entry_date")
+            if isinstance(ed, str):
+                entry_date = date.fromisoformat(ed[:10])
+            elif isinstance(ed, date):
+                entry_date = ed
+            else:
+                return None
+            sid = str(raw.get("structure_id") or "")
+            if not sid:
+                return None
+            return PositionMeta(
+                symbol=str(raw["symbol"]),
+                option_type=str(raw["option_type"]),
+                strike=int(raw["strike"]),
+                benchmark_premium=float(raw["benchmark_premium"]),
+                benchmark_oi=float(raw["benchmark_oi"]),
+                entry_premium=float(raw["entry_premium"]),
+                entry_date=entry_date,
+                structure_id=sid,
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _strategy_meta(self, meta: PositionMeta) -> dict:
+        return {OI_POS_META_KEY: self._position_meta_to_dict(meta)}
+
+    def _try_merge_oi_meta_from_raw(self, structure_id: str, raw: dict) -> None:
+        meta = self._position_meta_from_dict(raw)
+        if meta is not None:
+            self._position_meta_by_sid[str(structure_id)] = meta
+
+    @staticmethod
+    def _parse_structure_id(structure_id: str) -> Optional[Tuple[str, date, str, int]]:
+        """OIPositionalBuy:NIFTY:2026-05-22:L1:CE:24600 -> symbol, date, opt, strike."""
+        parts = str(structure_id or "").split(":")
+        if len(parts) < 6:
+            return None
+        try:
+            sym = parts[1]
+            trade_d = date.fromisoformat(parts[2][:10])
+            opt = parts[4].upper()
+            strike = int(parts[5])
+            if opt not in ("CE", "PE"):
+                return None
+            return sym, trade_d, opt, strike
+        except (TypeError, ValueError):
+            return None
+
+    def _meta_from_position_fallback(
+        self, pos: Any, position_store: Any
+    ) -> Optional[PositionMeta]:
+        sid = str(getattr(pos, "structure_id", "") or "")
+        if not sid:
+            return None
+        parsed = self._parse_structure_id(sid)
+        inst = getattr(pos, "instrument", None)
+        if parsed is None or inst is None:
+            return None
+        sym, trade_d, opt, strike = parsed
+        entry_px = float(getattr(pos, "avg_price", 0) or 0)
+        if entry_px <= 0:
+            entry_px = float(getattr(pos, "entry_price", 0) or 0)
+        return PositionMeta(
+            symbol=sym,
+            option_type=opt,
+            strike=strike,
+            benchmark_premium=entry_px,
+            benchmark_oi=0.0,
+            entry_premium=entry_px,
+            entry_date=trade_d,
+            structure_id=sid,
+        )
+
+    def _restore_oi_meta_from_position(self, pos: Any, position_store: Any) -> None:
+        if not pos or not getattr(pos, "structure_id", None):
+            return
+        sid = str(pos.structure_id)
+        if sid in self._position_meta_by_sid:
+            return
+        sym = getattr(pos.instrument, "trading_symbol", None) if pos.instrument else None
+        if sym and position_store is not None:
+            bucket = position_store.get_position_metadata(sym) or {}
+            sm = bucket.get("strategy_meta") or {}
+            raw = sm.get(OI_POS_META_KEY) if isinstance(sm, dict) else None
+            if isinstance(raw, dict):
+                self._try_merge_oi_meta_from_raw(sid, raw)
+        if sid in self._position_meta_by_sid:
+            return
+        fallback = self._meta_from_position_fallback(pos, position_store)
+        if fallback is not None:
+            self._position_meta_by_sid[sid] = fallback
+            _LOGGER.info(
+                "oi_pos meta restored from position sid=%s %s %s",
+                sid,
+                fallback.option_type,
+                fallback.strike,
+            )
+
+    def _ensure_oi_meta_for_main_fill(
+        self,
+        structure_id: str,
+        instrument: Any,
+        ctx: Any,
+        intent_id: Optional[str],
+        metadata_extras: Any,
+        *,
+        fill_price: Optional[float] = None,
+    ) -> None:
+        sid = str(structure_id)
+        if sid in self._position_meta_by_sid:
+            return
+        if isinstance(metadata_extras, dict):
+            raw = metadata_extras.get(OI_POS_META_KEY)
+            if isinstance(raw, dict):
+                self._try_merge_oi_meta_from_raw(sid, raw)
+        if sid in self._position_meta_by_sid:
+            return
+        ps = getattr(ctx, "position_store", None) if ctx is not None else None
+        sym = getattr(instrument, "trading_symbol", None) if instrument else None
+        if ps is not None and sym:
+            bucket = ps.get_position_metadata(sym) or {}
+            sm = bucket.get("strategy_meta") or {}
+            raw = sm.get(OI_POS_META_KEY) if isinstance(sm, dict) else None
+            if isinstance(raw, dict):
+                self._try_merge_oi_meta_from_raw(sid, raw)
+        if sid in self._position_meta_by_sid:
+            return
+        ist = getattr(ctx, "intent_store", None) if ctx is not None else None
+        if ist is not None and intent_id and callable(getattr(ist, "get", None)):
+            rec = ist.get(intent_id)
+            if rec:
+                payload = rec.get("payload") or {}
+                sm = payload.get("strategy_meta")
+                if isinstance(sm, dict):
+                    raw = sm.get(OI_POS_META_KEY)
+                    if isinstance(raw, dict):
+                        self._try_merge_oi_meta_from_raw(sid, raw)
+        if sid in self._position_meta_by_sid:
+            return
+        if ps is not None and sym:
+            for pos in ps.get_open_positions(strategy=self.name) or []:
+                if str(getattr(pos, "structure_id", "")) == sid:
+                    self._restore_oi_meta_from_position(pos, ps)
+                    break
+        if sid in self._position_meta_by_sid:
+            return
+        if instrument is not None and fill_price is not None:
+            parsed = self._parse_structure_id(sid)
+            if parsed is not None:
+                sym_u, trade_d, opt, strike = parsed
+                px = float(fill_price)
+                self._position_meta_by_sid[sid] = PositionMeta(
+                    symbol=sym_u,
+                    option_type=opt,
+                    strike=strike,
+                    benchmark_premium=px,
+                    benchmark_oi=0.0,
+                    entry_premium=px,
+                    entry_date=trade_d,
+                    structure_id=sid,
+                )
+
+    def _meta_for_position(self, pos: Any, ctx: Any = None) -> Optional[PositionMeta]:
+        sid = str(getattr(pos, "structure_id", "") or "")
+        if not sid:
+            return None
+        meta = self._position_meta_by_sid.get(sid)
+        if meta is not None:
+            return meta
+        ps = getattr(ctx, "position_store", None) if ctx is not None else None
+        self._restore_oi_meta_from_position(pos, ps)
+        return self._position_meta_by_sid.get(sid)
+
+    def restore_state_on_startup(self, position_manager: Any, intent_store: Any = None) -> None:
+        """Reload in-memory PositionMeta for open MAIN legs after engine restart."""
+        del intent_store
+        if position_manager is None:
+            return
+        for pos in list(getattr(position_manager, "positions", {}).values()):
+            if int(getattr(pos, "net_qty", 0) or 0) == 0:
+                continue
+            if getattr(pos, "strategy", None) != self.name:
+                continue
+            if str(getattr(pos, "tag", "") or "").upper() != "MAIN":
+                continue
+            self._restore_oi_meta_from_position(pos, position_manager)
 
     # ------------------------------------------------------------------
     # 09:30 benchmark
@@ -283,6 +493,17 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
         )
         if inst is None:
             return None
+        pos_meta = PositionMeta(
+            symbol=candle["symbol"],
+            option_type=snap.option_type,
+            strike=snap.strike,
+            benchmark_premium=bench.premium,
+            benchmark_oi=bench.oi,
+            entry_premium=snap.premium,
+            entry_date=self._trade_date(candle),
+            structure_id=structure_id,
+        )
+        self._position_meta_by_sid[structure_id] = pos_meta
         intent = self.map_instrument_to_intent(
             inst=inst,
             strike_row={"close": snap.premium, "strike": snap.strike},
@@ -293,16 +514,7 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
             tag="MAIN",
             symbol=candle["symbol"],
             action="ENTRY",
-        )
-        self._position_meta_by_sid[structure_id] = PositionMeta(
-            symbol=candle["symbol"],
-            option_type=snap.option_type,
-            strike=snap.strike,
-            benchmark_premium=bench.premium,
-            benchmark_oi=bench.oi,
-            entry_premium=snap.premium,
-            entry_date=self._trade_date(candle),
-            structure_id=structure_id,
+            metadata_extras=self._strategy_meta(pos_meta),
         )
         return intent
 
@@ -359,9 +571,16 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
         **kw: Any,
     ) -> List[Any]:
         """After MAIN BUY fill, arm SL-M (40% down) and TARGET SL-M (1.5x entry)."""
-        del ctx, metadata_extras
         if not structure_id or not intent_id:
             return []
+        self._ensure_oi_meta_for_main_fill(
+            str(structure_id),
+            instrument,
+            ctx,
+            intent_id,
+            metadata_extras,
+            fill_price=price,
+        )
         meta = self._position_meta_by_sid.get(str(structure_id))
         if meta is None:
             return []
@@ -417,7 +636,7 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
         return px
 
     def _reason_to_exit(self, pos: Any, candle: dict, ctx: Any) -> Optional[str]:
-        meta = self._position_meta_by_sid.get(pos.structure_id)
+        meta = self._meta_for_position(pos, ctx)
         if meta is None:
             return None
         px = self._position_premium(candle, ctx, pos)

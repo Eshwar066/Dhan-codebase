@@ -281,6 +281,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             niml = metadata_extras.get("nifty_intraday_magical_line")
             if isinstance(niml, dict) and niml.get("symbol"):
                 return str(niml["symbol"])
+            oi = metadata_extras.get("oi_positional_buy")
+            if isinstance(oi, dict) and oi.get("symbol"):
+                return str(oi["symbol"])
         return None
 
     def _align_first_live_bar(
@@ -504,27 +507,47 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 self.position_manager.rebuild_structure_slices_from_intent_store(
                     intent_store
                 )
+        if hasattr(
+            self.position_manager, "rebuild_position_metadata_from_open_positions_csv"
+        ):
+            self.position_manager.rebuild_position_metadata_from_open_positions_csv()
+        if hasattr(
+            self.position_manager, "rebuild_open_positions_from_open_positions_csv"
+        ) and self.instrument_store:
+            self.position_manager.rebuild_open_positions_from_open_positions_csv(
+                self.instrument_store,
+                exchange=self.venue or "NSE",
+            )
         self.position_manager.reconcile_with_broker(
             resolved_broker_positions, strategy=strategy_name
         )
+        restore_fn = getattr(self.strategy, "restore_state_on_startup", None)
+        if callable(restore_fn):
+            try:
+                restore_fn(self.position_manager, intent_store)
+            except Exception as exc:
+                if self.engine_logger:
+                    self.engine_logger.reconciliation(
+                        f"restore_state_on_startup failed: {exc}"
+                    )
+        self._ensure_bracket_legs_after_reconcile()
         if self._open_positions_logger is not None and self.run_mode == RunMode.LIVE:
             self._open_positions_logger.record_broker_reconcile_snapshot(
                 self.position_manager
             )
-        self._ensure_broker_sl_after_reconcile()
         return True
 
-    def _ensure_broker_sl_after_reconcile(self) -> None:
-        """If MAIN is open but MAIN_SL was never armed (reconcile / fill race), place SL once."""
-        if self.run_mode != RunMode.LIVE:
-            return
+    def _ensure_bracket_legs_after_reconcile(self) -> None:
+        """If MAIN is open but bracket legs missing (restart), re-arm SL + TARGET once."""
         strategy_name = getattr(self.strategy, "name", None)
         if not strategy_name:
             return
         intent_store = getattr(self.order_router, "intent_store", None)
         if not intent_store:
             return
-        restore = getattr(self.strategy, "_restore_odml_meta_from_position", None)
+        restore_odml = getattr(self.strategy, "_restore_odml_meta_from_position", None)
+        restore_oi = getattr(self.strategy, "_restore_oi_meta_from_position", None)
+        broker = getattr(self.order_router, "broker", None)
         for sym, pos in list(self.position_manager.positions.items()):
             if int(pos.net_qty or 0) == 0:
                 continue
@@ -535,19 +558,54 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             struct_id = getattr(pos, "structure_id", None)
             if not struct_id:
                 continue
-            if intent_store.has_pending_intent(
-                strategy_name,
-                struct_id,
-                tags=["MAIN_SL"],
-                actions=["FORCE_EXIT"],
-            ):
-                continue
-            if callable(restore):
+            if callable(restore_odml):
                 try:
-                    restore(pos, self.position_manager)
+                    restore_odml(pos, self.position_manager)
                 except Exception:
                     pass
+            if callable(restore_oi):
+                try:
+                    restore_oi(pos, self.position_manager)
+                except Exception:
+                    pass
+            sim_sl = bool(
+                broker
+                and hasattr(broker, "_pending_sl")
+                and str(struct_id) in getattr(broker, "_pending_sl", {})
+            )
+            sim_tgt = bool(
+                broker
+                and hasattr(broker, "_pending_target")
+                and str(struct_id) in getattr(broker, "_pending_target", {})
+            )
+            if self.run_mode == RunMode.PAPER:
+                if sim_sl and sim_tgt:
+                    continue
+            else:
+                has_sl = intent_store.has_pending_intent(
+                    strategy_name,
+                    struct_id,
+                    tags=["MAIN_SL"],
+                    actions=["FORCE_EXIT"],
+                )
+                has_tgt = intent_store.has_pending_intent(
+                    strategy_name,
+                    struct_id,
+                    tags=["MAIN_TARGET"],
+                    actions=["FORCE_EXIT"],
+                )
+                if has_sl and has_tgt:
+                    continue
             meta_bucket = self.position_manager.get_position_metadata(sym) or {}
+            candle_ts = dt.datetime.now(dt.timezone.utc)
+            ctx = self.build_context_only(
+                {
+                    "symbol": sym,
+                    "timestamp": candle_ts,
+                    "close": float(pos.avg_price or 0),
+                    "exchange": None,
+                }
+            )
             self._on_pm_main_entry_fill(
                 instrument=pos.instrument,
                 side="SELL" if pos.net_qty < 0 else "BUY",
@@ -557,10 +615,11 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 structure_id=struct_id,
                 tag="MAIN",
                 action="ENTRY",
-                candle_ts=None,
+                candle_ts=candle_ts,
                 intent_id=getattr(pos, "intent_id", None)
                 or meta_bucket.get("intent_id"),
                 metadata_extras=meta_bucket.get("strategy_meta"),
+                ctx=ctx,
             )
 
     def _do_order_state_check(self) -> None:
