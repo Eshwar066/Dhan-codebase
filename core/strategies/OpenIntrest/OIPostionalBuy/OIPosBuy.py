@@ -29,6 +29,8 @@ from .oi_types import (
     OISnapshot,
     PendingEntry,
     PositionMeta,
+    SymbolConfig,
+    get_symbol_config,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -52,13 +54,18 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
     api = "DHAN"
     expiryType = "MONTHLY"
     dhan_monthly_rollover_after_calendar_day = 15  # after 15th → next month series
+    # NIFTY defaults (mixin reads ``otm_strike_step`` / ``otm_strike_count`` via getattr).
+    # Per-candle overrides apply in ``_apply_symbol_config_to_self`` so BANKNIFTY/SENSEX
+    # use their own ladder. ``SYMBOL_CONFIG`` in ``oi_types.py`` defines the per-symbol values.
     otm_strike_step = 100
     otm_strike_count = 30
 
     def __init__(self, *args, **kwargs):
         self._init_option_chain_state()
         super().__init__(*args, **kwargs)
-        self._benchmarks_by_day: Dict[date, Dict[str, List[OISnapshot]]] = {}
+        # (trade_date, underlying_symbol) → {"CE": [...], "PE": [...]} 09:30 OI snapshot.
+        # Keyed by symbol so BANKNIFTY does not overwrite NIFTY's benchmark on the same day.
+        self._benchmarks_by_day: Dict[Tuple[date, str], Dict[str, List[OISnapshot]]] = {}
         self._position_meta_by_sid: Dict[str, PositionMeta] = {}
         self._sl_blocked_day_by_symbol: Dict[str, date] = {}
         self._pending_exit_sids: set[str] = set()
@@ -67,6 +74,29 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
         self._reentry_near_premium: Dict[str, float] = {}
         self._defer_eod_review = False
         self._eod_review_candle: Optional[dict] = None
+
+    # ------------------------------------------------------------------
+    # Per-symbol tuning
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _candle_symbol(candle: dict) -> str:
+        return str((candle or {}).get("symbol") or "").upper()
+
+    def _symbol_config(self, candle: dict) -> SymbolConfig:
+        return get_symbol_config(self._candle_symbol(candle))
+
+    def _apply_symbol_config_to_self(self, candle: dict) -> SymbolConfig:
+        """Set per-candle attrs that downstream mixin code reads via ``getattr(self, ...)``.
+
+        ``IndiaMktMixins.fetch_option_chain`` and ``ExpiryResolver.get_otm_strikes`` both
+        read ``self.otm_strike_step`` / ``self.otm_strike_count``. Same instance is shared
+        across symbols, so reset for the symbol we are evaluating right now.
+        """
+        cfg = self._symbol_config(candle)
+        self.otm_strike_step = cfg.strike_step
+        self.otm_strike_count = cfg.strike_count
+        return cfg
 
     def get_warmup_period(self):
         return 0
@@ -334,19 +364,20 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
 
     def _capture_930_benchmark(self, candle: dict, ctx: Any) -> None:
         d = self._trade_date(candle)
-        symbol = candle["symbol"]
+        symbol = self._candle_symbol(candle)
+        key = (d, symbol)
         self._persist_reference_snapshot(candle, ctx, ENTRY_SNAPSHOT_TIME)
         chain = self._fetch_full_option_chain(candle, ctx)
         if chain is None:
             bench = self._load_benchmark_from_logs(candle, d)
             if bench:
-                self._benchmarks_by_day[d] = bench
+                self._benchmarks_by_day[key] = bench
             return
         data = {
             "CE": self._snapshots_from_chain(chain, candle, "CE"),
             "PE": self._snapshots_from_chain(chain, candle, "PE"),
         }
-        self._benchmarks_by_day[d] = data
+        self._benchmarks_by_day[key] = data
         _LOGGER.info(
             "oi_pos 09:30 benchmark sym=%s CE=%s PE=%s",
             symbol,
@@ -376,7 +407,10 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
     def _load_benchmark_from_logs(
         self, candle: dict, trade_date: date
     ) -> Optional[Dict[str, List[OISnapshot]]]:
-        df = self._read_oi_log_chain_df(trade_date, self._benchmark_log_slot())
+        symbol = self._candle_symbol(candle)
+        df = self._read_oi_log_chain_df(
+            trade_date, self._benchmark_log_slot(), symbol=symbol
+        )
         if df is None:
             return None
         bench_candle = self._benchmark_candle_for_date(candle, trade_date)
@@ -391,11 +425,12 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
     def _ensure_benchmark(
         self, candle: dict, ctx: Any, trade_date: date
     ) -> Optional[Dict[str, List[OISnapshot]]]:
-        if trade_date in self._benchmarks_by_day:
-            return self._benchmarks_by_day[trade_date]
+        key = (trade_date, self._candle_symbol(candle))
+        if key in self._benchmarks_by_day:
+            return self._benchmarks_by_day[key]
         bench = self._load_benchmark_from_logs(candle, trade_date)
         if bench:
-            self._benchmarks_by_day[trade_date] = bench
+            self._benchmarks_by_day[key] = bench
         return bench
 
     # ------------------------------------------------------------------
@@ -668,6 +703,8 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
     # ------------------------------------------------------------------
 
     def on_candle(self, candle: dict, ctx: Any):
+        # Re-tune ladder width and premium band for this symbol before any chain access.
+        self._apply_symbol_config_to_self(candle)
         self._update_snapshot_retry_context(candle, ctx)
         t = self._ist_time(candle)
 
@@ -678,7 +715,9 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
         if t in SLOT_TIMES:
             self._take_reference_snapshots(candle, ctx, t)
             if t == EOD_REVIEW_TIME and not self._snapshot_on_disk(
-                self._trade_date(candle), EOD_REVIEW_TIME
+                self._trade_date(candle),
+                EOD_REVIEW_TIME,
+                symbol=self._candle_symbol(candle),
             ):
                 self._defer_eod_review = True
                 self._eod_review_candle = dict(candle)
@@ -688,12 +727,15 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
         return None
 
     def should_exit(self, position: Any, candle: dict, ctx: Any = None) -> bool:
+        self._apply_symbol_config_to_self(candle)
         if position.tag != "MAIN" or position.structure_id in self._pending_exit_sids:
             return False
         exit_candle = candle
         if self._defer_eod_review:
             td = self._trade_date(candle)
-            if not self._snapshot_on_disk(td, EOD_REVIEW_TIME):
+            if not self._snapshot_on_disk(
+                td, EOD_REVIEW_TIME, symbol=self._candle_symbol(candle)
+            ):
                 return False
             exit_candle = self._eod_review_candle or candle
             self._defer_eod_review = False

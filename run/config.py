@@ -68,7 +68,11 @@ ENGINE_JOBS = [
         "run_mode": "PAPER",
         "capital": 200000,
         "ORDER_QTY_LOTS": 1,
-        "symbols": ["NIFTY"],
+        # Multi-underlying: BANKNIFTY/SENSEX get their security_id, exchange_segment,
+        # strike_step and premium_band from ``oi_types.SYMBOL_CONFIG`` automatically.
+        # DHAN's live option-chain library re-maps SENSEX→BSE internally, so the
+        # job-level ``exchange`` stays "NSE" (BSE legs are resolved at chain-fetch time).
+        "symbols": ["NIFTY", "BANKNIFTY", "SENSEX"],
         "exchange": "NSE",
         "strategies": ["OIPositionalBuy"],
         "live": {"exchange": "INDEX", "sector": "YES"},

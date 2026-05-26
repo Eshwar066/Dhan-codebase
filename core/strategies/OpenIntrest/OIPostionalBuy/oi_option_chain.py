@@ -23,10 +23,9 @@ from core.utils.option_chain_snapshot_log import (
 from .oi_types import (
     EOD_REVIEW_TIME,
     OISnapshot,
-    PREMIUM_MAX,
-    PREMIUM_MIN,
     PendingReferenceSnapshot,
     REFERENCE_SNAPSHOT_TIMES,
+    get_symbol_config,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -85,8 +84,16 @@ class OIOptionChainMixin:
     def _snapshot_slot_key(self, symbol: str, trade_date: date, target: dt_time) -> str:
         return "|".join([str(symbol or ""), trade_date.isoformat(), self._target_time_to_slot(target)])
 
-    def _snapshot_on_disk(self, trade_date: date, target: dt_time) -> bool:
-        path = self._oi_log_csv_path(trade_date, self._target_time_to_slot(target))
+    def _snapshot_on_disk(
+        self,
+        trade_date: date,
+        target: dt_time,
+        *,
+        symbol: Optional[str] = None,
+    ) -> bool:
+        path = self._oi_log_csv_path(
+            trade_date, self._target_time_to_slot(target), symbol=symbol
+        )
         if path is None:
             return False
         try:
@@ -192,6 +199,7 @@ class OIOptionChainMixin:
         strikes = self.fetch_option_chain(candle, ctx, "CE")
         if not strikes:
             return None
+        cfg = get_symbol_config(candle.get("symbol") or getattr(ctx, "symbol", None))
         params: Dict[str, Any] = {
             "exchange": ctx.exchange,
             "interval": self.timeframe,
@@ -205,8 +213,8 @@ class OIOptionChainMixin:
                 {
                     "strike": strike_param,
                     "option_type": "CE",
-                    "exchangeSegment": "NSE_FNO",
-                    "securityId": "13",
+                    "exchangeSegment": cfg.exchange_segment,
+                    "securityId": cfg.security_id,
                 }
             )
         chain = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
@@ -310,7 +318,7 @@ class OIOptionChainMixin:
         slot = self._target_time_to_slot(target)
         slot_key = self._snapshot_slot_key(symbol, trade_date, target)
 
-        if self._snapshot_on_disk(trade_date, target):
+        if self._snapshot_on_disk(trade_date, target, symbol=symbol):
             self._mark_snapshot_complete(slot_key, target=target)
             _LOGGER.info(
                 "oi_positional_buy snapshot already on disk sym=%s slot=%s path_exists",
@@ -369,7 +377,8 @@ class OIOptionChainMixin:
         slot = self._ist_log_slot_for_candle(candle)
         if slot is None:
             return None
-        df = self._read_oi_log_chain_df(trade_date, slot)
+        symbol = str(candle.get("symbol") or "")
+        df = self._read_oi_log_chain_df(trade_date, slot, symbol=symbol)
         if df is None:
             return None
         return {
@@ -377,7 +386,7 @@ class OIOptionChainMixin:
             "exchange": getattr(ctx, "exchange", None) or "INDEX",
             "chain": df,
             "atm_strike": None,
-            "expiry": self._read_oi_log_chain_expiry(trade_date, slot),
+            "expiry": self._read_oi_log_chain_expiry(trade_date, slot, symbol=symbol),
         }
 
     def _fetch_full_option_chain(self, candle: dict, ctx: Any) -> Any:
@@ -401,6 +410,7 @@ class OIOptionChainMixin:
         if not strikes:
             return None
 
+        cfg = get_symbol_config(candle.get("symbol") or getattr(ctx, "symbol", None))
         params: Dict[str, Any] = {
             "exchange": ctx.exchange,
             "interval": self.timeframe,
@@ -414,8 +424,8 @@ class OIOptionChainMixin:
                 {
                     "strike": strike_param,
                     "option_type": "CE",
-                    "exchangeSegment": "NSE_FNO",
-                    "securityId": "13",
+                    "exchangeSegment": cfg.exchange_segment,
+                    "securityId": cfg.security_id,
                 }
             )
 
@@ -483,6 +493,10 @@ class OIOptionChainMixin:
         oi_col = self._oi_column(df, option_type)
         if not strike_col or not prem_col or not oi_col:
             return []
+        cfg = get_symbol_config(candle.get("symbol"))
+        prem_min, prem_max = cfg.premium_band
+        # Drop strikes that aren't on this symbol's strike grid (NIFTY=100, BANKNIFTY=100, SENSEX=100).
+        strike_step = max(1, int(cfg.strike_step))
         out: List[OISnapshot] = []
         ts = self._candle_timestamp_utc(candle)
         for _, row in df.iterrows():
@@ -492,11 +506,11 @@ class OIOptionChainMixin:
                 oi = float(row[oi_col])
             except (TypeError, ValueError):
                 continue
-            if strike % 100 != 0:
+            if strike % strike_step != 0:
                 continue
             if strikes_filter is not None and strike not in strikes_filter:
                 continue
-            if apply_premium_filter and not (PREMIUM_MIN <= premium <= PREMIUM_MAX):
+            if apply_premium_filter and not (prem_min <= premium <= prem_max):
                 continue
             out.append(
                 OISnapshot(
@@ -557,23 +571,54 @@ class OIOptionChainMixin:
         root = Path(__file__).resolve().parents[4]
         return root / "logs" / "OIPositionalBuy" / trade_date.isoformat()
 
-    def _oi_log_csv_path(self, trade_date: date, slot: str) -> Optional[Path]:
+    def _oi_log_csv_path(
+        self,
+        trade_date: date,
+        slot: str,
+        *,
+        symbol: Optional[str] = None,
+    ) -> Optional[Path]:
+        """Resolve snapshot CSV path.
+
+        Search order (so per-symbol multi-underlying runs don't collide):
+          1. ``{SYMBOL}_{HH-MM}.csv`` (new)
+          2. ``{HH-MM}.csv``           (legacy single-symbol)
+          3. fuzzy glob ``*{HH-MM}*.csv``
+        """
         day_dir = self._oi_logs_day_dir(trade_date)
         if not day_dir.is_dir():
             return None
         token = slot.strip().replace(":", "-")
-        candidates = [
-            day_dir / f"{token}.csv",
-            day_dir / f"{token.replace('-', '')}.csv",
-        ]
+        sym = (symbol or "").strip().upper()
+        candidates = []
+        if sym:
+            candidates.extend(
+                [
+                    day_dir / f"{sym}_{token}.csv",
+                    day_dir / f"{sym}_{token.replace('-', '')}.csv",
+                ]
+            )
+        candidates.extend(
+            [
+                day_dir / f"{token}.csv",
+                day_dir / f"{token.replace('-', '')}.csv",
+            ]
+        )
         path = next((p for p in candidates if p.is_file()), None)
         if path is None:
-            matches = sorted(day_dir.glob(f"*{token}*.csv"))
+            glob_pat = f"*{sym}*{token}*.csv" if sym else f"*{token}*.csv"
+            matches = sorted(day_dir.glob(glob_pat))
             path = matches[0] if matches else None
         return path if path is not None and path.is_file() else None
 
-    def _read_oi_log_chain_expiry(self, trade_date: date, slot: str) -> Optional[Any]:
-        path = self._oi_log_csv_path(trade_date, slot)
+    def _read_oi_log_chain_expiry(
+        self,
+        trade_date: date,
+        slot: str,
+        *,
+        symbol: Optional[str] = None,
+    ) -> Optional[Any]:
+        path = self._oi_log_csv_path(trade_date, slot, symbol=symbol)
         if path is None:
             return None
         try:
@@ -585,8 +630,14 @@ class OIOptionChainMixin:
         val = meta["_chain_expiry"].iloc[0]
         return None if pd.isna(val) else val
 
-    def _read_oi_log_chain_df(self, trade_date: date, slot: str) -> Optional[pd.DataFrame]:
-        path = self._oi_log_csv_path(trade_date, slot)
+    def _read_oi_log_chain_df(
+        self,
+        trade_date: date,
+        slot: str,
+        *,
+        symbol: Optional[str] = None,
+    ) -> Optional[pd.DataFrame]:
+        path = self._oi_log_csv_path(trade_date, slot, symbol=symbol)
         if path is None:
             return None
         try:
@@ -616,7 +667,9 @@ class OIOptionChainMixin:
         if cal_exp is None:
             slot = self._ist_log_slot_for_candle(candle)
             if slot:
-                cal_exp = self._read_oi_log_chain_expiry(trade_date, slot)
+                cal_exp = self._read_oi_log_chain_expiry(
+                    trade_date, slot, symbol=str(candle.get("symbol") or "")
+                )
         if cal_exp is not None:
             ctx.selected_expiry = pd.Timestamp(cal_exp).date()
             return

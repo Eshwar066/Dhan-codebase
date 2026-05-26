@@ -315,7 +315,15 @@ def log_option_chain_snapshot(
     df_out.insert(2, "_snapshot_slot", time_part)
 
     time_token = _safe_filename_part(time_part)
-    if target in _NAMED_SNAPSHOT_TARGETS:
+    if target == "oi_positional_buy":
+        # Multi-symbol safe: include underlying so NIFTY/BANKNIFTY/SENSEX snapshots don't collide.
+        # Falls back to plain ``{slot}.csv`` when the symbol is unknown so legacy single-symbol
+        # callers keep working.
+        if sym and sym != "UNK":
+            fname = f"{sym}_{time_token}.csv"
+        else:
+            fname = f"{time_token}.csv"
+    elif target in _NAMED_SNAPSHOT_TARGETS:
         fname = f"{time_token}.csv"
     else:
         exp_part = meta.get("snapshot_expiry") or "exp"
