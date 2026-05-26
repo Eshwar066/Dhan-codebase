@@ -315,10 +315,13 @@ class SimulatedBroker(BaseBroker):
                 },
             )
             oid = f"{fill_prefix}-{uuid.uuid4().hex[:10]}"
+            # Bracket intents carry lot count (intent.qty == lots); expand to units like place_order.
+            lot_size = int(getattr(inst, "lot_size", 1) or 1)
+            fill_units = max(1, int(getattr(intent, "qty", 1) or 1)) * lot_size
             order_router.process_fill(
                 instrument=inst,
                 side=intent.side,
-                qty=intent.qty,
+                qty=fill_units,
                 price=float(ltp),
                 expected_price=trig,
                 order_id=oid,

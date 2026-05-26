@@ -7,23 +7,32 @@ from typing import Any, Optional
 
 import pandas as pd
 from utils.logger.trade_logger import TradeLogger
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import uuid
 from core.utils.instruments.instrument_store import Instrument
 
 logger = logging.getLogger(__name__)
 
+IST = ZoneInfo("Asia/Kolkata")
+
 
 def _fill_clock_for_trade_log(fill_ts: Any) -> Optional[datetime]:
     """
-    Normalize bar/fill time for trade_log CSV (backtest = candle close instant, not wall clock).
+    Normalize bar/fill time to **IST naive** for trade_log CSV display.
+
+    Naive inputs are interpreted as UTC because the engine canonicalizes
+    ``candle['timestamp']`` to naive UTC (see ``_normalize_candle_timestamp_utc_naive``).
     """
     if fill_ts is None:
         return None
-    ts = pd.Timestamp(fill_ts)
-    if ts.tzinfo is not None:
-        ts = ts.tz_convert("Asia/Kolkata").tz_localize(None)
-    return ts.to_pydatetime()
+    try:
+        ts = pd.Timestamp(fill_ts)
+    except (TypeError, ValueError):
+        return None
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return ts.tz_convert("Asia/Kolkata").tz_localize(None).to_pydatetime()
 
 # use
 # How to Run Auto-Reconciliation
@@ -339,11 +348,13 @@ class PositionManager:
                 _exit_like = trade_type in ("EXIT", "FORCE_EXIT")
                 pnl_val = pos.realized_pnl if _exit_like else ""
                 cumulative_val = pos.cumulative_pnl if _exit_like else ""
+                # CSV timestamps are rendered in IST (naive UTC inputs are converted)
+                candle_ts_ist = _fill_clock_for_trade_log(candle_ts)
                 row = {
                     "candle_timestamp": (
-                        candle_ts.strftime("%Y-%m-%d %H:%M")
-                        if isinstance(candle_ts, datetime)
-                        else candle_ts
+                        candle_ts_ist.strftime("%Y-%m-%d %H:%M")
+                        if candle_ts_ist is not None
+                        else (candle_ts if candle_ts is not None else "")
                     ),
                     "tag": tag,
                     "symbol": sym,
@@ -370,20 +381,28 @@ class PositionManager:
                     if execution_source:
                         row["execution_source"] = execution_source
 
-                    # Log complete trade for performance analytics (trade log)
+                    # Log complete trade for performance analytics (trade log) — all timestamps in IST
                     if getattr(pos, "entry_clock", None) is not None:
+                        # entry_clock is already IST-naive (see _fill_clock_for_trade_log)
                         entry_time_str = pos.entry_clock.strftime("%Y-%m-%d %H:%M:%S")
                     elif pos.entry_time is not None:
-                        entry_time_str = datetime.fromtimestamp(pos.entry_time).strftime(
-                            "%Y-%m-%d %H:%M:%S"
+                        entry_time_str = (
+                            datetime.fromtimestamp(pos.entry_time, tz=timezone.utc)
+                            .astimezone(IST)
+                            .replace(tzinfo=None)
+                            .strftime("%Y-%m-%d %H:%M:%S")
                         )
                     else:
                         entry_time_str = ""
-                    exit_time_str = (
-                        candle_ts.strftime("%Y-%m-%d %H:%M:%S")
-                        if candle_ts is not None and isinstance(candle_ts, datetime)
-                        else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    )
+                    if candle_ts_ist is not None:
+                        exit_time_str = candle_ts_ist.strftime("%Y-%m-%d %H:%M:%S")
+                    else:
+                        exit_time_str = (
+                            datetime.now(tz=timezone.utc)
+                            .astimezone(IST)
+                            .replace(tzinfo=None)
+                            .strftime("%Y-%m-%d %H:%M:%S")
+                        )
                     # Entry side: long position was entered with BUY, short with SELL
                     entry_side = "BUY" if prev_qty > 0 else "SELL"
                     entry_price_for_log = pos.entry_price
@@ -693,10 +712,11 @@ class PositionManager:
         if not path or not os.path.isfile(path):
             return
         try:
-            from logger.open_positions_logger import (
+            from utils.logger.open_positions_logger import (
                 load_position_metadata_from_csv,
             )
-        except ImportError:
+        except ImportError as exc:
+            logger.warning("open_positions_logger import failed: %s", exc)
             return
         file_meta = load_position_metadata_from_csv(path)
         with self._lock:
@@ -716,8 +736,11 @@ class PositionManager:
         if not path or not instrument_store:
             return 0
         try:
-            from logger.open_positions_logger import read_open_positions_snapshot
-        except ImportError:
+            from utils.logger.open_positions_logger import (
+                read_open_positions_snapshot,
+            )
+        except ImportError as exc:
+            logger.warning("open_positions_logger import failed: %s", exc)
             return 0
         snap = read_open_positions_snapshot(path)
         if not snap:
@@ -734,12 +757,17 @@ class PositionManager:
                 cur = self.positions.get(sym)
                 if cur is not None and int(cur.net_qty or 0) != 0:
                     continue
+                opt_type, strike = self._extract_option_hint(
+                    sym, row.get("structure_id")
+                )
                 inst = instrument_store.intent_creation_details(
-                    sym, exchange, None, None, None
+                    sym, exchange, None, opt_type, strike
                 )
                 if inst is None:
                     logger.warning(
-                        "oi_pos CSV restore: cannot resolve instrument for %s", sym
+                        "CSV restore: cannot resolve instrument for %s (exchange=%s)",
+                        sym,
+                        exchange,
                     )
                     continue
                 try:
@@ -783,6 +811,41 @@ class PositionManager:
                 "Restored %s open position(s) from %s", restored, path
             )
         return restored
+
+    @staticmethod
+    def _extract_option_hint(
+        trading_symbol: str, structure_id: Optional[str]
+    ) -> tuple[Optional[str], Optional[int]]:
+        """Best-effort parse of (option_type, strike) from structure_id / trading_symbol.
+
+        Helps ``intent_creation_details`` resolve via _resolve_option_row_fallback
+        when expiry/option_type/strike were not persisted in the CSV row.
+        """
+        opt: Optional[str] = None
+        strike: Optional[int] = None
+        sid = str(structure_id or "")
+        if sid:
+            parts = sid.split(":")
+            if len(parts) >= 6 and parts[4].upper() in ("CE", "PE"):
+                opt = parts[4].upper()
+                try:
+                    strike = int(parts[5])
+                except (TypeError, ValueError):
+                    strike = None
+        if opt is None or strike is None:
+            ts = str(trading_symbol or "").upper().strip()
+            tokens = ts.replace("-", " ").split()
+            for tok in tokens:
+                if tok in ("CE", "PE", "CALL", "PUT"):
+                    opt = "CE" if tok in ("CE", "CALL") else "PE"
+                elif strike is None:
+                    try:
+                        val = int(tok)
+                        if val >= 100:
+                            strike = val
+                    except (TypeError, ValueError):
+                        continue
+        return opt, strike
 
     def has_open_structure(self, strategy: str, structure_id: str, tag: str) -> bool:
         tag_u = str(tag or "").upper()
@@ -844,14 +907,18 @@ class PositionManager:
             self.open_positions_csv_path
         ):
             try:
-                from logger.open_positions_logger import (
+                from utils.logger.open_positions_logger import (
                     load_position_metadata_from_csv,
                 )
 
                 file_meta = load_position_metadata_from_csv(
                     self.open_positions_csv_path
                 )
-            except ImportError:
+            except ImportError as exc:
+                logger.warning(
+                    "open_positions_logger import failed during reconcile: %s",
+                    exc,
+                )
                 file_meta = None
 
         with self._lock:

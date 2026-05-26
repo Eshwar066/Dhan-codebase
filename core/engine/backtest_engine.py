@@ -49,6 +49,7 @@ class BacktestEngine(BaseEngine):
         if not candle:
             return
         recent = getattr(self, "_last_candle_buffer", None) or []
+        kwargs.pop("ctx", None)
         ctx = self.build_context_only(candle, recent_candles=recent)
         intents = fn(ctx=ctx, **kwargs) or []
         for intent in intents:
@@ -82,6 +83,7 @@ class BacktestEngine(BaseEngine):
             )
         ts = kwargs.get("candle_ts")
         candle_stub = {"symbol": sym or "", "timestamp": ts, "close": 0.0}
+        kwargs.pop("ctx", None)
         ctx = (
             self.build_context(candle_stub)
             if sym and callable(getattr(self, "build_context", None))

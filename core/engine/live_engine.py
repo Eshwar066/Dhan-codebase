@@ -359,6 +359,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             "close": float(spot),
             "exchange": None,
         }
+        kwargs.pop("ctx", None)
         ctx = self.build_context_only(candle)
         intents = fn(ctx=ctx, **kwargs) or []
         risk_manager = getattr(self.order_router, "risk", None)
@@ -399,6 +400,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             "close": float(spot if spot is not None else 0.0),
             "exchange": None,
         }
+        kwargs.pop("ctx", None)
         ctx = self.build_context_only(candle_stub) if sym else None
         pairs = fn(ctx=ctx, **kwargs) or []
         risk_manager = getattr(self.order_router, "risk", None)
@@ -516,7 +518,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         ) and self.instrument_store:
             self.position_manager.rebuild_open_positions_from_open_positions_csv(
                 self.instrument_store,
-                exchange=self.venue or "NSE",
+                exchange=self._live_exchange or "NSE",
             )
         self.position_manager.reconcile_with_broker(
             resolved_broker_positions, strategy=strategy_name
@@ -598,14 +600,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     continue
             meta_bucket = self.position_manager.get_position_metadata(sym) or {}
             candle_ts = dt.datetime.now(dt.timezone.utc)
-            ctx = self.build_context_only(
-                {
-                    "symbol": sym,
-                    "timestamp": candle_ts,
-                    "close": float(pos.avg_price or 0),
-                    "exchange": None,
-                }
-            )
             self._on_pm_main_entry_fill(
                 instrument=pos.instrument,
                 side="SELL" if pos.net_qty < 0 else "BUY",
@@ -619,7 +613,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 intent_id=getattr(pos, "intent_id", None)
                 or meta_bucket.get("intent_id"),
                 metadata_extras=meta_bucket.get("strategy_meta"),
-                ctx=ctx,
             )
 
     def _do_order_state_check(self) -> None:
