@@ -608,6 +608,21 @@ class OIOptionChainMixin:
             trade_date, calendar_rollover_day=rollover
         )
 
+    def _dhan_monthly_target_expiry_date(self, trade_date: date) -> date:
+        """
+        Resolve OI monthly target as a calendar date, not a moving DHAN list index:
+        - day <= rollover: current month expiry
+        - day > rollover: next month expiry
+        If current expiry already passed, always move to next month.
+        """
+        rollover = int(getattr(self, "dhan_monthly_rollover_after_calendar_day", 15))
+        current_exp = ExpiryResolver.current_month_expiry(trade_date)
+        if trade_date > current_exp:
+            return ExpiryResolver.next_month_expiry(trade_date)
+        if trade_date.day > rollover:
+            return ExpiryResolver.next_month_expiry(trade_date)
+        return current_exp
+
     def _ensure_selected_expiry(self, candle: dict, ctx: Any, chain: Any = None) -> None:
         if getattr(ctx, "selected_expiry", None) is not None:
             return
@@ -620,5 +635,5 @@ class OIOptionChainMixin:
         if cal_exp is not None:
             ctx.selected_expiry = pd.Timestamp(cal_exp).date()
             return
-        ctx.selected_expiry = self._dhan_monthly_expiry_index(trade_date)
+        ctx.selected_expiry = self._dhan_monthly_target_expiry_date(trade_date)
         self.fetch_option_chain(candle, ctx, "CE")

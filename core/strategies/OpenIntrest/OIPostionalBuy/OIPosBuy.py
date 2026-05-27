@@ -76,6 +76,24 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
     def _find_strike_snapshot_params(self, candle, ctx, option_type):
         return {}
 
+    def fetch_option_chain(self, candle, ctx, option_type):
+        """
+        OI positional monthly rule must be calendar-date based, not DHAN index based:
+        till rollover day use current month expiry, after rollover use next month expiry.
+        """
+        if self.api == "DHAN" and str(getattr(self, "expiryType", "")).upper() == "MONTHLY":
+            trade_date = self._trade_date(candle)
+            ctx.selected_expiry = self._dhan_monthly_target_expiry_date(trade_date)
+            spot = candle["close"]
+            step = getattr(self, "otm_strike_step", 500)
+            count = int(getattr(self, "otm_strike_count", 4))
+            otm_strikes = ExpiryResolver.get_otm_strikes(
+                self, spot=spot, option_type=option_type, step=step, count=count
+            )
+            ctx.otm_strikes = otm_strikes
+            return otm_strikes
+        return super().fetch_option_chain(candle, ctx, option_type)
+
     # ------------------------------------------------------------------
     # OI pattern vs 09:30 benchmark
     # ------------------------------------------------------------------
