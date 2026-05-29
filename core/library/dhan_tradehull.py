@@ -131,6 +131,34 @@ def _dhan_invalid_auth_hint(payload) -> str:
     return ""
 
 
+class _DhanRestHttp:
+    """
+    REST POST helper for dhanhq 2.x clients (session + base_url, no dhan_http attribute).
+    Response shape matches newer dhanhq builds: {status, data, remarks?}.
+    """
+
+    def __init__(self, dhan_client) -> None:
+        self._client = dhan_client
+
+    def post(self, path: str, payload: dict) -> dict:
+        path = path if str(path).startswith("/") else f"/{path}"
+        url = f"{self._client.base_url.rstrip('/')}{path}"
+        response = self._client.session.post(
+            url,
+            data=json.dumps(payload),
+            headers=self._client.header,
+            timeout=getattr(self._client, "timeout", 60),
+            verify=not getattr(self._client, "disable_ssl", False),
+        )
+        try:
+            body = json.loads(response.content) if response.content else {}
+        except Exception:
+            body = {}
+        if response.status_code == 200:
+            return {"status": "success", "data": body}
+        return {"status": "failure", "data": body, "remarks": body}
+
+
 class Tradehull:
     clientCode: str
     interval_parameters: dict
@@ -523,6 +551,34 @@ class Tradehull:
             self.logger.exception(f"got exception in get_login as {e} ")
             traceback.print_exc()
 
+    def _get_dhan_http(self):
+        """
+        Resolve Dhan REST client for v2 endpoints (/orders, /margincalculator/multi, etc.).
+
+        Tries, in order: DhanContext.get_dhan_http(), dhanhq.dhan_http, then a session
+        adapter for dhanhq 2.x (PyPI package without dhan_http on the client object).
+        """
+        if getattr(self, "_dhan_http_resolved", False):
+            return getattr(self, "_dhan_http_client", None)
+
+        http = None
+        ctx = getattr(self, "dhan_context", None)
+        if ctx is not None and hasattr(ctx, "get_dhan_http"):
+            try:
+                http = ctx.get_dhan_http()
+            except Exception:
+                http = None
+        if http is None:
+            http = getattr(getattr(self, "Dhan", None), "dhan_http", None)
+        if http is None:
+            dhan = getattr(self, "Dhan", None)
+            if dhan is not None and hasattr(dhan, "session") and hasattr(dhan, "base_url"):
+                http = _DhanRestHttp(dhan)
+
+        self._dhan_http_client = http
+        self._dhan_http_resolved = True
+        return http
+
     def get_instrument_file(self):
         global instrument_df
         current_date = time.strftime("%Y-%m-%d")
@@ -902,7 +958,27 @@ class Tradehull:
                 rest_payload["boProfitValue"] = float(bo_profit_value)
             if bo_stop_loss_Value is not None:
                 rest_payload["boStopLossValue"] = float(bo_stop_loss_Value)
-            order = self.Dhan.dhan_http.post("/orders", rest_payload)
+            http = self._get_dhan_http()
+            if http is not None:
+                order = http.post("/orders", rest_payload)
+            else:
+                order = self.Dhan.place_order(
+                    security_id=str(security_id),
+                    exchange_segment=exchangeSegment,
+                    transaction_type=order_side,
+                    quantity=int(quantity),
+                    order_type=order_type,
+                    product_type=product_Type,
+                    price=float(price),
+                    trigger_price=float(trigger_price),
+                    disclosed_quantity=int(disclosed_quantity),
+                    after_market_order=bool(after_market_order),
+                    validity=time_in_force,
+                    amo_time=amo_time.upper() if after_market_order else "OPEN",
+                    bo_profit_value=bo_profit_value,
+                    bo_stop_loss_Value=bo_stop_loss_Value,
+                    tag=corr_dhan,
+                )
 
             if order.get("status") == "failure":
                 self.logger.warning(
@@ -3131,11 +3207,29 @@ class Tradehull:
                 "includeOrders": bool(include_orders),
                 "scripList": api_scripts,
             }
-            http = getattr(self.Dhan, "dhan_http", None)
+            http = self._get_dhan_http()
             if http is None:
-                raise AttributeError(
-                    "dhanhq client has no dhan_http; upgrade dhanhq or use margin_calculator per leg"
-                )
+                total_margin = 0.0
+                for leg in api_scripts:
+                    leg_resp = self.Dhan.margin_calculator(
+                        leg["securityId"],
+                        leg["exchangeSegment"],
+                        leg["transactionType"],
+                        leg["quantity"],
+                        leg["productType"],
+                        leg["price"],
+                        leg.get("triggerPrice", 0) or 0,
+                    )
+                    if leg_resp.get("status") != "success":
+                        raise Exception(leg_resp)
+                    leg_data = leg_resp.get("data") or {}
+                    total_margin += float(
+                        leg_data.get("totalMargin")
+                        or leg_data.get("total_margin")
+                        or leg_data.get("margin")
+                        or 0
+                    )
+                return {"total_margin": total_margin, "totalMargin": total_margin}
             parsed = http.post("/margincalculator/multi", payload)
             if debug.upper() == "YES":
                 print(parsed)
@@ -4068,7 +4162,11 @@ class Tradehull:
             if not hasattr(self, "dhan_context") or self.dhan_context is None:
                 self.dhan_context = DhanContext(self.ClientCode, self.token_id)
 
-            dhan_http = self.dhan_context.get_dhan_http()
+            dhan_http = self._get_dhan_http()
+            if dhan_http is None:
+                raise AttributeError(
+                    "No Dhan REST client available for rollingoption charts"
+                )
 
             payload = {
                 "exchangeSegment": exchangeSegment,
