@@ -163,3 +163,118 @@ def from_broker_error(response: Any) -> Tuple[str, Optional[str], Optional[str]]
     et = response.get("errorType") or response.get("error_type")
     ec = response.get("errorCode") or response.get("error_code")
     return (str(msg), str(et) if et is not None else None, str(ec) if ec is not None else None)
+
+
+def parse_dhan_api_error(obj: Any) -> Dict[str, Optional[str]]:
+    """
+    Extract Dhan ``errorCode`` / ``errorMessage`` / ``errorType`` from API bodies,
+    nested ``data``/``remarks``, or Exception payloads (e.g. tradehull failure dict).
+    """
+    error_code: Optional[str] = None
+    error_type: Optional[str] = None
+    error_message: Optional[str] = None
+
+    def _merge(d: Dict[str, Any]) -> None:
+        nonlocal error_code, error_type, error_message
+        ec = d.get("errorCode") or d.get("error_code")
+        et = d.get("errorType") or d.get("error_type")
+        em = d.get("errorMessage") or d.get("error_message")
+        if ec and not error_code:
+            error_code = str(ec)
+        if et and not error_type:
+            error_type = str(et)
+        if em and not error_message:
+            error_message = str(em)
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, Exception):
+            if node.args:
+                _walk(node.args[0])
+            else:
+                _walk(str(node))
+            return
+        if isinstance(node, dict):
+            _merge(node)
+            for key in ("data", "remarks", "response"):
+                child = node.get(key)
+                if isinstance(child, dict):
+                    _walk(child)
+            return
+        if isinstance(node, (list, tuple)) and node:
+            _walk(node[0])
+
+    _walk(obj)
+
+    if not error_message and isinstance(obj, dict):
+        msg, et, ec = from_broker_error(obj)
+        if ec and not error_code:
+            error_code = ec
+        if et and not error_type:
+            error_type = et
+        if msg and msg != str(obj) and not error_message:
+            error_message = msg
+    if not error_message and obj is not None:
+        error_message = str(obj)
+
+    if error_code and error_message:
+        display = f"{error_code}: {error_message}"
+    elif error_code:
+        display = str(error_code)
+    else:
+        display = error_message
+
+    return {
+        "error_code": error_code,
+        "error_type": error_type,
+        "error_message": error_message,
+        "display_message": display,
+    }
+
+
+def format_broker_failure_for_log(
+    broker_fail: Optional[Dict[str, Any]],
+    *,
+    default: str = "Broker place_order returned None",
+) -> Dict[str, Any]:
+    """
+    Normalize ``_last_place_order_failure`` (or API error dict) for engine JSON logs.
+    """
+    if not broker_fail:
+        return {
+            "message": default,
+            "error_code": None,
+            "error_type": None,
+            "error_message": None,
+            "display_message": default,
+            "reason": "no_order_id",
+            "retryable": True,
+        }
+    parsed = parse_dhan_api_error(
+        broker_fail.get("response") or broker_fail.get("broker_response") or broker_fail
+    )
+    error_code = broker_fail.get("error_code") or parsed.get("error_code")
+    error_type = broker_fail.get("error_type") or parsed.get("error_type")
+    error_message = (
+        broker_fail.get("error_message")
+        or parsed.get("error_message")
+        or broker_fail.get("message")
+    )
+    display = broker_fail.get("display_message") or parsed.get("display_message")
+    if error_code and error_message:
+        display = f"{error_code}: {error_message}"
+    elif not display:
+        display = str(broker_fail.get("message") or default)
+
+    code_u = str(error_code or "").upper()
+    retryable = code_u not in ("DH-906", "DH-907")
+    reason = code_u.lower() if code_u else "no_order_id"
+
+    return {
+        "message": display,
+        "error_code": error_code,
+        "error_type": error_type,
+        "error_message": error_message,
+        "display_message": display,
+        "reason": reason,
+        "retryable": retryable,
+    }

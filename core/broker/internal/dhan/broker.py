@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 from core.broker.base import BaseBroker
 from core.broker.internal.dhan import mappings as dhan_mappings
-from core.broker.internal.dhan.mappings import dhan_correlation_id
+from core.broker.internal.dhan.mappings import dhan_correlation_id, parse_dhan_api_error
 from core.utils.global_rate_limiter import DHAN_ORDER_API, GlobalRateLimiter
 
 
@@ -387,9 +387,19 @@ class DhanBroker(BaseBroker):
                 if not isinstance(resp, dict):
                     raise Exception(f"Invalid broker response: {resp}")
                 if resp.get("status") != "success":
-                    fail_msg = resp.get("message") or str(resp)
+                    parsed = parse_dhan_api_error(resp)
+                    fail_msg = (
+                        parsed.get("display_message")
+                        or resp.get("message")
+                        or str(resp)
+                    )
                     self._last_place_order_failure = {
                         "message": fail_msg,
+                        "display_message": fail_msg,
+                        "error_code": resp.get("error_code") or parsed.get("error_code"),
+                        "error_type": resp.get("error_type") or parsed.get("error_type"),
+                        "error_message": resp.get("error_message")
+                        or parsed.get("error_message"),
                         "payload": resp.get("payload") or order_payload,
                         "response": resp,
                         "attempt": attempt + 1,
@@ -416,10 +426,20 @@ class DhanBroker(BaseBroker):
                     raise Exception("Order failed after retries")
                 time.sleep(0.4)
             except Exception as e:
+                parsed = parse_dhan_api_error(e)
+                fail_msg = parsed.get("display_message") or str(e)
                 self._last_place_order_failure = {
-                    "message": str(e),
+                    "message": fail_msg,
+                    "display_message": fail_msg,
+                    "error_code": parsed.get("error_code"),
+                    "error_type": parsed.get("error_type"),
+                    "error_message": parsed.get("error_message"),
                     "payload": order_payload,
-                    "response": None,
+                    "response": (
+                        e.args[0]
+                        if getattr(e, "args", None) and isinstance(e.args[0], dict)
+                        else None
+                    ),
                     "attempt": attempt + 1,
                 }
                 logger.warning(

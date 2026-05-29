@@ -889,27 +889,50 @@ class DhanSource:
             )
             if result is not None and isinstance(result, str):
                 return {"status": "success", "order_id": result, "payload": request_payload}
+            from core.broker.internal.dhan.mappings import parse_dhan_api_error
+
+            last_err = getattr(self.tsl, "_last_dhan_api_error", None)
+            parsed = parse_dhan_api_error(last_err) if last_err is not None else {}
+            display = (
+                parsed.get("display_message")
+                or "order_placement returned None (see tradehull logs for API response)"
+            )
             logger.warning(
-                "Dhan place_order returned no order_id payload=%s",
+                "Dhan place_order returned no order_id payload=%s error=%s",
                 request_payload,
+                display,
             )
             return {
                 "status": "error",
                 "order_id": None,
-                "message": "order_placement returned None (see tradehull logs for API response)",
+                "message": display,
+                "error_code": parsed.get("error_code"),
+                "error_type": parsed.get("error_type"),
+                "error_message": parsed.get("error_message"),
+                "broker_response": last_err,
                 "payload": request_payload,
             }
         except Exception as e:
+            from core.broker.internal.dhan.mappings import parse_dhan_api_error
+
+            parsed = parse_dhan_api_error(e)
+            display = parsed.get("display_message") or str(e)
             logger.warning(
                 "Dhan place_order exception payload=%s error=%s",
                 request_payload,
-                e,
+                display,
                 exc_info=True,
             )
             return {
                 "status": "error",
                 "order_id": None,
-                "message": str(e),
+                "message": display,
+                "error_code": parsed.get("error_code"),
+                "error_type": parsed.get("error_type"),
+                "error_message": parsed.get("error_message"),
+                "broker_response": (
+                    e.args[0] if getattr(e, "args", None) and isinstance(e.args[0], dict) else None
+                ),
                 "payload": request_payload,
             }
 

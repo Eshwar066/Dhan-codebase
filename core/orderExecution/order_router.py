@@ -17,6 +17,7 @@ try:
 except ImportError:
     round_json_floats = None  # type: ignore
 
+from core.broker.internal.dhan.mappings import format_broker_failure_for_log
 from core.orderExecution.bracket_orders import BRACKET_TAGS, BracketLegRegistry
 from core.orderExecution.intent_store import IntentStatus
 
@@ -164,6 +165,9 @@ class OrderRouter:
             "order_id",
             "attempt",
             "broker_error",
+            "broker_error_code",
+            "broker_error_message",
+            "broker_error_type",
             "broker_payload",
         ):
             if key in extra and extra[key] is not None:
@@ -296,6 +300,8 @@ class OrderRouter:
     @staticmethod
     def _is_retryable_broker_error(exc: Exception) -> bool:
         msg = str(exc or "").lower()
+        if "dh-906" in msg or "dh-907" in msg or "market is closed" in msg:
+            return False
         retry_tokens = (
             "timeout",
             "temporarily",
@@ -309,6 +315,23 @@ class OrderRouter:
             "rate limit",
         )
         return any(token in msg for token in retry_tokens)
+
+    @staticmethod
+    def _broker_failure_log_fields(
+        broker_fail: Optional[Dict[str, Any]],
+        *,
+        default: str = "Broker place_order returned None",
+    ) -> Dict[str, Any]:
+        info = format_broker_failure_for_log(broker_fail, default=default)
+        return {
+            "fail_detail": info["display_message"],
+            "reason": info["reason"],
+            "retryable": info["retryable"],
+            "broker_error": info["display_message"],
+            "broker_error_code": info.get("error_code"),
+            "broker_error_message": info.get("error_message"),
+            "broker_error_type": info.get("error_type"),
+        }
 
     @staticmethod
     def _coerce_positive_exec_price(price: Any) -> Optional[float]:
@@ -652,29 +675,66 @@ class OrderRouter:
         try:
             order_id = self.broker.place_order(intent, execution_price=exec_price)
         except Exception as e:
-            retryable = self._is_retryable_broker_error(e)
+            broker_fail = getattr(self.broker, "_last_place_order_failure", None) or {}
+            if not broker_fail:
+                from core.broker.internal.dhan.mappings import parse_dhan_api_error
+
+                parsed = parse_dhan_api_error(e)
+                broker_fail = {
+                    "message": parsed.get("display_message") or str(e),
+                    "error_code": parsed.get("error_code"),
+                    "error_type": parsed.get("error_type"),
+                    "error_message": parsed.get("error_message"),
+                }
+            fail_fields = self._broker_failure_log_fields(broker_fail, default=str(e))
+            retryable = (
+                fail_fields["retryable"]
+                if fail_fields.get("retryable") is not None
+                else self._is_retryable_broker_error(e)
+            )
             self._consecutive_failures += 1
             self._log_oms_step(
                 "place_order",
                 intent,
                 ok=False,
-                message=str(e),
+                message=fail_fields["fail_detail"],
                 intent_strategy_id=intent_strategy_id,
                 exec_price=exec_price,
-                reason="broker_error",
+                reason=fail_fields["reason"],
+                broker_payload=broker_fail.get("payload"),
+                **{
+                    k: fail_fields[k]
+                    for k in (
+                        "broker_error",
+                        "broker_error_code",
+                        "broker_error_message",
+                        "broker_error_type",
+                    )
+                },
             )
             if self.engine_logger:
                 self.engine_logger.log(
                     "order_failed",
-                    f"ORDER_FAILED intent_id={intent.intent_id} reason=broker_error error={e}",
+                    (
+                        f"ORDER_FAILED intent_id={intent.intent_id} "
+                        f"reason={fail_fields['reason']} "
+                        f"error={fail_fields['fail_detail']}"
+                    ),
                     symbol=sym,
                     side=side,
                     qty=qty,
                     intent_id=getattr(intent, "intent_id", None),
                     strategy_id=intent_strategy_id,
+                    broker_payload=broker_fail.get("payload"),
+                    broker_error=fail_fields["broker_error"],
+                    broker_error_code=fail_fields.get("broker_error_code"),
+                    broker_error_message=fail_fields.get("broker_error_message"),
+                    broker_error_type=fail_fields.get("broker_error_type"),
                 )
             if retryable and raise_on_retryable_failure:
-                raise RuntimeError(f"retryable_broker_error: {e}") from e
+                raise RuntimeError(
+                    f"retryable_broker_error: {fail_fields['fail_detail']}"
+                ) from e
             if (
                 self._consecutive_failures >= self.circuit_breaker_threshold
                 and self.risk
@@ -698,12 +758,12 @@ class OrderRouter:
         if order_id is None:
             self._consecutive_failures += 1
             broker_fail = getattr(self.broker, "_last_place_order_failure", None) or {}
-            fail_detail = broker_fail.get("message") or "Broker place_order returned None"
+            fail_fields = self._broker_failure_log_fields(broker_fail)
             fail_payload = broker_fail.get("payload")
-            fail_msg = (
-                f"{fail_detail}"
-                + (f" | payload={fail_payload}" if fail_payload else "")
-            )
+            fail_msg = fail_fields["fail_detail"]
+            if fail_payload:
+                fail_msg = f"{fail_msg} | payload={fail_payload}"
+            retryable = bool(fail_fields.get("retryable", True))
             self._log_oms_step(
                 "place_order",
                 intent,
@@ -711,26 +771,43 @@ class OrderRouter:
                 message=fail_msg,
                 intent_strategy_id=intent_strategy_id,
                 exec_price=exec_price,
-                reason="no_order_id",
-                broker_error=fail_detail,
+                reason=fail_fields["reason"],
+                broker_error=fail_fields["broker_error"],
+                broker_error_code=fail_fields.get("broker_error_code"),
+                broker_error_message=fail_fields.get("broker_error_message"),
+                broker_error_type=fail_fields.get("broker_error_type"),
                 broker_payload=fail_payload,
             )
             if self.engine_logger:
                 self.engine_logger.log(
                     "order_failed",
-                    f"ORDER_FAILED intent_id={intent.intent_id} reason=no_order_id error={fail_detail}",
+                    (
+                        f"ORDER_FAILED intent_id={intent.intent_id} "
+                        f"reason={fail_fields['reason']} error={fail_fields['fail_detail']}"
+                    ),
                     symbol=sym,
                     side=side,
                     qty=qty,
                     intent_id=getattr(intent, "intent_id", None),
                     strategy_id=intent_strategy_id,
                     broker_payload=fail_payload,
-                    broker_error=fail_detail,
+                    broker_error=fail_fields["broker_error"],
+                    broker_error_code=fail_fields.get("broker_error_code"),
+                    broker_error_message=fail_fields.get("broker_error_message"),
+                    broker_error_type=fail_fields.get("broker_error_type"),
                 )
             else:
-                logger.warning("Broker place_order returned None for %s %s qty=%s", sym, side, qty)
-            if raise_on_retryable_failure:
-                raise RuntimeError("retryable_broker_error: no_order_id")
+                logger.warning(
+                    "Broker place_order failed for %s %s qty=%s: %s",
+                    sym,
+                    side,
+                    qty,
+                    fail_fields["fail_detail"],
+                )
+            if retryable and raise_on_retryable_failure:
+                raise RuntimeError(
+                    f"retryable_broker_error: {fail_fields['reason']}"
+                )
             if (
                 self._consecutive_failures >= self.circuit_breaker_threshold
                 and self.risk
@@ -747,9 +824,13 @@ class OrderRouter:
                 intent.intent_id,
                 OrderState.REJECTED,
                 action="broker_no_order_id",
-                message="Broker place_order returned None",
+                message=fail_fields["fail_detail"],
             )
-            return {"ok": False, "retryable": True, "reason": "no_order_id"}
+            return {
+                "ok": False,
+                "retryable": retryable,
+                "reason": fail_fields["reason"],
+            }
 
         self._consecutive_failures = 0
         self._log_oms_step(

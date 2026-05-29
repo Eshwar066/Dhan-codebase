@@ -140,12 +140,24 @@ class _DhanRestHttp:
     def __init__(self, dhan_client) -> None:
         self._client = dhan_client
 
+    def _with_client_id(self, payload: dict) -> dict:
+        """Dhan v2 REST bodies require dhanClientId (SDK adds it; raw POST must too)."""
+        body = dict(payload) if payload else {}
+        if "dhanClientId" not in body:
+            client_id = getattr(self._client, "client_id", None) or getattr(
+                self._client, "ClientCode", None
+            )
+            if client_id:
+                body["dhanClientId"] = str(client_id)
+        return body
+
     def post(self, path: str, payload: dict) -> dict:
         path = path if str(path).startswith("/") else f"/{path}"
         url = f"{self._client.base_url.rstrip('/')}{path}"
+        body = self._with_client_id(payload)
         response = self._client.session.post(
             url,
-            data=json.dumps(payload),
+            data=json.dumps(body),
             headers=self._client.header,
             timeout=getattr(self._client, "timeout", 60),
             verify=not getattr(self._client, "disable_ssl", False),
@@ -544,6 +556,7 @@ class Tradehull:
             print("-----Logged into Dhan-----")
             self.dhan_context = DhanContext(self.ClientCode, self.token_id)
             self.Dhan = dhanhq(self.dhan_context)
+            self._last_dhan_api_error = None
             self.instrument_df = self.get_instrument_file()
             print("Got the instrument file")
         except Exception as e:
@@ -936,6 +949,7 @@ class Tradehull:
             self.logger.info("Dhan place_order API request: %s", req_json)
             # Dhan v2: correlationId max 30 chars; omit null BO fields (DH-905 if sent as null).
             rest_payload = {
+                "dhanClientId": str(self.ClientCode),
                 "transactionType": order_side,
                 "exchangeSegment": exchangeSegment,
                 "productType": product_Type,
@@ -981,6 +995,7 @@ class Tradehull:
                 )
 
             if order.get("status") == "failure":
+                self._last_dhan_api_error = order
                 self.logger.warning(
                     "Dhan place_order API failure request=%s response=%s",
                     req_json,
@@ -1009,6 +1024,9 @@ class Tradehull:
                     "correlation_id": locals().get("correlation_id"),
                 },
                 default=str,
+            )
+            self._last_dhan_api_error = (
+                e.args[0] if getattr(e, "args", None) and isinstance(e.args[0], dict) else e
             )
             self.logger.warning(
                 "Dhan place_order exception request=%s error=%s",
@@ -3203,6 +3221,7 @@ class Tradehull:
                     }
                 )
             payload = {
+                "dhanClientId": str(self.ClientCode),
                 "includePosition": bool(include_position),
                 "includeOrders": bool(include_orders),
                 "scripList": api_scripts,
@@ -3235,8 +3254,13 @@ class Tradehull:
                 print(parsed)
             if parsed.get("status") == "success":
                 return parsed.get("data") or parsed
+            if parsed.get("status") == "failure":
+                self._last_dhan_api_error = parsed
             raise Exception(parsed)
         except Exception as e:
+            self._last_dhan_api_error = (
+                e.args[0] if getattr(e, "args", None) and isinstance(e.args[0], dict) else e
+            )
             print(f"Error at margin_calculator_multi: {e}")
             return 0
 
