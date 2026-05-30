@@ -3,11 +3,12 @@ from typing import TYPE_CHECKING, Optional
 from core.strategies.base import BaseStrategy
 from core.strategies.IndiaMktMixins import IndiaMktMixins
 from datetime import datetime, timedelta
+import pdb
 
 if TYPE_CHECKING:
     from core.models.strategy_context import StrategyContext
 
-# use for  BTC profit factor 1.2
+# Nifty EMA  0.6 and 0.4
 class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
 
     name = "FuturesEMAHighLow"
@@ -15,17 +16,10 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
     required_context = ["instrument", "qty", "intent_builder"]
     api = "DELTA"
 
-    macro_ema_slope_period = 50
-    macro_ema_slope_threshold = 0.5
-
-    atr_period = 14
-    atr_min = 0.003
-    atr_max = 0.015
-
     def __init__(self):
         self.ema_period = 5
-        self.target_pct = 0.025
-        self.sl_pct = 0.005
+        self.target_pct = 0.006
+        self.sl_pct = 0.004
 
         # State
         self.last_exit_reason = None
@@ -44,28 +38,9 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
     # ----------------- Indicators -----------------
 
     def get_warmup_period(self):
-        # ATR needs atr_period + a few bars to stabilize; ema needs ema_period * 3
-        return max(self.ema_period * 3, getattr(self, "atr_period", 14) + 5)
+        return self.ema_period * 3
 
     def prepare_indicators(self, df):
-        # Macro / HTF trend (same-TF): used by should_evaluate; shared by backtest and live
-        macro_slope = getattr(self, "macro_ema_slope_period", None)
-        macro_ema = getattr(self, "macro_ema_period", None)
-        slope_threshold = getattr(self, "macro_ema_slope_threshold", 0.5)
-        if macro_slope is not None:
-            df["ema_50"] = df["close"].ewm(span=macro_slope, adjust=False).mean()
-            df["ema_slope"] = df["ema_50"].diff()
-            df["htf_trend"] = None
-            df.loc[df["ema_slope"] > slope_threshold, "htf_trend"] = "BULL"
-            df.loc[df["ema_slope"] < -slope_threshold, "htf_trend"] = "BEAR"
-        elif macro_ema is not None:
-            df["ema_100"] = df["close"].ewm(span=macro_ema, adjust=False).mean()
-            df["htf_trend"] = None
-            df.loc[df["close"] > df["ema_100"], "htf_trend"] = "BULL"
-            df.loc[df["close"] < df["ema_100"], "htf_trend"] = "BEAR"
-        else:
-            df["htf_trend"] = None
-
         df["ema_high"] = df["high"].ewm(span=self.ema_period, adjust=False).mean()
         df["ema_low"] = df["low"].ewm(span=self.ema_period, adjust=False).mean()
         return df
@@ -128,20 +103,8 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
                 else:
                     signal = None
 
-        # Macro filter: LONG only if close > ema_100 (Option 1) or ema_slope > 0 (Option 2); SHORT only if opposite
-        if signal and (
-            getattr(self, "macro_ema_slope_period", None)
-            or getattr(self, "macro_ema_period", None)
-        ):
-            htf_trend = candle.get("htf_trend")
-            if signal == "LONG" and htf_trend != "BULL":
-                signal = None
-            elif signal == "SHORT" and htf_trend != "BEAR":
-                signal = None
-
         self.current_signal = signal
         self._update_previous(candle)
-
         return signal is not None
 
     # ----------------- Regime -----------------
@@ -159,41 +122,9 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
 
     # ----------------- Entry -----------------
 
-    def _atr_filter_ok(self, candle, ctx: "StrategyContext") -> bool:
-        """True if ATR filter passes (or filter disabled). Uses IndiaMktMixins._atr. ATR as % of price (regime-stable)."""
-        atr_period = getattr(self, "atr_period", 14)
-        atr_min = getattr(self, "atr_min", None)
-        atr_max = getattr(self, "atr_max", None)
-        if atr_min is None and atr_max is None:
-            return True
-        recent = ctx.get_recent_candles(atr_period + 1)
-        if len(recent) < atr_period + 1:
-            return False
-        atr_list = self._atr(recent, atr_period)
-        if atr_list is None or len(atr_list) == 0:
-            return False
-        current_atr = atr_list[-1]
-        if current_atr is None or (
-            isinstance(current_atr, float)
-            and (pd.isna(current_atr) or current_atr <= 0)
-        ):
-            return False
-        price = float(candle.get("close") or 0)
-        if price <= 0:
-            return False
-        atr_pct = current_atr / price
-        if atr_min is not None and atr_pct < atr_min:
-            return False
-        if atr_max is not None and atr_pct > atr_max:
-            return False
-        return True
-
     def on_candle(self, candle, ctx: "StrategyContext"):
 
         if not self.current_signal:
-            return None
-
-        if not self._atr_filter_ok(candle, ctx):
             return None
 
         regime = self.compute_regime(candle)
@@ -202,6 +133,7 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
         hasOpenPosition = ctx.position_store.has_open_structure(
             strategy=self.name, structure_id=structure_id, tag="MAIN"
         )
+        # pdb.set_trace()
         if hasOpenPosition:
             return None
 
