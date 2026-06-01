@@ -94,10 +94,10 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     def should_evaluate(self, candle):
         rsi = candle.get("rsi")
         prev = candle.get("prev_rsi")
-        # return True
-        if pd.isna(rsi) or pd.isna(prev):
-            return False
-        return (prev >= 32 and rsi < 32) or (prev <= 52 and rsi > 52)
+        return True
+        # if pd.isna(rsi) or pd.isna(prev):
+        #     return False
+        # return (prev >= 32 and rsi < 32) or (prev <= 52 and rsi > 52)
 
     # ==================================================
     # ENTRY
@@ -111,9 +111,9 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             option_type = "PUT"
             regime = "RSI_GT_52"
         else:
-            # option_type = "PUT"
-            # regime = "RSI_GT_52"
-            return None
+            option_type = "PUT"
+            regime = "RSI_GT_52"
+            # return None
 
         structure_id = self.build_structure_id(candle, regime)
 
