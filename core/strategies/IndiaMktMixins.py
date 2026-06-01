@@ -246,6 +246,16 @@ class IndiaMktMixins:
         except (TypeError, ValueError):
             return s
 
+    @staticmethod
+    def _is_option_instrument(strike, option_type) -> bool:
+        """True when strike/option_type identify an options leg (not futures/index)."""
+        if strike is None and option_type is None:
+            return False
+        if strike is None or option_type is None:
+            return False
+        ot = str(option_type).strip().upper()
+        return ot in ("CE", "CALL", "PE", "PUT")
+
     def get_option_price_at_candle(
         self,
         candle,
@@ -261,10 +271,12 @@ class IndiaMktMixins:
                 return None
             sym = (trading_symbol or "").strip()
             if not sym:
+                if not self._is_option_instrument(strike, option_type):
+                    return None
                 exp_code = self._delta_expiry_ddmmyy(expiry)
                 sym = delta_option_trading_symbol(
                     None,
-                    float(strike) if strike is not None else 0.0,
+                    float(strike),
                     option_type or "CE",
                     exp_code,
                 )
@@ -281,6 +293,9 @@ class IndiaMktMixins:
                 return float(px)
             except (TypeError, ValueError):
                 return None
+
+        if not self._is_option_instrument(strike, option_type):
+            return None
 
         if str(getattr(self, "api", "") or "").upper() == "DHAN":
             cached_px = self._option_price_from_resolved_chain(
@@ -302,25 +317,19 @@ class IndiaMktMixins:
         }
 
         chain = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
-
-        df: Optional[pd.DataFrame] = None
-        if chain is None:
-            return None
-        if isinstance(chain, dict):
-            df = chain.get("chain")
-        elif isinstance(chain, pd.DataFrame):
-            df = chain
-        else:
-            return None
+        df = self._coerce_backtest_option_chain_df(chain, option_type)
+        if df is None:
+            if isinstance(chain, dict):
+                df = chain.get("chain")
+            elif isinstance(chain, pd.DataFrame):
+                df = chain
         if df is None or not isinstance(df, pd.DataFrame) or df.empty:
             return None
 
         # DHAN rolling option bars: multiple timestamps — keep the current candle row only.
         if "datetime" in df.columns and len(df) > 0:
-            candle_time = candle["timestamp"].replace(tzinfo=None)
-            ts = pd.to_datetime(df["datetime"])
-            wall = ts.dt.strftime("%Y-%m-%d %H:%M")
-            wall_c = pd.Timestamp(candle_time).strftime("%Y-%m-%d %H:%M")
+            wall = self._chain_datetime_wall_clock_keys(df)
+            wall_c = self._candle_wall_clock_key(candle)
             filt = df[wall == wall_c]
             if not filt.empty:
                 df = filt
@@ -731,15 +740,69 @@ class IndiaMktMixins:
         except (TypeError, ValueError):
             return None
 
-    def _option_chain_df(self, chain: Any) -> Optional[pd.DataFrame]:
+    @staticmethod
+    def _coerce_backtest_option_chain_df(
+        chain: Any, option_type: str
+    ) -> Optional[pd.DataFrame]:
+        """
+        Normalize DHAN rolling-option / NSE backtest payloads to one side's DataFrame.
+
+        Handles ``{"chain": df}``, bare DataFrames, and DHAN API ``{"CE": df, "PE": df}``.
+        """
+        if chain is None:
+            return None
+        ot = str(option_type or "").upper()
+        want_ce = ot in ("CE", "CALL")
+        want_pe = ot in ("PUT", "PE")
+        if isinstance(chain, dict):
+            inner = chain.get("chain")
+            if isinstance(inner, pd.DataFrame) and not inner.empty:
+                return inner
+            if want_ce:
+                ce = chain.get("CE") or chain.get("ce")
+                if isinstance(ce, pd.DataFrame) and not ce.empty:
+                    return ce
+            if want_pe:
+                pe = chain.get("PE") or chain.get("pe")
+                if isinstance(pe, pd.DataFrame) and not pe.empty:
+                    return pe
+            return None
+        if isinstance(chain, pd.DataFrame):
+            return chain if not chain.empty else None
+        return None
+
+    def _option_chain_df(
+        self, chain: Any, option_type: str = ""
+    ) -> Optional[pd.DataFrame]:
         if chain is None:
             return None
         if isinstance(chain, dict):
             inner = chain.get("chain")
-            return inner if isinstance(inner, pd.DataFrame) else None
+            if isinstance(inner, pd.DataFrame):
+                return inner if not inner.empty else None
+            if option_type:
+                return self._coerce_backtest_option_chain_df(chain, option_type)
+            return None
         if isinstance(chain, pd.DataFrame):
-            return chain
+            return chain if not chain.empty else None
         return None
+
+    @staticmethod
+    def _candle_wall_clock_key(candle: dict) -> str:
+        """IST wall-clock ``YYYY-MM-DD HH:MM`` for matching rolling option bars."""
+        ts = pd.Timestamp(candle["timestamp"])
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(IST)
+        else:
+            ts = ts.tz_convert(IST)
+        return ts.strftime("%Y-%m-%d %H:%M")
+
+    @staticmethod
+    def _chain_datetime_wall_clock_keys(chain: pd.DataFrame) -> pd.Series:
+        ts = pd.to_datetime(chain["datetime"])
+        if getattr(ts.dt, "tz", None) is not None:
+            ts = ts.dt.tz_convert(IST)
+        return ts.dt.strftime("%Y-%m-%d %H:%M")
 
     def _snapshot_slot_from_candle(self, candle: dict) -> Tuple[str, str]:
         """IST wall-clock slot ``(YYYY-MM-DD, HH-MM)`` at bar close (for snapshot CSV lookup)."""
@@ -771,7 +834,7 @@ class IndiaMktMixins:
         else the LEAPS (or other) snapshot CSV for the same slot — no extra API call.
         """
         cached = getattr(self, "_last_option_chain", None)
-        df = self._option_chain_df(cached)
+        df = self._option_chain_df(cached, option_type="")
         if df is not None and not df.empty:
             return cached
 
@@ -796,7 +859,7 @@ class IndiaMktMixins:
     def _strike_row_from_chain(
         self, chain: Any, strike: Union[int, float], option_type: str
     ) -> Optional[pd.Series]:
-        df = self._option_chain_df(chain)
+        df = self._option_chain_df(chain, option_type=option_type)
         if df is None or df.empty:
             return None
         strike_col = self._option_chain_strike_column(df)
@@ -958,8 +1021,6 @@ class IndiaMktMixins:
         )
         use_delta = d_min is not None and d_max is not None
 
-        candle_time = candle["timestamp"].replace(tzinfo=None)
-
         # When delta bounds are set and the chain has a delta column, strike selection uses
         # |delta| only — no min_prem/max_prem filtering or final premium check.
 
@@ -1002,7 +1063,6 @@ class IndiaMktMixins:
                 params.update(extra_snapshot_params)
 
         chain = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
-        self._last_option_chain = chain
         if bool(params.get("snapshot", False)):
             try:
                 log_option_chain_snapshot(
@@ -1017,23 +1077,23 @@ class IndiaMktMixins:
                     "log_option_chain_snapshot raised: %s", exc, exc_info=True
                 )
 
-        if chain is None:
-            print(">>no option chain data", ctx, params)
-            return None
-        if isinstance(chain, pd.DataFrame):
-            if chain.empty:
-                print(">>no option chain data", ctx, params)
-                return None
-        elif isinstance(chain, dict):
-            if not chain:
-                print(">>no option chain data", ctx, params)
-                return None
-        else:
-            print(">>no option chain data", ctx, params)
-            return None
-
         skip_premium_check = False
         if RUN_MODE == RunMode.LIVE or RUN_MODE == RunMode.PAPER:
+            self._last_option_chain = chain
+            if chain is None:
+                print(">>no option chain data", ctx, params)
+                return None
+            if isinstance(chain, pd.DataFrame):
+                if chain.empty:
+                    print(">>no option chain data", ctx, params)
+                    return None
+            elif isinstance(chain, dict):
+                if not chain:
+                    print(">>no option chain data", ctx, params)
+                    return None
+            else:
+                print(">>no option chain data", ctx, params)
+                return None
             # DHAN live: get_chain returns {"symbol", "exchange", "chain": DataFrame, "atm_strike", "expiry"}.
             # Snapshot has CE/PE LTP + Strike Price (+ greeks); no datetime / close / strike columns.
             live_df = chain.get("chain") if isinstance(chain, dict) else chain
@@ -1113,22 +1173,16 @@ class IndiaMktMixins:
             premium = float(pd.to_numeric(r0[premium_col], errors="coerce") or 0.0)
             selected_strike = r0[strike_col]
         else:
-            # NSE backtest often returns {"chain": df}; DHAN / Tradehull may return a bare DataFrame.
-            if isinstance(chain, dict):
-                chain = chain.get("chain")
+            chain = self._coerce_backtest_option_chain_df(chain, option_type)
+            self._last_option_chain = chain
             if chain is None:
-                return None
-            if isinstance(chain, pd.DataFrame):
-                if chain.empty:
-                    return None
-            else:
+                print(">>no option chain data", ctx, params)
                 return None
 
             # Rolling option history (e.g. DHAN): multiple bars — keep the current candle row only.
             if "datetime" in chain.columns and len(chain) > 0:
-                ts = pd.to_datetime(chain["datetime"])
-                wall = ts.dt.strftime("%Y-%m-%d %H:%M")
-                wall_c = pd.Timestamp(candle_time).strftime("%Y-%m-%d %H:%M")
+                wall = self._chain_datetime_wall_clock_keys(chain)
+                wall_c = self._candle_wall_clock_key(candle)
                 filt = chain[wall == wall_c]
                 if not filt.empty:
                     chain = filt

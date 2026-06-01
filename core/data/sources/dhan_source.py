@@ -9,8 +9,6 @@ import logging
 import os
 import sys
 import pandas as pd
-import pdb
-
 logger = logging.getLogger(__name__)
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -38,6 +36,7 @@ from core.utils.expiry_resolver import ExpiryResolver
 from core.utils.dhan_expired_option_chain_files import (
     default_expired_option_chain_root,
     load_expired_option_chain_from_files,
+    strikes_to_atm_folder_labels,
 )
 
 load_dotenv()
@@ -545,6 +544,31 @@ class DhanSource:
     # -------------------------------------------------------------------------
     # Data: Option chain (historical / expired) for backtest
     # -------------------------------------------------------------------------
+    @staticmethod
+    def _coerce_expired_option_side_df(raw, option_type: str):
+        """Pick CALL/CE or PUT/PE frame from DHAN rolling-option API payload."""
+        if raw is None:
+            return None
+        ot = str(option_type or "").upper()
+        want_ce = ot in ("CE", "CALL")
+        want_pe = ot in ("PUT", "PE")
+        if isinstance(raw, dict):
+            inner = raw.get("chain")
+            if isinstance(inner, pd.DataFrame) and not inner.empty:
+                return inner
+            if want_ce:
+                ce = raw.get("CE") or raw.get("ce")
+                if isinstance(ce, pd.DataFrame) and not ce.empty:
+                    return ce
+            if want_pe:
+                pe = raw.get("PE") or raw.get("pe")
+                if isinstance(pe, pd.DataFrame) and not pe.empty:
+                    return pe
+            return None
+        if isinstance(raw, pd.DataFrame):
+            return raw if not raw.empty else None
+        return None
+
     def get_expired_optionchain(
         self,
         exchange,
@@ -595,48 +619,46 @@ class DhanSource:
             print(">> returned data from expired dhan options files")
             return df
         
-        try:
-            first = strikes[0] if strikes else "ATM"
-            strike_arg = first
-            if isinstance(first, str) and str(first).upper().startswith("ATM"):
-                strike_arg = first
-            elif isinstance(first, (int, float)) or (
-                isinstance(first, str)
-                and str(first).replace(".", "", 1).replace("-", "", 1).isdigit()
-            ):
-                fs = float(first)
-                atm_strike = round(sp / 50.0) * 50.0
-                n = int((fs - atm_strike) / 50.0)
-                mx = 10
-                if n == 0:
-                    strike_arg = "ATM"
-                elif 0 < n <= mx:
-                    strike_arg = f"ATM+{n}"
-                elif -mx <= n < 0:
-                    strike_arg = f"ATM{n}"
-                elif n > mx:
-                    strike_arg = f"ATM+{mx}"
-                else:
-                    strike_arg = f"ATM-{mx}"
+        labels = strikes_to_atm_folder_labels(strikes, sp, strike_step=50)
+        if not labels:
+            labels = ["ATM"]
 
-            print(">> returned data from api")
-            return self.tsl.get_expired_option_data(
-                exchangeSegment=exchangeSegment,
-                instrument=instrument,
-                fromDate=from_date,
-                toDate=to_date,
-                exchange=exchange,
-                interval=(
-                    int(interval)
-                    if isinstance(interval, str) and interval.isdigit()
-                    else interval
-                ),
-                securityId=securityId,
-                expiry_flag=expiry_flag,
-                expiry_code=int(ec),
-                strike=strike_arg,
-                option_type=option_type,
+        interval_arg = (
+            int(interval)
+            if isinstance(interval, str) and interval.isdigit()
+            else interval
+        )
+        frames = []
+        try:
+            for strike_arg in labels:
+                raw = self.tsl.get_expired_option_data(
+                    exchangeSegment=exchangeSegment,
+                    instrument=instrument,
+                    fromDate=from_date,
+                    toDate=to_date,
+                    exchange=exchange,
+                    interval=interval_arg,
+                    securityId=securityId,
+                    expiry_flag=expiry_flag,
+                    expiry_code=int(ec),
+                    strike=strike_arg,
+                    option_type=option_type,
+                )
+                side = self._coerce_expired_option_side_df(raw, option_type)
+                if side is not None and not side.empty:
+                    frames.append(side)
+            if frames:
+                out = pd.concat(frames, ignore_index=True)
+                out = out.sort_values("datetime").reset_index(drop=True)
+                print(">> returned data from api")
+                return out
+            logger.warning(
+                "Dhan expired option chain API returned no rows for %s %s labels=%s",
+                sym,
+                from_date,
+                labels,
             )
+            return None
         except Exception as e:
             logger.warning("Dhan expired option chain API fallback failed: %s", e)
             return None

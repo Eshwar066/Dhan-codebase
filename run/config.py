@@ -9,7 +9,7 @@ class RunMode(str, Enum):
 
 
 # 🔁 Default run mode when a job does not specify "run_mode".
-RUN_MODE = RunMode.PAPER
+RUN_MODE = RunMode.LIVE
 
 # Global fallback: entry quantity in lots (used when a job does not override).
 ORDER_QTY_LOTS = 1
@@ -53,8 +53,8 @@ ENGINE_JOBS = [
         "live": {"exchange": "INDEX", "sector": "YES", "rsi": "YES"},
         # "live": {"exchange": "MCX", "sector": "NO", "rsi": "YES"},
         "backtest": {
-            "start_date": "2026-04-24",
-            "end_date": "2026-04-24",
+            "start_date": "2026-01-01",
+            "end_date": "2026-05-24",
             "timeframe": "60",
             "exchange": "INDEX",
             "sector": "YES",
@@ -70,7 +70,7 @@ ENGINE_JOBS = [
         "ORDER_QTY_LOTS": 1,
         "symbols": ["NIFTY"],
         "exchange": "NSE",
-        "strategies": ["OIPositionalBuy"],
+        "strategies": ["OIPositionalBuy","NiftyIntradayMagicalLine"],
         "live": {"exchange": "INDEX", "sector": "YES"},
         "telegram": {
             "bot_token": os.getenv(
@@ -88,6 +88,47 @@ ENGINE_JOBS = [
         },
     },
     {
+        "engine_id": "delta_futures_ema_highlow",
+        "venue": "DHAN",
+        "enabled": False,
+        "capital": 200000,
+        "run_mode": "BACKTEST",
+        # "symbols": ["BTCUSD"],
+        "symbols": ["NIFTY"],
+        "exchange": "NSE",
+        "strategies": ["FuturesEMAHighLow"],
+        "delta_india": False,
+        "delta_testnet": False,
+        "delta_leverage": 1,
+        "live": {"exchange": "INDEX", "sector": "YES"},
+        "backtest": {
+            "start_date": "2024-02-01",
+            "end_date": "2026-03-02",
+            "timeframe": "60",
+            "exchange": "INDEX",
+            "sector": "YES",
+        },
+    },
+    {
+        "engine_id": "dhan_nifty_intraday_magical",
+        "venue": "DHAN",
+        "enabled": False,
+        "run_mode": "BACKTEST",
+        "capital": 200000,
+        "ORDER_QTY_LOTS": 1,
+        "symbols": ["NIFTY"],
+        "exchange": "NSE",
+        "strategies": ["NiftyIntradayMagicalLine"],
+        "live": {"exchange": "INDEX", "sector": "YES"},
+        "backtest": {
+            "start_date": "2026-01-02",
+            "end_date": "2026-02-19",
+            "timeframe": "15",
+            "exchange": "INDEX",
+            "sector": "YES",
+        },
+    },
+    { # mutliple magical line
         "engine_id": "dhan_magicallines",
         "venue": "DHAN",
         "enabled": False,
@@ -164,7 +205,7 @@ ENGINE_JOBS = [
     {
         "engine_id": "delta_oneday_magicalline",
         "venue": "DELTA",
-        "enabled": True,
+        "enabled": False,
         "run_mode": "LIVE",
         "capital": 200000,
         "symbols": ["BTCUSD"],
@@ -188,25 +229,7 @@ ENGINE_JOBS = [
         },
     },
     
-    {
-        "engine_id": "delta_futures_ema_highlow",
-        "venue": "DELTA",
-        "enabled": False,
-        "capital": 200000,
-        "symbols": ["BTCUSD"],
-        "strategies": ["FuturesEMAHighLow"],
-        "delta_india": True,
-        "delta_testnet": False,
-        "delta_leverage": 1,
-        "live": {"exchange": "INDEX", "sector": "YES"},
-        "backtest": {
-            "start_date": "2024-02-01",
-            "end_date": "2026-03-02",
-            "timeframe": "60",
-            "exchange": "INDEX",
-            "sector": "YES",
-        },
-    },
+    
     {
         "engine_id": "delta_futures_ema_momentum",
         "venue": "DELTA",

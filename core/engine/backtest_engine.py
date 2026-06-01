@@ -55,16 +55,21 @@ class BacktestEngine(BaseEngine):
         for intent in intents:
             inst = intent.instrument
             sym = inst.trading_symbol
-            px = self.strategy.get_option_price_at_candle(
-                candle,
-                ctx,
-                inst.strike,
-                inst.option_type,
-                inst.expiry,
-                trading_symbol=sym,
-            )
-            if px is None:
+            strike = getattr(inst, "strike", None)
+            option_type = getattr(inst, "option_type", None)
+            if not self.strategy._is_option_instrument(strike, option_type):
                 px = float(intent.price)
+            else:
+                px = self.strategy.get_option_price_at_candle(
+                    candle,
+                    ctx,
+                    strike,
+                    option_type,
+                    inst.expiry,
+                    trading_symbol=sym,
+                )
+                if px is None:
+                    px = float(intent.price)
             price_map = {sym: float(px)}
             self.order_router.process_intent(intent, price_map)
 

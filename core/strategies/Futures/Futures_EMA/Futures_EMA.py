@@ -14,10 +14,10 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
     name = "FuturesEMAHighLow"
     timeframe = "60"
     required_context = ["instrument", "qty", "intent_builder"]
-    api = "DELTA"
+    api = "NSE"
 
     def __init__(self):
-        self.ema_period = 5
+        self.ema_period = 8
         self.target_pct = 0.006
         self.sl_pct = 0.004
 

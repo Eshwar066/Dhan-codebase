@@ -35,7 +35,6 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
-import pdb
 
 from run.config import RUN_MODE, RunMode
 from core.strategies.base import BaseStrategy

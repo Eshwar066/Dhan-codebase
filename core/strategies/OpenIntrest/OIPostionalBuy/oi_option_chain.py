@@ -44,6 +44,11 @@ class OIOptionChainMixin:
         self._snapshot_retry_thread: Optional[threading.Thread] = None
         self._full_chain_cache: Any = None
         self._full_chain_cache_key: Optional[tuple] = None
+        # Pin the IndiaMktMixins snapshot fallback to this strategy's CSV bucket so
+        # bracket-stop pricing (paper / post-restart) reads OI snapshots from
+        # logs/OIPositionalBuy/<date>/<slot>.csv instead of defaulting to the
+        # leaps_rsi bucket and falling through to a live broker chain call.
+        self._last_option_chain_snapshot_target = "oi_positional_buy"
 
     # --- Candle / IST time (used by chain + strategy) ---
 

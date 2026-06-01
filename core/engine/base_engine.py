@@ -96,16 +96,21 @@ class BaseEngine:
             ts = getattr(inst, "trading_symbol", None)
             if not ts:
                 continue
-            px = self.strategy.get_option_price_at_candle(
-                candle,
-                ctx,
-                inst.strike,
-                inst.option_type,
-                inst.expiry,
-                trading_symbol=ts,
-            )
-            if px is None:
+            strike = getattr(inst, "strike", None)
+            option_type = getattr(inst, "option_type", None)
+            if not self.strategy._is_option_instrument(strike, option_type):
                 px = float(candle.get("close", 0) or 0)
+            else:
+                px = self.strategy.get_option_price_at_candle(
+                    candle,
+                    ctx,
+                    strike,
+                    option_type,
+                    inst.expiry,
+                    trading_symbol=ts,
+                )
+                if px is None:
+                    px = float(candle.get("close", 0) or 0)
             price_map[ts] = float(px)
         if not price_map:
             return
