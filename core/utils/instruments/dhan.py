@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 DHAN_INSTRUMENT_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 from run.config import RUN_MODE, RunMode
+from core.utils.expiry_resolver import ExpiryResolver
 
 from .base import BaseInstrumentStore, Instrument
 
@@ -191,6 +192,51 @@ class DhanInstrumentStore(BaseInstrumentStore):
         except (TypeError, ValueError, OverflowError):
             return None
 
+    def _pick_option_row_for_expiry(
+        self,
+        df: pd.DataFrame,
+        expiry: Any,
+        *,
+        prefer_monthly: bool = False,
+    ) -> pd.DataFrame:
+        """Narrow candidate rows to the intended calendar expiry (and monthly series when asked)."""
+        if df is None or df.empty:
+            return pd.DataFrame()
+        exp_dt = self._sem_expiry_to_date(expiry)
+        if exp_dt is None:
+            return pd.DataFrame()
+
+        def _row_expiry(row) -> Optional[date]:
+            return self._sem_expiry_to_date(row.get("SEM_EXPIRY_DATE"))
+
+        exact = df[df.apply(lambda r: _row_expiry(r) == exp_dt, axis=1)]
+        if not exact.empty:
+            out = exact
+        else:
+            def _same_month_year(row) -> bool:
+                d = _row_expiry(row)
+                return bool(d and d.month == exp_dt.month and d.year == exp_dt.year)
+
+            out = df[df.apply(_same_month_year, axis=1)]
+            if out.empty:
+                return out
+
+        if prefer_monthly and "SEM_EXPIRY_FLAG" in out.columns:
+            m_only = out[
+                out["SEM_EXPIRY_FLAG"].astype(str).str.upper().str.strip() == "M"
+            ]
+            if not m_only.empty:
+                out = m_only
+
+        if len(out) > 1:
+            out = out.assign(
+                _dd=out["SEM_EXPIRY_DATE"].apply(
+                    lambda v: abs((_row_expiry(v) or exp_dt) - exp_dt).days
+                )
+            ).sort_values("_dd", ascending=True)
+            out = out.drop(columns=["_dd"], errors="ignore")
+        return out.head(1)
+
     def _resolve_option_row_fallback(
         self,
         ex: str,
@@ -198,11 +244,13 @@ class DhanInstrumentStore(BaseInstrumentStore):
         expiry: Any,
         option_type: Any,
         strike: Any,
+        *,
+        prefer_monthly: bool = False,
     ) -> pd.DataFrame:
         """
         When SEM_TRADING_SYMBOL / SEM_CUSTOM_SYMBOL do not match ``build_option_symbol`` output
         (e.g. last-Thursday vs NSE monthly Tuesday, or compact ``NIFTY-May2026-25400-CE`` vs
-        ``NIFTY 28 MAY 25400 CALL``), match by exchange + strike + CE/PE + underlying + expiry month.
+        ``NIFTY 28 MAY 25400 CALL``), match by exchange + strike + CE/PE + underlying + expiry.
         Prefers SEM_EXPIRY_FLAG == M (monthly) when multiple rows share month/year.
         """
         opt = self._option_type_to_ce_pe(option_type)
@@ -236,52 +284,108 @@ class DhanInstrumentStore(BaseInstrumentStore):
             base = base & first_tok.eq(root)
 
         cand = df[base]
-        if cand.empty or exp_dt is None:
+        if cand.empty:
             return cand
+        if exp_dt is None:
+            logger.warning(
+                "Option row fallback requires expiry; got None for %s strike=%s",
+                trading_symbol,
+                strike,
+            )
+            return pd.DataFrame()
 
-        def _same_month_year(row) -> bool:
-            d = self._sem_expiry_to_date(row.get("SEM_EXPIRY_DATE"))
-            return bool(d and d.month == exp_dt.month and d.year == exp_dt.year)
-
-        month_ok = cand[cand.apply(_same_month_year, axis=1)]
-        if month_ok.empty:
-            return month_ok
-
-        out = month_ok
-        if "SEM_EXPIRY_FLAG" in out.columns:
-            m_only = out[out["SEM_EXPIRY_FLAG"].astype(str).str.upper().str.strip() == "M"]
-            if not m_only.empty:
-                out = m_only
-        if len(out) > 1:
-            out = out.assign(
-                _dd=out["SEM_EXPIRY_DATE"].apply(
-                    lambda v: abs((self._sem_expiry_to_date(v) or exp_dt) - exp_dt).days
-                )
-            ).sort_values("_dd", ascending=True)
-            out = out.drop(columns=["_dd"], errors="ignore")
-        return out.head(1)
+        return self._pick_option_row_for_expiry(
+            cand, exp_dt, prefer_monthly=prefer_monthly
+        )
 
     def intent_creation_details(
-        self, trading_symbol, exchange, expiry, option_type, strike
+        self,
+        trading_symbol,
+        exchange,
+        expiry,
+        option_type,
+        strike,
+        *,
+        prefer_monthly: bool = False,
     ) -> Optional[Instrument]:
         ex = self.INSTRUMENT_EXCHANGE.get(exchange, exchange)
 
         if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
-            df = self.df[
-                (
-                    (self.df["SEM_TRADING_SYMBOL"] == trading_symbol)
-                    | (self.df["SEM_CUSTOM_SYMBOL"] == trading_symbol)
+            exp_dt = self._sem_expiry_to_date(expiry)
+            root = self._underlying_root_from_option_trading_symbol(trading_symbol)
+            lookup_symbols: list[str] = [str(trading_symbol).strip()]
+            if exp_dt is not None and root:
+                try:
+                    lookup_symbols.append(
+                        ExpiryResolver.build_dhan_compact_option_symbol(
+                            root, exp_dt, strike, option_type
+                        )
+                    )
+                    lookup_symbols.append(
+                        ExpiryResolver.build_option_symbol(
+                            root, exp_dt, strike, option_type, include_year=True
+                        )
+                    )
+                except (TypeError, ValueError):
+                    pass
+            seen: set[str] = set()
+            unique_lookups = []
+            for sym in lookup_symbols:
+                if sym and sym not in seen:
+                    seen.add(sym)
+                    unique_lookups.append(sym)
+
+            df = pd.DataFrame()
+            for sym in unique_lookups:
+                hit = self.df[
+                    (
+                        (self.df["SEM_TRADING_SYMBOL"] == sym)
+                        | (self.df["SEM_CUSTOM_SYMBOL"] == sym)
+                    )
+                    & (self.df["SEM_EXM_EXCH_ID"] == ex)
+                ]
+                if hit.empty:
+                    continue
+                narrowed = self._pick_option_row_for_expiry(
+                    hit, expiry, prefer_monthly=prefer_monthly
                 )
-                & (self.df["SEM_EXM_EXCH_ID"] == ex)
-            ]
+                if not narrowed.empty:
+                    df = narrowed
+                    break
+
             if df.empty:
                 df = self._resolve_option_row_fallback(
-                    ex, trading_symbol, expiry, option_type, strike
+                    ex,
+                    trading_symbol,
+                    expiry,
+                    option_type,
+                    strike,
+                    prefer_monthly=prefer_monthly,
                 )
             if df.empty:
-                logger.warning("No instrument found for %s on %s", trading_symbol, exchange)
+                logger.warning(
+                    "No instrument found for %s on %s expiry=%s strike=%s prefer_monthly=%s",
+                    trading_symbol,
+                    exchange,
+                    expiry,
+                    strike,
+                    prefer_monthly,
+                )
                 return None
-            return self.map_row_to_instrument(df.iloc[0])
+            inst = self.map_row_to_instrument(df.iloc[0])
+            if prefer_monthly and exp_dt is not None:
+                resolved = self._sem_expiry_to_date(inst.expiry)
+                if resolved is None or (
+                    resolved.year != exp_dt.year or resolved.month != exp_dt.month
+                ):
+                    logger.warning(
+                        "Monthly hedge resolve mismatch: wanted %s got %s (%s)",
+                        exp_dt,
+                        resolved,
+                        inst.trading_symbol,
+                    )
+                    return None
+            return inst
 
         DhanInstrumentStore.dummy_security_counter += 1
         dummy_row = {

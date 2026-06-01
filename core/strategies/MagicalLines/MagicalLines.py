@@ -226,7 +226,7 @@ class MagicalLines(IndiaMktMixins, BaseStrategy):
 
         expiry = ctx.selected_expiry
         trading_symbol = ExpiryResolver.build_option_symbol(
-            self, candle["symbol"], expiry, strike, option_type
+            candle["symbol"], expiry, strike, option_type
         )
         inst = ctx.instrument_store.intent_creation_details(
             trading_symbol, ctx.exchange, expiry, option_type, strike
@@ -252,10 +252,19 @@ class MagicalLines(IndiaMktMixins, BaseStrategy):
         hedge_strike, hedge_prem = hedge
         hedge_expiry = self.get_expiry_for_magical(ctx)
         hedge_symbol = ExpiryResolver.build_option_symbol(
-            self, candle["symbol"], hedge_expiry, hedge_strike, option_type
+            candle["symbol"],
+            hedge_expiry,
+            hedge_strike,
+            option_type,
+            include_year=True,
         )
         hedge_inst = ctx.instrument_store.intent_creation_details(
-            hedge_symbol, ctx.exchange, hedge_expiry, option_type, hedge_strike
+            hedge_symbol,
+            ctx.exchange,
+            hedge_expiry,
+            option_type,
+            hedge_strike,
+            prefer_monthly=True,
         )
         if hedge_inst is None:
             return [sell_intent]

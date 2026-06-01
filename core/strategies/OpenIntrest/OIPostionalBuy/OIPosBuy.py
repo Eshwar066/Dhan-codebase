@@ -504,7 +504,7 @@ class OIPositionalBuy(OIOptionChainMixin, IndiaMktMixins, BaseStrategy):
         if isinstance(expiry, int):
             expiry = ExpiryResolver.dhan_expiry_index_to_date(self._trade_date(candle), expiry)
         trading_symbol = ExpiryResolver.build_option_symbol(
-            self, candle["symbol"], expiry, snap.strike, snap.option_type
+            candle["symbol"], expiry, snap.strike, snap.option_type
         )
         inst = ctx.instrument_store.intent_creation_details(
             trading_symbol, ctx.exchange, expiry, snap.option_type, snap.strike

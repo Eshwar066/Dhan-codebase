@@ -81,39 +81,68 @@ class ExpiryResolver:
         else:
             raise ValueError("option_type must be CALL/CE or PUT/PE")
 
-    def build_option_symbol(self, symbol, expiry, strike, option_type):
-        """
-        Output:
-        NIFTY 30 MAR 25000 PUT
-        NIFTY 30 MAR 25000 CALL
-        """
-
-        # normalize expiry
+    @staticmethod
+    def normalize_expiry_date(expiry: Any) -> dt.date:
         if isinstance(expiry, str):
-            expiry = dt.datetime.strptime(expiry, "%Y-%m-%d").date()
-        elif isinstance(expiry, dt.datetime):
-            expiry = expiry.date()
+            return dt.datetime.strptime(expiry, "%Y-%m-%d").date()
+        if isinstance(expiry, dt.datetime):
+            return expiry.date()
+        if isinstance(expiry, pd.Timestamp):
+            return expiry.date()
+        if isinstance(expiry, dt.date):
+            return expiry
+        raise TypeError(f"Unsupported expiry type: {type(expiry)!r}")
 
-        day = f"{expiry.day:02d}"  # 30
-        month = expiry.strftime("%b").upper()  # MAR
-
-        strike = int(float(strike))
-
-        # --- normalize option type ---
-        opt = option_type.upper()
+    @staticmethod
+    def normalize_option_side(option_type: str) -> str:
+        opt = str(option_type or "").upper()
         option_map = {
             "CE": "CALL",
             "PE": "PUT",
             "CALL": "CALL",
             "PUT": "PUT",
         }
-
         if opt not in option_map:
             raise ValueError(f"Invalid option_type: {option_type}")
+        return option_map[opt]
 
-        option_type = option_map[opt]
+    @staticmethod
+    def normalize_option_side_compact(option_type: str) -> str:
+        """CE/PE for Dhan ``SEM_TRADING_SYMBOL`` compact keys."""
+        side = ExpiryResolver.normalize_option_side(option_type)
+        return "CE" if side == "CALL" else "PE"
 
-        return f"{symbol.upper()} {day} {month} {strike} {option_type}"
+    @staticmethod
+    def build_option_symbol(
+        symbol, expiry, strike, option_type, *, include_year: bool = False
+    ):
+        """
+        Output:
+        NIFTY 30 MAR 25000 PUT
+        NIFTY 30 MAR 26 25000 CALL  (include_year=True)
+        """
+        expiry = ExpiryResolver.normalize_expiry_date(expiry)
+        day = f"{expiry.day:02d}"
+        month = expiry.strftime("%b").upper()
+        strike = int(float(strike))
+        option_type = ExpiryResolver.normalize_option_side(option_type)
+        root = str(symbol).upper()
+        if include_year:
+            year = expiry.year % 100
+            return f"{root} {day} {month} {year:02d} {strike} {option_type}"
+        return f"{root} {day} {month} {strike} {option_type}"
+
+    @staticmethod
+    def build_dhan_compact_option_symbol(symbol, expiry, strike, option_type) -> str:
+        """
+        Dhan instrument master ``SEM_TRADING_SYMBOL`` form, e.g. ``NIFTY-Jun2026-24000-CE``.
+        Includes calendar year so June 2026 monthly does not collide with June 2030 LEAPS.
+        """
+        expiry = ExpiryResolver.normalize_expiry_date(expiry)
+        strike = int(float(strike))
+        mon = expiry.strftime("%b")
+        opt = ExpiryResolver.normalize_option_side_compact(option_type)
+        return f"{str(symbol).upper()}-{mon}{expiry.year}-{strike}-{opt}"
 
     @staticmethod
     def last_thursday(year, month):

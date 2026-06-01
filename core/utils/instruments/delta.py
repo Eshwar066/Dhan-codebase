@@ -175,7 +175,14 @@ class DeltaInstrumentStore(BaseInstrumentStore):
         )
 
     def intent_creation_details(
-        self, trading_symbol, exchange, expiry, option_type, strike
+        self,
+        trading_symbol,
+        exchange,
+        expiry,
+        option_type,
+        strike,
+        *,
+        prefer_monthly: bool = False,
     ) -> Optional[Instrument]:
         row = self._row_for_contract_key(trading_symbol)
         if row is not None:

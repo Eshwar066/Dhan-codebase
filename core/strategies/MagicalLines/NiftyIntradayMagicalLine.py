@@ -226,7 +226,7 @@ class NiftyIntradayMagicalLine(IndiaMktMixins, BaseStrategy):
         if expiry is None:
             return None
         trading_symbol = ExpiryResolver.build_option_symbol(
-            self, candle["symbol"], expiry, strike, option_type
+            candle["symbol"], expiry, strike, option_type
         )
         inst = ctx.instrument_store.intent_creation_details(
             trading_symbol, ctx.exchange, expiry, option_type, strike
@@ -566,7 +566,7 @@ class NiftyIntradayMagicalLine(IndiaMktMixins, BaseStrategy):
         if expiry is None:
             return [exit_intent]
         trading_symbol = ExpiryResolver.build_option_symbol(
-            self, meta.symbol, expiry, strike, reverse_option_type
+            meta.symbol, expiry, strike, reverse_option_type
         )
         inst = ctx.instrument_store.intent_creation_details(
             trading_symbol, ctx.exchange, expiry, reverse_option_type, strike

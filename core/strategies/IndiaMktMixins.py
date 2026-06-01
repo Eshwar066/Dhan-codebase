@@ -1453,11 +1453,11 @@ class IndiaMktMixins:
         )
 
         hedge_symbol = ExpiryResolver.build_option_symbol(
-            self,
             candle["symbol"],
             hedge_expiry,
             hedge_strike,
             parent_sell_intent.instrument.option_type,
+            include_year=True,
         )
 
         inst = ctx.instrument_store.intent_creation_details(
@@ -1466,8 +1466,30 @@ class IndiaMktMixins:
             hedge_expiry,
             parent_sell_intent.instrument.option_type,
             hedge_strike,
+            prefer_monthly=True,
         )
         if inst is None:
+            return None
+
+        resolved_exp = pd.to_datetime(inst.expiry, errors="coerce")
+        if pd.isna(resolved_exp):
+            logger.warning(
+                "Hedge instrument has no expiry: %s (wanted %s)",
+                getattr(inst, "trading_symbol", inst),
+                hedge_expiry,
+            )
+            return None
+        resolved_date = resolved_exp.date()
+        if (
+            resolved_date.year != hedge_expiry.year
+            or resolved_date.month != hedge_expiry.month
+        ):
+            logger.warning(
+                "Hedge expiry mismatch: resolved %s (%s) wanted %s",
+                resolved_date,
+                inst.trading_symbol,
+                hedge_expiry,
+            )
             return None
 
         hedge_price = self._option_price_from_resolved_chain(

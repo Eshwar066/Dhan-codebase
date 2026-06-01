@@ -83,7 +83,14 @@ class BaseInstrumentStore(ABC):
 
     @abstractmethod
     def intent_creation_details(
-        self, trading_symbol, exchange, expiry, option_type, strike
+        self,
+        trading_symbol,
+        exchange,
+        expiry,
+        option_type,
+        strike,
+        *,
+        prefer_monthly: bool = False,
     ) -> Optional[Instrument]:
         """Resolve option contract to Instrument for order intent. Returns None if not found."""
         raise NotImplementedError
