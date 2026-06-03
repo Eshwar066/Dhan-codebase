@@ -9,6 +9,11 @@ python -m run.option_buildup_scheduler --symbols NIFTY --exchange NSE
 python -m run.option_buildup_scheduler --symbols NIFTY --exchange NSE --all-day
 
 python -m run.option_buildup_scheduler --symbols GOLD --exchange MCX
+
+sudo cp /root/Dhan-codebase/utils/systemd/option-buildup-scheduler.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl restart option-buildup-scheduler.service
+sudo journalctl -u option-buildup-scheduler.service -n 20
 """
 
 from __future__ import annotations

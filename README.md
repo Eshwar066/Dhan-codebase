@@ -260,6 +260,8 @@ python -m run.main --venue DELTA
 ```bash
 sudo systemctl daemon-reload          # after editing unit files
 sudo systemctl restart dhan-leaps-rsi.service
+sudo systemctl start dhan-oi-positional-buy.service
+sudo systemctl enable option-buildup-scheduler.service
 sudo systemctl list-units 'dhan*' 'option-buildup*' 'delta*'
 ```
 

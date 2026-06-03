@@ -126,6 +126,15 @@ class EngineLogger:
         self._file_handlers: Dict[str, TimedRotatingFileHandler] = {}
         os.makedirs(self._log_dir, exist_ok=True)
 
+    def notify_operator(self, message: str) -> None:
+        """Send an out-of-band operator alert (not limited to TELEGRAM_ALERT_EVENTS)."""
+        if not self._telegram_alert or not message:
+            return
+        try:
+            self._telegram_alert(str(message))
+        except Exception:
+            pass
+
     def _get_file_handler(self, path: str) -> TimedRotatingFileHandler:
         handler = self._file_handlers.get(path)
         if handler is not None:

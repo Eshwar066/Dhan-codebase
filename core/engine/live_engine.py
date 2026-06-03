@@ -427,6 +427,27 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         if self.engine_logger:
             self.engine_logger.graceful_shutdown(f"Signal {signum} received")
 
+    def _handle_startup_failure(self, detail: str) -> None:
+        """Exit process for systemd retry; stop and Telegram-alert after failure budget."""
+        import sys
+
+        from core.utils.engine_restart_budget import (
+            ExitBudgetExceeded,
+            on_startup_failure,
+        )
+
+        engine_id = str(getattr(self, "engine_id", None) or "unknown")
+        notify = (
+            self.engine_logger.notify_operator
+            if self.engine_logger
+            else None
+        )
+        try:
+            on_startup_failure(engine_id, detail, notify=notify)
+            sys.exit(1)
+        except ExitBudgetExceeded:
+            sys.exit(0)
+
     def reconcile_positions_on_start(self) -> bool:
         """
         Fetch broker positions, sync PositionManager to broker truth, log any mismatch.
@@ -1342,7 +1363,12 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
 
         if not self.reconcile_positions_on_start():
             self.engine_logger.log("critical", "Startup reconciliation failed")
+            self._handle_startup_failure("Startup reconciliation failed")
             return
+
+        from core.utils.engine_restart_budget import reset_startup_success
+
+        reset_startup_success(str(getattr(self, "engine_id", None) or "unknown"))
 
         _rm = getattr(self.run_mode, "value", None) or str(self.run_mode or "")
         self._log_startup_balance_snapshot()

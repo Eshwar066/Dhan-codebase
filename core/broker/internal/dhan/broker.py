@@ -522,19 +522,73 @@ class DhanBroker(BaseBroker):
     def get_positions(self):
         return self.api.get_positions()
 
+    @staticmethod
+    def _position_row_value(row, *column_names, default=0):
+        """Read a position field from a pandas Series with API column name fallbacks."""
+        for name in column_names:
+            try:
+                if hasattr(row, "index") and name not in row.index:
+                    continue
+                val = row[name] if hasattr(row, "index") else row.get(name)
+                if val is None:
+                    continue
+                if isinstance(val, float) and val != val:
+                    continue
+                return val
+            except (KeyError, TypeError, ValueError):
+                continue
+        return default
+
     def get_positions_for_recon(self):
         df = self.api.get_positions()
-        if df is None or df.empty:
+        if df is None:
+            return {}
+        if isinstance(df, dict):
+            return {}
+        try:
+            if getattr(df, "empty", True):
+                return {}
+        except Exception:
             return {}
         broker_positions = {}
         for _, row in df.iterrows():
-            sym = row["tradingSymbol"]
-            broker_positions[sym] = {
-                "qty": int(row["netQty"]),
-                "avg_price": float(row["avgPrice"]),
-                "segment": row.get("segment", "EQ"),
-                "lot_size": int(row.get("lotSize", 1)),
-            }
+            sym = self._position_row_value(
+                row,
+                "tradingSymbol",
+                "trading_symbol",
+                "symbol",
+                default=None,
+            )
+            if not sym:
+                continue
+            qty_raw = self._position_row_value(
+                row, "netQty", "net_qty", "quantity", default=0
+            )
+            avg_raw = self._position_row_value(
+                row,
+                "avgPrice",
+                "avg_price",
+                "averagePrice",
+                "costPrice",
+                "buyAvg",
+                "sellAvg",
+                default=0,
+            )
+            segment = self._position_row_value(
+                row, "segment", "exchangeSegment", default="EQ"
+            )
+            lot_raw = self._position_row_value(row, "lotSize", "lot_size", default=1)
+            try:
+                broker_positions[str(sym)] = {
+                    "qty": int(qty_raw),
+                    "avg_price": float(avg_raw),
+                    "segment": str(segment or "EQ"),
+                    "lot_size": max(1, int(lot_raw)),
+                }
+            except (TypeError, ValueError) as e:
+                logger.warning(
+                    "Skipping position row for recon sym=%s: %s", sym, e
+                )
         return broker_positions
 
     def sync_positions(self):
