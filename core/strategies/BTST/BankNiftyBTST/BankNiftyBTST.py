@@ -1,0 +1,334 @@
+"""
+Bank Nifty BTST (Buy Today Sell Tomorrow) — Dhan index options.
+
+Rules (see readme.md)
+- 9:20 IST: pick CE and PE strikes near ~100 premium; LIMIT BUY each at premium × 1.5.
+- After fill: resting SL-SELL at 50% of the limit entry price.
+- If SL not hit: exit both legs next session at 9:25 IST.
+
+
+python -m run.main --engine-id dhan_banknifty_btst
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, time
+from types import SimpleNamespace
+from typing import Any, Dict, List, Optional, Union
+
+import pandas as pd
+
+from run.config import RUN_MODE, RunMode
+from core.strategies.base import BaseStrategy
+from core.strategies.IndiaMktMixins import IST, IndiaMktMixins
+from core.utils.expiry_resolver import ExpiryResolver
+
+ENTRY_BAR_CLOSE = time(9, 20)
+EXIT_BAR_CLOSE = time(9, 25)
+
+TARGET_PREMIUM = 100.0
+PREM_MIN = 80.0
+PREM_MAX = 120.0
+LIMIT_PREM_MULT = 1.5
+SL_OF_LIMIT = 0.5
+
+
+@dataclass(frozen=True)
+class _BtstLegMeta:
+    symbol: str
+    entry_date: date
+    option_type: str
+    ref_premium: float
+    limit_price: float
+
+
+class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
+    """
+    Bank Nifty BTST: buy CE + PE near 100 premium, SL at half of limit entry, exit T+1 9:25.
+    """
+
+    name = "BankNiftyBTST"
+    timeframe = "5"
+    required_context = ["option_chain"]
+    api = "DHAN"
+    expiryType = "MONTHLY"
+    dhan_option_security_id = "25"
+    dhan_monthly_rollover_after_calendar_day = 15
+
+    otm_strike_step = 100
+    otm_strike_count = 10
+    option_chain_strike_step = 100
+    option_chain_ideal_premium = TARGET_PREMIUM
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._meta_by_structure_id: Dict[str, _BtstLegMeta] = {}
+        self._snapshot_logged_slots: set[str] = set()
+
+    def get_warmup_period(self):
+        return 0
+
+    def _bar_close_time(self, candle: dict) -> time:
+        ts = pd.Timestamp(candle["timestamp"])
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(IST)
+        else:
+            ts = ts.tz_convert(IST)
+        bar_minutes = int(self.timeframe) if str(self.timeframe).isdigit() else 5
+        close_ts = ts + pd.Timedelta(minutes=bar_minutes)
+        return close_ts.time().replace(second=0, microsecond=0)
+
+    def _candle_close_ts_ist(self, candle: dict) -> pd.Timestamp:
+        ts = pd.Timestamp(candle["timestamp"])
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(IST)
+        else:
+            ts = ts.tz_convert(IST)
+        bar_minutes = int(self.timeframe) if str(self.timeframe).isdigit() else 5
+        return ts + pd.Timedelta(minutes=bar_minutes)
+
+    def _find_strike_snapshot_params(self, candle, ctx, option_type):
+        ts_ist = self._candle_close_ts_ist(candle)
+        snapshot_date = ts_ist.strftime("%Y-%m-%d")
+        snapshot_time = ts_ist.strftime("%H-%M")
+        slot_key = "|".join(
+            [
+                str(getattr(ctx, "symbol", "") or ""),
+                str(option_type or ""),
+                snapshot_date,
+                snapshot_time,
+            ]
+        )
+        if slot_key in self._snapshot_logged_slots:
+            return {}
+        self._snapshot_logged_slots.add(slot_key)
+        return {
+            "snapshot": True,
+            "snapshot_date": snapshot_date,
+            "snapshot_time": snapshot_time,
+            "snapshot_target": "banknifty_btst",
+        }
+
+    def _calendar_expiry_for_symbol(self, ctx) -> Optional[Union[date, str]]:
+        exp = self._expiry_from_option_chain()
+        if exp is not None:
+            return exp
+        sel = ctx.selected_expiry
+        if sel is None:
+            return None
+        if isinstance(sel, int):
+            td = pd.Timestamp(ctx.timestamp).date()
+            return ExpiryResolver.dhan_expiry_index_to_date(td, sel)
+        return sel
+
+    def _structure_id(self, symbol: str, trade_dt: date, option_type: str) -> str:
+        leg = str(option_type).upper()
+        if leg in ("CALL", "CE"):
+            leg = "CE"
+        elif leg in ("PUT", "PE"):
+            leg = "PE"
+        return f"{self.name}:{symbol}:{trade_dt}:{leg}"
+
+    def _strategy_meta(self, meta: _BtstLegMeta) -> dict:
+        return {
+            "banknifty_btst": {
+                "symbol": meta.symbol,
+                "entry_date": meta.entry_date.isoformat(),
+                "option_type": meta.option_type,
+                "ref_premium": meta.ref_premium,
+                "limit_price": meta.limit_price,
+            }
+        }
+
+    def should_evaluate(self, candle) -> bool:
+        return self._bar_close_time(candle) == ENTRY_BAR_CLOSE
+
+    def _build_entry_intent(
+        self,
+        candle: dict,
+        ctx: Any,
+        *,
+        option_type: str,
+        trade_dt: date,
+    ) -> Optional[Any]:
+        symbol = candle["symbol"]
+        structure_id = self._structure_id(symbol, trade_dt, option_type)
+
+        if ctx.position_store.has_open_structure(
+            strategy=self.name, structure_id=structure_id, tag="MAIN"
+        ):
+            return None
+
+        result = self.find_strike_in_premium_range(
+            candle,
+            ctx,
+            option_type,
+            min_prem=PREM_MIN,
+            max_prem=PREM_MAX,
+        )
+        if result is None:
+            print(f"⚠️ BankNiftyBTST: no {option_type} strike near {TARGET_PREMIUM} at {candle['timestamp']}")
+            return None
+
+        strike, ref_premium, row = result
+        if not strike:
+            return None
+
+        try:
+            strike = int(float(strike))
+        except (TypeError, ValueError):
+            return None
+        if strike % 100 != 0:
+            return None
+
+        expiry = self._calendar_expiry_for_symbol(ctx)
+        if expiry is None:
+            print(f"⚠️ BankNiftyBTST: no expiry at {candle['timestamp']}")
+            return None
+
+        trading_symbol = ExpiryResolver.build_option_symbol(
+            symbol, expiry, strike, option_type
+        )
+        inst = ctx.instrument_store.intent_creation_details(
+            trading_symbol, ctx.exchange, expiry, option_type, strike
+        )
+        if inst is None:
+            print(f"❌ BankNiftyBTST: instrument not found for {trading_symbol}")
+            return None
+
+        ref_premium = float(ref_premium or 0.0)
+        if ref_premium <= 0:
+            return None
+        limit_price = ref_premium * LIMIT_PREM_MULT
+
+        meta = _BtstLegMeta(
+            symbol=symbol,
+            entry_date=trade_dt,
+            option_type=option_type,
+            ref_premium=ref_premium,
+            limit_price=limit_price,
+        )
+        self._meta_by_structure_id[structure_id] = meta
+
+        return self.create_order_intent(
+            inst=inst,
+            side="BUY",
+            qty=self._entry_order_qty(inst),
+            price=float(limit_price),
+            order_type="LIMIT",
+            strategy=self.name,
+            candle_ts=candle["timestamp"],
+            structure_id=structure_id,
+            tag="MAIN",
+            symbol=symbol,
+            action="ENTRY",
+            metadata_extras=self._strategy_meta(meta),
+        )
+
+    def on_candle(self, candle, ctx):
+        if self._bar_close_time(candle) != ENTRY_BAR_CLOSE:
+            return None
+
+        trade_dt = pd.Timestamp(candle["timestamp"]).date()
+        intents: List[Any] = []
+
+        for opt in ("CE", "PE"):
+            leg_intent = self._build_entry_intent(
+                candle, ctx, option_type=opt, trade_dt=trade_dt
+            )
+            if leg_intent is not None:
+                intents.append(leg_intent)
+
+        return intents or None
+
+    def _build_main_sl_intent(
+        self,
+        entry_ref: Any,
+        trigger_price: float,
+        candle_ts: Any,
+        symbol: str,
+    ) -> Any:
+        return self.create_order_intent(
+            inst=entry_ref.instrument,
+            side="SELL",
+            qty=entry_ref.qty,
+            price=float(trigger_price),
+            order_type="SL-M",
+            strategy=self.name,
+            candle_ts=candle_ts,
+            structure_id=entry_ref.structure_id,
+            tag="MAIN_SL",
+            symbol=symbol,
+            action="FORCE_EXIT",
+            parent_intent_id=entry_ref.intent_id,
+            trigger_price=float(trigger_price),
+        )
+
+    def on_main_entry_filled(
+        self,
+        *,
+        ctx: Any,
+        instrument: Any,
+        structure_id: Optional[str],
+        intent_id: Optional[str],
+        candle_ts: Any,
+        metadata_extras: Any = None,
+        **kwargs: Any,
+    ) -> List[Any]:
+        del ctx, metadata_extras
+        if not structure_id or not intent_id:
+            return []
+        meta = self._meta_by_structure_id.get(structure_id)
+        if meta is None:
+            return []
+        sl_trigger = float(meta.limit_price * SL_OF_LIMIT)
+        fill_qty = kwargs.get("qty")
+        ref = SimpleNamespace(
+            instrument=instrument,
+            structure_id=structure_id,
+            intent_id=intent_id,
+            qty=self._normalize_order_qty(instrument, fill_qty),
+        )
+        return [self._build_main_sl_intent(ref, sl_trigger, candle_ts, meta.symbol)]
+
+    def should_exit(self, position, candle, ctx=None):
+        del ctx
+        if position.tag != "MAIN" or position.net_qty <= 0:
+            return False
+        meta = self._meta_by_structure_id.get(position.structure_id)
+        if meta is None:
+            return False
+        trade_dt = pd.Timestamp(candle["timestamp"]).date()
+        if trade_dt <= meta.entry_date:
+            return False
+        return self._bar_close_time(candle) == EXIT_BAR_CLOSE
+
+    def on_position_exit(self, position, candle, ctx):
+        price = (
+            self.get_option_price_at_candle(
+                candle,
+                ctx,
+                position.instrument.strike,
+                position.instrument.option_type,
+                position.instrument.expiry,
+                trading_symbol=position.instrument.trading_symbol,
+            )
+            if RUN_MODE == RunMode.BACKTEST
+            else None
+        )
+        return [
+            self.create_order_intent(
+                inst=position.instrument,
+                side="SELL",
+                qty=abs(position.net_qty),
+                price=price,
+                order_type="LIMIT",
+                strategy=self.name,
+                candle_ts=candle["timestamp"],
+                structure_id=position.structure_id,
+                tag="MAIN_EXIT",
+                symbol=candle["symbol"],
+                action="EXIT",
+            )
+        ]

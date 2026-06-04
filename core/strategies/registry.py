@@ -7,6 +7,7 @@ from core.strategies.Intraday.oneDayMagicalLine import OneDayMagicalLine
 from core.strategies.OpenIntrest.OIPostionalBuy.OIPosBuy import OIPositionalBuy
 from core.strategies.OpenIntrest.optionbuildup import OptionBuildup
 from core.strategies.Futures.Futures_EMA.Futures_EMA import FuturesEMAHighLow
+from core.strategies.BTST.BankNiftyBTST.BankNiftyBTST import BankNiftyBTST
 from core.strategies.Futures.Futures_EMA_Momentum.Futures_EMA_Momentum import (
     FuturesEMAMomentum,
 )
@@ -28,6 +29,15 @@ STRATEGY_MAP = {
             RunMode.BACKTEST,
             RunMode.LIVE,
             RunMode.PAPER,
+        ],
+    },
+    "BankNiftyBTST": {
+        "strategy": BankNiftyBTST,
+        "instrument": "OPTION",
+        "allowed_modes": [
+            RunMode.BACKTEST,
+            RunMode.PAPER,
+            RunMode.LIVE,
         ],
     },
     "MagicalLines": {

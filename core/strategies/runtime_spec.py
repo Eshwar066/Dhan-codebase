@@ -34,6 +34,39 @@ STRATEGY_RUNTIME_SPEC = {
             }
         },
     },
+    "BankNiftyBTST": {
+        RunMode.BACKTEST: {
+            "data": {
+                "option_chain": {
+                    "exchange": "NSE",
+                    "interval": "5",
+                    "segment": "OPT",
+                    "api": "DHAN",
+                    "expiry_flag": "MONTHLY",
+                }
+            }
+        },
+        RunMode.PAPER: {
+            "data": {
+                "option_chain": {
+                    "exchange": "NSE",
+                    "interval": "5",
+                    "segment": "OPT",
+                    "api": "DHAN",
+                    "expiry_flag": "MONTHLY",
+                }
+            }
+        },
+        RunMode.LIVE: {
+            "data": {
+                "option_chain": {
+                    "exchange": "NSE",
+                    "interval": "1",
+                    "segment": "OPT",
+                }
+            }
+        },
+    },
     "OneDayMagicalLine": {
         RunMode.BACKTEST: {
             "data": {

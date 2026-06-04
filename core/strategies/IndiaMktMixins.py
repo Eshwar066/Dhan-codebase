@@ -69,6 +69,10 @@ class IndiaMktMixins:
         lots = int(getattr(self, "order_qty_lots", ORDER_QTY_LOTS) or 1)
         return max(1, lots)
 
+    def _dhan_option_security_id(self) -> str:
+        """Dhan rolling-option ``securityId`` (NIFTY=13, BANKNIFTY=25). Override on strategy class."""
+        return str(getattr(self, "dhan_option_security_id", None) or "13")
+
     @staticmethod
     def _order_qty_in_lots(inst, qty: Any) -> int:
         """Normalize qty to whole lots: values ≥ lot_size that divide evenly are treated as units."""
@@ -313,7 +317,7 @@ class IndiaMktMixins:
             "instrument": "OPTIDX",
             "exchangeSegment": "NSE_FNO",
             "expiry_flag": "MONTH",
-            "securityId": "13",
+            "securityId": self._dhan_option_security_id(),
         }
 
         chain = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
@@ -968,7 +972,7 @@ class IndiaMktMixins:
                     "strike": strike_param,
                     "option_type": option_type,
                     "exchangeSegment": "NSE_FNO",
-                    "securityId": "13",
+                    "securityId": self._dhan_option_security_id(),
                 }
             )
         extra_snapshot_params = self._find_strike_snapshot_params(
@@ -1057,7 +1061,7 @@ class IndiaMktMixins:
                 "instrument": "OPTIDX",
                 "exchangeSegment": "NSE_FNO",
                 "expiry_flag": "MONTH",
-                "securityId": "13",
+                "securityId": self._dhan_option_security_id(),
             }
             if isinstance(extra_snapshot_params, dict) and extra_snapshot_params:
                 params.update(extra_snapshot_params)

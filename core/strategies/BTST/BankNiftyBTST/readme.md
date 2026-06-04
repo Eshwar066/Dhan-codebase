@@ -1,5 +1,28 @@
-Rules: Indian Market
-	1. At 9:20AM, search for near to 100premium banknifty strike and place a limit order  for both CE and PE
-		Limit price = premium + 50per of premium (i.e.. Of premium is 100, limit price is 150)
-	2. Once the order executed place an SL at 50per of premium i.e.. If limit price is 150, sl is at 75
-	3. If SL is not triggered exit next day at 9:25
+# Bank Nifty BTST
+
+## Rules (Indian market)
+
+1. **9:20 IST** — find Bank Nifty CE and PE strikes near **~100 premium**; place **LIMIT BUY** on both legs at **premium × 1.5** (e.g. premium 100 → limit 150).
+2. **After fill** — arm **SL-M SELL** at **50% of limit price** (e.g. limit 150 → SL 75).
+3. **If SL not hit** — exit next session at **9:25 IST** (BTST square-off).
+
+## Run
+
+```powershell
+python -m run.main --engine-id dhan_banknifty_btst
+```
+
+## Wiring
+
+| Item | Location |
+|------|----------|
+| Strategy | `core/strategies/BTST/BankNiftyBTST/BankNiftyBTST.py` |
+| Registry | `STRATEGY_MAP["BankNiftyBTST"]` |
+| Runtime spec | 5m option chain (backtest/paper), live 1m |
+| Engine job | `run/config.py` → `dhan_banknifty_btst` |
+| Symbol | `BANKNIFTY` |
+| Dhan securityId | `25` (via `dhan_option_security_id` on strategy class) |
+
+## Backtest data
+
+Uses DHAN expired option CSVs or rolling-option API (same as LEAPS / NIML). Prefer local **5m** bars under `DHAN_EXPIRED_OPTION_CHAIN_ROOT` for Bank Nifty monthly series.
