@@ -16,6 +16,8 @@ try:
 except ImportError:
     round_json_floats = None  # type: ignore
 
+from core.utils import indicator_history as ind_hist
+
 
 class IndicatorManager:
     """
@@ -26,7 +28,8 @@ class IndicatorManager:
 
     Bootstrap (L2 candles log → L2b RSI history → L3 API):
     - Primary: closed candles from ``logs/{strategy}/{engine_id}_candles.log`` (single append-only file).
-    - Secondary: close-only bars from ``{strategy}_rsi_history.log`` when the candle log is short.
+    - Secondary: ``logs/indicators/{symbol}/{tf}/indicator_history.jsonl`` (and legacy
+      ``{strategy}_rsi_history.log``) when the candle log is short.
     - ``get_intraday`` only when both logs are missing or insufficient; same-day API rows are stripped
       so today's OHLC comes only from closed ``*_candles.log`` lines.
     - RSI history on disk is treated as already seeded on restart (append-only ``live_append``).
@@ -73,6 +76,23 @@ class IndicatorManager:
             return bool(fn())
         except Exception:
             return False
+
+    @staticmethod
+    def _strategy_persisted_indicator_keys(strategy: Any) -> List[str]:
+        fn = getattr(strategy, "persisted_indicator_keys", None)
+        if callable(fn):
+            try:
+                keys = list(fn() or [])
+                return [str(k) for k in keys if k]
+            except Exception:
+                return []
+        return []
+
+    @classmethod
+    def _strategy_uses_indicator_history(cls, strategy: Any) -> bool:
+        return bool(cls._strategy_persisted_indicator_keys(strategy)) or cls._strategy_requires_rsi(
+            strategy
+        )
 
     @staticmethod
     def _compute_rsi_columns(df: Any, period: int = 14) -> Any:
@@ -237,106 +257,49 @@ class IndicatorManager:
     def _hydrate_rsi_session_state_from_disk(
         self, strategy_id: str, symbol: str, tf: str
     ) -> None:
-        """Mark RSI history streams that already exist on disk so restarts only append new bars."""
-        stream_key = (strategy_id, symbol, tf)
+        """Mark indicator history streams on disk so restarts only append new bars."""
+        stream_key = (symbol, tf)
         if stream_key in self._rsi_session_hydrated:
             return
         self._rsi_session_hydrated.add(stream_key)
-
-        path = self._rsi_history_path(strategy_id)
-        if not os.path.isfile(path):
-            return
-
-        sym_u = str(symbol or "").strip().upper()
-        tf_s = str(tf or "").strip()
-        found = 0
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    s = line.strip()
-                    if not s:
-                        continue
-                    try:
-                        payload = json.loads(s)
-                    except Exception:
-                        continue
-                    if str(payload.get("symbol") or "").strip().upper() != sym_u:
-                        continue
-                    if str(payload.get("timeframe") or "").strip() != tf_s:
-                        continue
-                    ist_ts = str(payload.get("candle_timestamp_ist") or "").strip()
-                    if not ist_ts:
-                        continue
-                    if "T" in ist_ts:
-                        ist_ts = ist_ts.replace("T", " ")[:16]
-                    source = str(payload.get("source") or "historical_seed")
-                    key = (strategy_id, symbol, tf, ist_ts, source)
-                    self._rsi_logged_keys.add(key)
-                    found += 1
-        except Exception:
-            logger.exception("Failed hydrating RSI session state: %s", path)
-            return
-
-        if found > 0:
-            self._rsi_seeded_streams.add(stream_key)
+        found = ind_hist.hydrate_session_keys_from_disk(
+            symbol,
+            tf,
+            strategy_id,
+            self._rsi_logged_keys,
+            self._rsi_seeded_streams,
+            log_root=self._rsi_log_root,
+        )
+        if found <= 0:
+            self._rsi_session_hydrated.discard(stream_key)
 
     def _load_rsi_history_rows(
         self, strategy_id: str, symbol: str, tf: str, max_rows: int
     ) -> List[Dict[str, Any]]:
-        """Load recent rows from ``{strategy}_rsi_history.log`` for RSI warmup (close-only bars)."""
-        import math
-
-        sym_u = str(symbol or "").strip().upper()
-        tf_s = str(tf or "").strip()
-        path = self._rsi_history_path(strategy_id)
-        if not os.path.isfile(path):
-            return []
+        """Load recent bars from shared indicator history (+ legacy RSI log)."""
+        merged = ind_hist.load_indicator_history_rows(
+            symbol,
+            tf,
+            max_rows=max_rows,
+            log_root=self._rsi_log_root,
+            strategy_id=strategy_id,
+        )
         rows: List[Dict[str, Any]] = []
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    s = line.strip()
-                    if not s:
-                        continue
-                    try:
-                        payload = json.loads(s)
-                    except Exception:
-                        continue
-                    if str(payload.get("symbol") or "").strip().upper() != sym_u:
-                        continue
-                    if str(payload.get("timeframe") or "").strip() != tf_s:
-                        continue
-                    bar_dt = self._parse_bar_timestamp_ist_to_aware(payload.get("candle_timestamp_ist"))
-                    if bar_dt is None:
-                        continue
-                    close = payload.get("close")
-                    try:
-                        c = float(close)
-                        if math.isnan(c):
-                            continue
-                    except (TypeError, ValueError):
-                        continue
-                    ts_utc = bar_dt.astimezone(dt.timezone.utc)
-                    ex = str(payload.get("exchange") or self._live_exchange or "INDEX")
-                    rows.append(
-                        {
-                            "timestamp": ts_utc,
-                            "open": c,
-                            "high": c,
-                            "low": c,
-                            "close": c,
-                            "volume": 0.0,
-                            "symbol": sym_u,
-                            "exchange": ex,
-                        }
-                    )
-        except Exception:
-            logger.exception("Failed reading RSI history log: %s", path)
-            return []
-        rows = self._dedupe_rows_by_timestamp(rows)
-        if len(rows) > max_rows:
-            rows = rows[-max_rows:]
-        return rows
+        for item in merged:
+            row = {
+                "timestamp": item["timestamp"],
+                "open": item["open"],
+                "high": item["high"],
+                "low": item["low"],
+                "close": item["close"],
+                "volume": item.get("volume", 0.0),
+                "symbol": item["symbol"],
+                "exchange": item.get("exchange") or self._live_exchange or "INDEX",
+            }
+            for k, v in (item.get("indicators") or {}).items():
+                row[k] = v
+            rows.append(row)
+        return self._dedupe_rows_by_timestamp(rows)
 
     def _load_candles_from_rsi_history(
         self, strategy_id: str, symbol: str, tf: str, tail_rows: int
@@ -531,67 +494,34 @@ class IndicatorManager:
         symbol: str,
         tf: str,
         df: Any,
+        strategy: Any = None,
     ) -> None:
-        if df is None or len(df) == 0:
+        """Append indicator snapshot row(s) to shared history (symbol + timeframe)."""
+        if df is None or len(df) == 0 or "timestamp" not in df.columns:
             return
-        if "timestamp" not in df.columns or "rsi" not in df.columns:
+        keys = self._strategy_persisted_indicator_keys(strategy) if strategy else []
+        if not keys and "rsi" in df.columns:
+            keys = ["rsi", "prev_rsi"]
+        if not keys:
             return
 
         self._hydrate_rsi_session_state_from_disk(strategy_id, symbol, tf)
-
-        strategy_dir = str(strategy_id or "GLOBAL").strip() or "GLOBAL"
-        log_dir = os.path.join(self._rsi_log_root, strategy_dir)
-        os.makedirs(log_dir, exist_ok=True)
-        path = os.path.join(log_dir, f"{strategy_dir}_rsi_history.log")
-        stream_key = (strategy_id, symbol, tf)
+        stream_key = (symbol, tf)
         seeded = stream_key in self._rsi_seeded_streams
-        # After hydration, only append the latest bar (never re-dump full history on restart).
         rows = [df.iloc[-1]] if seeded else [r for _, r in df.iterrows()]
+        source = "live_append" if seeded else "historical_seed"
 
         for row in rows:
-            ts = row.get("timestamp")
-            if ts is None:
-                continue
-
-            if hasattr(ts, "to_pydatetime"):
-                ts = ts.to_pydatetime()
-
-            ist_ts = self._to_ist_iso(ts)
-
-            if not ist_ts:
-                continue
-
-            # remove seconds and timezone
-            ist_ts = dt.datetime.fromisoformat(ist_ts).strftime("%Y-%m-%d %H:%M")
-
-            source = "live_append" if seeded else "historical_seed"
-            key = (strategy_id, symbol, tf, ist_ts, source)
-
-            if key in self._rsi_logged_keys:
-                continue
-            self._rsi_logged_keys.add(key)
-            payload = {
-                # "strategy_id": strategy_id,
-                "symbol": symbol,
-                "timeframe": tf,
-                "source": source,
-                "candle_timestamp_ist": ist_ts,
-                # "open": row.get("open"),
-                # "high": row.get("high"),
-                # "low": row.get("low"),
-                "close": row.get("close"),
-                "rsi": row.get("rsi"),
-                "prev_rsi": row.get("prev_rsi"),
-            }
-            try:
-                pl = payload
-                if round_json_floats is not None:
-                    pl = round_json_floats(payload)
-                with open(path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(pl, default=str) + "\n")
-            except Exception:
-                logger.exception("Failed writing RSI history log: %s", path)
-                return
+            ind_hist.append_indicator_history_row(
+                symbol,
+                tf,
+                row,
+                keys,
+                source=source,
+                log_root=self._rsi_log_root,
+                logged_keys=self._rsi_logged_keys,
+                round_fn=round_json_floats,
+            )
         self._rsi_seeded_streams.add(stream_key)
 
     def _load_today_live_candles(
@@ -723,7 +653,7 @@ class IndicatorManager:
                 ok, reason = self._validate_log_candles(df_rsi, tf, exchange, window)
                 if ok:
                     df = df_rsi.copy()
-                    source = "rsi_history"
+                    source = "indicator_history"
                 else:
                     logger.info(
                         "BOOTSTRAP_RSI_HISTORY_REJECT symbol=%s tf=%s strategy=%s reason=%s rows=%s need=%s",
@@ -797,9 +727,9 @@ class IndicatorManager:
                 len(df),
                 window,
             )
-        elif source == "rsi_history":
+        elif source == "indicator_history":
             logger.info(
-                "BOOTSTRAP_PRIMARY_RSI_HISTORY symbol=%s tf=%s strategy=%s rows=%s window=%s",
+                "BOOTSTRAP_PRIMARY_INDICATOR_HISTORY symbol=%s tf=%s strategy=%s rows=%s window=%s",
                 symbol,
                 tf,
                 strategy_id,
@@ -823,7 +753,7 @@ class IndicatorManager:
         sector = str(self._live_sector or "NO")
         strategy_id = str(getattr(strategy, "name", "unknown_strategy"))
         window = self.indicator_window_size(strategy)
-        if self._strategy_requires_rsi(strategy):
+        if self._strategy_uses_indicator_history(strategy):
             self._hydrate_rsi_session_state_from_disk(strategy_id, symbol, tf)
         base_state = self._bootstrap_base_candle_state(
             symbol, tf, exchange, sector, window, strategy_id=strategy_id
@@ -959,7 +889,7 @@ class IndicatorManager:
             if not cache_hit:
                 compute_start = time.time()
                 work_df = df.copy()
-                if self._strategy_requires_rsi(strategy):
+                if self._strategy_uses_indicator_history(strategy):
                     work_df = self._merge_rsi_history_into_base_df(
                         work_df,
                         strategy_id=str(getattr(strategy, "name", "unknown_strategy")),
@@ -1020,6 +950,15 @@ class IndicatorManager:
                     symbol=symbol,
                     tf=tf,
                     df=df,
+                    strategy=strategy,
+                )
+            elif self._strategy_persisted_indicator_keys(strategy):
+                self._append_rsi_history_log(
+                    strategy_id=str(getattr(strategy, "name", "unknown_strategy")),
+                    symbol=symbol,
+                    tf=tf,
+                    df=df,
+                    strategy=strategy,
                 )
             strategy_state = {"df": df, "base_sig": base_sig}
             self._strategy_indicator_state[strategy_key] = strategy_state

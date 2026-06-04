@@ -5,6 +5,7 @@ from datetime import date
 from run.config import RUN_MODE, RunMode
 from core.strategies.base import BaseStrategy
 from core.strategies.IndiaMktMixins import IST, IndiaMktMixins
+from core.strategies.indicator_helpers import default_persisted_keys_for_rsi
 from core.utils.expiry_resolver import ExpiryResolver
 
 class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
@@ -42,6 +43,9 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
 
     def requires_live_rsi_patch(self) -> bool:
         return True
+
+    def persisted_indicator_keys(self):
+        return default_persisted_keys_for_rsi()
 
     def resolve_hedge_expiry(self, trade_date: date, parent_expiry=None):
         """

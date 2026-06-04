@@ -9,9 +9,11 @@ Run (use ``python3`` on Debian/Ubuntu; use a venv — system Python is PEP 668 "
     pip install yfinance pandas numpy TA-Lib
     python3 utils/yfinance/yfinance_nifty_rsi.py
 
-To refresh ``logs/LEAPS_RSI/LEAPS_RSI_rsi_history.log`` (keeps ``live_append`` rows)::
+To refresh shared indicator history (keeps ``live_append`` rows)::
 
     python3 utils/yfinance/refresh_leaps_rsi_from_yahoo.py
+    # -> logs/indicators/NIFTY/60/indicator_history.jsonl (RSI)
+    # -> logs/indicators/NIFTY/15/indicator_history.jsonl (Bollinger)
 
 If a project ``.venv`` already exists, only ``activate`` + ``pip install yfinance`` (and deps) is needed.
 """
@@ -45,14 +47,17 @@ def _flatten_yfinance_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _fetch_hourly_ohlc(symbol: str, period: str) -> pd.DataFrame:
+def _fetch_interval_ohlc(symbol: str, period: str, interval: str = "60m") -> pd.DataFrame:
     """
-    Fetch hourly OHLC from Yahoo. Prefer ``Ticker.history`` — recent yfinance builds
-    often return empty from ``yf.download`` for ``^NSEI`` ("possibly delisted").
+    Fetch OHLC from Yahoo at ``interval`` (e.g. ``60m``, ``15m``).
+    Prefer ``Ticker.history`` — recent yfinance builds often return empty from
+    ``yf.download`` for ``^NSEI`` ("possibly delisted").
     """
     raw = pd.DataFrame()
     try:
-        hist = yf.Ticker(symbol).history(period=period, interval="60m", auto_adjust=False)
+        hist = yf.Ticker(symbol).history(
+            period=period, interval=interval, auto_adjust=False
+        )
         if hist is not None and not hist.empty:
             raw = hist
     except Exception:
@@ -62,7 +67,7 @@ def _fetch_hourly_ohlc(symbol: str, period: str) -> pd.DataFrame:
             dl = yf.download(
                 tickers=symbol,
                 period=period,
-                interval="60m",
+                interval=interval,
                 auto_adjust=False,
                 progress=False,
             )
@@ -73,6 +78,39 @@ def _fetch_hourly_ohlc(symbol: str, period: str) -> pd.DataFrame:
     if raw is None or raw.empty:
         return pd.DataFrame()
     return _flatten_yfinance_columns(raw)
+
+
+def _fetch_hourly_ohlc(symbol: str, period: str) -> pd.DataFrame:
+    """Backward-compatible alias for 60m OHLC."""
+    return _fetch_interval_ohlc(symbol, period, interval="60m")
+
+
+def _prepare_yahoo_frame(raw: pd.DataFrame, tail: int | None) -> pd.DataFrame:
+    if raw.empty:
+        return pd.DataFrame()
+    df = raw.copy()
+    if tail is not None:
+        df = df.tail(int(tail)).copy()
+    if isinstance(df.index, pd.DatetimeIndex) or df.index.name in ("Datetime", "Date"):
+        df = df.reset_index()
+    else:
+        df = df.reset_index(drop=True)
+    time_candidates = ("Datetime", "Date", "Index")
+    time_col = next((n for n in time_candidates if n in df.columns), None)
+    if time_col is None:
+        for c in df.columns:
+            if pd.api.types.is_datetime64_any_dtype(df[c]):
+                time_col = c
+                break
+    if time_col is None:
+        raise ValueError(f"No datetime column in Yahoo OHLC frame: {list(df.columns)}")
+    df = df.rename(columns={time_col: "Datetime"})
+    dt = pd.to_datetime(df["Datetime"], errors="coerce")
+    if getattr(dt.dt, "tz", None) is None:
+        df["Datetime_IST"] = dt.dt.tz_localize("Asia/Kolkata")
+    else:
+        df["Datetime_IST"] = dt.dt.tz_convert("Asia/Kolkata")
+    return df
 
 
 def fetch_nifty_hourly_with_rsi(
@@ -87,40 +125,44 @@ def fetch_nifty_hourly_with_rsi(
     Pass ``tail=None`` to keep every bar returned for the period.
     ``Datetime`` column is converted to Asia/Kolkata as ``Datetime_IST``.
     """
-    raw = _fetch_hourly_ohlc(symbol, period)
-    if raw.empty:
-        return pd.DataFrame()
-
-    df = raw.copy()
-    if tail is not None:
-        df = df.tail(int(tail)).copy()
-    # Datetime lives on the index from Ticker.history — do not drop it.
-    if isinstance(df.index, pd.DatetimeIndex) or df.index.name in ("Datetime", "Date"):
-        df = df.reset_index()
-    else:
-        df = df.reset_index(drop=True)
-
-    time_candidates = ("Datetime", "Date", "Index")
-    time_col = next((n for n in time_candidates if n in df.columns), None)
-    if time_col is None:
-        for c in df.columns:
-            if pd.api.types.is_datetime64_any_dtype(df[c]):
-                time_col = c
-                break
-    if time_col is None:
-        raise ValueError(f"No datetime column in Yahoo OHLC frame: {list(df.columns)}")
-    df = df.rename(columns={time_col: "Datetime"})
+    raw = _fetch_interval_ohlc(symbol, period, interval="60m")
+    df = _prepare_yahoo_frame(raw, tail)
+    if df.empty:
+        return df
 
     close = pd.to_numeric(df["Close"], errors="coerce").astype(float)
     df["RSI_14"] = talib.RSI(close.values, timeperiod=int(rsi_period))
     df["PREV_RSI"] = df["RSI_14"].shift(1)
+    return df
 
-    dt = pd.to_datetime(df["Datetime"], errors="coerce")
-    if getattr(dt.dt, "tz", None) is None:
-        df["Datetime_IST"] = dt.dt.tz_localize("Asia/Kolkata")
-    else:
-        df["Datetime_IST"] = dt.dt.tz_convert("Asia/Kolkata")
 
+def fetch_nifty_15m_with_bollinger(
+    *,
+    symbol: str = SYMBOL,
+    period: str = "60d",
+    tail: int | None = None,
+    bb_period: int = 20,
+    bb_std: float = 2.0,
+) -> pd.DataFrame:
+    """Download 15m NIFTY bars and add Bollinger columns (bb_upper, bb_mid, bb_lower)."""
+    from core.strategies.indicator_helpers import add_bollinger_bands
+
+    raw = _fetch_interval_ohlc(symbol, period, interval="15m")
+    df = _prepare_yahoo_frame(raw, tail)
+    if df.empty:
+        return df
+    work = df.rename(
+        columns={
+            "Open": "open",
+            "High": "high",
+            "Low": "low",
+            "Close": "close",
+        }
+    )
+    work = add_bollinger_bands(work, period=bb_period, std_dev=bb_std)
+    df["bb_upper"] = work["bb_upper"]
+    df["bb_mid"] = work["bb_mid"]
+    df["bb_lower"] = work["bb_lower"]
     return df
 
 

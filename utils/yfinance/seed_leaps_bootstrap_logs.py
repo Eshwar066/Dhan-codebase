@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Rebuild ``logs/LEAPS_RSI/dhan_leaps_rsi_candles.log`` (150+ valid 1h INDEX rows) and
-refresh the tail of ``logs/LEAPS_RSI/LEAPS_RSI_rsi_history.log`` so ``IndicatorManager``
+refresh ``logs/indicators/NIFTY/60/indicator_history.jsonl`` (and legacy RSI log if needed) so ``IndicatorManager``
 can bootstrap from logs only (no intraday API) and RSI merge has a full session through
 the last 15:15 bar.
 

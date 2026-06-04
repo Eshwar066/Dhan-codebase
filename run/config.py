@@ -49,7 +49,7 @@ ENGINE_JOBS = [
             "chat_id": os.getenv("TELEGRAM_LEAPS_CHAT_ID", "1021479950"),
         },
         
-        "strategies": ["LEAPS_RSI",], #"NiftyIntradayMagicalLine"
+        "strategies": ["LEAPS_RSI"],
         "live": {"exchange": "INDEX", "sector": "YES", "rsi": "YES"},
         # "live": {"exchange": "MCX", "sector": "NO", "rsi": "YES"},
         "backtest": {
@@ -70,7 +70,7 @@ ENGINE_JOBS = [
         "ORDER_QTY_LOTS": 1,
         "symbols": ["NIFTY"],
         "exchange": "NSE",
-        "strategies": ["OIPositionalBuy","NiftyIntradayMagicalLine"],
+        "strategies": ["OIPositionalBuy","NiftyIntradayMagicalLine","FuturesEMAHighLow"],
         "live": {"exchange": "INDEX", "sector": "YES"},
         "telegram": {
             "bot_token": os.getenv(

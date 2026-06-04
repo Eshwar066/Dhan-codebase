@@ -2,6 +2,10 @@ import pandas as pd
 from typing import TYPE_CHECKING, Optional
 from core.strategies.base import BaseStrategy
 from core.strategies.IndiaMktMixins import IndiaMktMixins
+from core.strategies.indicator_helpers import (
+    add_ema_high_low,
+    default_persisted_keys_for_ema_high_low,
+)
 from datetime import datetime, timedelta
 import pdb
 
@@ -41,9 +45,13 @@ class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
         return self.ema_period * 3
 
     def prepare_indicators(self, df):
-        df["ema_high"] = df["high"].ewm(span=self.ema_period, adjust=False).mean()
-        df["ema_low"] = df["low"].ewm(span=self.ema_period, adjust=False).mean()
-        return df
+        return add_ema_high_low(df, period=self.ema_period)
+
+    def persisted_indicator_keys(self):
+        return default_persisted_keys_for_ema_high_low()
+
+    def shared_indicator_signature(self) -> str:
+        return f"ema_high_low_{self.ema_period}"
 
     # ----------------- Internal Helper -----------------
 

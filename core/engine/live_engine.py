@@ -105,6 +105,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             str(getattr(s, "name", f"strategy_{idx}")): s
             for idx, s in enumerate(self.strategies)
         }
+        self._engine_timeframes = self._collect_engine_timeframes()
         self.candle_service = candle_service
         self.order_router = order_router
         self.position_manager = position_manager
@@ -1184,6 +1185,30 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             self._ensure_strategy_worker(strategy)
 
 
+    @staticmethod
+    def _collect_engine_timeframes_from_strategies(strategies: List[Any], primary: Any) -> List[str]:
+        seen: set[str] = set()
+        out: List[str] = []
+        for s in strategies:
+            tf_s = str(getattr(s, "timeframe", "") or "").strip()
+            if tf_s and tf_s not in seen:
+                seen.add(tf_s)
+                out.append(tf_s)
+        if not out:
+            p = str(getattr(primary, "timeframe", "") or "").strip()
+            if p:
+                out.append(p)
+        return out
+
+    def _collect_engine_timeframes(self) -> List[str]:
+        return self._collect_engine_timeframes_from_strategies(
+            self.strategies, self.strategy
+        )
+
+    @staticmethod
+    def _symbol_tf_eval_key(symbol: str, timeframe: str) -> str:
+        return f"{symbol}|{timeframe}"
+
     def _enrich_candle_for_strategy(self, strategy: Any, candle: Dict[str, Any]) -> Dict[str, Any]:
         return self.indicator_manager.enrich_candle_for_strategy(
             strategy=strategy,
@@ -1191,10 +1216,15 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             candle_bucket_fn=self._candle_bucket_start_unix,
         )
 
-    def _evaluate_strategies_parallel(self, candle: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _evaluate_strategies_parallel(
+        self, candle: Dict[str, Any], timeframe: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         response_q: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         expected = 0
+        tf_filter = str(timeframe or "").strip() if timeframe is not None else ""
         for strategy in self.strategies:
+            if tf_filter and str(getattr(strategy, "timeframe", "") or "").strip() != tf_filter:
+                continue
             strategy_candle = self._enrich_candle_for_strategy(strategy, candle)
             if not strategy.should_evaluate(strategy_candle):
                 continue
@@ -1398,7 +1428,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 self._dhan_order_ws_bound = True
             except Exception:
                 self._dhan_order_ws_bound = False
-        tf = getattr(self.strategy, "timeframe", None)
+        primary_tf = getattr(self.strategy, "timeframe", None)
+        engine_timeframes = list(self._engine_timeframes or [])
+        if not engine_timeframes and primary_tf:
+            engine_timeframes = [str(primary_tf)]
         use_feed = self.realtime_feed and self.realtime_feed.is_connected()
         
         risk_manager = getattr(self.order_router, "risk", None)
@@ -1432,7 +1465,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     self._export_eod(self._last_eod_date)
                 self._last_eod_date = today
 
-            if tf:
+            if engine_timeframes:
                 use_aggregator = (
                     use_feed
                     and self.tick_queue is not None
@@ -1442,6 +1475,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     self._drain_tick_queue()
                     self._maybe_flush_session_end_candles()
 
+            for tf in engine_timeframes:
+                if not tf:
+                    continue
                 for symbol in self.symbols:
                     candle = None
                     candle_source = "none"
@@ -1452,9 +1488,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
 
                         if candle:
                             self._last_candle_timestamp[symbol] = time.time()
+                        eval_ts_key = self._symbol_tf_eval_key(symbol, str(tf))
                         if candle and candle.get(
                             "bucket_ts"
-                        ) == self._last_evaluated_candle_ts.get(symbol):
+                        ) == self._last_evaluated_candle_ts.get(eval_ts_key):
                             logger.debug(
                                 "Skip %s: same candle bucket_ts=%s (waiting for new bar)",
                                 symbol,
@@ -1578,13 +1615,15 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     eval_key = candle.get("bucket_ts")
                     if eval_key is None:
                         eval_key = eval_bucket
+                    eval_ts_key = self._symbol_tf_eval_key(symbol, str(tf))
                     if (
                         eval_key is not None
-                        and eval_key == self._last_evaluated_candle_ts.get(symbol)
+                        and eval_key == self._last_evaluated_candle_ts.get(eval_ts_key)
                     ):
                         logger.debug(
-                            "Skip %s: already evaluated candle key=%s",
+                            "Skip %s tf=%s: already evaluated candle key=%s",
                             symbol,
+                            tf,
                             eval_key,
                         )
                         continue
@@ -1645,7 +1684,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                                 eval_bucket,
                             )
                     if eval_key is not None:
-                        self._last_evaluated_candle_ts[symbol] = eval_key
+                        self._last_evaluated_candle_ts[eval_ts_key] = eval_key
                     if self.engine_logger:
                         queue_size = None
                         try:
@@ -1694,7 +1733,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         )
 
                     self._enrich_candle_depth(symbol, candle) 
-                    for eval_result in self._evaluate_strategies_parallel(candle):
+                    for eval_result in self._evaluate_strategies_parallel(candle, timeframe=tf):
                         eval_strategy = eval_result.get("strategy")
                         eval_strategy_name = str(
                             getattr(eval_strategy, "name", "unknown_strategy")
