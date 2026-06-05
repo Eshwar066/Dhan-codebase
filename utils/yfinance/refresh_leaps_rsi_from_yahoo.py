@@ -58,6 +58,7 @@ from core.strategies.indicator_helpers import add_ema_high_low  # noqa: E402
 from core.utils.indicator_history import (  # noqa: E402
     SCHEMA_VERSION,
     indicator_history_path,
+    is_nse_60m_bar_ist,
     legacy_rsi_history_path,
 )
 from utils.yfinance.yfinance_nifty_rsi import (  # noqa: E402
@@ -67,7 +68,6 @@ from utils.yfinance.yfinance_nifty_rsi import (  # noqa: E402
 
 LIVE_SOURCE = "live_append"
 REFRESH_SOURCE = "yahoo_refresh"
-NSE_60_BAR_MINUTES = {(9, 15), (10, 15), (11, 15), (12, 15), (13, 15), (14, 15), (15, 15)}
 
 
 def _normalize_ist_key(ts: str) -> str:
@@ -158,9 +158,11 @@ def _load_history(path: str) -> Tuple[Dict[str, dict], List[dict]]:
 
 
 def _is_nse_60m_bar(dt_ist: pd.Timestamp) -> bool:
-    if dt_ist.weekday() >= 5:
-        return False
-    return (int(dt_ist.hour), int(dt_ist.minute)) in NSE_60_BAR_MINUTES
+    if hasattr(dt_ist, "to_pydatetime"):
+        dt_ist = dt_ist.to_pydatetime()
+    if dt_ist.tzinfo is None:
+        dt_ist = dt_ist.replace(tzinfo=__import__("zoneinfo").ZoneInfo("Asia/Kolkata"))
+    return is_nse_60m_bar_ist(dt_ist)
 
 
 def _is_nse_15m_bar(dt_ist: pd.Timestamp) -> bool:
@@ -212,6 +214,19 @@ def _build_schema_row(
     }
 
 
+def _ohlc_from_row(row: Any, field: str) -> Optional[float]:
+    """Read OHLC from a row that may use ``Open``/``Close`` or ``open``/``close``."""
+    key = str(field or "").strip().lower()
+    if not key:
+        return None
+    titled = key.capitalize()
+    for col in (key, titled, key.upper()):
+        val = _float_or_none(row.get(col) if hasattr(row, "get") else None)
+        if val is not None:
+            return val
+    return None
+
+
 def _yahoo_rows_60(
     *,
     period: str,
@@ -219,7 +234,7 @@ def _yahoo_rows_60(
     timeframe: str,
     rsi_period: int,
     ema_period: int = 8,
-) -> Dict[str, dict]:
+) -> Tuple[Dict[str, dict], Dict[str, int]]:
     df = fetch_nifty_hourly_with_rsi(
         symbol=symbol,
         period=period,
@@ -227,13 +242,15 @@ def _yahoo_rows_60(
         rsi_period=rsi_period,
     )
     out: Dict[str, dict] = {}
+    stats = {"fetched": 0, "skipped_nse_time": 0, "skipped_rsi": 0, "skipped_close": 0}
     if df is None or df.empty:
-        return out
+        return out, stats
 
     work = df.rename(
         columns={"Open": "open", "High": "high", "Low": "low", "Close": "close"}
     )
     work = add_ema_high_low(work, period=ema_period)
+    stats["fetched"] = len(work)
 
     for _, row in work.iterrows():
         dt = row.get("Datetime_IST")
@@ -245,14 +262,17 @@ def _yahoo_rows_60(
         else:
             dt_ist = dt_ist.tz_convert("Asia/Kolkata")
         if not _is_nse_60m_bar(dt_ist):
+            stats["skipped_nse_time"] += 1
             continue
         key = dt_ist.strftime("%Y-%m-%d %H:%M")
         rsi = _float_or_none(row.get("RSI_14"))
         if rsi is None:
+            stats["skipped_rsi"] += 1
             continue
         prev = _float_or_none(row.get("PREV_RSI"))
-        close = _float_or_none(row.get("Close"))
+        close = _ohlc_from_row(row, "close")
         if close is None:
+            stats["skipped_close"] += 1
             continue
         indicators: Dict[str, Any] = {"rsi": rsi, "prev_rsi": prev}
         ema_h = _float_or_none(row.get("ema_high"))
@@ -265,13 +285,13 @@ def _yahoo_rows_60(
             symbol=symbol,
             timeframe=timeframe,
             ist_key=key,
-            o=_float_or_none(row.get("open")),
-            h=_float_or_none(row.get("high")),
-            l=_float_or_none(row.get("low")),
+            o=_ohlc_from_row(row, "open"),
+            h=_ohlc_from_row(row, "high"),
+            l=_ohlc_from_row(row, "low"),
             c=close,
             indicators=indicators,
         )
-    return out
+    return out, stats
 
 
 def backfill_ema_on_indicator_history(
@@ -474,7 +494,7 @@ def refresh_indicator_history_file(
         )
         label = "bollinger"
     else:
-        yahoo = _yahoo_rows_60(
+        yahoo, yahoo_stats = _yahoo_rows_60(
             period=period,
             symbol="^NSEI" if symbol.upper() in ("NIFTY", "^NSEI") else symbol,
             timeframe=timeframe,
@@ -484,6 +504,23 @@ def refresh_indicator_history_file(
         label = "rsi"
 
     if not yahoo:
+        if mode == "60" and yahoo_stats.get("fetched", 0) == 0:
+            raise SystemExit(
+                "Yahoo Finance returned no hourly OHLC data for ^NSEI "
+                f"(period={period}). This is usually a network/blocking issue "
+                "(DNS/ad-block on fc.yahoo.com) or transient Yahoo rate limits — "
+                "not the NSE bar-time filter. "
+                f"File was not modified: {hist_path}"
+            )
+        if mode == "60":
+            raise SystemExit(
+                "Yahoo hourly data was fetched but produced 0 NSE 60m indicator rows "
+                f"(fetched={yahoo_stats.get('fetched', 0)} "
+                f"skipped_nse_time={yahoo_stats.get('skipped_nse_time', 0)} "
+                f"skipped_rsi={yahoo_stats.get('skipped_rsi', 0)} "
+                f"skipped_close={yahoo_stats.get('skipped_close', 0)}). "
+                f"File was not modified: {hist_path}"
+            )
         raise SystemExit(
             f"Yahoo Finance returned no NSE {timeframe}m bars for {label} after filtering. "
             "Check network, yfinance install, and --period (e.g. 60d). File was not modified: "

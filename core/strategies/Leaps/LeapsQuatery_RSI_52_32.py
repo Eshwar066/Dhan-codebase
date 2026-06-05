@@ -29,6 +29,10 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._leaps_snapshot_logged_slots: set[str] = set()
+        # structure_id|bar_open_ist — one ENTRY bundle per closed hourly bar
+        self._entry_signaled_keys: set[str] = set()
+        # bar_open_ist|regime — one strategy evaluation per hourly bar per regime
+        self._evaluated_signal_keys: set[str] = set()
 
     # ==================================================
     # INDICATORS
@@ -92,16 +96,42 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             "snapshot_target": "leaps_rsi",
         }
 
+    def _hourly_bar_open_key(self, candle: dict) -> str:
+        bucket = candle.get("bucket_ts")
+        if bucket is not None:
+            try:
+                ts = pd.to_datetime(int(float(bucket)), unit="s", utc=True).tz_convert(IST)
+                return ts.strftime("%Y-%m-%d %H:%M")
+            except (TypeError, ValueError):
+                pass
+        ts = pd.Timestamp(candle.get("timestamp"))
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(IST)
+        else:
+            ts = ts.tz_convert(IST)
+        return ts.strftime("%Y-%m-%d %H:%M")
+
+    def _entry_signal_guard_key(self, candle: dict, structure_id: str) -> str:
+        return f"{structure_id}|{self._hourly_bar_open_key(candle)}"
+
     # ==================================================
     # SHOULD EVALUATE
     # ==================================================
     def should_evaluate(self, candle):
         rsi = candle.get("rsi")
         prev = candle.get("prev_rsi")
-        # return True
         if pd.isna(rsi) or pd.isna(prev):
             return False
-        return (prev >= 32 and rsi < 32) or (prev <= 52 and rsi > 52)
+        cross_lt_32 = prev >= 32 and rsi < 32
+        cross_gt_52 = prev <= 52 and rsi > 52
+        if not cross_lt_32 and not cross_gt_52:
+            return False
+        regime = "RSI_LT_32" if cross_lt_32 else "RSI_GT_52"
+        eval_key = f"{self._hourly_bar_open_key(candle)}|{regime}"
+        if eval_key in self._evaluated_signal_keys:
+            return False
+        self._evaluated_signal_keys.add(eval_key)
+        return True
 
     # ==================================================
     # ENTRY
@@ -121,9 +151,21 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
 
         structure_id = self.build_structure_id(candle, regime)
 
+        signal_key = self._entry_signal_guard_key(candle, structure_id)
+        if signal_key in self._entry_signaled_keys:
+            return None
+
         # Check if structure is already open
         if ctx.position_store.has_open_structure(
             strategy=self.name, structure_id=structure_id, tag="MAIN"
+        ):
+            return None
+
+        intent_store = getattr(ctx, "intent_store", None)
+        if intent_store is not None and intent_store.has_pending_intent(
+            strategy=self.name,
+            structure_id=structure_id,
+            actions=["ENTRY"],
         ):
             return None
 
@@ -190,8 +232,10 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             ctx=ctx,
         )
 
+        self._entry_signaled_keys.add(signal_key)
+
         # Return intents as a list
-        return [hedge_intent,sell_intent] if hedge_intent else [sell_intent]
+        return [hedge_intent, sell_intent] if hedge_intent else [sell_intent]
 
     # ==================================================
     # EXIT SIGNAL

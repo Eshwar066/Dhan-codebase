@@ -495,6 +495,9 @@ class IndicatorManager:
         tf: str,
         df: Any,
         strategy: Any = None,
+        *,
+        exchange: Optional[str] = None,
+        append_live: bool = True,
     ) -> None:
         """Append indicator snapshot row(s) to shared history (symbol + timeframe)."""
         if df is None or len(df) == 0 or "timestamp" not in df.columns:
@@ -508,6 +511,8 @@ class IndicatorManager:
         self._hydrate_rsi_session_state_from_disk(strategy_id, symbol, tf)
         stream_key = (symbol, tf)
         seeded = stream_key in self._rsi_seeded_streams
+        if seeded and not append_live:
+            return
         rows = [df.iloc[-1]] if seeded else [r for _, r in df.iterrows()]
         source = "live_append" if seeded else "historical_seed"
 
@@ -521,6 +526,7 @@ class IndicatorManager:
                 log_root=self._rsi_log_root,
                 logged_keys=self._rsi_logged_keys,
                 round_fn=round_json_floats,
+                exchange=exchange,
             )
         self._rsi_seeded_streams.add(stream_key)
 
@@ -765,6 +771,7 @@ class IndicatorManager:
         bucket = candle.get("bucket_ts")
         if bucket is None:
             bucket = candle_bucket_fn(candle)
+        bar_closed_for_append = False
         if bucket is not None and base_state.get("last_bucket") != bucket:
             # Canonicalize live candle time to bar-open timestamp for continuity checks.
             # Prefer bucket_ts (seconds since epoch, bar start), then fallback to candle timestamp.
@@ -818,6 +825,7 @@ class IndicatorManager:
                     base_state["df"] = base_df
                     base_state["last_bucket"] = bucket
                     base_state["update_seq"] = int(base_state.get("update_seq", 0)) + 1
+                    bar_closed_for_append = False
                 else:
                     # One-shot continuity validation between bootstrap history and first live append.
                     if not base_state.get("continuity_checked", False):
@@ -852,6 +860,7 @@ class IndicatorManager:
                     base_state["df"] = base_df
                     base_state["last_bucket"] = bucket
                     base_state["update_seq"] = int(base_state.get("update_seq", 0)) + 1
+                    bar_closed_for_append = True
             else:
                 base_df = pd.concat([base_df, pd.DataFrame([row])], ignore_index=True)
                 if len(base_df) > int(base_state.get("window") or window):
@@ -860,6 +869,7 @@ class IndicatorManager:
                 base_state["last_bucket"] = bucket
                 base_state["continuity_checked"] = True
                 base_state["update_seq"] = int(base_state.get("update_seq", 0)) + 1
+                bar_closed_for_append = True
 
         strategy_key = self._key_strategy_symbol_tf(strategy, symbol, tf)
         strategy_state = self._strategy_indicator_state.get(strategy_key)
@@ -951,6 +961,8 @@ class IndicatorManager:
                     tf=tf,
                     df=df,
                     strategy=strategy,
+                    exchange=exchange,
+                    append_live=bar_closed_for_append,
                 )
             elif self._strategy_persisted_indicator_keys(strategy):
                 self._append_rsi_history_log(
@@ -959,6 +971,8 @@ class IndicatorManager:
                     tf=tf,
                     df=df,
                     strategy=strategy,
+                    exchange=exchange,
+                    append_live=bar_closed_for_append,
                 )
             strategy_state = {"df": df, "base_sig": base_sig}
             self._strategy_indicator_state[strategy_key] = strategy_state

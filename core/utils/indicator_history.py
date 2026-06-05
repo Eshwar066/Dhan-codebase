@@ -20,6 +20,14 @@ logger = logging.getLogger(__name__)
 
 IST = __import__("zoneinfo").ZoneInfo("Asia/Kolkata")
 SCHEMA_VERSION = 2
+
+# NSE cash index hourly bar opens (IST).
+NSE_60_BAR_MINUTES = frozenset(
+    {(9, 15), (10, 15), (11, 15), (12, 15), (13, 15), (14, 15), (15, 15)}
+)
+NSE_INDEX_SYMBOLS = frozenset(
+    {"NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX", "MIDCPNIFTY", "^NSEI", "NSEI"}
+)
 DEFAULT_LOG_ROOT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
     "logs",
@@ -67,6 +75,75 @@ def normalize_ist_bar_key(bar_ist: Any) -> str:
         return aware.strftime("%Y-%m-%d %H:%M")
     s = str(bar_ist).strip().replace("T", " ")[:16]
     return s
+
+
+def is_nse_60m_bar_ist(dt_ist: datetime) -> bool:
+    """True when ``dt_ist`` is an NSE cash-session hourly bar open (weekday, :15)."""
+    if dt_ist.weekday() >= 5:
+        return False
+    return (int(dt_ist.hour), int(dt_ist.minute)) in NSE_60_BAR_MINUTES
+
+
+def bucket_ts_is_nse_60m_bar(bucket_ts: Any) -> bool:
+    """True when unix bucket start maps to an NSE hourly bar open in IST."""
+    try:
+        bt = int(float(bucket_ts))
+    except (TypeError, ValueError):
+        return False
+    try:
+        dt_ist = datetime.fromtimestamp(bt, IST)
+    except (OSError, OverflowError, ValueError):
+        return False
+    return is_nse_60m_bar_ist(dt_ist)
+
+
+def is_nse_index_context(symbol: str, exchange: Optional[str] = None) -> bool:
+    sym = str(symbol or "").strip().upper()
+    ex = str(exchange or "").strip().upper()
+    if ex in ("INDEX", "NSE_INDEX", "NSE"):
+        return True
+    return sym in NSE_INDEX_SYMBOLS
+
+
+def row_timestamp_to_ist(row_ts: Any) -> Optional[datetime]:
+    if row_ts is None:
+        return None
+    if hasattr(row_ts, "to_pydatetime"):
+        row_ts = row_ts.to_pydatetime()
+    if hasattr(row_ts, "astimezone"):
+        try:
+            if row_ts.tzinfo is None:
+                return row_ts.replace(tzinfo=IST)
+            return row_ts.astimezone(IST).replace(second=0, microsecond=0)
+        except Exception:
+            return None
+    if isinstance(row_ts, datetime):
+        if row_ts.tzinfo is None:
+            return row_ts.replace(tzinfo=IST)
+        return row_ts.astimezone(IST).replace(second=0, microsecond=0)
+    return parse_bar_timestamp_ist_to_aware(row_ts)
+
+
+def should_append_live_indicator_row(
+    symbol: str,
+    timeframe: str,
+    row_timestamp: Any,
+    *,
+    exchange: Optional[str] = None,
+) -> bool:
+    """
+    Gate ``live_append`` rows: for NSE index 60m history only accept session hourly opens.
+    Other symbols/timeframes pass through unchanged.
+    """
+    tf = str(timeframe or "").strip().lower()
+    if tf not in ("60", "1h"):
+        return True
+    if not is_nse_index_context(symbol, exchange):
+        return True
+    dt_ist = row_timestamp_to_ist(row_timestamp)
+    if dt_ist is None:
+        return False
+    return is_nse_60m_bar_ist(dt_ist)
 
 
 def _extract_indicators_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -232,12 +309,17 @@ def append_indicator_history_row(
     log_root: str = DEFAULT_LOG_ROOT,
     logged_keys: Optional[set] = None,
     round_fn: Any = None,
+    exchange: Optional[str] = None,
 ) -> None:
     """Append one JSONL line; indicator_keys selects columns from row (Series/dict)."""
     if not indicator_keys:
         return
     ts = row.get("timestamp") if hasattr(row, "get") else None
     if ts is None:
+        return
+    if source == "live_append" and not should_append_live_indicator_row(
+        symbol, timeframe, ts, exchange=exchange
+    ):
         return
     if hasattr(ts, "to_pydatetime"):
         ts = ts.to_pydatetime()

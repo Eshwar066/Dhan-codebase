@@ -5,6 +5,8 @@ Standalone Option Buildup scheduler.
 - Does not depend on engine candle callbacks or websocket feed.
 - Polls spot via Dhan REST and calls OptionBuildup strategy methods directly.
 
+source .venv/bin/activate
+
 python -m run.option_buildup_scheduler --symbols NIFTY --exchange NSE
 python -m run.option_buildup_scheduler --symbols NIFTY --exchange NSE --all-day
 

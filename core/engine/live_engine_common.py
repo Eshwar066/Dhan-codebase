@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import psutil
 
 from core.data.candle_aggregator import _resolution_to_seconds
+from core.utils.indicator_history import bucket_ts_is_nse_60m_bar, is_nse_index_context
 
 DEFAULT_FEED_STALE_SECONDS = 60
 logger = logging.getLogger(__name__)
@@ -395,6 +396,16 @@ class LiveEngineHelpersMixin:
             return now.astimezone(timezone.utc).replace(tzinfo=None)
         return now
 
+    def _is_nse_index_candle(self, candle: Dict) -> bool:
+        symbol = str(candle.get("symbol") or "")
+        exchange = str(
+            candle.get("exchange")
+            or getattr(self, "market_exchange", None)
+            or getattr(self, "_live_exchange", None)
+            or ""
+        )
+        return is_nse_index_context(symbol, exchange)
+
     def _is_closed_candle(
         self, candle: Dict, timeframe: str, now: Optional[dt.datetime] = None
     ) -> bool:
@@ -404,6 +415,7 @@ class LiveEngineHelpersMixin:
         - **Aggregator path**: ``bucket_ts`` is an integer unix *start* aligned to TF seconds;
           if present and divisible by the strategy TF (same seconds as ``CandleAggregator``),
           treat as aligned (canonical closed bar).
+        - **NSE index 60m**: require session-anchored hourly opens (09:15, 10:15, …, 15:15 IST).
         - **Alignment**: unix second offset modulo ``tf_sec`` where ``tf_sec`` comes from
           ``_resolution_to_seconds`` (same map as ``TIMEFRAME_SECONDS`` / aggregator). This
           matches ``"15"``, ``"15m"``, ``"60"``, ``"1h"``, etc., unlike naive ``int(tf)``.
@@ -423,12 +435,15 @@ class LiveEngineHelpersMixin:
         bt = candle.get("bucket_ts")
         if bt is not None:
             try:
-                int(float(bt))
+                bt_int = int(float(bt))
+            except (TypeError, ValueError):
+                bt_int = None
+            if bt_int is not None:
+                if tf_sec == 3600 and self._is_nse_index_candle(candle):
+                    return bucket_ts_is_nse_60m_bar(bt_int)
                 # bucket_ts originates from CandleAggregator/engine bucketing and can be
                 # session-anchored (e.g. NSE/BSE 1h at 09:15), so do not require epoch modulus.
                 return True
-            except (TypeError, ValueError):
-                pass
 
         epoch = dt.datetime(1970, 1, 1)
         unix_s = int((ts_utc - epoch).total_seconds())
