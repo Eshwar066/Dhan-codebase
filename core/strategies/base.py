@@ -7,6 +7,8 @@ if TYPE_CHECKING:
 class BaseStrategy:
     name = ""
     required_context = []
+    # When set, live/backtest evaluation is limited to these underlyings (empty = all engine symbols).
+    underlying_symbols: List[str] = []
 
     def prepare_indicators(self, df: Any) -> Any:
         return df
@@ -32,6 +34,13 @@ class BaseStrategy:
 
     def get_warmup_period(self):
         return 0
+
+    def applies_to_symbol(self, symbol: str) -> bool:
+        allowed = getattr(self, "underlying_symbols", None) or []
+        if not allowed:
+            return True
+        sym = str(symbol or "").strip().upper()
+        return sym in {str(s).strip().upper() for s in allowed}
 
     def on_forced_exit(self, **kwargs: Any) -> None:
         """Optional: broker-driven close (liquidation, orphan fill, etc.). Override to sync strategy state."""

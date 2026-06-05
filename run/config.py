@@ -36,7 +36,7 @@ ENGINE_JOBS = [
         "run_mode": "LIVE",
         "capital": 200000,
         "ORDER_QTY_LOTS": 1,
-        "symbols": ["NIFTY"],
+        "symbols": ["NIFTY", "BANKNIFTY"],
         "exchange": "NSE",
         # "symbols": ["GOLD"],
         # "exchange": "MCX",
@@ -49,7 +49,7 @@ ENGINE_JOBS = [
             "chat_id": os.getenv("TELEGRAM_LEAPS_CHAT_ID", "1021479950"),
         },
         
-        "strategies": ["LEAPS_RSI"],
+        "strategies": ["LEAPS_RSI", "BankNiftyBTST"],
         "live": {"exchange": "INDEX", "sector": "YES", "rsi": "YES"},
         # "live": {"exchange": "MCX", "sector": "NO", "rsi": "YES"},
         "backtest": {

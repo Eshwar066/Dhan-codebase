@@ -49,6 +49,7 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
     """
 
     name = "BankNiftyBTST"
+    underlying_symbols = ["BANKNIFTY"]
     timeframe = "5"
     required_context = ["option_chain"]
     api = "DHAN"

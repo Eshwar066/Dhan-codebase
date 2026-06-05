@@ -1222,8 +1222,11 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         response_q: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         expected = 0
         tf_filter = str(timeframe or "").strip() if timeframe is not None else ""
+        candle_symbol = str(candle.get("symbol") or "").strip().upper()
         for strategy in self.strategies:
             if tf_filter and str(getattr(strategy, "timeframe", "") or "").strip() != tf_filter:
+                continue
+            if candle_symbol and not strategy.applies_to_symbol(candle_symbol):
                 continue
             strategy_candle = self._enrich_candle_for_strategy(strategy, candle)
             if not strategy.should_evaluate(strategy_candle):

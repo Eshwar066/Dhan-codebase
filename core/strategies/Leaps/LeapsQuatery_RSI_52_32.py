@@ -15,6 +15,7 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     """
 
     name = "LEAPS_RSI"
+    underlying_symbols = ["NIFTY"]
     timeframe = "60"
     required_context = ["option_chain"]
     api = "DHAN"
