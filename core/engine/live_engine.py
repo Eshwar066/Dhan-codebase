@@ -269,7 +269,20 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
     def build_context(self, candle, recent_candles=None):
         intent_store = getattr(self.order_router, "intent_store", None)
         return super().build_context(
-            candle, recent_candles=recent_candles, intent_store=intent_store
+            candle,
+            recent_candles=recent_candles,
+            intent_store=intent_store,
+            order_router=getattr(self, "order_router", None),
+        )
+
+    def build_context_only(self, candle, recent_candles=None, intent_store=None):
+        if intent_store is None:
+            intent_store = getattr(self.order_router, "intent_store", None)
+        return super().build_context_only(
+            candle,
+            recent_candles=recent_candles,
+            intent_store=intent_store,
+            order_router=getattr(self, "order_router", None),
         )
 
     def _underlying_from_strategy_meta(self, metadata_extras: Any) -> Optional[str]:
@@ -285,7 +298,42 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             oi = metadata_extras.get("oi_positional_buy")
             if isinstance(oi, dict) and oi.get("symbol"):
                 return str(oi["symbol"])
+            btst = metadata_extras.get("banknifty_btst")
+            if isinstance(btst, dict) and btst.get("symbol"):
+                return str(btst["symbol"])
         return None
+
+    @staticmethod
+    def _underlying_from_structure_id(structure_id: Any) -> Optional[str]:
+        parts = str(structure_id or "").split(":")
+        if len(parts) >= 3 and parts[1]:
+            return str(parts[1])
+        return None
+
+    def _strategy_obj_for_name(self, strategy_name: Any) -> Optional[Any]:
+        name = str(strategy_name or "").strip()
+        if not name:
+            return None
+        obj = self._strategy_by_name.get(name)
+        if obj is not None:
+            return obj
+        if name == getattr(self.strategy, "name", None):
+            return self.strategy
+        return None
+
+    def _resolve_underlying_for_fill_hook(
+        self, metadata_extras: Any, structure_id: Any, strategy_obj: Any
+    ) -> Optional[str]:
+        sym = self._underlying_from_strategy_meta(metadata_extras)
+        if not sym:
+            sym = self._underlying_from_structure_id(structure_id)
+        if not sym and strategy_obj is not None:
+            allowed = getattr(strategy_obj, "underlying_symbols", None) or []
+            if len(allowed) == 1:
+                sym = str(allowed[0])
+        if not sym and self.symbols and len(self.symbols) == 1:
+            sym = self.symbols[0]
+        return sym
 
     def _align_first_live_bar(
         self, first_live_ts: Optional[int], last_hist_ts: Optional[int], tf_sec: int
@@ -336,16 +384,17 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         return None
 
     def _on_pm_main_entry_fill(self, **kwargs: Any) -> None:
-        strategy = kwargs.get("strategy")
-        if strategy != self.strategy.name:
+        strategy_name = kwargs.get("strategy")
+        strategy_obj = self._strategy_obj_for_name(strategy_name)
+        if strategy_obj is None:
             return
-        fn = getattr(self.strategy, "on_main_entry_filled", None)
+        fn = getattr(strategy_obj, "on_main_entry_filled", None)
         if not callable(fn):
             return
         meta_ex = kwargs.get("metadata_extras")
-        sym = self._underlying_from_strategy_meta(meta_ex)
-        if not sym and self.symbols:
-            sym = self.symbols[0]
+        sym = self._resolve_underlying_for_fill_hook(
+            meta_ex, kwargs.get("structure_id"), strategy_obj
+        )
         if not sym:
             return
         ts = kwargs.get("candle_ts")
@@ -367,7 +416,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         for intent in intents:
             self._process_entry_like_intent(
                 intent,
-                self.strategy,
+                strategy_obj,
                 sym,
                 candle,
                 None,
@@ -376,21 +425,22 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             )
 
     def _on_pm_main_exit_fill(self, **kwargs: Any) -> None:
-        strategy = kwargs.get("strategy")
-        if strategy != self.strategy.name:
+        strategy_name = kwargs.get("strategy")
+        strategy_obj = self._strategy_obj_for_name(strategy_name)
+        if strategy_obj is None:
             return
-        fn = getattr(self.strategy, "on_main_exit_filled", None)
+        fn = getattr(strategy_obj, "on_main_exit_filled", None)
         if not callable(fn):
             return
         meta_ex = kwargs.get("metadata_extras")
-        sym = self._underlying_from_strategy_meta(meta_ex)
+        sym = self._resolve_underlying_for_fill_hook(
+            meta_ex, kwargs.get("structure_id"), strategy_obj
+        )
         inst = kwargs.get("instrument")
         if not sym and inst is not None:
             sym = getattr(inst, "underlying_symbol", None) or getattr(
                 inst, "symbol", None
             )
-        if not sym and self.symbols:
-            sym = self.symbols[0]
         ts = kwargs.get("candle_ts")
         if ts is None:
             ts = dt.datetime.utcnow()
@@ -407,13 +457,17 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         risk_manager = getattr(self.order_router, "risk", None)
         for intent, candle in pairs:
             sym = candle.get("symbol")
-            if not sym and self.symbols:
-                sym = self.symbols[0]
+            if not sym:
+                sym = self._resolve_underlying_for_fill_hook(
+                    getattr(intent, "metadata_extras", None),
+                    getattr(intent, "structure_id", None),
+                    strategy_obj,
+                )
             if not sym:
                 continue
             self._process_entry_like_intent(
                 intent,
-                self.strategy,
+                strategy_obj,
                 sym,
                 candle,
                 None,
@@ -562,80 +616,76 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         return True
 
     def _ensure_bracket_legs_after_reconcile(self) -> None:
-        """If MAIN is open but bracket legs missing (restart), re-arm SL + TARGET once."""
-        strategy_name = getattr(self.strategy, "name", None)
-        if not strategy_name:
-            return
+        """If MAIN is open but bracket legs missing (restart), re-arm per strategy."""
         intent_store = getattr(self.order_router, "intent_store", None)
         if not intent_store:
             return
-        restore_odml = getattr(self.strategy, "_restore_odml_meta_from_position", None)
-        restore_oi = getattr(self.strategy, "_restore_oi_meta_from_position", None)
         broker = getattr(self.order_router, "broker", None)
-        for sym, pos in list(self.position_manager.positions.items()):
-            if int(pos.net_qty or 0) == 0:
+        for strategy_obj in self.strategies:
+            strategy_name = str(getattr(strategy_obj, "name", "") or "")
+            if not strategy_name:
                 continue
-            if getattr(pos, "strategy", None) != strategy_name:
-                continue
-            if str(getattr(pos, "tag", "") or "").upper() != "MAIN":
-                continue
-            struct_id = getattr(pos, "structure_id", None)
-            if not struct_id:
-                continue
-            if callable(restore_odml):
-                try:
-                    restore_odml(pos, self.position_manager)
-                except Exception:
-                    pass
-            if callable(restore_oi):
-                try:
-                    restore_oi(pos, self.position_manager)
-                except Exception:
-                    pass
-            sim_sl = bool(
-                broker
-                and hasattr(broker, "_pending_sl")
-                and str(struct_id) in getattr(broker, "_pending_sl", {})
+            restore_hooks = [
+                getattr(strategy_obj, "_restore_odml_meta_from_position", None),
+                getattr(strategy_obj, "_restore_oi_meta_from_position", None),
+                getattr(strategy_obj, "_restore_btst_meta_from_position", None),
+            ]
+            bracket_tags = list(
+                getattr(strategy_obj, "bracket_leg_tags", None)
+                or ["MAIN_SL", "MAIN_TARGET"]
             )
-            sim_tgt = bool(
-                broker
-                and hasattr(broker, "_pending_target")
-                and str(struct_id) in getattr(broker, "_pending_target", {})
-            )
-            if self.run_mode == RunMode.PAPER:
-                if sim_sl and sim_tgt:
+            for sym, pos in list(self.position_manager.positions.items()):
+                if int(pos.net_qty or 0) == 0:
                     continue
-            else:
-                has_sl = intent_store.has_pending_intent(
-                    strategy_name,
-                    struct_id,
-                    tags=["MAIN_SL"],
-                    actions=["FORCE_EXIT"],
-                )
-                has_tgt = intent_store.has_pending_intent(
-                    strategy_name,
-                    struct_id,
-                    tags=["MAIN_TARGET"],
-                    actions=["FORCE_EXIT"],
-                )
-                if has_sl and has_tgt:
+                if getattr(pos, "strategy", None) != strategy_name:
                     continue
-            meta_bucket = self.position_manager.get_position_metadata(sym) or {}
-            candle_ts = dt.datetime.now(dt.timezone.utc)
-            self._on_pm_main_entry_fill(
-                instrument=pos.instrument,
-                side="SELL" if pos.net_qty < 0 else "BUY",
-                qty=abs(int(pos.net_qty)),
-                price=float(pos.avg_price or 0),
-                strategy=strategy_name,
-                structure_id=struct_id,
-                tag="MAIN",
-                action="ENTRY",
-                candle_ts=candle_ts,
-                intent_id=getattr(pos, "intent_id", None)
-                or meta_bucket.get("intent_id"),
-                metadata_extras=meta_bucket.get("strategy_meta"),
-            )
+                if str(getattr(pos, "tag", "") or "").upper() != "MAIN":
+                    continue
+                struct_id = getattr(pos, "structure_id", None)
+                if not struct_id:
+                    continue
+                for restore_fn in restore_hooks:
+                    if callable(restore_fn):
+                        try:
+                            restore_fn(pos, self.position_manager)
+                        except Exception:
+                            pass
+                sim_brackets_ok = True
+                if self.run_mode == RunMode.PAPER and broker is not None:
+                    pending_sl = getattr(broker, "_pending_sl", {}) or {}
+                    pending_tgt = getattr(broker, "_pending_target", {}) or {}
+                    sim_brackets_ok = all(
+                        str(struct_id) in (pending_sl if tag == "MAIN_SL" else pending_tgt)
+                        for tag in bracket_tags
+                    )
+                else:
+                    sim_brackets_ok = all(
+                        intent_store.has_pending_intent(
+                            strategy_name,
+                            struct_id,
+                            tags=[tag],
+                            actions=["FORCE_EXIT"],
+                        )
+                        for tag in bracket_tags
+                    )
+                if sim_brackets_ok:
+                    continue
+                meta_bucket = self.position_manager.get_position_metadata(sym) or {}
+                candle_ts = dt.datetime.now(dt.timezone.utc)
+                self._on_pm_main_entry_fill(
+                    instrument=pos.instrument,
+                    side="SELL" if pos.net_qty < 0 else "BUY",
+                    qty=abs(int(pos.net_qty)),
+                    price=float(pos.avg_price or 0),
+                    strategy=strategy_name,
+                    structure_id=struct_id,
+                    tag="MAIN",
+                    action="ENTRY",
+                    candle_ts=candle_ts,
+                    intent_id=getattr(pos, "intent_id", None)
+                    or meta_bucket.get("intent_id"),
+                    metadata_extras=meta_bucket.get("strategy_meta"),
+                )
 
     def _do_order_state_check(self) -> None:
         # PAPER: skip broker order comparison (SimulatedBroker has no real orders; avoids false mismatches).

@@ -4,7 +4,8 @@ Bank Nifty BTST (Buy Today Sell Tomorrow) — Dhan index options.
 Rules (see readme.md)
 - 9:20 IST: pick CE and PE strikes near ~100 premium; LIMIT BUY each at premium × 1.5.
 - After fill: resting SL-SELL at 50% of the limit entry price.
-- If SL not hit: exit both legs next session at 9:25 IST.
+- 15:20 IST: cancel any unfilled ENTRY limits placed today.
+- If SL not hit: exit next session at 9:25 IST.
 
 
 python -m run.main --engine-id dhan_banknifty_btst
@@ -26,12 +27,16 @@ from core.utils.expiry_resolver import ExpiryResolver
 
 ENTRY_BAR_CLOSE = time(9, 20)
 EXIT_BAR_CLOSE = time(9, 25)
+CANCEL_UNFILLED_BAR_CLOSE = time(15, 20)
 
 TARGET_PREMIUM = 100.0
 PREM_MIN = 80.0
 PREM_MAX = 120.0
 LIMIT_PREM_MULT = 1.5
 SL_OF_LIMIT = 0.5
+
+
+BTST_META_KEY = "banknifty_btst"
 
 
 @dataclass(frozen=True)
@@ -50,12 +55,13 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
 
     name = "BankNiftyBTST"
     underlying_symbols = ["BANKNIFTY"]
+    bracket_leg_tags = ["MAIN_SL"]
     timeframe = "5"
     required_context = ["option_chain"]
     api = "DHAN"
     expiryType = "MONTHLY"
     dhan_option_security_id = "25"
-    dhan_monthly_rollover_after_calendar_day = 15
+    dhan_monthly_rollover_after_calendar_day = 16
 
     otm_strike_step = 100
     otm_strike_count = 10
@@ -66,6 +72,12 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         super().__init__(*args, **kwargs)
         self._meta_by_structure_id: Dict[str, _BtstLegMeta] = {}
         self._snapshot_logged_slots: set[str] = set()
+        # structure_id|bar_open_ist — one ENTRY intent per leg per 9:20 bar
+        self._entry_signaled_keys: set[str] = set()
+        # symbol|bar_open_ist — one strategy evaluation per 9:20 bar
+        self._evaluated_signal_keys: set[str] = set()
+        # cancel|symbol|bar_open_ist — one cutoff cancel pass per 15:20 bar
+        self._cancel_evaluated_signal_keys: set[str] = set()
 
     def get_warmup_period(self):
         return 0
@@ -123,6 +135,28 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
             return ExpiryResolver.dhan_expiry_index_to_date(td, sel)
         return sel
 
+    def _entry_bar_open_key(self, candle: dict) -> str:
+        bucket = candle.get("bucket_ts")
+        if bucket is not None:
+            try:
+                ts = pd.to_datetime(int(float(bucket)), unit="s", utc=True).tz_convert(IST)
+                return ts.strftime("%Y-%m-%d %H:%M")
+            except (TypeError, ValueError):
+                pass
+        ts = pd.Timestamp(candle.get("timestamp"))
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(IST)
+        else:
+            ts = ts.tz_convert(IST)
+        return ts.strftime("%Y-%m-%d %H:%M")
+
+    def _entry_signal_guard_key(self, candle: dict, structure_id: str) -> str:
+        return f"{structure_id}|{self._entry_bar_open_key(candle)}"
+
+    def _evaluate_signal_key(self, candle: dict) -> str:
+        symbol = str(candle.get("symbol") or "").strip().upper()
+        return f"{symbol}|{self._entry_bar_open_key(candle)}"
+
     def _structure_id(self, symbol: str, trade_dt: date, option_type: str) -> str:
         leg = str(option_type).upper()
         if leg in ("CALL", "CE"):
@@ -133,7 +167,7 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
 
     def _strategy_meta(self, meta: _BtstLegMeta) -> dict:
         return {
-            "banknifty_btst": {
+            BTST_META_KEY: {
                 "symbol": meta.symbol,
                 "entry_date": meta.entry_date.isoformat(),
                 "option_type": meta.option_type,
@@ -142,8 +176,122 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
             }
         }
 
+    def _try_merge_btst_meta_from_raw(self, structure_id: str, raw: dict) -> bool:
+        """Parse persisted ``banknifty_btst`` payload into ``_meta_by_structure_id``."""
+        if structure_id in self._meta_by_structure_id:
+            return True
+        try:
+            meta = _BtstLegMeta(
+                symbol=str(raw["symbol"]),
+                entry_date=date.fromisoformat(str(raw["entry_date"])),
+                option_type=str(raw["option_type"]),
+                ref_premium=float(raw["ref_premium"]),
+                limit_price=float(raw["limit_price"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+        self._meta_by_structure_id[structure_id] = meta
+        return True
+
+    def _restore_btst_meta_from_position(self, pos: Any, position_store: Any) -> None:
+        if not pos or not getattr(pos, "structure_id", None):
+            return
+        sid = str(pos.structure_id)
+        if sid in self._meta_by_structure_id:
+            return
+        sym = getattr(pos.instrument, "trading_symbol", None) if pos.instrument else None
+        if sym and position_store is not None:
+            bucket = position_store.get_position_metadata(sym) or {}
+            sm = bucket.get("strategy_meta") or {}
+            raw = sm.get(BTST_META_KEY) if isinstance(sm, dict) else None
+            if isinstance(raw, dict):
+                self._try_merge_btst_meta_from_raw(sid, raw)
+
+    def _ensure_btst_meta_for_main_fill(
+        self,
+        structure_id: str,
+        instrument: Any,
+        ctx: Any,
+        intent_id: Optional[str],
+        metadata_extras: Any,
+    ) -> None:
+        """
+        Repopulate BTST meta after restart from fill kwargs, open-positions CSV,
+        or the original ENTRY intent in intent_store (LIMIT pending/filled).
+        """
+        sid = str(structure_id)
+        if sid in self._meta_by_structure_id:
+            return
+        if isinstance(metadata_extras, dict):
+            raw = metadata_extras.get(BTST_META_KEY)
+            if isinstance(raw, dict):
+                self._try_merge_btst_meta_from_raw(sid, raw)
+        if sid in self._meta_by_structure_id:
+            return
+        ps = getattr(ctx, "position_store", None) if ctx is not None else None
+        sym = getattr(instrument, "trading_symbol", None) if instrument else None
+        if ps is not None and sym and callable(getattr(ps, "get_position_metadata", None)):
+            bucket = ps.get_position_metadata(sym) or {}
+            sm = bucket.get("strategy_meta") or {}
+            raw = sm.get(BTST_META_KEY) if isinstance(sm, dict) else None
+            if isinstance(raw, dict):
+                self._try_merge_btst_meta_from_raw(sid, raw)
+        if sid in self._meta_by_structure_id:
+            return
+        ist = getattr(ctx, "intent_store", None) if ctx is not None else None
+        if ist is not None and intent_id and callable(getattr(ist, "get", None)):
+            rec = ist.get(intent_id)
+            if rec:
+                payload = rec.get("payload") or {}
+                sm = payload.get("strategy_meta")
+                if isinstance(sm, dict):
+                    raw = sm.get(BTST_META_KEY)
+                    if isinstance(raw, dict):
+                        self._try_merge_btst_meta_from_raw(sid, raw)
+        if sid in self._meta_by_structure_id:
+            return
+        if ps is not None:
+            for pos in ps.get_open_positions(strategy=self.name) or []:
+                if str(getattr(pos, "structure_id", "")) == sid:
+                    self._restore_btst_meta_from_position(pos, ps)
+                    break
+
+    def _cancel_evaluate_signal_key(self, candle: dict) -> str:
+        return f"cancel|{self._evaluate_signal_key(candle)}"
+
+    def _cancel_unfilled_entry_orders(self, candle: dict, ctx: Any) -> None:
+        router = getattr(ctx, "order_router", None)
+        if router is None or not hasattr(router, "cancel_unfilled_strategy_orders"):
+            print("⚠️ BankNiftyBTST: order_router unavailable; cannot cancel unfilled orders")
+            return
+        trade_dt = pd.Timestamp(candle["timestamp"]).date()
+        n = router.cancel_unfilled_strategy_orders(
+            self.name,
+            tags=["MAIN"],
+            actions=["ENTRY"],
+            trade_date=trade_dt,
+        )
+        if n:
+            print(
+                f"BankNiftyBTST: cancelled {n} unfilled ENTRY order(s) at "
+                f"{CANCEL_UNFILLED_BAR_CLOSE.strftime('%H:%M')} IST"
+            )
+
     def should_evaluate(self, candle) -> bool:
-        return self._bar_close_time(candle) == ENTRY_BAR_CLOSE
+        close = self._bar_close_time(candle)
+        if close == CANCEL_UNFILLED_BAR_CLOSE:
+            eval_key = self._cancel_evaluate_signal_key(candle)
+            if eval_key in self._cancel_evaluated_signal_keys:
+                return False
+            self._cancel_evaluated_signal_keys.add(eval_key)
+            return True
+        if close != ENTRY_BAR_CLOSE:
+            return False
+        eval_key = self._evaluate_signal_key(candle)
+        if eval_key in self._evaluated_signal_keys:
+            return False
+        self._evaluated_signal_keys.add(eval_key)
+        return True
 
     def _build_entry_intent(
         self,
@@ -156,8 +304,20 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         symbol = candle["symbol"]
         structure_id = self._structure_id(symbol, trade_dt, option_type)
 
+        signal_key = self._entry_signal_guard_key(candle, structure_id)
+        if signal_key in self._entry_signaled_keys:
+            return None
+
         if ctx.position_store.has_open_structure(
             strategy=self.name, structure_id=structure_id, tag="MAIN"
+        ):
+            return None
+
+        intent_store = getattr(ctx, "intent_store", None)
+        if intent_store is not None and intent_store.has_pending_intent(
+            strategy=self.name,
+            structure_id=structure_id,
+            actions=["ENTRY"],
         ):
             return None
 
@@ -211,6 +371,7 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
             limit_price=limit_price,
         )
         self._meta_by_structure_id[structure_id] = meta
+        self._entry_signaled_keys.add(signal_key)
 
         return self.create_order_intent(
             inst=inst,
@@ -228,7 +389,11 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         )
 
     def on_candle(self, candle, ctx):
-        if self._bar_close_time(candle) != ENTRY_BAR_CLOSE:
+        close = self._bar_close_time(candle)
+        if close == CANCEL_UNFILLED_BAR_CLOSE:
+            self._cancel_unfilled_entry_orders(candle, ctx)
+            return None
+        if close != ENTRY_BAR_CLOSE:
             return None
 
         trade_dt = pd.Timestamp(candle["timestamp"]).date()
@@ -277,27 +442,38 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         metadata_extras: Any = None,
         **kwargs: Any,
     ) -> List[Any]:
-        del ctx, metadata_extras
         if not structure_id or not intent_id:
             return []
-        meta = self._meta_by_structure_id.get(structure_id)
+        sid = str(structure_id)
+        self._ensure_btst_meta_for_main_fill(
+            sid, instrument, ctx, intent_id, metadata_extras
+        )
+        meta = self._meta_by_structure_id.get(sid)
         if meta is None:
             return []
         sl_trigger = float(meta.limit_price * SL_OF_LIMIT)
         fill_qty = kwargs.get("qty")
         ref = SimpleNamespace(
             instrument=instrument,
-            structure_id=structure_id,
+            structure_id=sid,
             intent_id=intent_id,
             qty=self._normalize_order_qty(instrument, fill_qty),
         )
         return [self._build_main_sl_intent(ref, sl_trigger, candle_ts, meta.symbol)]
 
     def should_exit(self, position, candle, ctx=None):
-        del ctx
         if position.tag != "MAIN" or position.net_qty <= 0:
             return False
-        meta = self._meta_by_structure_id.get(position.structure_id)
+        sid = str(position.structure_id or "")
+        if sid:
+            self._ensure_btst_meta_for_main_fill(
+                sid,
+                position.instrument,
+                ctx,
+                getattr(position, "intent_id", None),
+                None,
+            )
+        meta = self._meta_by_structure_id.get(sid)
         if meta is None:
             return False
         trade_dt = pd.Timestamp(candle["timestamp"]).date()

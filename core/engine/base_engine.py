@@ -30,10 +30,14 @@ class BaseEngine:
     def get_strategy_params(self):
         return STRATEGY_RUNTIME_SPEC[self.strategy.name][RUN_MODE]
 
-    def build_context(self, candle, recent_candles=None, intent_store=None):
+    def build_context(self, candle, recent_candles=None, intent_store=None, order_router=None):
         ts = candle["timestamp"]
         if not isinstance(ts, datetime):
             ts = datetime.fromisoformat(str(ts))
+        if intent_store is None and hasattr(self, "order_router"):
+            intent_store = getattr(self.order_router, "intent_store", None)
+        if order_router is None and hasattr(self, "order_router"):
+            order_router = getattr(self, "order_router", None)
 
         ctx = StrategyContext(
             symbol=candle["symbol"],
@@ -46,6 +50,7 @@ class BaseEngine:
             universe_service=getattr(self, "universe_service", None),
             recent_candles=recent_candles,
             intent_store=intent_store,
+            order_router=order_router,
         )
 
         # Lag diagnosis: data delay before strategy (set ALGO_LAG_DIAG=1). See cursor.md
@@ -55,7 +60,7 @@ class BaseEngine:
         return ctx, intent
 
     def build_context_only(
-        self, candle, recent_candles=None, intent_store=None
+        self, candle, recent_candles=None, intent_store=None, order_router=None
     ) -> "StrategyContext":
         """StrategyContext without calling ``on_candle`` (for fill-time hooks)."""
         ts = candle["timestamp"]
@@ -63,6 +68,8 @@ class BaseEngine:
             ts = datetime.fromisoformat(str(ts))
         if intent_store is None and hasattr(self, "order_router"):
             intent_store = getattr(self.order_router, "intent_store", None)
+        if order_router is None and hasattr(self, "order_router"):
+            order_router = getattr(self, "order_router", None)
         return StrategyContext(
             symbol=candle["symbol"],
             exchange=candle.get("exchange"),
@@ -74,6 +81,7 @@ class BaseEngine:
             universe_service=getattr(self, "universe_service", None),
             recent_candles=recent_candles,
             intent_store=intent_store,
+            order_router=order_router,
         )
 
     def evaluate_sim_broker_stops(self, candle: Dict[str, Any], ctx: Any) -> None:

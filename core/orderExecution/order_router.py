@@ -3,7 +3,7 @@ import logging
 import time
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 # Trade-led OMS: positions are updated only from trade events (fills), not from order state.
 
@@ -19,7 +19,7 @@ except ImportError:
 
 from core.broker.internal.dhan.mappings import format_broker_failure_for_log
 from core.orderExecution.bracket_orders import BRACKET_TAGS, BracketLegRegistry
-from core.orderExecution.intent_store import IntentStatus
+from core.orderExecution.intent_store import IntentStatus, IntentStore
 
 
 class OrderState(str, Enum):
@@ -1038,6 +1038,96 @@ class OrderRouter:
         if broker_sent_ts is not None:
             last_result["broker_sent_ts"] = broker_sent_ts
         return last_result
+
+    def cancel_unfilled_strategy_orders(
+        self,
+        strategy_id: str,
+        *,
+        tags: Optional[Union[str, Iterable[str]]] = None,
+        actions: Optional[Union[str, Iterable[str]]] = None,
+        trade_date: Optional[Any] = None,
+    ) -> int:
+        """
+        Cancel unfilled broker orders for in-flight intents (SENT/VALIDATED) owned by strategy_id.
+        Optionally restrict to structure_id entry dates matching trade_date (date object or iso str).
+        """
+        if not self.intent_store:
+            return 0
+        tag_filter = IntentStore._upper_set(tags)
+        action_filter = IntentStore._upper_set(actions)
+        trade_d: Optional[Any] = None
+        if trade_date is not None:
+            try:
+                if hasattr(trade_date, "isoformat"):
+                    trade_d = trade_date
+                else:
+                    from datetime import date as _date
+
+                    trade_d = _date.fromisoformat(str(trade_date)[:10])
+            except (TypeError, ValueError):
+                trade_d = None
+
+        pending = list(self.intent_store.list_by_status(IntentStatus.SENT)) + list(
+            self.intent_store.list_by_status(IntentStatus.VALIDATED)
+        )
+        cancelled = 0
+        for rec in pending:
+            payload = rec.get("payload") or {}
+            if payload.get("strategy_id") != strategy_id:
+                continue
+            rec_tag = str(payload.get("tag") or rec.get("tag") or "").upper()
+            if tag_filter is not None and rec_tag not in tag_filter:
+                continue
+            rec_action = str(payload.get("action") or rec.get("action") or "").upper()
+            if action_filter is not None and rec_action not in action_filter:
+                continue
+            structure_id = str(
+                rec.get("structure_id") or payload.get("structure_id") or ""
+            )
+            if trade_d is not None and structure_id:
+                parts = structure_id.split(":")
+                if len(parts) >= 3:
+                    try:
+                        from datetime import date as _date
+
+                        sid_dt = _date.fromisoformat(str(parts[2])[:10])
+                        if sid_dt != trade_d:
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+            intent_id = rec.get("intent_id")
+            if not intent_id:
+                continue
+            broker_order_id = rec.get("broker_order_id")
+            if broker_order_id and self.broker and hasattr(
+                self.broker, "cancel_order_by_id"
+            ):
+                ok = self.broker.cancel_order_by_id(
+                    str(broker_order_id),
+                    intent_id=str(intent_id),
+                    reason=f"{strategy_id}_cutoff_cancel",
+                )
+                if not ok:
+                    continue
+            self.intent_store.update(
+                intent_id,
+                IntentStatus.CANCELLED,
+                order_state=OrderState.CANCELLED,
+            )
+            self._set_order_state(
+                intent_id,
+                OrderState.CANCELLED,
+                action="cutoff_cancel",
+                message=f"Cancelled unfilled {strategy_id} order at session cutoff",
+            )
+            if self.engine_logger:
+                self.engine_logger.log(
+                    "oms",
+                    f"Cutoff cancel strategy={strategy_id} intent_id={intent_id} "
+                    f"broker_order_id={broker_order_id or 'none'} structure_id={structure_id}",
+                )
+            cancelled += 1
+        return cancelled
 
     # working
     def refresh_stale_exit_orders(
