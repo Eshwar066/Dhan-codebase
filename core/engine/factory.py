@@ -217,6 +217,14 @@ class EngineFactory:
                     bot_token=str(config.telegram_bot_token),
                 )
 
+        for strat in strategies:
+            if telegram_alert is not None:
+                setattr(strat, "telegram_alert", telegram_alert)
+            if getattr(config, "telegram_bot_token", None):
+                setattr(strat, "telegram_bot_token", config.telegram_bot_token)
+            if getattr(config, "telegram_chat_id", None):
+                setattr(strat, "telegram_chat_id", config.telegram_chat_id)
+
         # ---------- OMS (isolated per engine) ----------
         trade_logger = TradeLogger()
         _engine_id = config.engine_id or "live"

@@ -199,4 +199,9 @@ STRATEGY_RUNTIME_SPEC = {
         RunMode.PAPER: {"data": {}},
         RunMode.LIVE: {"data": {}},
     },
+    "CryptoRsiIndicator": {
+        RunMode.BACKTEST: {"data": {}},
+        RunMode.PAPER: {"data": {}},
+        RunMode.LIVE: {"data": {}},
+    },
 }

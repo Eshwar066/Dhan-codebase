@@ -296,3 +296,34 @@ def append_indicator_history_row(
             f.write(json.dumps(pl, default=str) + "\n")
     except OSError:
         logger.exception("Failed writing indicator history: %s", path)
+
+
+def clear_indicator_history(
+    symbol: str,
+    timeframe: str,
+    *,
+    log_root: str = DEFAULT_LOG_ROOT,
+    strategy_id: Optional[str] = None,
+) -> bool:
+    """Remove shared (and optional legacy) indicator history files for symbol|timeframe."""
+    removed = False
+    sym_u = str(symbol or "").strip().upper()
+    tf_s = str(timeframe or "").strip()
+    for path in (indicator_history_path(sym_u, tf_s, log_root=log_root),):
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+                removed = True
+                logger.info("Cleared indicator history: %s", path)
+            except OSError:
+                logger.exception("Failed clearing indicator history: %s", path)
+    if strategy_id:
+        legacy = legacy_rsi_history_path(strategy_id, log_root=log_root)
+        if os.path.isfile(legacy):
+            try:
+                os.remove(legacy)
+                removed = True
+                logger.info("Cleared legacy indicator history: %s", legacy)
+            except OSError:
+                logger.exception("Failed clearing legacy indicator history: %s", legacy)
+    return removed

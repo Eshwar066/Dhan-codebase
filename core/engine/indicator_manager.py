@@ -11,6 +11,9 @@ from zoneinfo import ZoneInfo
 logger = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
 
+# Delta crypto RSI gap recovery (backfill / post-gap warmup) — not used for Dhan/NSE.
+_CRYPTO_GAP_RECOVERY_SYMBOLS = frozenset({"BTCUSD", "ETHUSD"})
+
 try:
     from core.utils.json_numeric import round_json_floats
 except ImportError:
@@ -578,6 +581,228 @@ class IndicatorManager:
         out = df.loc[mask].reset_index(drop=True)
         return out
 
+    @classmethod
+    def _uses_crypto_gap_recovery(cls, symbol: str) -> bool:
+        """Gap backfill and post-gap RSI warmup apply only to Delta crypto alert symbols."""
+        return str(symbol or "").strip().upper() in _CRYPTO_GAP_RECOVERY_SYMBOLS
+
+    def _strategy_warmup_bars(self, strategy: Any) -> int:
+        try:
+            return max(0, int(getattr(strategy, "get_warmup_period", lambda: 0)() or 0))
+        except Exception:
+            return 0
+
+    def _continuity_gap_limit_seconds(self, tf: str) -> float:
+        return float(self._timeframe_to_seconds(tf) * 3)
+
+    def _try_backfill_gap_candles(
+        self,
+        symbol: str,
+        tf: str,
+        start_ts: Any,
+        end_ts: Any,
+        exchange: str,
+        sector: str,
+    ) -> Any:
+        """Fetch missing OHLC between ``start_ts`` and ``end_ts`` via data provider REST."""
+        import pandas as pd
+
+        start = pd.to_datetime(start_ts, utc=True, errors="coerce")
+        end = pd.to_datetime(end_ts, utc=True, errors="coerce")
+        if pd.isna(start) or pd.isna(end) or end <= start:
+            return None
+        start_ist = pd.Timestamp(start).tz_convert(IST)
+        end_ist = pd.Timestamp(end).tz_convert(IST)
+        chunks: List[Any] = []
+        day = start_ist.date()
+        end_day = end_ist.date()
+        while day <= end_day:
+            date_s = day.strftime("%Y-%m-%d")
+            part = None
+            try:
+                part = self.data.get_intraday(
+                    symbol=symbol,
+                    start_date=date_s,
+                    end_date=date_s,
+                    timeframe=tf,
+                    exchange=exchange,
+                    sector=sector,
+                )
+            except TypeError:
+                try:
+                    part = self.data.get_intraday(
+                        symbol=symbol,
+                        start_date=date_s,
+                        end_date=date_s,
+                        timeframe=tf,
+                        exchange=exchange,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Gap backfill day failed symbol=%s tf=%s date=%s",
+                        symbol,
+                        tf,
+                        date_s,
+                        exc_info=True,
+                    )
+            except Exception:
+                logger.debug(
+                    "Gap backfill day failed symbol=%s tf=%s date=%s",
+                    symbol,
+                    tf,
+                    date_s,
+                    exc_info=True,
+                )
+            if part is not None and len(part) > 0:
+                chunks.append(part.copy())
+            day += dt.timedelta(days=1)
+        if not chunks:
+            return None
+        raw = pd.concat(chunks, ignore_index=True) if len(chunks) > 1 else chunks[0]
+        df = raw.copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        df = df.dropna(subset=["timestamp"])
+        df = df[(df["timestamp"] > start) & (df["timestamp"] <= end)]
+        df = (
+            df.sort_values("timestamp")
+            .drop_duplicates(subset=["timestamp"], keep="last")
+            .reset_index(drop=True)
+        )
+        if len(df) == 0:
+            return None
+        if "symbol" not in df.columns:
+            df["symbol"] = symbol
+        if "exchange" not in df.columns:
+            df["exchange"] = exchange
+        return df
+
+    @staticmethod
+    def _merge_backfill_into_df(base_df: Any, backfill_df: Any, window: int) -> Any:
+        import pandas as pd
+
+        if backfill_df is None or len(backfill_df) == 0:
+            return base_df
+        merged = pd.concat([base_df, backfill_df], ignore_index=True)
+        merged["timestamp"] = pd.to_datetime(merged["timestamp"], utc=True, errors="coerce")
+        merged = merged.dropna(subset=["timestamp"])
+        merged = (
+            merged.sort_values("timestamp")
+            .drop_duplicates(subset=["timestamp"], keep="last")
+            .reset_index(drop=True)
+        )
+        if len(merged) > window:
+            merged = merged.iloc[-window:].reset_index(drop=True)
+        return merged
+
+    def _verify_backfill_connects(
+        self, last_ts: Any, backfill_df: Any, next_ts: Any, tf: str
+    ) -> bool:
+        import pandas as pd
+
+        if backfill_df is None or len(backfill_df) == 0:
+            return False
+        tf_lim = self._continuity_gap_limit_seconds(tf)
+        last = pd.to_datetime(last_ts, utc=True, errors="coerce")
+        bf_first = pd.to_datetime(backfill_df.iloc[0]["timestamp"], utc=True, errors="coerce")
+        bf_last = pd.to_datetime(backfill_df.iloc[-1]["timestamp"], utc=True, errors="coerce")
+        nxt = pd.to_datetime(next_ts, utc=True, errors="coerce")
+        if pd.isna(last) or pd.isna(bf_first) or pd.isna(bf_last):
+            return False
+        gap1 = float((bf_first - last).total_seconds())
+        if gap1 <= 0 or gap1 > tf_lim:
+            return False
+        if pd.isna(nxt):
+            return True
+        gap2 = float((nxt - bf_last).total_seconds())
+        return gap2 <= tf_lim
+
+    def _purge_strategy_indicator_state(self, symbol: str, tf: str) -> None:
+        suffix = f"|{symbol}|{tf}"
+        for key in list(self._strategy_indicator_state.keys()):
+            if key.endswith(suffix):
+                self._strategy_indicator_state.pop(key, None)
+
+    def _clear_rsi_session_for_stream(self, symbol: str, tf: str, strategy_id: str) -> None:
+        sym_u = str(symbol or "").strip().upper()
+        tf_s = str(tf or "").strip()
+        stream_key = (sym_u, tf_s)
+        self._rsi_seeded_streams.discard(stream_key)
+        self._rsi_session_hydrated.discard(stream_key)
+        self._rsi_logged_keys = {
+            k
+            for k in self._rsi_logged_keys
+            if not (len(k) >= 2 and k[0] == sym_u and k[1] == tf_s)
+        }
+        ind_hist.clear_indicator_history(
+            sym_u, tf_s, log_root=self._rsi_log_root, strategy_id=strategy_id
+        )
+
+    def _activate_post_gap_warmup(
+        self,
+        base_state: Dict[str, Any],
+        symbol: str,
+        tf: str,
+        strategy_id: str,
+        strategy: Any = None,
+    ) -> None:
+        import pandas as pd
+
+        needed = self._strategy_warmup_bars(strategy) if strategy is not None else 15
+        needed = max(needed, 15)
+        base_state["df"] = pd.DataFrame()
+        base_state["post_gap_warmup_active"] = True
+        base_state["post_gap_warmup_needed"] = needed
+        base_state["last_bucket"] = None
+        base_state["update_seq"] = int(base_state.get("update_seq", 0)) + 1
+        self._clear_rsi_session_for_stream(symbol, tf, strategy_id)
+        self._purge_strategy_indicator_state(symbol, tf)
+        logger.warning(
+            "POST_GAP_WARMUP symbol=%s tf=%s need_bars=%s cleared_indicator_history=True",
+            symbol,
+            tf,
+            needed,
+        )
+
+    def _resolve_continuity_gap(
+        self,
+        base_state: Dict[str, Any],
+        base_df: Any,
+        symbol: str,
+        tf: str,
+        last_hist_ts: Any,
+        target_ts: Any,
+        exchange: str,
+        sector: str,
+        window: int,
+        strategy_id: str,
+        strategy: Any = None,
+    ) -> Any:
+        """Backfill missing bars or reset history and require RSI warmup before signals."""
+        import pandas as pd
+
+        backfill = self._try_backfill_gap_candles(
+            symbol, tf, last_hist_ts, target_ts, exchange, sector
+        )
+        if (
+            backfill is not None
+            and len(backfill) > 0
+            and self._verify_backfill_connects(last_hist_ts, backfill, target_ts, tf)
+        ):
+            merged = self._merge_backfill_into_df(base_df, backfill, window)
+            base_state["df"] = merged
+            base_state["post_gap_warmup_active"] = False
+            logger.info(
+                "GAP_BACKFILL_OK symbol=%s tf=%s backfill_rows=%s total_rows=%s",
+                symbol,
+                tf,
+                len(backfill),
+                len(merged),
+            )
+            return merged
+
+        self._activate_post_gap_warmup(base_state, symbol, tf, strategy_id, strategy)
+        return base_state.get("df")
+
     @staticmethod
     def _indicator_row_for_candle(df: Any, row_ts: Any) -> Any:
         """Return the indicator dataframe row matching the live candle bar open time."""
@@ -612,7 +837,9 @@ class IndicatorManager:
 
         key = self._key_symbol_tf(symbol, tf)
         state = self._base_candle_state.get(key)
-        if state:
+        if state is not None:
+            if state.get("post_gap_warmup_active"):
+                return state
             df0 = state.get("df")
             prev_w = int(state.get("window") or 0)
             if (
@@ -706,6 +933,44 @@ class IndicatorManager:
             df["symbol"] = symbol
         if "exchange" not in df.columns:
             df["exchange"] = exchange
+
+        tf_secs = self._timeframe_to_seconds(tf)
+        post_gap_warmup_active = False
+        post_gap_warmup_needed = 15
+        crypto_gap = self._uses_crypto_gap_recovery(symbol)
+        if crypto_gap and len(df) > 0 and "timestamp" in df.columns:
+            last_ts = pd.to_datetime(df.iloc[-1]["timestamp"], utc=True, errors="coerce")
+            now = pd.Timestamp.now(tz=dt.timezone.utc)
+            if not pd.isna(last_ts):
+                gap_now = float((now - last_ts).total_seconds())
+                if gap_now > tf_secs * 3:
+                    backfill = self._try_backfill_gap_candles(
+                        symbol, tf, last_ts, now, exchange, sector
+                    )
+                    if (
+                        backfill is not None
+                        and len(backfill) > 0
+                        and self._verify_backfill_connects(last_ts, backfill, now, tf)
+                    ):
+                        df = self._merge_backfill_into_df(df, backfill, window)
+                        logger.info(
+                            "BOOTSTRAP_GAP_BACKFILL symbol=%s tf=%s rows=%s gap_sec=%.0f",
+                            symbol,
+                            tf,
+                            len(backfill),
+                            gap_now,
+                        )
+                    else:
+                        logger.warning(
+                            "BOOTSTRAP_STALE symbol=%s tf=%s gap_sec=%.0f backfill_failed — RSI warmup from live bars",
+                            symbol,
+                            tf,
+                            gap_now,
+                        )
+                        df = pd.DataFrame()
+                        post_gap_warmup_active = True
+                        self._clear_rsi_session_for_stream(symbol, tf, strategy_id or "")
+
         if len(df) > window:
             df = df.iloc[-window:].reset_index(drop=True)
 
@@ -717,6 +982,9 @@ class IndicatorManager:
             "bootstrap_source": source,
             "bootstrap_at_ist": boot_ist,
             "update_seq": 0,
+            "post_gap_warmup_active": post_gap_warmup_active,
+            "post_gap_warmup_needed": post_gap_warmup_needed,
+            "continuity_checked": post_gap_warmup_active if crypto_gap else False,
         }
         self._base_candle_state[key] = new_state
         if source == "log":
@@ -844,6 +1112,29 @@ class IndicatorManager:
                                     str(row_ts),
                                     float(gap),
                                 )
+                                if self._uses_crypto_gap_recovery(symbol):
+                                    base_df = self._resolve_continuity_gap(
+                                        base_state,
+                                        base_df,
+                                        symbol,
+                                        tf,
+                                        last_hist_ts,
+                                        row_ts,
+                                        exchange,
+                                        sector,
+                                        int(base_state.get("window") or window),
+                                        strategy_id,
+                                        strategy=strategy,
+                                    )
+                                    last_hist_ts = (
+                                        pd.to_datetime(
+                                            base_df.iloc[-1].get("timestamp"),
+                                            utc=True,
+                                            errors="coerce",
+                                        )
+                                        if base_df is not None and len(base_df) > 0
+                                        else pd.NaT
+                                    )
                         base_state["continuity_checked"] = True
 
                     base_df = pd.concat([base_df, pd.DataFrame([row])], ignore_index=True)
@@ -889,7 +1180,9 @@ class IndicatorManager:
             if not cache_hit:
                 compute_start = time.time()
                 work_df = df.copy()
-                if self._strategy_uses_indicator_history(strategy):
+                if self._strategy_uses_indicator_history(strategy) and not base_state.get(
+                    "post_gap_warmup_active"
+                ):
                     work_df = self._merge_rsi_history_into_base_df(
                         work_df,
                         strategy_id=str(getattr(strategy, "name", "unknown_strategy")),
@@ -945,21 +1238,23 @@ class IndicatorManager:
                     except Exception:
                         pass
                     self._rsi_debug_printed = True
-                self._append_rsi_history_log(
-                    strategy_id=str(getattr(strategy, "name", "unknown_strategy")),
-                    symbol=symbol,
-                    tf=tf,
-                    df=df,
-                    strategy=strategy,
-                )
+                if not base_state.get("post_gap_warmup_active"):
+                    self._append_rsi_history_log(
+                        strategy_id=str(getattr(strategy, "name", "unknown_strategy")),
+                        symbol=symbol,
+                        tf=tf,
+                        df=df,
+                        strategy=strategy,
+                    )
             elif self._strategy_persisted_indicator_keys(strategy):
-                self._append_rsi_history_log(
-                    strategy_id=str(getattr(strategy, "name", "unknown_strategy")),
-                    symbol=symbol,
-                    tf=tf,
-                    df=df,
-                    strategy=strategy,
-                )
+                if not base_state.get("post_gap_warmup_active"):
+                    self._append_rsi_history_log(
+                        strategy_id=str(getattr(strategy, "name", "unknown_strategy")),
+                        symbol=symbol,
+                        tf=tf,
+                        df=df,
+                        strategy=strategy,
+                    )
             strategy_state = {"df": df, "base_sig": base_sig}
             self._strategy_indicator_state[strategy_key] = strategy_state
 
@@ -973,6 +1268,25 @@ class IndicatorManager:
             warmup = int(getattr(strategy, "get_warmup_period", lambda: 0)() or 0)
         except Exception:
             warmup = 0
+        crypto_gap = self._uses_crypto_gap_recovery(symbol)
+        post_gap = crypto_gap and bool(base_state.get("post_gap_warmup_active"))
+        if post_gap:
+            needed = int(base_state.get("post_gap_warmup_needed") or max(warmup, 15))
+            if strategy is not None:
+                needed = max(needed, self._strategy_warmup_bars(strategy), 15)
+                base_state["post_gap_warmup_needed"] = needed
+            if len(df) <= needed:
+                out = dict(candle)
+                out["indicator_signals_ready"] = False
+                return out
+            base_state["post_gap_warmup_active"] = False
+            logger.info(
+                "POST_GAP_WARMUP_COMPLETE symbol=%s tf=%s bars=%s needed=%s",
+                symbol,
+                tf,
+                len(df),
+                needed,
+            )
         if len(df) <= warmup:
             return out
 
@@ -989,5 +1303,7 @@ class IndicatorManager:
             if k in ("symbol", "exchange"):
                 continue
             out[k] = v
+        if crypto_gap:
+            out["indicator_signals_ready"] = True
         return out
 

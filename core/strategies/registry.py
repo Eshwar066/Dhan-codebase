@@ -13,6 +13,7 @@ from core.strategies.Futures.Futures_EMA_Momentum.Futures_EMA_Momentum import (
 )
 from core.strategies.PipelineTest.signal_flood_test import SignalFloodTestStrategy
 from core.strategies.Equity.IPOBreakout.IPOBreakout import IPOBreakout
+from core.strategies.Crypto.Indicator.CryptoRsiIndicator import CryptoRsiIndicator
 from core.instruments import EquityInstrument, OptionInstrument, FutureInstrument
 
 INSTRUMENT_MAP = {
@@ -116,6 +117,15 @@ STRATEGY_MAP = {
         "strategy": SignalFloodTestStrategy,
         "instrument": "FUTURE",
         "allowed_modes": [
+            RunMode.PAPER,
+            RunMode.LIVE,
+        ],
+    },
+    "CryptoRsiIndicator": {
+        "strategy": CryptoRsiIndicator,
+        "instrument": "FUTURE",
+        "allowed_modes": [
+            RunMode.BACKTEST,
             RunMode.PAPER,
             RunMode.LIVE,
         ],
