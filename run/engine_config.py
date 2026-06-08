@@ -98,6 +98,12 @@ class EngineConfig:
     # Live/paper params (used when run_mode in (PAPER, LIVE))
     live: Optional[Dict[str, Any]] = None
 
+    # Per-strategy live evaluation mode (strategy name -> mode).
+    # ``live_feed``: websocket ticks + closed candles.
+    # ``scheduled``: wall-clock IST slots + REST spot (see strategy ``scheduled_times``).
+    # When omitted, mode is inferred from strategy ``timeframe`` (None/EVENT = scheduled).
+    strategy_eval: Optional[Dict[str, str]] = None
+
     # Venue-specific options (optional overrides)
     delta_testnet: bool = True
     delta_india: bool = True

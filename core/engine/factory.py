@@ -351,25 +351,35 @@ class EngineFactory:
                 api_key, api_secret = None, None
             if api_key and api_secret:
                 timeframe = config.backtest.get("timeframe", "60")
-                realtime_feed = DeltaWebSocketFeed(
-                    api_key=api_key,
-                    api_secret=api_secret,
-                    symbols=config.symbols,
-                    timeframe=timeframe,
-                    testnet=config.delta_testnet,
-                    india=config.delta_india,
-                    subscribe_private=True,
-                    engine_logger=engine_logger,
-                    telegram_alert=telegram_alert,
+                eval_modes = getattr(config, "strategy_eval", None) or {}
+                feed_symbols = LiveEngine._collect_feed_symbols(
+                    config.symbols or [], strategies, eval_modes
                 )
-                if any(getattr(s, "timeframe", None) for s in strategies):
-                    tick_queue = queue.Queue(maxsize=50000)
-                    candle_aggregator = CandleAggregator(
-                        engine_logger=engine_logger,
-                        debug_mode=bool(getattr(config, "debug_mode", False)),
+                if not feed_symbols:
+                    logger.info(
+                        "Delta market WS skipped: no candle-based feed symbols for engine %s",
+                        config.engine_id,
                     )
-                    realtime_feed.set_tick_queue(tick_queue)
-                realtime_feed.start()
+                else:
+                    realtime_feed = DeltaWebSocketFeed(
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        symbols=feed_symbols,
+                        timeframe=timeframe,
+                        testnet=config.delta_testnet,
+                        india=config.delta_india,
+                        subscribe_private=True,
+                        engine_logger=engine_logger,
+                        telegram_alert=telegram_alert,
+                    )
+                    if LiveEngine.needs_candle_aggregator(strategies, eval_modes):
+                        tick_queue = queue.Queue(maxsize=50000)
+                        candle_aggregator = CandleAggregator(
+                            engine_logger=engine_logger,
+                            debug_mode=bool(getattr(config, "debug_mode", False)),
+                        )
+                        realtime_feed.set_tick_queue(tick_queue)
+                    realtime_feed.start()
             elif not api_key or not api_secret:
                 logger.warning("Delta realtime feed skipped: missing API credentials")
         elif config.broker_name == "DHAN":
@@ -385,9 +395,22 @@ class EngineFactory:
                 and client_id
                 and hasattr(instrument_store, "get_feed_instruments")
             ):
-                symbols_list = config.symbols or []
-                instruments = instrument_store.get_feed_instruments(symbols_list)
-                if not instruments:
+                eval_modes = getattr(config, "strategy_eval", None) or {}
+                feed_symbols = LiveEngine._collect_feed_symbols(
+                    config.symbols or [], strategies, eval_modes
+                )
+                symbols_list = feed_symbols
+                if not symbols_list:
+                    logger.info(
+                        "Dhan market WS skipped: no candle-based feed symbols for engine %s",
+                        config.engine_id,
+                    )
+                instruments = (
+                    instrument_store.get_feed_instruments(symbols_list)
+                    if symbols_list
+                    else []
+                )
+                if symbols_list and not instruments:
                     logger.warning("Dhan realtime feed skipped: get_feed_instruments returned empty for %s", symbols_list)
                 if instruments:
                     realtime_feed = DhanWebSocketFeed(
@@ -400,7 +423,7 @@ class EngineFactory:
                             config, "market_ws_stall_timeout_seconds", None
                         ),
                     )
-                    if any(getattr(s, "timeframe", None) for s in strategies):
+                    if LiveEngine.needs_candle_aggregator(strategies, eval_modes):
                         tick_queue = queue.Queue(maxsize=50000)
                         if is_nse_like:
                             candle_aggregator = CandleAggregator(
@@ -434,6 +457,7 @@ class EngineFactory:
         return LiveEngine(
             strategy=strategy,
             strategies=strategies,
+            strategy_eval_modes=getattr(config, "strategy_eval", None) or {},
             data=data_provider,
             candle_service=candle_service,
             symbols=config.symbols or [],

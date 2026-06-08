@@ -1,3 +1,4 @@
+from datetime import time
 from typing import TYPE_CHECKING, Any, List, Optional
 
 if TYPE_CHECKING:
@@ -9,6 +10,8 @@ class BaseStrategy:
     required_context = []
     # When set, live/backtest evaluation is limited to these underlyings (empty = all engine symbols).
     underlying_symbols: List[str] = []
+    # Live wall-clock slots (IST). Set ``timeframe = None`` (or ``"EVENT"``) to use engine scheduled eval.
+    scheduled_times: List[time] = []
 
     def prepare_indicators(self, df: Any) -> Any:
         return df

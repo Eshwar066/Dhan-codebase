@@ -758,15 +758,20 @@ class LiveEngineHelpersMixin:
         self._notify_dhan_feed_connection_state()
         if not self._is_market_open_for_feed_health():
             self._entries_paused_feed_stale = False
-            for symbol in self.symbols:
+            for symbol in getattr(self, "_feed_health_symbols", lambda: self.symbols)():
                 if symbol in self._symbol_state:
                     self._symbol_state[symbol]["feed_stale"] = False
             return
-        if not self.realtime_feed or not self.realtime_feed.is_connected():
+        feed_syms = (
+            self._feed_health_symbols()
+            if hasattr(self, "_feed_health_symbols")
+            else list(self.symbols or [])
+        )
+        if not self.realtime_feed or not self.realtime_feed.is_connected() or not feed_syms:
             return
         now = time.time()
         any_stale = False
-        for symbol in self.symbols:
+        for symbol in feed_syms:
             last_tick = self._last_tick_timestamp.get(symbol, 0)
             last_candle = self._last_candle_timestamp.get(symbol, 0)
             stale = (now - max(last_tick, last_candle)) > self.feed_stale_seconds

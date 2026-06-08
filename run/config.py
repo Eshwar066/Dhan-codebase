@@ -36,6 +36,7 @@ ENGINE_JOBS = [
         "run_mode": "LIVE",
         "capital": 200000,
         "ORDER_QTY_LOTS": 1,
+        # BANKNIFTY is for BTST scheduled eval only (REST spot); WS subscribes NIFTY via feed_symbols.
         "symbols": ["NIFTY", "BANKNIFTY"],
         "exchange": "NSE",
         # "symbols": ["GOLD"],
@@ -50,6 +51,11 @@ ENGINE_JOBS = [
         },
         
         "strategies": ["LEAPS_RSI", "BankNiftyBTST"],
+        # Per-strategy eval: live_feed = WS candles; scheduled = IST wall-clock + REST.
+        "strategy_eval": {
+            "LEAPS_RSI": "live_feed",
+            "BankNiftyBTST": "scheduled",
+        },
         "live": {"exchange": "INDEX", "sector": "YES", "rsi": "YES"},
         # "live": {"exchange": "MCX", "sector": "NO", "rsi": "YES"},
         "backtest": {

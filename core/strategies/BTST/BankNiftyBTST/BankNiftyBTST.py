@@ -25,9 +25,9 @@ from core.strategies.base import BaseStrategy
 from core.strategies.IndiaMktMixins import IST, IndiaMktMixins
 from core.utils.expiry_resolver import ExpiryResolver
 
-ENTRY_BAR_CLOSE = time(9, 20)
-EXIT_BAR_CLOSE = time(9, 25)
-CANCEL_UNFILLED_BAR_CLOSE = time(15, 20)
+ENTRY_TIME = time(9, 20)
+EXIT_TIME = time(9, 25)
+CANCEL_TIME = time(15, 20)
 
 TARGET_PREMIUM = 100.0
 PREM_MIN = 80.0
@@ -51,12 +51,16 @@ class _BtstLegMeta:
 class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
     """
     Bank Nifty BTST: buy CE + PE near 100 premium, SL at half of limit entry, exit T+1 9:25.
+    Live: wall-clock scheduled evaluation (no websocket candles).
+    Backtest: 5m bar close alignment via ``backtest_timeframe``.
     """
 
     name = "BankNiftyBTST"
     underlying_symbols = ["BANKNIFTY"]
     bracket_leg_tags = ["MAIN_SL"]
-    timeframe = "5"
+    timeframe = None
+    backtest_timeframe = "5"
+    scheduled_times = [ENTRY_TIME, CANCEL_TIME, EXIT_TIME]
     required_context = ["option_chain"]
     api = "DHAN"
     expiryType = "MONTHLY"
@@ -72,15 +76,28 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         super().__init__(*args, **kwargs)
         self._meta_by_structure_id: Dict[str, _BtstLegMeta] = {}
         self._snapshot_logged_slots: set[str] = set()
-        # structure_id|bar_open_ist — one ENTRY intent per leg per 9:20 bar
         self._entry_signaled_keys: set[str] = set()
-        # symbol|bar_open_ist — one strategy evaluation per 9:20 bar
         self._evaluated_signal_keys: set[str] = set()
-        # cancel|symbol|bar_open_ist — one cutoff cancel pass per 15:20 bar
         self._cancel_evaluated_signal_keys: set[str] = set()
 
     def get_warmup_period(self):
         return 0
+
+    def _bar_minutes(self) -> int:
+        tf = getattr(self, "timeframe", None) or getattr(self, "backtest_timeframe", "5")
+        return int(tf) if str(tf).isdigit() else 5
+
+    def _scheduled_slot_from_candle(self, candle: dict) -> Optional[time]:
+        slot = candle.get("scheduled_slot")
+        if isinstance(slot, time):
+            return slot.replace(second=0, microsecond=0)
+        return None
+
+    def _active_slot(self, candle: dict) -> Optional[time]:
+        slot = self._scheduled_slot_from_candle(candle)
+        if slot is not None:
+            return slot
+        return self._bar_close_time(candle)
 
     def _bar_close_time(self, candle: dict) -> time:
         ts = pd.Timestamp(candle["timestamp"])
@@ -88,8 +105,7 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
             ts = ts.tz_localize(IST)
         else:
             ts = ts.tz_convert(IST)
-        bar_minutes = int(self.timeframe) if str(self.timeframe).isdigit() else 5
-        close_ts = ts + pd.Timedelta(minutes=bar_minutes)
+        close_ts = ts + pd.Timedelta(minutes=self._bar_minutes())
         return close_ts.time().replace(second=0, microsecond=0)
 
     def _candle_close_ts_ist(self, candle: dict) -> pd.Timestamp:
@@ -98,8 +114,7 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
             ts = ts.tz_localize(IST)
         else:
             ts = ts.tz_convert(IST)
-        bar_minutes = int(self.timeframe) if str(self.timeframe).isdigit() else 5
-        return ts + pd.Timedelta(minutes=bar_minutes)
+        return ts + pd.Timedelta(minutes=self._bar_minutes())
 
     def _find_strike_snapshot_params(self, candle, ctx, option_type):
         ts_ist = self._candle_close_ts_ist(candle)
@@ -135,7 +150,11 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
             return ExpiryResolver.dhan_expiry_index_to_date(td, sel)
         return sel
 
-    def _entry_bar_open_key(self, candle: dict) -> str:
+    def _slot_key(self, candle: dict) -> str:
+        slot = self._scheduled_slot_from_candle(candle)
+        if slot is not None:
+            trade_dt = pd.Timestamp(candle["timestamp"]).date()
+            return f"{trade_dt}|{slot.strftime('%H:%M')}"
         bucket = candle.get("bucket_ts")
         if bucket is not None:
             try:
@@ -151,11 +170,11 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         return ts.strftime("%Y-%m-%d %H:%M")
 
     def _entry_signal_guard_key(self, candle: dict, structure_id: str) -> str:
-        return f"{structure_id}|{self._entry_bar_open_key(candle)}"
+        return f"{structure_id}|{self._slot_key(candle)}"
 
     def _evaluate_signal_key(self, candle: dict) -> str:
         symbol = str(candle.get("symbol") or "").strip().upper()
-        return f"{symbol}|{self._entry_bar_open_key(candle)}"
+        return f"{symbol}|{self._slot_key(candle)}"
 
     def _structure_id(self, symbol: str, trade_dt: date, option_type: str) -> str:
         leg = str(option_type).upper()
@@ -274,18 +293,24 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         if n:
             print(
                 f"BankNiftyBTST: cancelled {n} unfilled ENTRY order(s) at "
-                f"{CANCEL_UNFILLED_BAR_CLOSE.strftime('%H:%M')} IST"
+                f"{CANCEL_TIME.strftime('%H:%M')} IST"
             )
 
     def should_evaluate(self, candle) -> bool:
-        close = self._bar_close_time(candle)
-        if close == CANCEL_UNFILLED_BAR_CLOSE:
+        slot = self._active_slot(candle)
+        if slot == CANCEL_TIME:
             eval_key = self._cancel_evaluate_signal_key(candle)
             if eval_key in self._cancel_evaluated_signal_keys:
                 return False
             self._cancel_evaluated_signal_keys.add(eval_key)
             return True
-        if close != ENTRY_BAR_CLOSE:
+        if slot == EXIT_TIME:
+            eval_key = f"exit|{self._evaluate_signal_key(candle)}"
+            if eval_key in self._evaluated_signal_keys:
+                return False
+            self._evaluated_signal_keys.add(eval_key)
+            return True
+        if slot != ENTRY_TIME:
             return False
         eval_key = self._evaluate_signal_key(candle)
         if eval_key in self._evaluated_signal_keys:
@@ -389,11 +414,13 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         )
 
     def on_candle(self, candle, ctx):
-        close = self._bar_close_time(candle)
-        if close == CANCEL_UNFILLED_BAR_CLOSE:
+        slot = self._active_slot(candle)
+        if slot == CANCEL_TIME:
             self._cancel_unfilled_entry_orders(candle, ctx)
             return None
-        if close != ENTRY_BAR_CLOSE:
+        if slot == EXIT_TIME:
+            return None
+        if slot != ENTRY_TIME:
             return None
 
         trade_dt = pd.Timestamp(candle["timestamp"]).date()
@@ -479,7 +506,7 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         trade_dt = pd.Timestamp(candle["timestamp"]).date()
         if trade_dt <= meta.entry_date:
             return False
-        return self._bar_close_time(candle) == EXIT_BAR_CLOSE
+        return self._active_slot(candle) == EXIT_TIME
 
     def on_position_exit(self, position, candle, ctx):
         price = (

@@ -16,7 +16,11 @@ import csv
 import threading
 import json
 from collections import deque
+from datetime import time as dt_time
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
+
+IST = ZoneInfo("Asia/Kolkata")
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +83,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         open_positions_logger: Optional[Any] = None,
         dhan_order_update_feed: Optional[Any] = None,
         strategies=None,
+        strategy_eval_modes: Optional[Dict[str, str]] = None,
         account_router: Optional[AccountRouter] = None,
         oms_rate_limit_per_sec: float = 5.0,
         intent_queue_maxsize: int = 1000,
@@ -105,7 +110,17 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             str(getattr(s, "name", f"strategy_{idx}")): s
             for idx, s in enumerate(self.strategies)
         }
+        self.strategy_eval_modes = dict(strategy_eval_modes or {})
         self._engine_timeframes = self._collect_engine_timeframes()
+        self._scheduled_strategies = [
+            s
+            for s in self.strategies
+            if self._is_scheduled_strategy(s, self.strategy_eval_modes)
+        ]
+        self._scheduled_evaluated_keys: set[str] = set()
+        self.feed_symbols = self._collect_feed_symbols(
+            self.symbols, self.strategies, self.strategy_eval_modes
+        )
         self.candle_service = candle_service
         self.order_router = order_router
         self.position_manager = position_manager
@@ -1236,28 +1251,263 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
 
 
     @staticmethod
-    def _collect_engine_timeframes_from_strategies(strategies: List[Any], primary: Any) -> List[str]:
+    def _is_scheduled_timeframe(timeframe: Any) -> bool:
+        tf_s = str(timeframe or "").strip().upper()
+        return not tf_s or tf_s == "EVENT"
+
+    @staticmethod
+    def _normalize_eval_mode(mode: Any) -> Optional[str]:
+        s = str(mode or "").strip().lower().replace("-", "_")
+        if s in ("live_feed", "live", "feed", "candle", "candles"):
+            return "live_feed"
+        if s in ("scheduled", "time_based", "time", "event"):
+            return "scheduled"
+        return None
+
+    @classmethod
+    def _eval_mode_for_strategy(
+        cls, strategy: Any, strategy_eval_modes: Optional[Dict[str, str]] = None
+    ) -> str:
+        name = str(getattr(strategy, "name", "") or "")
+        if strategy_eval_modes and name in strategy_eval_modes:
+            normalized = cls._normalize_eval_mode(strategy_eval_modes[name])
+            if normalized:
+                return normalized
+        if cls._is_scheduled_timeframe(getattr(strategy, "timeframe", None)):
+            return "scheduled"
+        return "live_feed"
+
+    @classmethod
+    def _is_scheduled_strategy(
+        cls, strategy: Any, strategy_eval_modes: Optional[Dict[str, str]] = None
+    ) -> bool:
+        return (
+            cls._eval_mode_for_strategy(strategy, strategy_eval_modes) == "scheduled"
+        )
+
+    @classmethod
+    def needs_candle_aggregator(
+        cls,
+        strategies: List[Any],
+        strategy_eval_modes: Optional[Dict[str, str]] = None,
+    ) -> bool:
+        return any(
+            cls._eval_mode_for_strategy(s, strategy_eval_modes) == "live_feed"
+            and str(getattr(s, "timeframe", "") or "").strip()
+            for s in (strategies or [])
+        )
+
+    @staticmethod
+    def _collect_feed_symbols(
+        engine_symbols: List[str],
+        strategies: List[Any],
+        strategy_eval_modes: Optional[Dict[str, str]] = None,
+    ) -> List[str]:
+        """Symbols that require websocket tick aggregation (excludes scheduled-only underlyings)."""
+        candle_syms: set[str] = set()
+        for s in strategies or []:
+            if LiveEngine._is_scheduled_strategy(s, strategy_eval_modes):
+                continue
+            allowed = getattr(s, "underlying_symbols", None) or []
+            if allowed:
+                for sym in allowed:
+                    candle_syms.add(str(sym).strip().upper())
+            else:
+                for sym in engine_symbols or []:
+                    candle_syms.add(str(sym).strip().upper())
+        return sorted(candle_syms)
+
+    @staticmethod
+    def _collect_engine_timeframes_from_strategies(
+        strategies: List[Any],
+        primary: Any,
+        strategy_eval_modes: Optional[Dict[str, str]] = None,
+    ) -> List[str]:
         seen: set[str] = set()
         out: List[str] = []
         for s in strategies:
+            if LiveEngine._is_scheduled_strategy(s, strategy_eval_modes):
+                continue
             tf_s = str(getattr(s, "timeframe", "") or "").strip()
             if tf_s and tf_s not in seen:
                 seen.add(tf_s)
                 out.append(tf_s)
         if not out:
-            p = str(getattr(primary, "timeframe", "") or "").strip()
-            if p:
-                out.append(p)
+            if not LiveEngine._is_scheduled_strategy(primary, strategy_eval_modes):
+                p = str(getattr(primary, "timeframe", "") or "").strip()
+                if p:
+                    out.append(p)
         return out
 
     def _collect_engine_timeframes(self) -> List[str]:
         return self._collect_engine_timeframes_from_strategies(
-            self.strategies, self.strategy
+            self.strategies, self.strategy, self.strategy_eval_modes
         )
 
     @staticmethod
     def _symbol_tf_eval_key(symbol: str, timeframe: str) -> str:
         return f"{symbol}|{timeframe}"
+
+    def _feed_health_symbols(self) -> List[str]:
+        return list(self.feed_symbols or self.symbols or [])
+
+    def _symbols_for_strategy(self, strategy: Any) -> List[str]:
+        allowed = getattr(strategy, "underlying_symbols", None) or []
+        if allowed:
+            allow_set = {str(s).strip().upper() for s in allowed}
+            return [
+                str(s).strip().upper()
+                for s in (self.symbols or [])
+                if str(s).strip().upper() in allow_set
+            ]
+        return [str(s).strip().upper() for s in (self.symbols or [])]
+
+    @staticmethod
+    def _normalize_scheduled_time(slot: Any) -> Optional[dt_time]:
+        if isinstance(slot, dt_time):
+            return slot.replace(second=0, microsecond=0)
+        try:
+            parts = str(slot or "").strip().split(":")
+            if len(parts) >= 2:
+                return dt_time(int(parts[0]), int(parts[1]))
+        except (TypeError, ValueError):
+            return None
+        return None
+
+    @staticmethod
+    def _extract_spot_close(ohlc_payload: Any, symbol: str) -> Optional[float]:
+        if not isinstance(ohlc_payload, dict):
+            return None
+        row = ohlc_payload.get(symbol)
+        if row is None and ohlc_payload:
+            row = next(iter(ohlc_payload.values()))
+        if not isinstance(row, dict):
+            return None
+        for key in ("close", "ltp", "last_price", "LTP", "Close"):
+            if key not in row:
+                continue
+            try:
+                v = float(row[key])
+                if v > 0:
+                    return v
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _build_scheduled_candle(
+        self,
+        symbol: str,
+        spot: float,
+        slot_time: dt_time,
+        exchange: str,
+        now_ist: dt.datetime,
+    ) -> Dict[str, Any]:
+        ts_utc = now_ist.astimezone(dt.timezone.utc).replace(tzinfo=None)
+        return {
+            "symbol": symbol,
+            "exchange": exchange,
+            "timestamp": ts_utc,
+            "open": float(spot),
+            "high": float(spot),
+            "low": float(spot),
+            "close": float(spot),
+            "volume": 0,
+            "scheduled_slot": slot_time,
+        }
+
+    def _maybe_run_scheduled_evaluations(self, exchange: str) -> None:
+        if not self._scheduled_strategies:
+            return
+        now_ist = dt.datetime.now(IST)
+        slot_t = now_ist.time().replace(second=0, microsecond=0)
+        due: List[tuple] = []
+        for strategy in self._scheduled_strategies:
+            for raw_slot in getattr(strategy, "scheduled_times", None) or []:
+                slot_time = self._normalize_scheduled_time(raw_slot)
+                if slot_time is None or slot_t != slot_time:
+                    continue
+                strategy_id = str(getattr(strategy, "name", "unknown_strategy"))
+                for sym in self._symbols_for_strategy(strategy):
+                    key = (
+                        f"{strategy_id}|{sym}|{now_ist.date().isoformat()}|"
+                        f"{slot_time.strftime('%H:%M')}"
+                    )
+                    if key in self._scheduled_evaluated_keys:
+                        continue
+                    due.append((strategy, sym, slot_time, key))
+        if not due:
+            return
+
+        symbols = sorted({item[1] for item in due})
+        ohlc = None
+        if self.data and hasattr(self.data, "get_latest_candles"):
+            try:
+                ohlc = self.data.get_latest_candles(symbols)
+            except Exception as exc:
+                logger.warning("Scheduled eval spot fetch failed: %s", exc)
+
+        for strategy, sym, slot_time, key in due:
+            close = self._extract_spot_close(ohlc, sym)
+            if close is None:
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "scheduled_eval_skipped",
+                        f"No REST spot for {sym} at {slot_time.strftime('%H:%M')} IST",
+                        strategy=str(getattr(strategy, "name", "")),
+                        symbol=sym,
+                    )
+                continue
+            candle = self._build_scheduled_candle(
+                sym, close, slot_time, exchange, now_ist
+            )
+            self._scheduled_evaluated_keys.add(key)
+            if self.engine_logger:
+                self.engine_logger.log(
+                    "scheduled_eval",
+                    (
+                        f"Scheduled slot {slot_time.strftime('%H:%M')} IST "
+                        f"symbol={sym} spot={close}"
+                    ),
+                    strategy=str(getattr(strategy, "name", "")),
+                    symbol=sym,
+                )
+            for eval_result in self._evaluate_strategies_parallel(
+                candle, scheduled=True
+            ):
+                eval_strategy = eval_result.get("strategy")
+                eval_strategy_name = str(
+                    getattr(eval_strategy, "name", "unknown_strategy")
+                )
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "strategy_evaluated",
+                        message=f"Strategy evaluated (scheduled): {eval_strategy_name}",
+                        strategy=eval_strategy_name,
+                        symbol=sym,
+                    )
+                intent = eval_result.get("intent")
+                if intent and self._entries_paused_feed_stale:
+                    continue
+                intent_has_entry = self._intent_has_entry(intent)
+                if (
+                    intent
+                    and intent_has_entry
+                    and (
+                        self._entries_paused_order_mismatch
+                        or self._entries_paused_memory
+                        or self._entries_paused_latency
+                    )
+                ):
+                    continue
+                self._run_strategy(
+                    sym,
+                    candle,
+                    eval_result["ctx"],
+                    intent,
+                    strategy=eval_result["strategy"],
+                    strategy_time_ms=eval_result.get("strategy_time_ms"),
+                    timeframe=None,
+                )
 
     def _enrich_candle_for_strategy(self, strategy: Any, candle: Dict[str, Any]) -> Dict[str, Any]:
         return self.indicator_manager.enrich_candle_for_strategy(
@@ -1267,15 +1517,24 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         )
 
     def _evaluate_strategies_parallel(
-        self, candle: Dict[str, Any], timeframe: Optional[str] = None
+        self,
+        candle: Dict[str, Any],
+        timeframe: Optional[str] = None,
+        scheduled: bool = False,
     ) -> List[Dict[str, Any]]:
         response_q: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         expected = 0
         tf_filter = str(timeframe or "").strip() if timeframe is not None else ""
         candle_symbol = str(candle.get("symbol") or "").strip().upper()
         for strategy in self.strategies:
-            if tf_filter and str(getattr(strategy, "timeframe", "") or "").strip() != tf_filter:
-                continue
+            if scheduled:
+                if not self._is_scheduled_strategy(strategy, self.strategy_eval_modes):
+                    continue
+            else:
+                if self._is_scheduled_strategy(strategy, self.strategy_eval_modes):
+                    continue
+                if tf_filter and str(getattr(strategy, "timeframe", "") or "").strip() != tf_filter:
+                    continue
             if candle_symbol and not strategy.applies_to_symbol(candle_symbol):
                 continue
             strategy_candle = self._enrich_candle_for_strategy(strategy, candle)
@@ -1350,7 +1609,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         )
 
     def _check_feed_stall_fail_safe(self) -> None:
-        if not self.realtime_feed or not self.symbols:
+        feed_syms = self._feed_health_symbols()
+        if not self.realtime_feed or not feed_syms:
             return
         # Outside market hours, stale feed is expected; suppress false alerts/spam.
         if not self._is_market_open_for_feed_health():
@@ -1381,7 +1641,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         # During startup warmup, suppress "all symbols stalled" when no symbol has seen any data yet.
         if now < self._feed_start_grace_until_ts:
             any_seen = False
-            for sym in self.symbols:
+            for sym in feed_syms:
                 if max(
                     self._last_tick_timestamp.get(sym, 0.0),
                     self._last_candle_timestamp.get(sym, 0.0),
@@ -1391,13 +1651,13 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             if not any_seen:
                 return
         stale_symbols = []
-        for sym in self.symbols:
+        for sym in feed_syms:
             last_tick = self._last_tick_timestamp.get(sym, 0.0)
             last_candle = self._last_candle_timestamp.get(sym, 0.0)
             last_seen = max(last_tick, last_candle)
             if last_seen <= 0 or (now - last_seen) > self._feed_stall_seconds:
                 stale_symbols.append(sym)
-        if len(stale_symbols) != len(self.symbols):
+        if len(stale_symbols) != len(feed_syms):
             self._feed_stall_last_log_ts = 0.0
             return
         if (
@@ -1510,6 +1770,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             self._sync_delta_ws_trades()
             self._retry_dhan_pending_fills()
             self._do_exit_order_refresh()
+            self._maybe_run_scheduled_evaluations(exchange)
 
             # Export eod report funtion
             if loop_count % 60 == 0:
