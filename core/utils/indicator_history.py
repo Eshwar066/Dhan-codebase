@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -95,6 +96,34 @@ def bucket_ts_is_nse_60m_bar(bucket_ts: Any) -> bool:
     except (OSError, OverflowError, ValueError):
         return False
     return is_nse_60m_bar_ist(dt_ist)
+
+
+def nse_60m_bar_close_eval_window(
+    candle: Any,
+    *,
+    grace_minutes: int = 8,
+    now_unix: Optional[float] = None,
+) -> bool:
+    """
+    True only within a short window after an NSE hourly bar closes.
+
+    Used by LEAPS (60m RSI) so indicator history, candle logs, and strategy eval
+    run once per closed bar — not on forming or stale replay bars.
+    """
+    if isinstance(candle, dict):
+        bucket = candle.get("bucket_ts")
+    else:
+        bucket = candle
+    if bucket is None or not bucket_ts_is_nse_60m_bar(bucket):
+        return False
+    try:
+        bar_open_unix = int(float(bucket))
+    except (TypeError, ValueError):
+        return False
+    bar_close_unix = bar_open_unix + 3600
+    now = int(now_unix if now_unix is not None else time.time())
+    grace_sec = max(60, int(grace_minutes) * 60)
+    return bar_close_unix <= now <= (bar_close_unix + grace_sec)
 
 
 def is_nse_index_context(symbol: str, exchange: Optional[str] = None) -> bool:

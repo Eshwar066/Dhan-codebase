@@ -27,9 +27,16 @@ _LOG_SUBDIR = "logs/option_chain_snapshots"
 _OPTION_BUILDUP_SUBDIR = "logs/option_buildup"
 _OI_POSITIONAL_BUY_SUBDIR = "logs/OIPositionalBuy"
 _LEAPS_RSI_SUBDIR = "logs/LEAPS_RSI/option_chain_snapshots"
+_LEAPS_RSI_HEDGE_SUBDIR = "logs/LEAPS_RSI/hedge_option_chain_snapshots"
 _BANKNIFTY_BTST_SUBDIR = "logs/BankNiftyBTST/option_chain_snapshots"
 _NAMED_SNAPSHOT_TARGETS = frozenset(
-    {"option_buildup", "oi_positional_buy", "leaps_rsi", "banknifty_btst"}
+    {
+        "option_buildup",
+        "oi_positional_buy",
+        "leaps_rsi",
+        "leaps_rsi_hedge",
+        "banknifty_btst",
+    }
 )
 
 logger = logging.getLogger(__name__)
@@ -90,6 +97,8 @@ def _snapshot_out_dir(snapshot_target: str) -> Path:
         return _ROOT / _OI_POSITIONAL_BUY_SUBDIR
     if target == "leaps_rsi":
         return _ROOT / _LEAPS_RSI_SUBDIR
+    if target == "leaps_rsi_hedge":
+        return _ROOT / _LEAPS_RSI_HEDGE_SUBDIR
     if target == "banknifty_btst":
         return _ROOT / _BANKNIFTY_BTST_SUBDIR
     return _ROOT / _LOG_SUBDIR
@@ -251,6 +260,8 @@ def log_option_chain_snapshot(
         out_dir = _ROOT / _OI_POSITIONAL_BUY_SUBDIR
     elif target == "leaps_rsi":
         out_dir = _ROOT / _LEAPS_RSI_SUBDIR
+    elif target == "leaps_rsi_hedge":
+        out_dir = _ROOT / _LEAPS_RSI_HEDGE_SUBDIR
     else:
         out_dir = _ROOT / _LOG_SUBDIR
 

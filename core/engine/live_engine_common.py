@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import psutil
 
 from core.data.candle_aggregator import _resolution_to_seconds
-from core.utils.indicator_history import bucket_ts_is_nse_60m_bar, is_nse_index_context
+from core.utils.indicator_history import bucket_ts_is_nse_60m_bar, is_nse_index_context, nse_60m_bar_close_eval_window
 
 DEFAULT_FEED_STALE_SECONDS = 60
 logger = logging.getLogger(__name__)
@@ -432,6 +432,7 @@ class LiveEngineHelpersMixin:
         if tf_sec <= 0:
             tf_sec = 60
 
+        epoch = dt.datetime(1970, 1, 1)
         bt = candle.get("bucket_ts")
         if bt is not None:
             try:
@@ -440,12 +441,14 @@ class LiveEngineHelpersMixin:
                 bt_int = None
             if bt_int is not None:
                 if tf_sec == 3600 and self._is_nse_index_candle(candle):
-                    return bucket_ts_is_nse_60m_bar(bt_int)
-                # bucket_ts originates from CandleAggregator/engine bucketing and can be
-                # session-anchored (e.g. NSE/BSE 1h at 09:15), so do not require epoch modulus.
+                    if not bucket_ts_is_nse_60m_bar(bt_int):
+                        return False
+                # bucket_ts is bar open (unix). Require wall-clock past bar close.
+                now_unix = int((now_utc - epoch).total_seconds())
+                if now_unix < bt_int + tf_sec:
+                    return False
                 return True
 
-        epoch = dt.datetime(1970, 1, 1)
         unix_s = int((ts_utc - epoch).total_seconds())
         return (unix_s % tf_sec) == 0
 
@@ -570,6 +573,8 @@ class LiveEngineHelpersMixin:
 
     @staticmethod
     def _candle_bucket_start_unix(candle: Dict[str, Any]) -> Optional[int]:
+        if candle is None:
+            return None
         bt = candle.get("bucket_ts")
         if bt is not None:
             try:

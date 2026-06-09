@@ -1444,6 +1444,37 @@ class IndiaMktMixins:
             return int(round((sold_strike * 1.02) / 500) * 500)
         return int(round((sold_strike * 0.98) / 500) * 500)
 
+    def resolve_hedge_entry_price(
+        self,
+        candle,
+        ctx,
+        hedge_strike,
+        option_type,
+        hedge_expiry,
+    ) -> Optional[float]:
+        """
+        Hedge leg limit price. Override when hedge expiry differs from the main
+        option chain (e.g. LEAPS sell + monthly hedge).
+        """
+        px = self._option_price_from_resolved_chain(
+            candle,
+            ctx,
+            hedge_strike,
+            option_type,
+            side="BUY",
+        )
+        if px is not None and px > 0:
+            return px
+        if RUN_MODE == RunMode.BACKTEST:
+            return self.get_option_price_at_candle(
+                candle,
+                ctx,
+                hedge_strike,
+                option_type,
+                hedge_expiry,
+            )
+        return None
+
     def create_hedge_intent(self, parent_sell_intent, candle, ctx):
         trade_date = pd.to_datetime(candle["timestamp"]).date()
         parent_expiry = getattr(
@@ -1496,24 +1527,15 @@ class IndiaMktMixins:
             )
             return None
 
-        hedge_price = self._option_price_from_resolved_chain(
+        hedge_price = self.resolve_hedge_entry_price(
             candle,
             ctx,
             hedge_strike,
             parent_sell_intent.instrument.option_type,
-            side="BUY",
+            hedge_expiry,
         )
         if hedge_price is None or hedge_price <= 0:
-            if RUN_MODE == RunMode.BACKTEST:
-                hedge_price = self.get_option_price_at_candle(
-                    candle,
-                    ctx,
-                    hedge_strike,
-                    parent_sell_intent.instrument.option_type,
-                    hedge_expiry,
-                )
-            else:
-                hedge_price = 0
+            hedge_price = 0
 
         return self.create_order_intent(
             inst=inst,

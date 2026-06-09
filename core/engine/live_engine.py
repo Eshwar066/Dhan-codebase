@@ -33,6 +33,11 @@ from core.engine.live_engine_common import (
 )
 from core.engine.execution_engine import ExecutionEngine
 from core.engine.indicator_manager import IndicatorManager
+from core.utils.indicator_history import (
+    bucket_ts_is_nse_60m_bar,
+    is_nse_index_context,
+    nse_60m_bar_close_eval_window,
+)
 from core.orderExecution.account_router import AccountRouter
 
 try:
@@ -355,6 +360,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
     ) -> Optional[int]:
         if first_live_ts is None or last_hist_ts is None:
             return first_live_ts
+        if bucket_ts_is_nse_60m_bar(first_live_ts) and not bucket_ts_is_nse_60m_bar(
+            last_hist_ts
+        ):
+            return first_live_ts
         if first_live_ts < last_hist_ts:
             aligned = int(last_hist_ts) + int(tf_sec)
             logger.warning(
@@ -382,6 +391,27 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             )
             df = state.get("df")
             if df is None or len(df) == 0 or "timestamp" not in df.columns:
+                return None
+            tf_s = str(tf or "").strip()
+            nse_60m = tf_s in ("60", "1h") and is_nse_index_context(symbol, exchange)
+            if nse_60m:
+                # Ignore wall-clock / misaligned rows (e.g. 12:16) that break alignment.
+                for i in range(len(df) - 1, -1, -1):
+                    last_ts = df.iloc[i].get("timestamp")
+                    if last_ts is None:
+                        continue
+                    if hasattr(last_ts, "to_pydatetime"):
+                        last_ts = last_ts.to_pydatetime()
+                    if isinstance(last_ts, dt.datetime):
+                        if last_ts.tzinfo is None:
+                            last_ts = last_ts.replace(tzinfo=dt.timezone.utc)
+                        bt = int(last_ts.astimezone(dt.timezone.utc).timestamp())
+                    elif isinstance(last_ts, (int, float)):
+                        bt = int(float(last_ts))
+                    else:
+                        continue
+                    if bucket_ts_is_nse_60m_bar(bt):
+                        return bt
                 return None
             last_ts = df.iloc[-1].get("timestamp")
             if last_ts is None:
@@ -1509,18 +1539,57 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     timeframe=None,
                 )
 
-    def _enrich_candle_for_strategy(self, strategy: Any, candle: Dict[str, Any]) -> Dict[str, Any]:
+    def _candle_strategy_for(self, symbol: str, timeframe: str) -> Any:
+        """Live-feed strategy whose ``timeframe`` matches the closed bar."""
+        tf_s = str(timeframe or "").strip()
+        sym_u = str(symbol or "").strip().upper()
+        for strategy in self.strategies:
+            if self._is_scheduled_strategy(strategy, self.strategy_eval_modes):
+                continue
+            if str(getattr(strategy, "timeframe", "") or "").strip() != tf_s:
+                continue
+            if sym_u and not strategy.applies_to_symbol(sym_u):
+                continue
+            return strategy
+        return self.strategy
+
+    def _enrich_candle_for_strategy(
+        self,
+        strategy: Any,
+        candle: Dict[str, Any],
+        out_meta: Optional[Dict[str, Any]] = None,
+        allow_live_persist: bool = True,
+    ) -> Dict[str, Any]:
         return self.indicator_manager.enrich_candle_for_strategy(
             strategy=strategy,
             candle=candle,
             candle_bucket_fn=self._candle_bucket_start_unix,
+            out_meta=out_meta,
+            allow_live_persist=allow_live_persist,
         )
+
+    def _should_process_nse_60m_closed_bar(
+        self, candle: Dict[str, Any], timeframe: str
+    ) -> bool:
+        tf = str(timeframe or "").strip()
+        if tf not in ("60", "1h"):
+            return True
+        symbol = str(candle.get("symbol") or "")
+        exchange = str(
+            candle.get("exchange")
+            or getattr(self, "market_exchange", None)
+            or ""
+        )
+        if not is_nse_index_context(symbol, exchange):
+            return True
+        return nse_60m_bar_close_eval_window(candle)
 
     def _evaluate_strategies_parallel(
         self,
         candle: Dict[str, Any],
         timeframe: Optional[str] = None,
         scheduled: bool = False,
+        already_enriched: bool = False,
     ) -> List[Dict[str, Any]]:
         response_q: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         expected = 0
@@ -1537,7 +1606,12 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     continue
             if candle_symbol and not strategy.applies_to_symbol(candle_symbol):
                 continue
-            strategy_candle = self._enrich_candle_for_strategy(strategy, candle)
+            if already_enriched and str(getattr(strategy, "timeframe", "") or "").strip() == tf_filter:
+                strategy_candle = dict(candle)
+            else:
+                strategy_candle = self._enrich_candle_for_strategy(
+                    strategy, candle, allow_live_persist=False
+                )
             if not strategy.should_evaluate(strategy_candle):
                 continue
             # >>Signal Generation msg and logger print
@@ -1803,15 +1877,19 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         if candle:
                             self._last_candle_timestamp[symbol] = time.time()
                         eval_ts_key = self._symbol_tf_eval_key(symbol, str(tf))
-                        if candle and candle.get(
-                            "bucket_ts"
-                        ) == self._last_evaluated_candle_ts.get(eval_ts_key):
-                            logger.debug(
-                                "Skip %s: same candle bucket_ts=%s (waiting for new bar)",
-                                symbol,
-                                candle.get("bucket_ts"),
-                            )
-                            continue
+                        if candle:
+                            eval_bucket_key = self._candle_bucket_start_unix(candle)
+                            if (
+                                eval_bucket_key is not None
+                                and eval_bucket_key
+                                == self._last_evaluated_candle_ts.get(eval_ts_key)
+                            ):
+                                logger.debug(
+                                    "Skip %s: same candle bucket=%s (waiting for new bar)",
+                                    symbol,
+                                    eval_bucket_key,
+                                )
+                                continue
                     # Quote/ticker pseudo-candle fallback should be used only when
                     # aggregator mode is NOT active. In aggregator mode, pseudo-candles
                     # can create flat/synthetic OHLC rows (open==high==low==close).
@@ -1925,10 +2003,11 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                                 self._closed_candle_skip_counts[agg_key] = 0
                         continue
 
+                    if not self._should_process_nse_60m_closed_bar(candle, str(tf)):
+                        continue
+
                     eval_bucket = self._candle_bucket_start_unix(candle)
-                    eval_key = candle.get("bucket_ts")
-                    if eval_key is None:
-                        eval_key = eval_bucket
+                    eval_key = eval_bucket
                     eval_ts_key = self._symbol_tf_eval_key(symbol, str(tf))
                     if (
                         eval_key is not None
@@ -1948,7 +2027,15 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             getattr(self.realtime_feed, "is_dummy_feed", False)
                         )
                         tf_sec = max(60, int(_resolution_to_seconds(tf)))
-                        if not is_dummy_feed and (
+                        nse_60m_bar = (
+                            str(tf) in ("60", "1h")
+                            and is_nse_index_context(symbol, exchange)
+                            and eval_bucket is not None
+                            and bucket_ts_is_nse_60m_bar(eval_bucket)
+                        )
+                        if nse_60m_bar:
+                            self._first_live_alignment_done[symbol] = True
+                        elif not is_dummy_feed and (
                             not self._first_live_alignment_done.get(symbol, False)
                             and eval_bucket is not None
                         ):
@@ -1983,13 +2070,16 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             )
                         if skip_bar:
                             continue
-                        if replay_bar:
+                        if replay_bar and not self._should_process_nse_60m_closed_bar(
+                            candle, str(tf)
+                        ):
                             logger.debug(
-                                "REPLAY_BAR_ACCEPTED symbol=%s bucket=%s max_seen=%s",
+                                "Skip %s: replay bar bucket=%s max_seen=%s",
                                 symbol,
                                 eval_bucket,
                                 self._max_candle_bucket_unix.get(symbol),
                             )
+                            continue
                         if candle.get("bucket_ts") is not None:
                             self._has_seen_aggregator_bucket[symbol] = True
                         if eval_bucket is not None:
@@ -1997,8 +2087,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                                 self._max_candle_bucket_unix.get(symbol, 0),
                                 eval_bucket,
                             )
-                    if eval_key is not None:
-                        self._last_evaluated_candle_ts[eval_ts_key] = eval_key
                     if self.engine_logger:
                         queue_size = None
                         try:
@@ -2031,23 +2119,24 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             bucket_ts=candle.get("bucket_ts"),
                             eval_key=eval_key,
                         )
-                    if self.engine_logger and self._should_log_closed_candle(
-                        symbol, tf, candle
-                    ):
-                        candle_for_log = dict(candle)
-                        try:
-                            # Log candle with primary-strategy indicators (e.g. RSI) when available.
-                            candle_for_log = self._enrich_candle_for_strategy(
-                                self.strategy, candle
+                    enrich_meta: Dict[str, Any] = {}
+                    candle_strategy = self._candle_strategy_for(symbol, str(tf))
+                    enriched_candle = self._enrich_candle_for_strategy(
+                        candle_strategy,
+                        candle,
+                        out_meta=enrich_meta,
+                        allow_live_persist=True,
+                    )
+                    if self.engine_logger and enrich_meta.get("bar_closed_for_append"):
+                        if self._should_log_closed_candle(symbol, tf, candle):
+                            self.engine_logger.candle_created(
+                                enriched_candle, timeframe=tf
                             )
-                        except Exception:
-                            candle_for_log = dict(candle)
-                        self.engine_logger.candle_created(
-                            candle_for_log, timeframe=tf
-                        )
 
-                    self._enrich_candle_depth(symbol, candle) 
-                    for eval_result in self._evaluate_strategies_parallel(candle, timeframe=tf):
+                    self._enrich_candle_depth(symbol, candle)
+                    for eval_result in self._evaluate_strategies_parallel(
+                        enriched_candle, timeframe=tf, already_enriched=True
+                    ):
                         eval_strategy = eval_result.get("strategy")
                         eval_strategy_name = str(
                             getattr(eval_strategy, "name", "unknown_strategy")
@@ -2082,6 +2171,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             strategy_time_ms=eval_result["strategy_time_ms"],
                             timeframe=tf,
                         )
+                    if eval_key is not None:
+                        self._last_evaluated_candle_ts[eval_ts_key] = eval_key
             # To be checked properly else condition--> Pending
             else:
                 candles = None

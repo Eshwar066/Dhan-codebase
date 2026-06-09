@@ -21,6 +21,9 @@ from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
+# Temporary headroom while main-loop drain/stall ordering is improved (see utils/cursor.md).
+TICK_QUEUE_MAXSIZE = 500000
+
 from run.config import RunMode
 from run.engine_config import EngineConfig, configure_process_logging
 from core.strategies.registry import STRATEGY_MAP
@@ -373,7 +376,7 @@ class EngineFactory:
                         telegram_alert=telegram_alert,
                     )
                     if LiveEngine.needs_candle_aggregator(strategies, eval_modes):
-                        tick_queue = queue.Queue(maxsize=50000)
+                        tick_queue = queue.Queue(maxsize=TICK_QUEUE_MAXSIZE)
                         candle_aggregator = CandleAggregator(
                             engine_logger=engine_logger,
                             debug_mode=bool(getattr(config, "debug_mode", False)),
@@ -424,7 +427,7 @@ class EngineFactory:
                         ),
                     )
                     if LiveEngine.needs_candle_aggregator(strategies, eval_modes):
-                        tick_queue = queue.Queue(maxsize=50000)
+                        tick_queue = queue.Queue(maxsize=TICK_QUEUE_MAXSIZE)
                         if is_nse_like:
                             candle_aggregator = CandleAggregator(
                                 session_start_sec=(9 * 3600) + (15 * 60),

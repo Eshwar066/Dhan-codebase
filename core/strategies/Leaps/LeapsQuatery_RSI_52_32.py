@@ -1,17 +1,31 @@
+import logging
+from datetime import date
+from typing import Any, Optional
+
 import pandas as pd
 import talib
-from datetime import date
 
 from run.config import RUN_MODE, RunMode
 from core.strategies.base import BaseStrategy
 from core.strategies.IndiaMktMixins import IST, IndiaMktMixins
 from core.strategies.indicator_helpers import default_persisted_keys_for_rsi
 from core.utils.expiry_resolver import ExpiryResolver
+from core.utils.indicator_history import nse_60m_bar_close_eval_window
+from core.utils.option_chain_snapshot_log import log_option_chain_snapshot
+
+logger = logging.getLogger(__name__)
 
 class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     """
     LEAPS RSI option selling (monthly rollover expiry, 15th cutoff).
     SIGNAL + HEDGE
+
+    Live data path (60m NIFTY):
+    1. Closed bar from aggregator → ``indicator_manager.enrich_candle_for_strategy``
+    2. RSI + OHLC persisted to ``logs/indicators/NIFTY/60/indicator_history.jsonl``
+    3. Same enriched bar logged to ``logs/LEAPS_RSI/dhan_leaps_rsi_candles.log``
+    4. Enriched candle (rsi, prev_rsi) passed into ``should_evaluate`` / ``on_candle``
+    5. Hedge entry: fresh monthly-expiry chain → ``logs/LEAPS_RSI/hedge_option_chain_snapshots/``
     """
 
     name = "LEAPS_RSI"
@@ -30,6 +44,7 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._leaps_snapshot_logged_slots: set[str] = set()
+        self._leaps_hedge_snapshot_logged_slots: set[str] = set()
         # structure_id|bar_open_ist — one ENTRY bundle per closed hourly bar
         self._entry_signaled_keys: set[str] = set()
         # bar_open_ist|regime — one strategy evaluation per hourly bar per regime
@@ -97,6 +112,130 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             "snapshot_target": "leaps_rsi",
         }
 
+    def _hedge_snapshot_params(
+        self, candle: dict, ctx, option_type: str, hedge_expiry: date
+    ) -> dict:
+        """Snapshot CSV params for the monthly hedge expiry chain (not the LEAPS leg)."""
+        ts_ist = self._candle_close_ts_ist(candle)
+        snapshot_date = ts_ist.strftime("%Y-%m-%d")
+        snapshot_time = ts_ist.strftime("%H-%M")
+        slot_key = "|".join(
+            [
+                str(getattr(ctx, "symbol", "") or ""),
+                str(option_type or ""),
+                hedge_expiry.isoformat(),
+                snapshot_date,
+                snapshot_time,
+            ]
+        )
+        if slot_key in self._leaps_hedge_snapshot_logged_slots:
+            return {}
+        self._leaps_hedge_snapshot_logged_slots.add(slot_key)
+        return {
+            "snapshot": True,
+            "snapshot_date": snapshot_date,
+            "snapshot_time": snapshot_time,
+            "snapshot_target": "leaps_rsi_hedge",
+        }
+
+    def fetch_hedge_option_chain(
+        self,
+        candle: dict,
+        ctx,
+        hedge_expiry: date,
+        option_type: str,
+    ) -> Optional[Any]:
+        """
+        Live fetch of the monthly hedge expiry option chain (±60 strikes).
+        Logged under ``logs/LEAPS_RSI/hedge_option_chain_snapshots/``.
+        """
+        extra_snapshot_params = self._hedge_snapshot_params(
+            candle, ctx, option_type, hedge_expiry
+        )
+        params = {
+            "exchange": ctx.exchange,
+            "interval": self.timeframe,
+            "expiry_code": hedge_expiry,
+            "instrument": "OPTIDX",
+            "expiry_flag": "MONTH",
+            "strikes": 60,
+        }
+        if extra_snapshot_params:
+            params.update(extra_snapshot_params)
+
+        saved_expiry = getattr(ctx, "selected_expiry", None)
+        try:
+            ctx.selected_expiry = hedge_expiry
+            chain = ctx.option_chain_service.get_chain(
+                api=self.api, ctx=ctx, params=params
+            )
+        finally:
+            ctx.selected_expiry = saved_expiry
+
+        if bool(params.get("snapshot", False)) and chain is not None:
+            try:
+                log_option_chain_snapshot(
+                    chain,
+                    ctx=ctx,
+                    strategy_name=self.name,
+                    api=self.api,
+                    params=params,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "log_option_chain_snapshot (hedge) raised: %s", exc, exc_info=True
+                )
+        return chain
+
+    def resolve_hedge_entry_price(
+        self,
+        candle,
+        ctx,
+        hedge_strike,
+        option_type,
+        hedge_expiry,
+    ) -> Optional[float]:
+        """
+        Hedge BUY price from a fresh chain for ``hedge_expiry``, not the cached
+        LEAPS main-leg chain.
+        """
+        if RUN_MODE == RunMode.BACKTEST:
+            px = self.get_option_price_at_candle(
+                candle,
+                ctx,
+                hedge_strike,
+                option_type,
+                hedge_expiry,
+            )
+            if px is not None and px > 0:
+                return px
+
+        chain = self.fetch_hedge_option_chain(
+            candle, ctx, hedge_expiry, option_type
+        )
+        if chain is None:
+            logger.warning(
+                "LEAPS hedge chain missing sym=%s expiry=%s strike=%s opt=%s",
+                getattr(ctx, "symbol", "?"),
+                hedge_expiry,
+                hedge_strike,
+                option_type,
+            )
+            return None
+
+        row = self._strike_row_from_chain(chain, hedge_strike, option_type)
+        px = self._execution_price_from_chain_row(row, option_type, "BUY")
+        if px is not None and px > 0:
+            return px
+        logger.warning(
+            "LEAPS hedge price missing sym=%s expiry=%s strike=%s opt=%s",
+            getattr(ctx, "symbol", "?"),
+            hedge_expiry,
+            hedge_strike,
+            option_type,
+        )
+        return None
+
     def _hourly_bar_open_key(self, candle: dict) -> str:
         bucket = candle.get("bucket_ts")
         if bucket is not None:
@@ -115,10 +254,15 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     def _entry_signal_guard_key(self, candle: dict, structure_id: str) -> str:
         return f"{structure_id}|{self._hourly_bar_open_key(candle)}"
 
+    def _in_nse_hourly_close_eval_window(self, candle: dict, grace_minutes: int = 8) -> bool:
+        return nse_60m_bar_close_eval_window(candle, grace_minutes=grace_minutes)
+
     # ==================================================
     # SHOULD EVALUATE
     # ==================================================
     def should_evaluate(self, candle):
+        if not self._in_nse_hourly_close_eval_window(candle):
+            return False
         rsi = candle.get("rsi")
         prev = candle.get("prev_rsi")
         if pd.isna(rsi) or pd.isna(prev):
@@ -127,8 +271,9 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         cross_gt_52 = prev <= 52 and rsi > 52
         if not cross_lt_32 and not cross_gt_52:
             return False
-        regime = "RSI_LT_32" if cross_lt_32 else "RSI_GT_52"
-        eval_key = f"{self._hourly_bar_open_key(candle)}|{regime}"
+        # One evaluation per closed hourly bar (not per regime). Live RSI drift on
+        # forming bars must not fire opposite signals minutes apart on the same bar.
+        eval_key = self._hourly_bar_open_key(candle)
         if eval_key in self._evaluated_signal_keys:
             return False
         self._evaluated_signal_keys.add(eval_key)
@@ -163,12 +308,18 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             return None
 
         intent_store = getattr(ctx, "intent_store", None)
-        if intent_store is not None and intent_store.has_pending_intent(
-            strategy=self.name,
-            structure_id=structure_id,
-            actions=["ENTRY"],
-        ):
-            return None
+        if intent_store is not None:
+            if intent_store.has_pending_intent(
+                strategy=self.name,
+                structure_id=structure_id,
+                actions=["ENTRY"],
+            ):
+                return None
+            if intent_store.has_entry_for_structure(
+                strategy=self.name,
+                structure_id=structure_id,
+            ):
+                return None
 
         # Find strike in premium range (500-point grid; CALL 300–400 / PUT 200–400).
         opt_u = option_type.upper()

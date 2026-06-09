@@ -593,12 +593,14 @@ class IndicatorManager:
             return None
         target = pd.to_datetime(row_ts, utc=True, errors="coerce")
         if pd.isna(target):
-            return df.iloc[-1]
+            return None
         tss = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
         matches = df.loc[tss == target]
         if len(matches) > 0:
             return matches.iloc[-1]
-        return df.iloc[-1]
+        # Do not fall back to df.iloc[-1]: that attaches forming-bar RSI to a closed
+        # aggregator candle and causes repeated / contradictory entry signals.
+        return None
 
     def _bootstrap_base_candle_state(
         self,
@@ -744,7 +746,14 @@ class IndicatorManager:
             )
         return new_state
 
-    def enrich_candle_for_strategy(self, strategy: Any, candle: Dict[str, Any], candle_bucket_fn: Any) -> Dict[str, Any]:
+    def enrich_candle_for_strategy(
+        self,
+        strategy: Any,
+        candle: Dict[str, Any],
+        candle_bucket_fn: Any,
+        out_meta: Optional[Dict[str, Any]] = None,
+        allow_live_persist: bool = True,
+    ) -> Dict[str, Any]:
         import pandas as pd
 
         tf = str(getattr(strategy, "timeframe", "") or "")
@@ -861,6 +870,8 @@ class IndicatorManager:
                     base_state["last_bucket"] = bucket
                     base_state["update_seq"] = int(base_state.get("update_seq", 0)) + 1
                     bar_closed_for_append = True
+                    if out_meta is not None:
+                        out_meta["bar_closed_for_append"] = True
             else:
                 base_df = pd.concat([base_df, pd.DataFrame([row])], ignore_index=True)
                 if len(base_df) > int(base_state.get("window") or window):
@@ -870,6 +881,8 @@ class IndicatorManager:
                 base_state["continuity_checked"] = True
                 base_state["update_seq"] = int(base_state.get("update_seq", 0)) + 1
                 bar_closed_for_append = True
+                if out_meta is not None:
+                    out_meta["bar_closed_for_append"] = True
 
         strategy_key = self._key_strategy_symbol_tf(strategy, symbol, tf)
         strategy_state = self._strategy_indicator_state.get(strategy_key)
@@ -962,7 +975,7 @@ class IndicatorManager:
                     df=df,
                     strategy=strategy,
                     exchange=exchange,
-                    append_live=bar_closed_for_append,
+                    append_live=bool(bar_closed_for_append and allow_live_persist),
                 )
             elif self._strategy_persisted_indicator_keys(strategy):
                 self._append_rsi_history_log(
@@ -972,7 +985,7 @@ class IndicatorManager:
                     df=df,
                     strategy=strategy,
                     exchange=exchange,
-                    append_live=bar_closed_for_append,
+                    append_live=bool(bar_closed_for_append and allow_live_persist),
                 )
             strategy_state = {"df": df, "base_sig": base_sig}
             self._strategy_indicator_state[strategy_key] = strategy_state
@@ -996,12 +1009,29 @@ class IndicatorManager:
         if bar_row_ts is None or pd.isna(bar_row_ts):
             bar_row_ts = pd.to_datetime(candle.get("timestamp"), utc=True, errors="coerce")
         latest = self._indicator_row_for_candle(df, bar_row_ts)
+        if latest is None and bar_closed_for_append and len(df) > 0:
+            latest = df.iloc[-1]
         if latest is None:
+            if out_meta is not None and bar_closed_for_append:
+                out_meta["bar_closed_for_append"] = True
             return out
         latest_dict = latest.to_dict() if hasattr(latest, "to_dict") else dict(latest)
+        preserve = {
+            "symbol",
+            "exchange",
+            "timestamp",
+            "bucket_ts",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        }
         for k, v in latest_dict.items():
-            if k in ("symbol", "exchange"):
+            if k in preserve:
                 continue
             out[k] = v
+        if out_meta is not None:
+            out_meta["bar_closed_for_append"] = bool(bar_closed_for_append)
         return out
 

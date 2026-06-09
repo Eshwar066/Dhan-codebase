@@ -1,8 +1,11 @@
 import threading
 import time
 import uuid
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from typing import Iterable, List, Optional, Union
+
+_IST = timezone(timedelta(hours=5, minutes=30))
 
 #  idempotency_key = hash(strategy + symbol + candle_time + signal)
 
@@ -210,6 +213,60 @@ class IntentStore:
                 out.append(s)
         return out or None
 
+    @staticmethod
+    def _intent_strategy_id(rec: dict) -> Optional[str]:
+        payload = rec.get("payload") or {}
+        return payload.get("strategy_id") or rec.get("strategy")
+
+    @staticmethod
+    def _intent_structure_id(rec: dict) -> Optional[str]:
+        payload = rec.get("payload") or {}
+        return payload.get("structure_id") or rec.get("structure_id")
+
+    def has_entry_for_structure(
+        self,
+        strategy: str,
+        structure_id: str,
+        *,
+        ist_date: Optional[date] = None,
+        tags: Optional[Union[str, Iterable[str]]] = None,
+    ) -> bool:
+        """True if any non-terminal ENTRY intent exists for strategy + structure today (IST)."""
+        terminal = {
+            IntentStatus.REJECTED,
+            IntentStatus.CANCELLED,
+            IntentStatus.EXPIRED,
+        }
+        tag_filter = self._upper_set(tags)
+        if ist_date is None:
+            ist_date = datetime.now(_IST).date()
+        for rec in self.intents.values():
+            status = rec.get("status")
+            if status in terminal:
+                continue
+            if self._intent_strategy_id(rec) != strategy:
+                continue
+            if self._intent_structure_id(rec) != structure_id:
+                continue
+            payload = rec.get("payload") or {}
+            action = str(payload.get("action") or rec.get("action") or "").strip().upper()
+            if action != "ENTRY":
+                continue
+            if tag_filter is not None:
+                rec_tag = str(payload.get("tag") or rec.get("tag") or "").strip().upper()
+                if rec_tag not in tag_filter:
+                    continue
+            created_at = rec.get("created_at")
+            if created_at is not None:
+                try:
+                    created_ist = datetime.fromtimestamp(float(created_at), _IST).date()
+                except (TypeError, ValueError, OSError):
+                    created_ist = None
+                if created_ist is not None and created_ist != ist_date:
+                    continue
+            return True
+        return False
+
     def has_pending_intent(
         self,
         strategy: str,
@@ -223,8 +280,11 @@ class IntentStore:
         callers that guard duplicate MAIN_EXIT should pass
         ``tags=[\"MAIN_EXIT\"], actions=[\"EXIT\"]`` instead of matching all pendings.
         """
-        pending = list(self.list_by_status(IntentStatus.SENT)) + list(
-            self.list_by_status(IntentStatus.VALIDATED)
+        pending = (
+            list(self.list_by_status(IntentStatus.CREATED))
+            + list(self.list_by_status(IntentStatus.VALIDATED))
+            + list(self.list_by_status(IntentStatus.SENT))
+            + list(self.list_by_status(IntentStatus.ACKED))
         )
         tag_filter = self._upper_set(tags)
         action_filter = self._upper_set(actions)
@@ -233,7 +293,7 @@ class IntentStore:
         sym = parts[1] if len(parts) >= 2 else None
         for i in pending:
             p = i.get("payload") or {}
-            if p.get("strategy_id") != strategy:
+            if self._intent_strategy_id(i) != strategy:
                 continue
             struct_match = p.get("structure_id") == structure_id
             sym_match = sym is not None and p.get("symbol") == sym
