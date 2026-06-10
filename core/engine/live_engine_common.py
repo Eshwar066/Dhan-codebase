@@ -746,6 +746,11 @@ class LiveEngineHelpersMixin:
                     self.engine_logger.feed_health_recovered(msg)
                 if gen > 0:
                     self._dhan_feed_last_connect_generation_alerted = gen
+                # Pre-market engine starts set grace at boot; reset when WS actually connects.
+                grace_seconds = float(
+                    getattr(self, "_feed_first_tick_grace_seconds", 30.0) or 30.0
+                )
+                self._feed_start_grace_until_ts = time.time() + grace_seconds
         else:
             if self._dhan_feed_was_connected is True:
                 msg = (

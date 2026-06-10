@@ -1696,10 +1696,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         except Exception:
             return
         now = time.time()
+        last_market_tick_ts = 0.0
         # DHAN-specific hard guard: connection may stay alive while market data stalls.
         # Track pure market-tick heartbeat separately and fail fast when no ticks arrive.
         if str(self.venue or "").upper() == "DHAN":
-            last_market_tick_ts = 0.0
             try:
                 last_market_tick_ts = float(
                     getattr(self.realtime_feed, "last_market_tick_ts", 0.0) or 0.0
@@ -1729,7 +1729,14 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             last_tick = self._last_tick_timestamp.get(sym, 0.0)
             last_candle = self._last_candle_timestamp.get(sym, 0.0)
             last_seen = max(last_tick, last_candle)
-            if last_seen <= 0 or (now - last_seen) > self._feed_stall_seconds:
+            if last_market_tick_ts > 0.0:
+                last_seen = max(last_seen, last_market_tick_ts)
+            if last_seen <= 0:
+                if now < self._feed_start_grace_until_ts:
+                    continue
+                stale_symbols.append(sym)
+                continue
+            if (now - last_seen) > self._feed_stall_seconds:
                 stale_symbols.append(sym)
         if len(stale_symbols) != len(feed_syms):
             self._feed_stall_last_log_ts = 0.0
@@ -1819,8 +1826,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         engine_timeframes = list(self._engine_timeframes or [])
         if not engine_timeframes and primary_tf:
             engine_timeframes = [str(primary_tf)]
-        use_feed = self.realtime_feed and self.realtime_feed.is_connected()
-        
+
         risk_manager = getattr(self.order_router, "risk", None)
         self._start_execution_pipeline()
         loop_count = 0
@@ -1838,8 +1844,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
 
             # move to  Memory → every 5s , Feed health → every 1s ,Order state → every N minutes
             self._check_memory()
-            self.check_feed_health()
-            self._check_feed_stall_fail_safe()
             self._do_order_state_check()
             self._sync_delta_ws_trades()
             self._retry_dhan_pending_fills()
@@ -1853,6 +1857,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     self._export_eod(self._last_eod_date)
                 self._last_eod_date = today
 
+            use_feed = bool(
+                self.realtime_feed and self.realtime_feed.is_connected()
+            )
+
             if engine_timeframes:
                 use_aggregator = (
                     use_feed
@@ -1862,6 +1870,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 if use_aggregator:
                     self._drain_tick_queue()
                     self._maybe_flush_session_end_candles()
+
+            self.check_feed_health()
+            self._check_feed_stall_fail_safe()
 
             for tf in engine_timeframes:
                 if not tf:
