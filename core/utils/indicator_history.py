@@ -175,6 +175,20 @@ def should_append_live_indicator_row(
     return is_nse_60m_bar_ist(dt_ist)
 
 
+def _ohlc_close_from_payload(payload: Dict[str, Any]) -> float:
+    """Schema v2 stores OHLC under ``ohlc``; legacy rows may use top-level fields."""
+    ohlc = payload.get("ohlc") if isinstance(payload.get("ohlc"), dict) else {}
+    if ohlc and ohlc.get("close") is not None:
+        close = float(ohlc["close"])
+    elif payload.get("close") is not None:
+        close = float(payload["close"])
+    else:
+        raise TypeError("missing close")
+    if math.isnan(close):
+        raise ValueError("nan close")
+    return close
+
+
 def _extract_indicators_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     ind = payload.get("indicators")
     if isinstance(ind, dict):
@@ -235,13 +249,11 @@ def load_indicator_history_rows(
                     bar_dt = parse_bar_timestamp_ist_to_aware(ist_key)
                     if bar_dt is None:
                         continue
+                    ohlc = payload.get("ohlc") if isinstance(payload.get("ohlc"), dict) else {}
                     try:
-                        close = float(payload.get("close"))
-                        if math.isnan(close):
-                            continue
+                        close = _ohlc_close_from_payload(payload)
                     except (TypeError, ValueError):
                         continue
-                    ohlc = payload.get("ohlc") if isinstance(payload.get("ohlc"), dict) else {}
                     o = float(ohlc.get("open", close) if ohlc else payload.get("open", close))
                     h = float(ohlc.get("high", close) if ohlc else payload.get("high", close))
                     l = float(ohlc.get("low", close) if ohlc else payload.get("low", close))

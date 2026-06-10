@@ -325,7 +325,25 @@ class IndicatorManager:
         hist = self._load_rsi_history_rows(strategy_id, symbol, tf, max_rows=max_rows)
         if not hist:
             return df
-        hdf = pd.DataFrame(hist)
+        # OHLC only — indicators are recomputed on the merged frame.
+        hist_ohlc = [
+            {
+                k: item[k]
+                for k in (
+                    "timestamp",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "symbol",
+                    "exchange",
+                )
+                if k in item
+            }
+            for item in hist
+        ]
+        hdf = pd.DataFrame(hist_ohlc)
         base = df.copy()
         base["timestamp"] = pd.to_datetime(base["timestamp"], utc=True, errors="coerce")
         base = base.dropna(subset=["timestamp"])
@@ -513,8 +531,21 @@ class IndicatorManager:
         seeded = stream_key in self._rsi_seeded_streams
         if seeded and not append_live:
             return
-        rows = [df.iloc[-1]] if seeded else [r for _, r in df.iterrows()]
         source = "live_append" if seeded else "historical_seed"
+        if seeded:
+            row = df.iloc[-1]
+            # prev_rsi must be the prior bar's RSI, not a stale column from history merge.
+            if len(df) > 1 and "rsi" in df.columns:
+                try:
+                    prev_rsi = df["rsi"].iloc[-2]
+                    if prev_rsi == prev_rsi:  # not NaN
+                        row = row.copy()
+                        row["prev_rsi"] = float(prev_rsi)
+                except (TypeError, ValueError, IndexError):
+                    pass
+            rows = [row]
+        else:
+            rows = [r for _, r in df.iterrows()]
 
         for row in rows:
             ind_hist.append_indicator_history_row(

@@ -8,7 +8,11 @@ import talib
 from run.config import RUN_MODE, RunMode
 from core.strategies.base import BaseStrategy
 from core.strategies.IndiaMktMixins import IST, IndiaMktMixins
-from core.strategies.indicator_helpers import default_persisted_keys_for_rsi
+from core.strategies.indicator_helpers import (
+    add_ema_high_low,
+    default_persisted_keys_for_ema_high_low,
+    default_persisted_keys_for_rsi,
+)
 from core.utils.expiry_resolver import ExpiryResolver
 from core.utils.indicator_history import nse_60m_bar_close_eval_window
 from core.utils.option_chain_snapshot_log import log_option_chain_snapshot
@@ -24,7 +28,7 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     1. Closed bar from aggregator → ``indicator_manager.enrich_candle_for_strategy``
     2. RSI + OHLC persisted to ``logs/indicators/NIFTY/60/indicator_history.jsonl``
     3. Same enriched bar logged to ``logs/LEAPS_RSI/dhan_leaps_rsi_candles.log``
-    4. Enriched candle (rsi, prev_rsi) passed into ``should_evaluate`` / ``on_candle``
+    4. Enriched candle (rsi, prev_rsi, ema_high, ema_low) passed into ``should_evaluate`` / ``on_candle``
     5. Hedge entry: fresh monthly-expiry chain → ``logs/LEAPS_RSI/hedge_option_chain_snapshots/``
     """
 
@@ -40,6 +44,8 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     option_chain_ideal_premium = 350
     # Monthly hedge expiry cutoff (readme): before 15th → current month; on/after 15th → next month.
     hedge_monthly_rollover_after_calendar_day = 15
+    # Match ``refresh_leaps_rsi_from_yahoo.py`` (8-period EMA on high/low).
+    ema_period = 8
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -59,13 +65,17 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     def prepare_indicators(self, df):
         df["rsi"] = talib.RSI(df["close"], 14)
         df["prev_rsi"] = df["rsi"].shift(1)
+        df = add_ema_high_low(df, period=int(getattr(self, "ema_period", 8) or 8))
         return df
 
     def requires_live_rsi_patch(self) -> bool:
         return True
 
     def persisted_indicator_keys(self):
-        return default_persisted_keys_for_rsi()
+        return (
+            default_persisted_keys_for_rsi()
+            + default_persisted_keys_for_ema_high_low()
+        )
 
     def resolve_hedge_expiry(self, trade_date: date, parent_expiry=None):
         """
