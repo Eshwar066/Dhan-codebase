@@ -110,8 +110,10 @@ def nse_60m_bar_close_eval_window(
     Used by LEAPS (60m RSI) so indicator history, candle logs, and strategy eval
     run once per closed bar — not on forming or stale replay bars.
     """
+    session_partial = False
     if isinstance(candle, dict):
         bucket = candle.get("bucket_ts")
+        session_partial = bool(candle.get("session_close_partial"))
     else:
         bucket = candle
     if bucket is None or not bucket_ts_is_nse_60m_bar(bucket):
@@ -120,7 +122,15 @@ def nse_60m_bar_close_eval_window(
         bar_open_unix = int(float(bucket))
     except (TypeError, ValueError):
         return False
-    bar_close_unix = bar_open_unix + 3600
+    if session_partial:
+        from core.utils.session.session_manager import SessionManager
+
+        partial_close = SessionManager.session_end_unix_for_bar(bar_open_unix, "INDEX")
+        bar_close_unix = (
+            partial_close if partial_close is not None else bar_open_unix + 3600
+        )
+    else:
+        bar_close_unix = bar_open_unix + 3600
     now = int(now_unix if now_unix is not None else time.time())
     grace_sec = max(60, int(grace_minutes) * 60)
     return bar_close_unix <= now <= (bar_close_unix + grace_sec)

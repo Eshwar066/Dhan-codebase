@@ -1857,6 +1857,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     self._export_eod(self._last_eod_date)
                 self._last_eod_date = today
 
+            live_candle_pipeline = self._should_run_live_candle_pipeline()
             use_feed = bool(
                 self.realtime_feed and self.realtime_feed.is_connected()
             )
@@ -1868,11 +1869,17 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     and self.candle_aggregator is not None
                 )
                 if use_aggregator:
-                    self._drain_tick_queue()
+                    if live_candle_pipeline:
+                        self._drain_tick_queue()
                     self._maybe_flush_session_end_candles()
 
             self.check_feed_health()
             self._check_feed_stall_fail_safe()
+
+            if not live_candle_pipeline:
+                self._sync_market_ws_to_session()
+                time.sleep(1)
+                continue
 
             for tf in engine_timeframes:
                 if not tf:
@@ -2223,7 +2230,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             timeframe=None,
                         )
 
-            use_feed = self.realtime_feed and self.realtime_feed.is_connected()
+            self._sync_market_ws_to_session()
             if self.tick_queue is not None and self.candle_aggregator is not None:
                 time.sleep(0.1)
             else:

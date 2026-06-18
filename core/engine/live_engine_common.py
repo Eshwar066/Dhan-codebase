@@ -443,8 +443,22 @@ class LiveEngineHelpersMixin:
                 if tf_sec == 3600 and self._is_nse_index_candle(candle):
                     if not bucket_ts_is_nse_60m_bar(bt_int):
                         return False
-                # bucket_ts is bar open (unix). Require wall-clock past bar close.
                 now_unix = int((now_utc - epoch).total_seconds())
+                if candle.get("session_close_partial"):
+                    exchange = str(
+                        candle.get("exchange")
+                        or getattr(self, "market_exchange", None)
+                        or getattr(self, "_live_exchange", None)
+                        or "INDEX"
+                    )
+                    from core.utils.session.session_manager import SessionManager
+
+                    close_unix = SessionManager.session_end_unix_for_bar(
+                        bt_int, exchange
+                    )
+                    if close_unix is not None:
+                        return now_unix >= close_unix
+                # bucket_ts is bar open (unix). Require wall-clock past bar close.
                 if now_unix < bt_int + tf_sec:
                     return False
                 return True
@@ -548,6 +562,78 @@ class LiveEngineHelpersMixin:
         except Exception:
             return True
         return True
+
+    def _is_market_open_for_live_candles(self) -> bool:
+        """Gate tick drain and live candle evaluation (same calendar as feed health)."""
+        return self._is_market_open_for_feed_health()
+
+    def _has_unevaluated_session_partial_candle(self) -> bool:
+        ca = getattr(self, "candle_aggregator", None)
+        if ca is None:
+            return False
+        tfs = list(getattr(self, "_engine_timeframes", None) or [])
+        if not tfs:
+            primary_tf = getattr(getattr(self, "strategy", None), "timeframe", None)
+            if primary_tf:
+                tfs = [str(primary_tf)]
+        for symbol in self.symbols:
+            for tf in tfs:
+                if not tf:
+                    continue
+                candle = ca.get_last_closed_candle(symbol, tf)
+                if not candle or not candle.get("session_close_partial"):
+                    continue
+                bucket = self._candle_bucket_start_unix(candle)
+                if bucket is None:
+                    continue
+                eval_key = self._symbol_tf_eval_key(symbol, str(tf))
+                if self._last_evaluated_candle_ts.get(eval_key) != bucket:
+                    return True
+        return False
+
+    def _should_run_live_candle_pipeline(self) -> bool:
+        if self._is_market_open_for_live_candles():
+            return True
+        return self._has_unevaluated_session_partial_candle()
+
+    def _should_disconnect_market_ws(self) -> bool:
+        """True after NSE index regular session end (post 15:30 IST), not pre-market."""
+        if self._should_run_live_candle_pipeline():
+            return False
+        if self._is_market_open_for_live_candles():
+            return False
+        try:
+            from core.utils.session.session_manager import SessionManager
+            from core.utils.session.market_calendar import MARKET_SESSIONS
+
+            now = SessionManager._now("INDEX")
+            end_t = MARKET_SESSIONS["NSE_INDEX"]["regular"]["end"]
+            return now.time() > end_t
+        except Exception:
+            return False
+
+    def _sync_market_ws_to_session(self) -> None:
+        """Disconnect Dhan market WS after close; reconnect when session reopens."""
+        feed = self.realtime_feed
+        if not feed or bool(getattr(feed, "is_dummy_feed", False)):
+            return
+        if str(getattr(self, "venue", None) or "").upper() != "DHAN":
+            return
+        if self._should_run_live_candle_pipeline():
+            if hasattr(feed, "start"):
+                try:
+                    if not feed.is_connected():
+                        feed.start()
+                except Exception:
+                    logger.debug("Market WS start on session open failed", exc_info=True)
+            return
+        if not self._should_disconnect_market_ws():
+            return
+        if hasattr(feed, "stop") and feed.is_connected():
+            try:
+                feed.stop()
+            except Exception:
+                logger.debug("Market WS stop on session close failed", exc_info=True)
 
     # ---------- Candle enrichment ----------
 

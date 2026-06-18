@@ -93,6 +93,28 @@ class SessionManager:
 
         return min(close, session_end)
 
+    @staticmethod
+    def session_end_unix_for_bar(bucket_ts, exchange="NSE_INDEX"):
+        """Unix timestamp of regular session end on the bar's IST calendar day."""
+        exchange = SessionManager.normalize_exchange(exchange)
+        sess = MARKET_SESSIONS.get(exchange, {}).get("regular")
+        if not sess:
+            return None
+        try:
+            bt = int(float(bucket_ts))
+        except (TypeError, ValueError):
+            return None
+        tz = SessionManager._tz(exchange)
+        bar_dt = dt.datetime.fromtimestamp(bt, tz)
+        end_t = sess["end"]
+        session_end = bar_dt.replace(
+            hour=end_t.hour,
+            minute=end_t.minute,
+            second=end_t.second,
+            microsecond=0,
+        )
+        return int(session_end.timestamp())
+
     # ---------- Next Close ----------
     @staticmethod
     def next_candle_close(exchange, timeframe):
