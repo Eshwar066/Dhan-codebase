@@ -42,6 +42,8 @@ ENGINE_JOBS = [
         # "symbols": ["GOLD"],
         # "exchange": "MCX",
         "market_ws_stall_timeout_seconds": 0,
+        # LEAPS on_candle fetches main + hedge option chains; default 5s is too short.
+        "strategy_timeout_seconds": 60,
         "telegram": {
             "bot_token": os.getenv(
                 "TELEGRAM_LEAPS_BOT_TOKEN",
