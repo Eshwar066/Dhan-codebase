@@ -47,6 +47,41 @@ class DhanBrokerApi:
             correlation_id=correlation_id,
         )
 
+    def place_forever_order(
+        self,
+        tradingsymbol: str,
+        exchange: str,
+        quantity: int,
+        price: float = 0,
+        trigger_price: float = 0,
+        order_type: str = "LIMIT",
+        transaction_type: str = "BUY",
+        trade_type: str = "MARGIN",
+        order_flag: str = "SINGLE",
+        disclosed_quantity: int = 0,
+        validity: str = "DAY",
+        tag: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return self._source.place_forever_order(
+            tradingsymbol=tradingsymbol,
+            exchange=exchange,
+            quantity=quantity,
+            price=float(price),
+            trigger_price=float(trigger_price),
+            order_type=order_type,
+            transaction_type=transaction_type,
+            trade_type=trade_type,
+            order_flag=order_flag,
+            disclosed_quantity=disclosed_quantity,
+            validity=validity,
+            tag=tag,
+            correlation_id=correlation_id,
+        )
+
+    def cancel_forever_order(self, order_id: str) -> Any:
+        return getattr(self._source, "cancel_forever_order", lambda _oid: None)(order_id)
+
     def get_positions(self, debug: str = "NO") -> Any:
         return self._source.get_positions(debug=debug)
 

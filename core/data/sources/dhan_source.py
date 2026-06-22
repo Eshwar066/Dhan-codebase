@@ -962,6 +962,109 @@ class DhanSource:
         """Cancel a single order."""
         return self.tsl.cancel_order(order_id)
 
+    def place_forever_order(
+        self,
+        tradingsymbol,
+        exchange,
+        quantity,
+        price=0,
+        trigger_price=0,
+        order_type="LIMIT",
+        transaction_type="BUY",
+        trade_type="MARGIN",
+        order_flag="SINGLE",
+        disclosed_quantity=0,
+        validity="DAY",
+        tag=None,
+        correlation_id=None,
+    ):
+        """Place Dhan Forever (GTT) order. Returns same shape as place_order."""
+        request_payload = {
+            "tradingsymbol": tradingsymbol,
+            "exchange": str(exchange).upper(),
+            "quantity": int(quantity),
+            "price": float(price),
+            "trigger_price": float(trigger_price),
+            "order_type": str(order_type).upper(),
+            "transaction_type": str(transaction_type).upper(),
+            "trade_type": str(trade_type).upper(),
+            "order_flag": str(order_flag or "SINGLE").upper(),
+            "disclosed_quantity": int(disclosed_quantity),
+            "validity": validity,
+            "tag": tag or "",
+            "correlation_id": correlation_id if correlation_id is not None else tag,
+        }
+        try:
+            cid = correlation_id if correlation_id is not None else tag
+            logger.info("Dhan place_forever_order request payload=%s", request_payload)
+            result = self.tsl.forever_order_placement(
+                tradingsymbol=tradingsymbol,
+                exchange=exchange.upper(),
+                quantity=int(quantity),
+                price=float(price),
+                trigger_price=float(trigger_price),
+                order_type=order_type.upper(),
+                transaction_type=transaction_type.upper(),
+                trade_type=trade_type.upper(),
+                order_flag=str(order_flag or "SINGLE").upper(),
+                disclosed_quantity=int(disclosed_quantity),
+                validity=validity,
+                tag=tag or "",
+                correlation_id=cid,
+            )
+            if result is not None and isinstance(result, str):
+                return {"status": "success", "order_id": result, "payload": request_payload}
+            from core.broker.internal.dhan.mappings import parse_dhan_api_error
+
+            last_err = getattr(self.tsl, "_last_dhan_api_error", None)
+            parsed = parse_dhan_api_error(last_err) if last_err is not None else {}
+            display = (
+                parsed.get("display_message")
+                or "forever_order_placement returned None (see tradehull logs)"
+            )
+            logger.warning(
+                "Dhan place_forever_order returned no order_id payload=%s error=%s",
+                request_payload,
+                display,
+            )
+            return {
+                "status": "error",
+                "order_id": None,
+                "message": display,
+                "error_code": parsed.get("error_code"),
+                "error_type": parsed.get("error_type"),
+                "error_message": parsed.get("error_message"),
+                "broker_response": last_err,
+                "payload": request_payload,
+            }
+        except Exception as e:
+            from core.broker.internal.dhan.mappings import parse_dhan_api_error
+
+            parsed = parse_dhan_api_error(e)
+            display = parsed.get("display_message") or str(e)
+            logger.warning(
+                "Dhan place_forever_order exception payload=%s error=%s",
+                request_payload,
+                display,
+                exc_info=True,
+            )
+            return {
+                "status": "error",
+                "order_id": None,
+                "message": display,
+                "error_code": parsed.get("error_code"),
+                "error_type": parsed.get("error_type"),
+                "error_message": parsed.get("error_message"),
+                "broker_response": (
+                    e.args[0] if getattr(e, "args", None) and isinstance(e.args[0], dict) else None
+                ),
+                "payload": request_payload,
+            }
+
+    def cancel_forever_order(self, order_id):
+        """Cancel a pending Forever (GTT) order."""
+        return self.tsl.cancel_forever_order(order_id)
+
     def get_order_detail(self, order_id, debug="NO"):
         """Single order detail."""
         return getattr(self.tsl, "get_order_detail", lambda *a, **k: None)(

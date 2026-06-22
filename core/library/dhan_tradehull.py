@@ -170,6 +170,23 @@ class _DhanRestHttp:
             return {"status": "success", "data": body}
         return {"status": "failure", "data": body, "remarks": body}
 
+    def delete(self, path: str) -> dict:
+        path = path if str(path).startswith("/") else f"/{path}"
+        url = f"{self._client.base_url.rstrip('/')}{path}"
+        response = self._client.session.delete(
+            url,
+            headers=self._client.header,
+            timeout=getattr(self._client, "timeout", 60),
+            verify=not getattr(self._client, "disable_ssl", False),
+        )
+        try:
+            body = json.loads(response.content) if response.content else {}
+        except Exception:
+            body = {}
+        if response.status_code in (200, 202):
+            return {"status": "success", "data": body}
+        return {"status": "failure", "data": body, "remarks": body}
+
 
 class Tradehull:
     clientCode: str
@@ -1110,6 +1127,162 @@ class Tradehull:
                 return response["data"]["orderStatus"]
         except Exception as e:
             print(f"Got exception in cancel_order as {e}")
+
+    def forever_order_placement(
+        self,
+        tradingsymbol: str,
+        exchange: str,
+        quantity: int,
+        price: float,
+        trigger_price: float,
+        order_type: str,
+        transaction_type: str,
+        trade_type: str,
+        order_flag: str = "SINGLE",
+        disclosed_quantity: int = 0,
+        validity: str = "DAY",
+        tag=None,
+        correlation_id=None,
+    ) -> str:
+        """
+        Place a Dhan Forever (GTT) order via ``POST /forever/orders``.
+        SINGLE: when LTP hits ``trigger_price``, a ``order_type`` order is placed at ``price``.
+        """
+        try:
+            exchange = exchange.upper()
+            instrument_df = self.instrument_df.copy()
+            script_exchange = {
+                "NSE": self.Dhan.NSE,
+                "NFO": self.Dhan.NSE_FNO,
+                "BFO": self.Dhan.BSE_FNO,
+                "CUR": self.Dhan.CUR,
+                "BSE": self.Dhan.BSE,
+                "MCX": self.Dhan.MCX,
+            }
+            self.order_Type = {
+                "LIMIT": self.Dhan.LIMIT,
+                "MARKET": self.Dhan.MARKET,
+                "STOPLIMIT": self.Dhan.SL,
+                "STOPMARKET": self.Dhan.SLM,
+            }
+            product = {
+                "MIS": self.Dhan.INTRA,
+                "MARGIN": self.Dhan.MARGIN,
+                "MTF": self.Dhan.MTF,
+                "CO": self.Dhan.CO,
+                "BO": self.Dhan.BO,
+                "CNC": self.Dhan.CNC,
+            }
+            Validity = {"DAY": "DAY", "IOC": "IOC"}
+            transactiontype = {"BUY": self.Dhan.BUY, "SELL": self.Dhan.SELL}
+            instrument_exchange = {
+                "NSE": "NSE",
+                "BSE": "BSE",
+                "NFO": "NSE",
+                "BFO": "BSE",
+                "MCX": "MCX",
+                "CUR": "NSE",
+            }
+            exchange_segment = script_exchange[exchange]
+            product_type = product[trade_type.upper()]
+            mapped_order_type = self.order_Type[order_type.upper()]
+            order_side = transactiontype[transaction_type.upper()]
+            time_in_force = Validity[validity.upper()]
+            security_check = instrument_df[
+                (
+                    (instrument_df["SEM_TRADING_SYMBOL"] == tradingsymbol)
+                    | (instrument_df["SEM_CUSTOM_SYMBOL"] == tradingsymbol)
+                )
+                & (instrument_df["SEM_EXM_EXCH_ID"] == instrument_exchange[exchange])
+            ]
+            if security_check.empty:
+                raise Exception("Check the Tradingsymbol")
+            security_id = security_check.iloc[-1]["SEM_SMST_SECURITY_ID"]
+            corr = correlation_id if correlation_id is not None and str(correlation_id).strip() != "" else tag
+            try:
+                from core.broker.internal.dhan.mappings import dhan_correlation_id
+
+                corr_dhan = dhan_correlation_id(corr)
+            except ImportError:
+                corr_dhan = str(corr or "")[:30]
+            flag_u = str(order_flag or "SINGLE").strip().upper()
+            if flag_u not in ("SINGLE", "OCO"):
+                raise Exception("order_flag must be SINGLE or OCO")
+            rest_payload = {
+                "transactionType": order_side,
+                "exchangeSegment": exchange_segment,
+                "productType": product_type,
+                "orderType": mapped_order_type,
+                "validity": time_in_force,
+                "securityId": str(security_id),
+                "quantity": int(quantity),
+                "disclosedQuantity": int(disclosed_quantity),
+                "price": float(price),
+                "triggerPrice": float(trigger_price),
+                "orderFlag": flag_u,
+            }
+            if corr_dhan:
+                rest_payload["correlationId"] = corr_dhan
+            api_payload = {
+                "tradingsymbol": tradingsymbol,
+                "exchange": exchange,
+                "security_id": str(security_id),
+                **rest_payload,
+            }
+            req_json = json.dumps(api_payload, default=str)
+            self.logger.info("Dhan forever_order API request: %s", req_json)
+            http = self._get_dhan_http()
+            if http is None:
+                raise Exception("Dhan HTTP client unavailable for forever orders")
+            if not hasattr(http, "post"):
+                raise Exception("Dhan HTTP client missing post() for forever orders")
+            order = http.post("/forever/orders", rest_payload)
+            if order.get("status") == "failure":
+                self._last_dhan_api_error = order
+                self.logger.warning(
+                    "Dhan forever_order API failure request=%s response=%s",
+                    req_json,
+                    json.dumps(order, default=str),
+                )
+                raise Exception(order)
+            data = order.get("data") or {}
+            orderid = data.get("orderId") or data.get("order_id")
+            if not orderid:
+                raise Exception(order)
+            self.logger.info(
+                "Dhan forever_order API success request=%s order_id=%s",
+                req_json,
+                orderid,
+            )
+            return str(orderid)
+        except Exception as e:
+            req_hint = locals().get("req_json") or json.dumps(
+                {
+                    "tradingsymbol": locals().get("tradingsymbol"),
+                    "exchange": locals().get("exchange"),
+                    "quantity": locals().get("quantity"),
+                    "price": locals().get("price"),
+                    "trigger_price": locals().get("trigger_price"),
+                },
+                default=str,
+            )
+            self.logger.exception(
+                "Dhan forever_order exception request=%s error=%s", req_hint, e
+            )
+            raise
+
+    def cancel_forever_order(self, order_id: str) -> None:
+        try:
+            http = self._get_dhan_http()
+            if http is None or not hasattr(http, "delete"):
+                raise Exception("Dhan HTTP client unavailable for forever cancel")
+            response = http.delete(f"/forever/orders/{order_id}")
+            if response.get("status") == "failure":
+                raise Exception(response)
+            return response.get("data")
+        except Exception as e:
+            print(f"Got exception in cancel_forever_order as {e}")
+            raise
 
     def place_slice_order(
         self,

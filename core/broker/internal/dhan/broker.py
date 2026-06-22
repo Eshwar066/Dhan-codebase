@@ -24,12 +24,17 @@ def _order_intent_to_payload(intent, execution_price=None):
     qty = getattr(intent, "qty", inst.lot_size)
     lot_size = int(getattr(inst, "lot_size", 1))
     total_qty = int(qty) * lot_size
+    extras = getattr(intent, "metadata_extras", None) or {}
+    execution_mode = str(extras.get("execution_mode") or "").strip().upper()
+    trigger = float(getattr(intent, "trigger_price", 0) or 0)
+    if execution_mode == "GTT" and trigger <= 0:
+        trigger = float(price or 0)
     return {
         "tradingsymbol": inst.place_order_symbol(),
         "exchange": exchange,
         "quantity": total_qty,
         "price": float(price),
-        "trigger_price": float(getattr(intent, "trigger_price", 0) or 0),
+        "trigger_price": trigger,
         "order_type": getattr(intent, "order_type", "MARKET"),
         "transaction_type": intent.side,
         "trade_type": getattr(intent, "trade_type", "MARGIN"),
@@ -42,6 +47,8 @@ def _order_intent_to_payload(intent, execution_price=None):
         "tag": dhan_correlation_id(intent.intent_id),
         "intent_id": intent.intent_id,
         "correlation_id": dhan_correlation_id(intent.intent_id),
+        "execution_mode": execution_mode,
+        "order_flag": str(extras.get("order_flag") or "SINGLE").upper(),
     }
 
 
@@ -328,16 +335,131 @@ class DhanBroker(BaseBroker):
         intent_id: Optional[str] = None,
         reason: str = "",
     ) -> bool:
-        _ = intent_id, reason
+        _ = reason
         source = getattr(self.api, "_source", None)
-        if source is None or not hasattr(source, "cancel_order"):
+        if source is None:
             return False
-        try:
-            source.cancel_order(str(order_id))
+        execution_mode = ""
+        if intent_id and self.intent_store:
+            rec = self.intent_store.get(str(intent_id)) or {}
+            sm = (rec.get("payload") or {}).get("strategy_meta") or {}
+            if isinstance(sm, dict):
+                execution_mode = str(sm.get("execution_mode") or "").upper()
+
+        def _cancel_forever() -> bool:
+            if not hasattr(source, "cancel_forever_order"):
+                return False
+            try:
+                source.cancel_forever_order(str(order_id))
+                return True
+            except Exception as exc:
+                logger.warning(
+                    "Dhan cancel_forever_order failed order_id=%s: %s", order_id, exc
+                )
+                return False
+
+        def _cancel_regular() -> bool:
+            if not hasattr(source, "cancel_order"):
+                return False
+            try:
+                source.cancel_order(str(order_id))
+                return True
+            except Exception as exc:
+                logger.warning("Dhan cancel_order failed order_id=%s: %s", order_id, exc)
+                return False
+
+        if execution_mode == "GTT":
+            return _cancel_forever() or _cancel_regular()
+        if _cancel_regular():
             return True
-        except Exception as exc:
-            logger.warning("Dhan cancel_order failed order_id=%s: %s", order_id, exc)
-            return False
+        return _cancel_forever()
+
+    def _place_forever_order(self, order_payload: Dict[str, Any], intent_id: str, retries: int):
+        for attempt in range(retries + 1):
+            try:
+                GlobalRateLimiter.instance().acquire(DHAN_ORDER_API, 0.11)
+                logger.info(
+                    "Dhan place_forever_order attempt=%s/%s intent_id=%s payload=%s",
+                    attempt + 1,
+                    retries + 1,
+                    intent_id,
+                    order_payload,
+                )
+                resp = self.api.place_forever_order(
+                    tradingsymbol=order_payload["tradingsymbol"],
+                    exchange=order_payload["exchange"],
+                    quantity=order_payload["quantity"],
+                    price=order_payload["price"],
+                    trigger_price=order_payload["trigger_price"],
+                    order_type=order_payload["order_type"],
+                    transaction_type=order_payload["transaction_type"],
+                    trade_type=order_payload["trade_type"],
+                    order_flag=order_payload.get("order_flag") or "SINGLE",
+                    disclosed_quantity=order_payload["disclosed_quantity"],
+                    validity=order_payload["validity"],
+                    tag=order_payload["tag"],
+                    correlation_id=order_payload.get("correlation_id") or order_payload["tag"],
+                )
+                if not isinstance(resp, dict):
+                    raise Exception(f"Invalid broker response: {resp}")
+                if resp.get("status") != "success":
+                    parsed = parse_dhan_api_error(resp)
+                    fail_msg = (
+                        parsed.get("display_message")
+                        or resp.get("message")
+                        or str(resp)
+                    )
+                    self._last_place_order_failure = {
+                        "message": fail_msg,
+                        "display_message": fail_msg,
+                        "error_code": resp.get("error_code") or parsed.get("error_code"),
+                        "error_type": resp.get("error_type") or parsed.get("error_type"),
+                        "error_message": resp.get("error_message")
+                        or parsed.get("error_message"),
+                        "payload": resp.get("payload") or order_payload,
+                        "response": resp,
+                        "attempt": attempt + 1,
+                    }
+                    logger.warning(
+                        "Dhan broker place_forever_order rejected intent_id=%s attempt=%s payload=%s response=%s",
+                        intent_id,
+                        attempt + 1,
+                        order_payload,
+                        resp,
+                    )
+                    return None
+                order_id = resp.get("order_id")
+                if order_id and self.intent_store:
+                    self.intent_store.update(intent_id, "SENT")
+                return order_id
+            except Exception as e:
+                parsed = parse_dhan_api_error(e)
+                fail_msg = parsed.get("display_message") or str(e)
+                self._last_place_order_failure = {
+                    "message": fail_msg,
+                    "display_message": fail_msg,
+                    "error_code": parsed.get("error_code"),
+                    "error_type": parsed.get("error_type"),
+                    "error_message": parsed.get("error_message"),
+                    "payload": order_payload,
+                    "response": (
+                        e.args[0]
+                        if getattr(e, "args", None) and isinstance(e.args[0], dict)
+                        else None
+                    ),
+                    "attempt": attempt + 1,
+                }
+                logger.warning(
+                    "Dhan place_forever_order exception intent_id=%s attempt=%s payload=%s error=%s",
+                    intent_id,
+                    attempt + 1,
+                    order_payload,
+                    fail_msg,
+                )
+                if attempt == retries:
+                    return None
+                time.sleep(0.4)
+        return None
 
     def place_order(self, intent, execution_price=None, retries=2):
         tag_u = str(getattr(intent, "tag", "") or "").upper()
@@ -356,6 +478,8 @@ class DhanBroker(BaseBroker):
         order_payload = self._build_payload(intent, execution_price)
         intent_id = order_payload["intent_id"]
         self._last_place_order_failure = None
+        if str(order_payload.get("execution_mode") or "").upper() == "GTT":
+            return self._place_forever_order(order_payload, intent_id, retries)
         for attempt in range(retries + 1):
             try:
                 GlobalRateLimiter.instance().acquire(DHAN_ORDER_API, 0.11)
