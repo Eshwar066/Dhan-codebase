@@ -115,18 +115,30 @@ def resolve_option_chain_snapshot_path(
     time_part = str(snapshot_time or "").strip().replace(":", "-")
     if not date_part or not time_part:
         return None
-    day_dir = _snapshot_out_dir(snapshot_target) / _safe_filename_part(date_part)
-    if not day_dir.is_dir():
-        return None
     token = _safe_filename_part(time_part)
-    for candidate in (
-        day_dir / f"{token}.csv",
-        day_dir / f"{token.replace('-', '')}.csv",
-    ):
-        if candidate.is_file():
-            return candidate
-    matches = sorted(day_dir.glob(f"*{token}*.csv"))
-    return matches[0] if matches else None
+    search_dirs = [_snapshot_out_dir(snapshot_target) / _safe_filename_part(date_part)]
+    target = str(snapshot_target or "").strip().lower()
+    if target == "banknifty_btst":
+        legacy = _ROOT / _LOG_SUBDIR / _safe_filename_part(date_part)
+        if legacy not in search_dirs:
+            search_dirs.append(legacy)
+    for day_dir in search_dirs:
+        if not day_dir.is_dir():
+            continue
+        for candidate in (
+            day_dir / f"{token}.csv",
+            day_dir / f"{token.replace('-', '')}.csv",
+        ):
+            if candidate.is_file():
+                return candidate
+        matches = sorted(day_dir.glob(f"*{token}*.csv"))
+        if matches:
+            return matches[0]
+        # Same session: accept the only snapshot for that date when slot drifts (UTC vs IST).
+        all_csv = sorted(day_dir.glob("*.csv"))
+        if len(all_csv) == 1:
+            return all_csv[0]
+    return None
 
 
 def load_option_chain_snapshot_csv(
@@ -254,16 +266,7 @@ def log_option_chain_snapshot(
         return False
 
     target = str((params or {}).get("snapshot_target") or "").strip().lower()
-    if target == "option_buildup":
-        out_dir = _ROOT / _OPTION_BUILDUP_SUBDIR
-    elif target == "oi_positional_buy":
-        out_dir = _ROOT / _OI_POSITIONAL_BUY_SUBDIR
-    elif target == "leaps_rsi":
-        out_dir = _ROOT / _LEAPS_RSI_SUBDIR
-    elif target == "leaps_rsi_hedge":
-        out_dir = _ROOT / _LEAPS_RSI_HEDGE_SUBDIR
-    else:
-        out_dir = _ROOT / _LOG_SUBDIR
+    out_dir = _snapshot_out_dir(target)
 
     ts_now = datetime.now(timezone.utc)
     date_part = str((params or {}).get("snapshot_date") or ts_now.strftime("%Y-%m-%d"))

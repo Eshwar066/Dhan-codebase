@@ -66,8 +66,9 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
     required_context = ["option_chain"]
     api = "DHAN"
     expiryType = "MONTHLY"
+    dhan_monthly_expiry_weekday = 1  # BANKNIFTY monthly expiry: Tuesday
+    dhan_monthly_rollover_days_before_expiry = 3
     dhan_option_security_id = "25"
-    dhan_monthly_rollover_after_calendar_day = 16
 
     otm_strike_step = 100
     otm_strike_count = 10
@@ -111,21 +112,30 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         return close_ts.time().replace(second=0, microsecond=0)
 
     def _candle_close_ts_ist(self, candle: dict) -> pd.Timestamp:
+        """Bar close in IST. Scheduled engine candles store naive UTC in ``timestamp``."""
+        slot = self._scheduled_slot_from_candle(candle)
         ts = pd.Timestamp(candle["timestamp"])
         if ts.tzinfo is None:
-            ts = ts.tz_localize(IST)
+            if slot is not None:
+                ts = ts.tz_localize("UTC").tz_convert(IST)
+            else:
+                ts = ts.tz_localize(IST)
         else:
             ts = ts.tz_convert(IST)
+        if slot is not None:
+            return ts.replace(
+                hour=slot.hour, minute=slot.minute, second=0, microsecond=0
+            )
         return ts + pd.Timedelta(minutes=self._bar_minutes())
 
     def _find_strike_snapshot_params(self, candle, ctx, option_type):
         ts_ist = self._candle_close_ts_ist(candle)
         snapshot_date = ts_ist.strftime("%Y-%m-%d")
         snapshot_time = ts_ist.strftime("%H-%M")
+        # One full-chain snapshot per slot (CE + PE share the same wide table).
         slot_key = "|".join(
             [
                 str(getattr(ctx, "symbol", "") or ""),
-                str(option_type or ""),
                 snapshot_date,
                 snapshot_time,
             ]
@@ -149,7 +159,10 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
             return None
         if isinstance(sel, int):
             td = pd.Timestamp(ctx.timestamp).date()
-            return ExpiryResolver.dhan_expiry_index_to_date(td, sel)
+            wd = int(getattr(self, "dhan_monthly_expiry_weekday", 3))
+            return ExpiryResolver.dhan_expiry_index_to_date(
+                td, sel, monthly_expiry_weekday=wd
+            )
         return sel
 
     def _slot_key(self, candle: dict) -> str:

@@ -24,6 +24,9 @@ class ExpiryResolver:
         expiry_pref="MONTHLY",
         *,
         dhan_calendar_rollover_day=None,
+        weekly_expiry_weekday=None,
+        days_before_expiry_rollover=None,
+        monthly_expiry_weekday=None,
     ):
         # Normalize once to a pure date so downstream comparisons (e.g. in
         # _derive_monthly_series) never mix pd.Timestamp with datetime.date.
@@ -47,12 +50,20 @@ class ExpiryResolver:
         if api.upper() == "DHAN":
             if expiry_pref == "MONTHLY":
                 return ExpiryResolver._derive_monthly_series(
-                    trade_date, calendar_rollover_day=dhan_calendar_rollover_day
+                    trade_date,
+                    calendar_rollover_day=dhan_calendar_rollover_day,
+                    days_before_expiry_rollover=days_before_expiry_rollover,
+                    monthly_expiry_weekday=monthly_expiry_weekday,
                 )
             elif expiry_pref == "QUARTERLY":
                 return ExpiryResolver.quarterly_target_expiry_date(trade_date)
             elif expiry_pref == "LEAPS_ROLL":
                 return ExpiryResolver.leaps_rollover_target_expiry_date(trade_date)
+            elif expiry_pref == "WEEKLY":
+                weekday = int(
+                    weekly_expiry_weekday if weekly_expiry_weekday is not None else 2
+                )
+                return ExpiryResolver.current_weekly_expiry(trade_date, weekday=weekday)
 
         raise ValueError(f"Unsupported api={api}, expiry_pref={expiry_pref}")
 
@@ -145,25 +156,39 @@ class ExpiryResolver:
         return f"{str(symbol).upper()}-{mon}{expiry.year}-{strike}-{opt}"
 
     @staticmethod
-    def last_thursday(year, month):
-        last_day = dt.date(year, month, 1)
+    def last_weekday_of_month(year, month, weekday: int) -> dt.date:
+        """Last ``weekday`` (Mon=0 … Sun=6) in the given calendar month."""
         if month == 12:
             last_day = dt.date(year + 1, 1, 1) - dt.timedelta(days=1)
         else:
             last_day = dt.date(year, month + 1, 1) - dt.timedelta(days=1)
-
-        offset = (last_day.weekday() - 3) % 7
+        wd = int(weekday) % 7
+        offset = (last_day.weekday() - wd) % 7
         return last_day - dt.timedelta(days=offset)
 
     @staticmethod
-    def current_month_expiry(trade_date):
-        return ExpiryResolver.last_thursday(trade_date.year, trade_date.month)
+    def last_thursday(year, month):
+        return ExpiryResolver.last_weekday_of_month(year, month, 3)
 
     @staticmethod
-    def next_month_expiry(trade_date):
-        if trade_date.month == 12:
-            return ExpiryResolver.last_thursday(trade_date.year + 1, 1)
-        return ExpiryResolver.last_thursday(trade_date.year, trade_date.month + 1)
+    def current_month_expiry(trade_date, weekday: int = 3):
+        td = pd.Timestamp(trade_date).date()
+        return ExpiryResolver.last_weekday_of_month(td.year, td.month, weekday)
+
+    @staticmethod
+    def current_weekly_expiry(trade_date, weekday: int = 2) -> dt.date:
+        """Calendar expiry on ``weekday`` (Mon=0 … Sun=6) on or after ``trade_date``."""
+        td = pd.Timestamp(trade_date).date()
+        wd = int(weekday) % 7
+        days_ahead = (wd - td.weekday()) % 7
+        return td + dt.timedelta(days=days_ahead)
+
+    @staticmethod
+    def next_month_expiry(trade_date, weekday: int = 3):
+        td = pd.Timestamp(trade_date).date()
+        if td.month == 12:
+            return ExpiryResolver.last_weekday_of_month(td.year + 1, 1, weekday)
+        return ExpiryResolver.last_weekday_of_month(td.year, td.month + 1, weekday)
 
     @staticmethod
     def _select_nse_expiry(expiry_list, trade_date, *, target_month_year=None):
@@ -189,19 +214,31 @@ class ExpiryResolver:
         return matches[-1]
 
     @staticmethod
-    def _derive_monthly_series(trade_date, calendar_rollover_day=None):
+    def _derive_monthly_series(
+        trade_date,
+        calendar_rollover_day=None,
+        days_before_expiry_rollover=None,
+        monthly_expiry_weekday=None,
+    ):
         """
         Dhan / Tradehull monthly option chain index for backtest (``expiry_code`` is int).
 
         ``0`` = current month's series; ``1`` = next month's series when:
 
-        - this month's expiry Thursday has already passed, **or**
+        - this month's expiry day has already passed, **or**
+        - ``days_before_expiry_rollover`` is set and trade date is within that many
+          calendar days of this month's expiry (inclusive), **or**
         - ``calendar_rollover_day`` is set (e.g. 15) and ``trade_date.day`` is **greater than**
           that day (intraday monthly rollover — next series from folder / chain).
         """
-        this_exp = ExpiryResolver.current_month_expiry(trade_date)
+        exp_wd = 3 if monthly_expiry_weekday is None else int(monthly_expiry_weekday) % 7
+        this_exp = ExpiryResolver.current_month_expiry(trade_date, weekday=exp_wd)
         if trade_date > this_exp:
             return 1
+        if days_before_expiry_rollover is not None:
+            n = max(0, int(days_before_expiry_rollover))
+            if trade_date >= this_exp - dt.timedelta(days=n):
+                return 1
         if (
             calendar_rollover_day is not None
             and int(calendar_rollover_day) >= 1
@@ -267,11 +304,11 @@ class ExpiryResolver:
         return max(parsed, key=lambda x: x[1])[0]
 
     @staticmethod
-    def dhan_expiry_index_to_date(trade_date, expiry_index: Any):
+    def dhan_expiry_index_to_date(trade_date, expiry_index: Any, monthly_expiry_weekday: int = 3):
         """
         Map DHAN ``expiry_code`` / ``ctx.selected_expiry`` to a calendar expiry date.
 
-        - ``0`` / ``1``: front / next monthly (last Thursday)
+        - ``0`` / ``1``: front / next monthly (last weekday of month; default Thursday)
         - ``date`` / ISO string: returned as-is
         - legacy int ``> 1``: quarterly target for ``trade_date`` (old month-offset series)
         """
@@ -282,10 +319,11 @@ class ExpiryResolver:
         elif isinstance(trade_date, str):
             trade_date = pd.to_datetime(trade_date).date()
         idx = int(expiry_index)
+        exp_wd = int(monthly_expiry_weekday) % 7
         if idx <= 1:
             if idx == 0:
-                return ExpiryResolver.current_month_expiry(trade_date)
-            return ExpiryResolver.next_month_expiry(trade_date)
+                return ExpiryResolver.current_month_expiry(trade_date, weekday=exp_wd)
+            return ExpiryResolver.next_month_expiry(trade_date, weekday=exp_wd)
         return ExpiryResolver.quarterly_target_expiry_date(trade_date)
 
     @staticmethod

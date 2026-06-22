@@ -40,10 +40,7 @@ from core.utils.indicator_history import (
 )
 from core.orderExecution.account_router import AccountRouter
 
-try:
-    from logger.engine_logger import REPORTS_DIR
-except ImportError:
-    REPORTS_DIR = "reports"
+from utils.logger.engine_logger import REPORTS_DIR
 
 
 class NoMarketDataError(RuntimeError):
@@ -1392,6 +1389,17 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             ]
         return [str(s).strip().upper() for s in (self.symbols or [])]
 
+    def _current_ist_now(self) -> dt.datetime:
+        """IST now; dummy feed uses simulated ``start_datetime`` when set."""
+        feed = self.realtime_feed
+        if feed and getattr(feed, "is_dummy_feed", False):
+            getter = getattr(feed, "get_simulated_datetime_ist", None)
+            if callable(getter):
+                sim = getter()
+                if sim is not None:
+                    return sim
+        return dt.datetime.now(IST)
+
     @staticmethod
     def _normalize_scheduled_time(slot: Any) -> Optional[dt_time]:
         if isinstance(slot, dt_time):
@@ -1448,7 +1456,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
     def _maybe_run_scheduled_evaluations(self, exchange: str) -> None:
         if not self._scheduled_strategies:
             return
-        now_ist = dt.datetime.now(IST)
+        now_ist = self._current_ist_now()
         slot_t = now_ist.time().replace(second=0, microsecond=0)
         due: List[tuple] = []
         for strategy in self._scheduled_strategies:

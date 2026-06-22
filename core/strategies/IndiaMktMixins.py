@@ -73,6 +73,10 @@ class IndiaMktMixins:
         """Dhan rolling-option ``securityId`` (NIFTY=13, BANKNIFTY=25). Override on strategy class."""
         return str(getattr(self, "dhan_option_security_id", None) or "13")
 
+    def _dhan_expiry_flag(self) -> str:
+        """Dhan option chain / rolling-option expiry flag (``MONTH`` or ``WEEK``)."""
+        return str(getattr(self, "dhan_expiry_flag", "MONTH") or "MONTH")
+
     @staticmethod
     def _order_qty_in_lots(inst, qty: Any) -> int:
         """Normalize qty to whole lots: values ≥ lot_size that divide evenly are treated as units."""
@@ -316,7 +320,7 @@ class IndiaMktMixins:
             "option_type": option_type,
             "instrument": "OPTIDX",
             "exchangeSegment": "NSE_FNO",
-            "expiry_flag": "MONTH",
+            "expiry_flag": self._dhan_expiry_flag(),
             "securityId": self._dhan_option_security_id(),
         }
 
@@ -712,12 +716,20 @@ class IndiaMktMixins:
             )
 
         rollover = getattr(self, "dhan_monthly_rollover_after_calendar_day", None)
+        if str(getattr(self, "expiryType", "") or "").upper() != "MONTHLY":
+            rollover = None
+        weekly_wd = getattr(self, "weekly_expiry_weekday", None)
+        days_before_exp = getattr(self, "dhan_monthly_rollover_days_before_expiry", None)
+        monthly_exp_wd = getattr(self, "dhan_monthly_expiry_weekday", None)
         expiry_code = ExpiryResolver.resolve(
             expiry_list=ctx.get_expiry_list(),
             trade_date=ctx.timestamp,
             api=self.api,
             expiry_pref=self.expiryType,
             dhan_calendar_rollover_day=rollover,
+            weekly_expiry_weekday=weekly_wd,
+            days_before_expiry_rollover=days_before_exp,
+            monthly_expiry_weekday=monthly_exp_wd,
         )
         spot = candle["close"]
         step = getattr(self, "otm_strike_step", 500)
@@ -960,7 +972,7 @@ class IndiaMktMixins:
             "interval": self.timeframe,
             "expiry_code": ctx.selected_expiry,
             "instrument": "OPTIDX",
-            "expiry_flag": "MONTH",
+            "expiry_flag": self._dhan_expiry_flag(),
             "strikes": 60,
         }
         if self.api != "DHAN":
@@ -1047,7 +1059,7 @@ class IndiaMktMixins:
                 "interval": self.timeframe,
                 "expiry_code": ctx.selected_expiry,
                 "instrument": "OPTIDX",
-                "expiry_flag": "MONTH",
+                "expiry_flag": self._dhan_expiry_flag(),
                 "strikes": 60,
             }
             params.update(extra_snapshot_params)
@@ -1060,13 +1072,29 @@ class IndiaMktMixins:
                 "option_type": option_type,
                 "instrument": "OPTIDX",
                 "exchangeSegment": "NSE_FNO",
-                "expiry_flag": "MONTH",
+                "expiry_flag": self._dhan_expiry_flag(),
                 "securityId": self._dhan_option_security_id(),
             }
             if isinstance(extra_snapshot_params, dict) and extra_snapshot_params:
                 params.update(extra_snapshot_params)
 
-        chain = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
+        reuse_cached_chain = False
+        if not snapshot_mode and str(self.api or "").upper() == "DHAN":
+            cached = getattr(self, "_last_option_chain", None)
+            if isinstance(cached, dict):
+                inner = cached.get("chain")
+                reuse_cached_chain = isinstance(inner, pd.DataFrame) and not inner.empty
+            elif isinstance(cached, pd.DataFrame):
+                reuse_cached_chain = not cached.empty
+
+        if reuse_cached_chain:
+            chain = getattr(self, "_last_option_chain", None)
+        else:
+            chain = ctx.option_chain_service.get_chain(
+                api=self.api, ctx=ctx, params=params
+            )
+        if chain is None:
+            chain = self._resolve_option_chain_data(candle, ctx)
         if bool(params.get("snapshot", False)):
             try:
                 log_option_chain_snapshot(

@@ -20,10 +20,7 @@ from core.utils.indicator_history import bucket_ts_is_nse_60m_bar, is_nse_index_
 DEFAULT_FEED_STALE_SECONDS = 60
 logger = logging.getLogger(__name__)
 
-try:
-    from logger.engine_logger import REPORTS_DIR
-except ImportError:
-    REPORTS_DIR = "reports"
+from utils.logger.engine_logger import REPORTS_DIR
 
 
 # ---------- Time helpers ----------
