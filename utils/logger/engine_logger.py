@@ -1,7 +1,7 @@
 """
-Structured JSON logging per engine. One file per engine: logs/{engine_id}.log.
-Closed candles: logs/{strategy}/{engine_id}_candles.log — single append-only file (see candle_created).
-Engine events in logs/{strategy}/{engine_id}.log still rotate daily at midnight UTC.
+Structured JSON logging per strategy. One rotating file per strategy: logs/{strategy_id}/{strategy_id}.log.
+Closed candles: logs/{strategy_id}/{strategy_id}_candles.log — single append-only file (see candle_created).
+Engine events rotate daily at midnight UTC. Multi-strategy engines route each event only to its payload ``strategy_id`` file.
 No print(); all events logged as one JSON object per line.
 For ``candle_closed`` rows, ``timestamp`` and ``bar_timestamp_ist`` use IST wall time as ``YYYY-MM-DD HH:MM`` (no seconds). Other events still use full ISO-8601 with offset in ``timestamp``.
 """
@@ -101,7 +101,7 @@ def _safe_dir_name(name: Optional[str]) -> str:
 
 class EngineLogger:
     """
-    Per-engine structured logger. Thread-safe. Writes JSON lines to logs/{engine_id}.log.
+    Per-strategy structured logger. Thread-safe. Writes JSON lines to logs/{strategy_id}/{strategy_id}.log.
     """
 
     def __init__(
@@ -117,14 +117,20 @@ class EngineLogger:
         self.strategy = strategy
         self._telegram_alert = telegram_alert
         self._base_log_root = log_dir or LOGS_DIR
-        self._strategy_dir = _safe_dir_name(strategy)
-        self._log_dir = os.path.join(self._base_log_root, self._strategy_dir)
-        self._path = os.path.join(self._log_dir, f"{engine_id}.log")
-        self._candles_path = os.path.join(self._log_dir, f"{engine_id}_candles.log")
         self._lock = threading.Lock()
         self._line_formatter = logging.Formatter("%(message)s")
         self._file_handlers: Dict[str, TimedRotatingFileHandler] = {}
-        os.makedirs(self._log_dir, exist_ok=True)
+
+    def _strategy_log_dir(self, strategy_id: str) -> str:
+        return os.path.join(self._base_log_root, _safe_dir_name(strategy_id))
+
+    def _event_log_path(self, strategy_id: str) -> str:
+        sid = _safe_dir_name(strategy_id)
+        return os.path.join(self._strategy_log_dir(sid), f"{sid}.log")
+
+    def _candles_log_path(self, strategy_id: Optional[str] = None) -> str:
+        sid = _safe_dir_name(strategy_id or self.strategy)
+        return os.path.join(self._strategy_log_dir(sid), f"{sid}_candles.log")
 
     def notify_operator(self, message: str) -> None:
         """Send an out-of-band operator alert (not limited to TELEGRAM_ALERT_EVENTS)."""
@@ -254,15 +260,11 @@ class EngineLogger:
         if round_json_floats is not None:
             payload = round_json_floats(payload)
         line = json.dumps(payload, default=str) + "\n"
+        target_strategy = str(payload.get("strategy_id") or self.strategy).strip() or self.strategy
+        target_path = self._event_log_path(target_strategy)
         with self._lock:
-            os.makedirs(self._log_dir, exist_ok=True)
-            self._emit_line(self._path, line)
-            payload_strategy = str(payload.get("strategy_id") or "").strip()
-            if payload_strategy and payload_strategy != self.strategy:
-                alt_dir = os.path.join(self._base_log_root, _safe_dir_name(payload_strategy))
-                os.makedirs(alt_dir, exist_ok=True)
-                alt_path = os.path.join(alt_dir, f"{self.engine_id}.log")
-                self._emit_line(alt_path, line)
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            self._emit_line(target_path, line)
         self._send_telegram_alert(payload)
 
     def error(self, event_type: str, message: str = "", **kwargs) -> None:
@@ -441,7 +443,7 @@ class EngineLogger:
         timeframe: Optional[str] = None,
         source: str = "live",
     ) -> None:
-        """Append one JSON line per closed candle to logs/{strategy}/{engine_id}_candles.log."""
+        """Append one JSON line per closed candle to logs/{strategy_id}/{strategy_id}_candles.log."""
         ts = candle.get("timestamp")
         tf_sec = None
         if _resolution_to_seconds is not None and timeframe is not None:
@@ -483,8 +485,9 @@ class EngineLogger:
         if round_json_floats is not None:
             payload = round_json_floats(payload)
         line = json.dumps(payload, default=str) + "\n"
+        candles_path = self._candles_log_path(self.strategy)
         with self._lock:
-            self._append_line(self._candles_path, line)
+            self._append_line(candles_path, line)
         self._send_telegram_alert(payload)
 
     def order_placed(

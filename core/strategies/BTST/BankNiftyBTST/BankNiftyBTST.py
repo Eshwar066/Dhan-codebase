@@ -2,7 +2,7 @@
 Bank Nifty BTST (Buy Today Sell Tomorrow) — Dhan index options.
 
 Rules (see readme.md)
-- 9:20 IST: pick CE and PE strikes near ~100 premium; LIMIT BUY each at premium × 1.5.
+- 9:20 IST: pick CE and PE strikes near ~100 premium; GTT (Forever) LIMIT BUY each at premium × 1.5.
 - After fill: resting SL-SELL at 50% of the limit entry price.
 - 15:20 IST: cancel any unfilled ENTRY limits placed today.
 - If SL not hit: exit next session at 9:25 IST.
@@ -34,6 +34,8 @@ PREM_MIN = 80.0
 PREM_MAX = 120.0
 LIMIT_PREM_MULT = 1.5
 SL_OF_LIMIT = 0.5
+# Live ENTRY uses Dhan Forever (GTT): trigger/limit at LIMIT_PREM_MULT × ref premium.
+ENTRY_EXECUTION_MODE = "GTT"
 
 
 BTST_META_KEY = "banknifty_btst"
@@ -398,6 +400,11 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         self._meta_by_structure_id[structure_id] = meta
         self._entry_signaled_keys.add(signal_key)
 
+        use_gtt = RUN_MODE == RunMode.LIVE
+        strategy_meta = self._strategy_meta(meta)
+        if use_gtt:
+            strategy_meta["execution_mode"] = ENTRY_EXECUTION_MODE
+
         return self.create_order_intent(
             inst=inst,
             side="BUY",
@@ -410,7 +417,8 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
             tag="MAIN",
             symbol=symbol,
             action="ENTRY",
-            metadata_extras=self._strategy_meta(meta),
+            trigger_price=float(limit_price) if use_gtt else None,
+            metadata_extras=strategy_meta,
         )
 
     def on_candle(self, candle, ctx):

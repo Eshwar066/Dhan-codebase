@@ -27,7 +27,7 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     Live data path (60m NIFTY):
     1. Closed bar from aggregator → ``indicator_manager.enrich_candle_for_strategy``
     2. RSI + OHLC persisted to ``logs/indicators/NIFTY/60/indicator_history.jsonl``
-    3. Same enriched bar logged to ``logs/LEAPS_RSI/dhan_leaps_rsi_candles.log``
+    3. Same enriched bar logged to ``logs/LEAPS_RSI/LEAPS_RSI_candles.log``
     4. Enriched candle (rsi, prev_rsi, ema_high, ema_low) passed into ``should_evaluate`` / ``on_candle``
     5. Hedge entry: fresh monthly-expiry chain → ``logs/LEAPS_RSI/hedge_option_chain_snapshots/``
     """
