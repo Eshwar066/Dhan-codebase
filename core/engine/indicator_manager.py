@@ -27,7 +27,7 @@ class IndicatorManager:
     indicator state.
 
     Bootstrap (L2 candles log → L2b RSI history → L3 API):
-    - Primary: closed candles from ``logs/{strategy}/{engine_id}_candles.log`` (single append-only file).
+    - Primary: closed candles from ``logs/{strategy_id}/{strategy_id}_candles.log`` (single append-only file).
     - Secondary: ``logs/indicators/{symbol}/{tf}/indicator_history.jsonl`` (and legacy
       ``{strategy}_rsi_history.log``) when the candle log is short.
     - ``get_intraday`` only when both logs are missing or insufficient; same-day API rows are stripped
@@ -193,7 +193,7 @@ class IndicatorManager:
 
     @staticmethod
     def _is_candles_log_filename(name: str) -> bool:
-        """Single append-only ``{engine_id}_candles.log`` (excludes old ``*.log.YYYY-MM-DD`` rotators)."""
+        """Single append-only ``{strategy_id}_candles.log`` (excludes old ``*.log.YYYY-MM-DD`` rotators)."""
         return name.endswith("_candles.log") and "_candles.log." not in name
 
     def _list_candles_log_paths(self, strategy_id: Optional[str] = None) -> List[str]:
@@ -364,7 +364,7 @@ class IndicatorManager:
         strategy_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Scan strategy ``logs/{strategy}/{engine_id}_candles.log`` (append-only).
+        Scan strategy ``logs/{strategy_id}/{strategy_id}_candles.log`` (append-only).
 
         When ``strategy_id`` is omitted, scans all strategies under ``logs/``.
         When ``ist_day`` is set, only rows whose bar open falls on that IST calendar date.
