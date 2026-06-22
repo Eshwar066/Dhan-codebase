@@ -15,6 +15,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
+from zoneinfo import ZoneInfo
 
 from core.data.feeds.base_feed import RealtimeFeed
 
@@ -60,6 +61,7 @@ class DummyRealtimeFeed(RealtimeFeed):
 
         self._price: Dict[str, float] = {s: float(start_price) for s in self.symbols}
         self._last_ticker: Dict[str, Dict[str, Any]] = {}
+        self._tick_count = 0
 
         self._drift_min = float(drift_min)
         self._drift_max = float(drift_max)
@@ -119,6 +121,17 @@ class DummyRealtimeFeed(RealtimeFeed):
             "timestamp": ts,
         }
 
+    def get_simulated_datetime_ist(self) -> Optional[datetime]:
+        """Current simulated wall time in IST when ``start_datetime`` was set."""
+        if self._start_datetime is None:
+            return None
+        with self._state_lock:
+            tick_count = int(self._tick_count)
+        sim_utc = self._start_datetime + timedelta(
+            seconds=tick_count * self.tick_interval
+        )
+        return sim_utc.astimezone(ZoneInfo("Asia/Kolkata"))
+
     def _run(self) -> None:
         base_time = (
             self._start_datetime
@@ -169,6 +182,8 @@ class DummyRealtimeFeed(RealtimeFeed):
                     }
 
             tick_count += 1
+            with self._state_lock:
+                self._tick_count = tick_count
             time.sleep(self.tick_interval)
 
     def _next_price(self, symbol: str, tick_count: int) -> float:

@@ -1,4 +1,5 @@
 """
+BTC and ETH
 Futures_EMA_Momentum: Trend Breakout (EMA filter only).
 
 Trend defines direction. Donchian defines entry. No ATR/volatility gating.

@@ -12,7 +12,7 @@ import pdb
 if TYPE_CHECKING:
     from core.models.strategy_context import StrategyContext
 
-# Nifty EMA  0.6 and 0.4
+# Nifty EMA  0.6 and 0.4 Nifty strategy
 class FuturesEMAHighLow(IndiaMktMixins, BaseStrategy):
 
     name = "FuturesEMAHighLow"
