@@ -17,7 +17,7 @@ try:
 except ImportError:
     round_json_floats = None  # type: ignore
 
-from core.broker.internal.dhan.mappings import format_broker_failure_for_log
+from core.broker.internal.dhan.mappings import dhan_correlation_id, format_broker_failure_for_log
 from core.orderExecution.bracket_orders import BRACKET_TAGS, BracketLegRegistry
 from core.orderExecution.intent_store import IntentStatus, IntentStore
 
@@ -61,6 +61,7 @@ class OrderRouter:
         slippage_threshold_pct: float = None,
         engine_id: Optional[str] = None,
         strategy_id: Optional[str] = None,
+        known_strategies: Optional[Iterable[str]] = None,
         # Orphan fill sync (no intent match): ignore stale / pre-session broker rows
         max_orphan_fill_age_seconds: Optional[float] = 300,
         reject_orphan_fills_before_oms_session: bool = True,
@@ -77,6 +78,13 @@ class OrderRouter:
         self.slippage_threshold_pct = slippage_threshold_pct
         self.engine_id = engine_id
         self.strategy_id = strategy_id
+        self._known_strategies: List[str] = []
+        seen_strats: Set[str] = set()
+        for raw in [strategy_id, *(known_strategies or [])]:
+            sid = str(raw or "").strip()
+            if sid and sid not in seen_strats:
+                seen_strats.add(sid)
+                self._known_strategies.append(sid)
         self.max_orphan_fill_age_seconds = max_orphan_fill_age_seconds
         self.reject_orphan_fills_before_oms_session = (
             reject_orphan_fills_before_oms_session
@@ -100,13 +108,15 @@ class OrderRouter:
         # EXTERNAL_CLOSE: additive confidence (see _external_close_confidence_score)
         self._orphan_close_score_threshold = 6
         self._orphan_close_suspect_floor = 5
-        _strategy_dir = (
-            str(self.strategy_id or "GLOBAL").replace(" ", "_").replace("/", "_")
-        )
-        _logs_dir = Path(__file__).resolve().parents[2] / "logs" / _strategy_dir
-        _logs_dir.mkdir(parents=True, exist_ok=True)
+        _logs_root = Path(__file__).resolve().parents[2] / "logs"
         _safe_id = (engine_id or "default").replace(" ", "_").replace("/", "_")
-        self._order_state_file = _logs_dir / f"order_state_{_safe_id}.json"
+        self._order_state_engine_id = _safe_id
+        self._logs_root = _logs_root
+        self._legacy_order_state_file = (
+            _logs_root
+            / str(self.strategy_id or "GLOBAL").replace(" ", "_").replace("/", "_")
+            / f"order_state_{_safe_id}.json"
+        )
         self._load_order_state()
         self._rebuild_order_state_cache()
         # Fills before this instant are ignored for orphan EXTERNAL_CLOSE / LIQUIDATION / ADL paths.
@@ -116,6 +126,107 @@ class OrderRouter:
     def reset_oms_session_boundary(self) -> None:
         """Call when starting a new trading session (same process) to tighten orphan fill acceptance."""
         self._oms_session_start_unix = time.time()
+
+    def _intent_strategy_id(
+        self, intent_id: Optional[str], default: Optional[str] = None
+    ) -> Optional[str]:
+        sid = default or self.strategy_id
+        if not intent_id or self.intent_store is None:
+            return sid
+        rec = self.intent_store.get(str(intent_id))
+        if not rec:
+            return sid
+        payload = rec.get("payload") or {}
+        return (
+            rec.get("strategy")
+            or payload.get("strategy_id")
+            or sid
+        )
+
+    def _intent_execution_mode(self, intent_rec: Dict[str, Any]) -> str:
+        if not intent_rec:
+            return ""
+        payload = intent_rec.get("payload") or {}
+        strategy_meta = (
+            payload.get("strategy_meta")
+            or intent_rec.get("strategy_meta")
+            or {}
+        )
+        if isinstance(strategy_meta, dict):
+            mode = strategy_meta.get("execution_mode")
+            if mode:
+                return str(mode).strip().upper()
+        return str(payload.get("execution_mode") or "").strip().upper()
+
+    def _intent_is_gtt(self, intent_rec: Dict[str, Any]) -> bool:
+        return self._intent_execution_mode(intent_rec) == "GTT"
+
+    @staticmethod
+    def _broker_tag_matches_intent(intent_id: str, broker_tag: str) -> bool:
+        tag = str(broker_tag or "").strip()
+        iid = str(intent_id or "").strip()
+        if not tag or not iid:
+            return False
+        if tag == iid:
+            return True
+        return tag == dhan_correlation_id(iid)
+
+    def _intent_matched_on_broker_open(
+        self,
+        intent_id: str,
+        broker_order_id: Optional[str],
+        broker_tags: Set[str],
+        broker_order_ids: Set[str],
+    ) -> bool:
+        iid = str(intent_id or "").strip()
+        if not iid:
+            return False
+        if iid in broker_tags:
+            return True
+        dhan_cid = dhan_correlation_id(iid)
+        if dhan_cid in broker_tags:
+            return True
+        if broker_order_id and str(broker_order_id) in broker_order_ids:
+            return True
+        return False
+
+    def _resolve_intent_id_from_broker_order(
+        self, order: Dict[str, Any], local_pending: List[Dict[str, Any]]
+    ) -> Optional[str]:
+        tag = str(order.get("tag") or order.get("correlationId") or "").strip()
+        oid = str(order.get("order_id") or order.get("orderId") or "").strip()
+        for rec in local_pending:
+            iid = str(rec.get("intent_id") or "").strip()
+            if not iid:
+                continue
+            if tag and self._broker_tag_matches_intent(iid, tag):
+                return iid
+            if oid and str(rec.get("broker_order_id") or "") == oid:
+                return iid
+        return None
+
+    def _merge_forever_orders_for_recon(
+        self,
+        broker_open: List[Dict[str, Any]],
+        local_pending: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not hasattr(self.broker, "get_forever_open_orders"):
+            return broker_open
+        try:
+            forever_raw = self.broker.get_forever_open_orders() or []
+        except Exception as exc:
+            logger.warning("Failed to fetch forever open orders: %s", exc)
+            return broker_open
+        merged = list(broker_open)
+        for o in forever_raw:
+            if not isinstance(o, dict):
+                continue
+            norm = self._normalize_broker_order_for_recon(o)
+            resolved = self._resolve_intent_id_from_broker_order(norm, local_pending)
+            if resolved:
+                norm["tag"] = resolved
+            merged.append(norm)
+        return merged
 
     def _log_oms_step(
         self,
@@ -135,7 +246,11 @@ class OrderRouter:
         if getattr(intent, "instrument", None) is not None:
             sym = getattr(intent.instrument, "trading_symbol", None) or ""
         intent_id = getattr(intent, "intent_id", None)
-        strategy_id = intent_strategy_id or self.strategy_id
+        strategy_id = (
+            intent_strategy_id
+            or getattr(intent, "strategy", None)
+            or self.strategy_id
+        )
         parts = [
             f"OMS step={step}",
             f"ok={ok}",
@@ -184,57 +299,121 @@ class OrderRouter:
             **{k: v for k, v in extra.items() if v is not None},
         )
 
-    def _load_order_state(self) -> None:
-        """Load intent_id -> OrderState and optional action log from logs/order_state_{engine_id}.json."""
-        if (
-            not getattr(self, "_order_state_file", None)
-            or not self._order_state_file.exists()
-        ):
-            return
+    def _safe_strategy_dir(self, strategy_id: Optional[str]) -> str:
+        return str(strategy_id or self.strategy_id or "GLOBAL").replace(
+            " ", "_"
+        ).replace("/", "_")
+
+    def _order_state_file_for_strategy(self, strategy_id: str) -> Path:
+        sid = self._safe_strategy_dir(strategy_id)
+        path = self._logs_root / sid / f"order_state_{self._order_state_engine_id}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _order_state_files_to_load(self) -> List[Path]:
+        paths: List[Path] = []
+        seen: Set[str] = set()
+        legacy = getattr(self, "_legacy_order_state_file", None)
+        if legacy is not None:
+            paths.append(legacy)
+            seen.add(str(legacy))
+        for sid in self._known_strategies:
+            p = self._order_state_file_for_strategy(sid)
+            key = str(p)
+            if key not in seen:
+                paths.append(p)
+                seen.add(key)
+        if not paths and self.strategy_id:
+            p = self._order_state_file_for_strategy(self.strategy_id)
+            if str(p) not in seen:
+                paths.append(p)
+        return paths
+
+    @staticmethod
+    def _read_order_state_file(path: Path) -> Tuple[Dict[str, OrderState], List[Dict[str, Any]]]:
+        states: Dict[str, OrderState] = {}
+        log_entries: List[Dict[str, Any]] = []
+        if not path.exists():
+            return states, log_entries
         try:
-            with open(self._order_state_file, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if not isinstance(data, dict):
-                return
-            # New format: { "states": {...}, "log": [...] }
+                return states, log_entries
             if "states" in data:
                 for intent_id, val in data["states"].items():
                     try:
-                        self._order_state[intent_id] = (
+                        states[str(intent_id)] = (
                             OrderState(val) if isinstance(val, str) else val
                         )
                     except (ValueError, TypeError):
                         pass
-                self._order_state_log = data.get("log") or []
+                log_entries = list(data.get("log") or [])
             else:
-                # Legacy: flat intent_id -> state
                 for intent_id, val in data.items():
                     try:
-                        self._order_state[intent_id] = (
+                        states[str(intent_id)] = (
                             OrderState(val) if isinstance(val, str) else val
                         )
                     except (ValueError, TypeError):
                         pass
-                self._order_state_log = []
         except (json.JSONDecodeError, OSError):
             pass
+        return states, log_entries
+
+    def _load_order_state(self) -> None:
+        """Load intent_id -> OrderState from per-strategy logs/{strategy}/order_state_{engine}.json."""
+        merged_states: Dict[str, OrderState] = {}
+        merged_log: List[Dict[str, Any]] = []
+        for path in self._order_state_files_to_load():
+            states, log_entries = self._read_order_state_file(path)
+            merged_states.update(states)
+            merged_log.extend(log_entries)
+        self._order_state = merged_states
+        self._order_state_log = merged_log[-self._order_state_log_max :]
 
     def _persist_order_state(self) -> None:
-        """Write _order_state and action log to logs/order_state_{engine_id}.json."""
-        if not getattr(self, "_order_state_file", None):
-            return
-        try:
-            states = {
-                k: (v.value if isinstance(v, OrderState) else v)
-                for k, v in self._order_state.items()
+        """Write order states split by strategy into logs/{strategy_id}/order_state_{engine_id}.json."""
+        if not self._order_state:
+            targets = list(self._known_strategies) or (
+                [self.strategy_id] if self.strategy_id else []
+            )
+        else:
+            targets = set(self._known_strategies)
+            for intent_id in self._order_state:
+                targets.add(self._intent_strategy_id(intent_id) or self.strategy_id or "GLOBAL")
+            targets = sorted(targets)
+        if not targets and self.strategy_id:
+            targets = [self.strategy_id]
+        states_all = {
+            k: (v.value if isinstance(v, OrderState) else v)
+            for k, v in self._order_state.items()
+        }
+        log_all = getattr(self, "_order_state_log", [])
+        for strategy_id in targets:
+            sid = strategy_id or self.strategy_id or "GLOBAL"
+            strat_states = {
+                k: v
+                for k, v in states_all.items()
+                if (self._intent_strategy_id(k) or self.strategy_id or "GLOBAL") == sid
             }
-            log = getattr(self, "_order_state_log", [])
-            data = {"states": states, "log": log}
-            to_save = round_json_floats(data) if round_json_floats else data
-            with open(self._order_state_file, "w", encoding="utf-8") as f:
-                json.dump(to_save, f, indent=2)
-        except OSError:
-            pass
+            strat_log = [
+                e
+                for e in log_all
+                if not e.get("intent_id")
+                or (self._intent_strategy_id(str(e.get("intent_id"))) or self.strategy_id or "GLOBAL")
+                == sid
+            ]
+            if not strat_states and not strat_log:
+                continue
+            path = self._order_state_file_for_strategy(sid)
+            try:
+                data = {"states": strat_states, "log": strat_log}
+                to_save = round_json_floats(data) if round_json_floats else data
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(to_save, f, indent=2)
+            except OSError:
+                pass
 
     def _set_order_state(
         self,
@@ -1125,6 +1304,9 @@ class OrderRouter:
                     "oms",
                     f"Cutoff cancel strategy={strategy_id} intent_id={intent_id} "
                     f"broker_order_id={broker_order_id or 'none'} structure_id={structure_id}",
+                    strategy_id=strategy_id,
+                    intent_id=intent_id,
+                    structure_id=structure_id,
                 )
             cancelled += 1
         return cancelled
@@ -1256,18 +1438,14 @@ class OrderRouter:
             broker_open_raw = self.broker.get_open_orders()
         except Exception as e:
             if self.engine_logger:
-                self.engine_logger.order_state_mismatch(
-                    f"Failed to fetch broker open orders: {e}"
+                self.engine_logger.log(
+                    "oms",
+                    f"Failed to fetch broker open orders: {e}",
+                    severity="error",
                 )
             else:
                 logger.warning("Failed to fetch broker open orders: %s", e)
             return False, {"error": str(e)}
-
-        broker_open = [
-            self._normalize_broker_order_for_recon(o)
-            for o in (broker_open_raw or [])
-            if isinstance(o, dict)
-        ]
 
         # Trade-led: sync trades (fills) first so positions are up to date before we compare order state
         self.sync_trades_from_broker()
@@ -1277,11 +1455,22 @@ class OrderRouter:
             IntentStatus.SENT
         ) + self.intent_store.list_by_status(IntentStatus.VALIDATED)
 
+        broker_open = [
+            self._normalize_broker_order_for_recon(o)
+            for o in (broker_open_raw or [])
+            if isinstance(o, dict)
+        ]
+        broker_open = self._merge_forever_orders_for_recon(broker_open, local_pending)
+
         local_intent_ids = {
             i.get("intent_id") for i in local_pending if i.get("intent_id")
         }
         broker_tags = {o.get("tag") for o in broker_open if o.get("tag")}
-        # broker_order_ids = {o.get("order_id") for o in broker_open}
+        broker_order_ids = {
+            str(o.get("order_id"))
+            for o in broker_open
+            if o.get("order_id") is not None
+        }
 
         # 1. Orphans: On broker but not in local pending
         # We might have recorded them earlier, so check if they exist AT ALL in intent_store
@@ -1293,8 +1482,15 @@ class OrderRouter:
             tag = o.get("tag")
             if not tag:
                 continue
+            matched_intent = tag if tag in local_intent_ids else None
+            if not matched_intent:
+                matched_intent = self._resolve_intent_id_from_broker_order(
+                    o, local_pending
+                )
 
-            if not self.intent_store.exists(tag):
+            if not self.intent_store.exists(tag) and not (
+                matched_intent and self.intent_store.exists(matched_intent)
+            ):
                 orphans.append(o)
                 # Orphan Adoption: Create local record for pre-existing broker order
                 b_sym = o.get("symbol") or o.get("product_symbol")
@@ -1374,29 +1570,38 @@ class OrderRouter:
                     )
                 resolved_orphans.add(str(tag))
 
-            elif tag in local_intent_ids:
+            elif matched_intent and matched_intent in local_intent_ids:
                 # Local thinks it's pending, broker confirms it's open. Sync order ID and persist OPEN.
+                tag_key = matched_intent
                 self._set_order_state(
-                    tag,
+                    tag_key,
                     OrderState.OPEN,
                     action="sync_open",
                     message="Broker confirms order is open",
                 )
-                intent = self.intent_store.get(tag)
+                intent = self.intent_store.get(tag_key)
                 self.intent_store.update(
-                    tag,
+                    tag_key,
                     IntentStatus.SENT,
                     broker_order_id=intent.get("broker_order_id") or o.get("order_id"),
                     order_state=OrderState.OPEN,
                 )
-                resolved_missing.add(str(tag))
+                resolved_missing.add(str(tag_key))
 
         # 2. Missing: In local pending but not on broker open list
         # Usually FILLED/REJECTED/CANCELLED. Only poll broker when cache doesn't have terminal state.
         missing = []
         for i in local_pending:
             intent_id = i.get("intent_id")
-            if not intent_id or intent_id in broker_tags:
+            if not intent_id:
+                continue
+            if self._intent_matched_on_broker_open(
+                str(intent_id),
+                i.get("broker_order_id"),
+                broker_tags,
+                broker_order_ids,
+            ):
+                resolved_missing.add(str(intent_id))
                 continue
             payload = i.get("payload") or {}
             action = str(payload.get("action") or i.get("action") or "").upper()
@@ -1408,6 +1613,11 @@ class OrderRouter:
                 if created_at > 0 and (now_ts - created_at) < self._force_exit_pending_max_wait_sec:
                     resolved_missing.add(str(intent_id))
                     continue
+            # GTT (Forever) orders live on /forever/orders, not the regular open-order book.
+            # After broker ack, trust placement + fills + cutoff cancel until terminal state.
+            if self._intent_is_gtt(i) and i.get("broker_order_id"):
+                resolved_missing.add(str(intent_id))
+                continue
             missing.append(i)
         missing_needing_poll = [
             i
@@ -1589,6 +1799,8 @@ class OrderRouter:
                                 self.engine_logger.log(
                                     "oms",
                                     f"Missing order {tag}: no fill in API; leaving state unchanged (trade-led OMS)",
+                                    strategy_id=self._intent_strategy_id(str(tag)),
+                                    intent_id=str(tag),
                                 )
                 except Exception as e:
                     if self.engine_logger:
@@ -1613,8 +1825,30 @@ class OrderRouter:
 
         if unresolved_orphan_tags or unresolved_missing_ids:
             if self.engine_logger:
+                mismatch_sid = self.strategy_id
+                if unresolved_missing_ids:
+                    mismatch_sid = (
+                        self._intent_strategy_id(unresolved_missing_ids[0])
+                        or mismatch_sid
+                    )
+                elif unresolved_orphan_tags:
+                    mismatch_sid = (
+                        self._intent_strategy_id(unresolved_orphan_tags[0])
+                        or mismatch_sid
+                    )
                 self.engine_logger.order_state_mismatch(
-                    "Order state mismatch detected", details=diff
+                    "Order state mismatch detected",
+                    details=diff,
+                    strategy_id=mismatch_sid,
+                    intent_id=(
+                        unresolved_missing_ids[0]
+                        if unresolved_missing_ids
+                        else (
+                            unresolved_orphan_tags[0]
+                            if unresolved_orphan_tags
+                            else None
+                        )
+                    ),
                 )
             return False, diff
 

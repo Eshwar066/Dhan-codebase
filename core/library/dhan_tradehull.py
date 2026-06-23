@@ -1284,6 +1284,27 @@ class Tradehull:
             print(f"Got exception in cancel_forever_order as {e}")
             raise
 
+    def get_forever_orders(self) -> list:
+        """List all Forever (GTT) orders via ``GET /forever/orders``."""
+        try:
+            http = self._get_dhan_http()
+            if http is None or not hasattr(http, "get"):
+                raise Exception("Dhan HTTP client unavailable for forever orders")
+            response = http.get("/forever/orders")
+            if isinstance(response, dict) and response.get("status") == "failure":
+                raise Exception(response)
+            data = response.get("data") if isinstance(response, dict) else response
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                nested = data.get("data")
+                if isinstance(nested, list):
+                    return nested
+            return []
+        except Exception as e:
+            self.logger.warning("Dhan get_forever_orders failed: %s", e)
+            return []
+
     def place_slice_order(
         self,
         tradingsymbol,

@@ -1149,6 +1149,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             strategy_time_ms=strategy_time_ms,
                             broker_latency_ms=0.0,
                             total_latency_ms=strategy_time_ms,
+                            strategy_id=str(getattr(strategy, "name", "") or ""),
                         )
                     continue
                 group = valid_group if valid_group else group
@@ -2393,6 +2394,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     strategy_time_ms=strategy_time_ms,
                     broker_latency_ms=0.0,
                     total_latency_ms=total_ms,
+                    strategy_id=str(getattr(strategy, "name", "") or ""),
                 )
             if total_ms > self.latency_critical_ms:
                 self._latency_critical_count += 1

@@ -1065,6 +1065,10 @@ class DhanSource:
         """Cancel a pending Forever (GTT) order."""
         return self.tsl.cancel_forever_order(order_id)
 
+    def get_forever_orders(self):
+        """List all Forever (GTT) orders."""
+        return self.tsl.get_forever_orders()
+
     def get_order_detail(self, order_id, debug="NO"):
         """Single order detail."""
         return getattr(self.tsl, "get_order_detail", lambda *a, **k: None)(

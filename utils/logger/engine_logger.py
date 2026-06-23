@@ -12,7 +12,7 @@ import os
 import threading
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 try:
@@ -111,12 +111,21 @@ class EngineLogger:
         strategy: str,
         log_dir: Optional[str] = None,
         telegram_alert: Optional[Callable[[str], None]] = None,
+        known_strategies: Optional[Sequence[str]] = None,
     ):
         self.engine_id = engine_id
         self.venue = venue
         self.strategy = strategy
         self._telegram_alert = telegram_alert
         self._base_log_root = log_dir or LOGS_DIR
+        self._known_strategies: List[str] = []
+        seen: set[str] = set()
+        for raw in [strategy, *(known_strategies or [])]:
+            sid = str(raw or "").strip()
+            if sid and sid not in seen:
+                seen.add(sid)
+                self._known_strategies.append(sid)
+        self._known_strategy_ids = set(self._known_strategies)
         self._lock = threading.Lock()
         self._line_formatter = logging.Formatter("%(message)s")
         self._file_handlers: Dict[str, TimedRotatingFileHandler] = {}
@@ -200,6 +209,31 @@ class EngineLogger:
                 f"Missing required correlation fields for event_type={event_type}: {missing}"
             )
 
+    def _infer_strategy_id(self, kwargs: Dict[str, Any], message: str = "") -> Optional[str]:
+        """Resolve target log file strategy when call sites omit ``strategy_id``."""
+        sid = kwargs.get("strategy_id") or kwargs.get("strategy")
+        if sid and str(sid).strip():
+            return str(sid).strip()
+        stid = kwargs.get("structure_id")
+        if stid:
+            prefix = str(stid).split(":")[0]
+            if prefix in self._known_strategy_ids:
+                return prefix
+        sym = str(kwargs.get("symbol") or "").upper()
+        if sym.startswith("BANKNIFTY") and "BankNiftyBTST" in self._known_strategy_ids:
+            return "BankNiftyBTST"
+        if sym.startswith("NIFTY") and "LEAPS_RSI" in self._known_strategy_ids:
+            return "LEAPS_RSI"
+        msg = str(message or "")
+        if "BankNiftyBTST" in msg and "BankNiftyBTST" in self._known_strategy_ids:
+            return "BankNiftyBTST"
+        if "LEAPS_RSI" in msg and "LEAPS_RSI" in self._known_strategy_ids:
+            return "LEAPS_RSI"
+        for ks in self._known_strategies:
+            if f"strategy={ks}" in msg or f"strategy_id={ks}" in msg:
+                return ks
+        return None
+
     def _payload(
         self,
         event_type: str,
@@ -250,6 +284,9 @@ class EngineLogger:
         # Backward compatibility: old call-sites may still pass "strategy".
         if "strategy" in kwargs and "strategy_id" not in kwargs:
             kwargs["strategy_id"] = kwargs.pop("strategy")
+        inferred = self._infer_strategy_id(kwargs, message)
+        if inferred:
+            kwargs["strategy_id"] = inferred
         event_type = EVENT_TYPE_ALIASES.get(event_type, event_type)
         if event_type in STRATEGY_EVENTS:
             assert kwargs.get("strategy_id") is not None, (
@@ -583,8 +620,8 @@ class EngineLogger:
         self.log("engine_start", message=message)
 
     # ---------- Production safeguards ----------
-    def order_state_mismatch(self, message: str, details: Optional[Dict] = None) -> None:
-        self.log("order_state_mismatch", message=message, **(details or {}))
+    def order_state_mismatch(self, message: str, details: Optional[Dict] = None, **kwargs) -> None:
+        self.log("order_state_mismatch", message=message, **(details or {}), **kwargs)
 
     def duplicate_signal_blocked(self, symbol: Optional[str] = None, signal_hash: Optional[str] = None) -> None:
         self.log("duplicate_signal_blocked", message="Duplicate signal skipped", symbol=symbol, signal_hash=signal_hash)

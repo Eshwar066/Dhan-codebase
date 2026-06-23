@@ -82,6 +82,9 @@ class DhanBrokerApi:
     def cancel_forever_order(self, order_id: str) -> Any:
         return getattr(self._source, "cancel_forever_order", lambda _oid: None)(order_id)
 
+    def get_forever_orders(self) -> List[Dict[str, Any]]:
+        return getattr(self._source, "get_forever_orders", lambda: [])()
+
     def get_positions(self, debug: str = "NO") -> Any:
         return self._source.get_positions(debug=debug)
 

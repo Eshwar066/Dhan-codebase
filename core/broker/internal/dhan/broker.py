@@ -585,7 +585,51 @@ class DhanBroker(BaseBroker):
             tag = str(o.get("tag") or o.get("correlationId") or "").strip()
             if tag == cid or tag == dhan_cid:
                 return o
+        forever = self.get_forever_open_orders() or []
+        for o in forever:
+            tag = str(o.get("tag") or o.get("correlationId") or "").strip()
+            if tag == cid or tag == dhan_cid:
+                return o
         return None
+
+    def get_forever_open_orders(self) -> List[Dict[str, Any]]:
+        """Pending Forever (GTT) orders for reconciliation (not in regular order book)."""
+        if not getattr(self.api, "get_forever_orders", None):
+            return []
+        try:
+            orders = self.api.get_forever_orders() or []
+        except Exception as exc:
+            logger.warning("Dhan get_forever_orders failed: %s", exc)
+            return []
+        closed_statuses = {
+            "traded",
+            "cancelled",
+            "rejected",
+            "expired",
+            "complete",
+            "completed",
+        }
+        out: List[Dict[str, Any]] = []
+        for o in orders if isinstance(orders, list) else []:
+            if not isinstance(o, dict):
+                continue
+            status = (o.get("orderStatus") or o.get("status") or "").lower()
+            if status in closed_statuses:
+                continue
+            corr = o.get("correlationId") or o.get("tag") or ""
+            out.append(
+                {
+                    "order_id": o.get("orderId") or o.get("order_id"),
+                    "tag": corr,
+                    "correlationId": corr,
+                    "status": status or "open",
+                    "quantity": o.get("quantity") or o.get("qty"),
+                    "filled_size": 0,
+                    "is_forever": True,
+                    "symbol": o.get("tradingSymbol") or o.get("trading_symbol"),
+                }
+            )
+        return out
 
     def get_recent_fills(self, page_size: int = 50) -> List[Dict[str, Any]]:
         """Recent fills from order list (TRADED/filled) for trade-led OMS sync."""
@@ -752,7 +796,7 @@ class DhanBroker(BaseBroker):
                 continue
             out.append({
                 "order_id": o.get("orderId") or o.get("order_id"),
-                "tag": o.get("tag") or o.get("intent_id"),
+                "tag": o.get("tag") or o.get("correlationId") or o.get("intent_id"),
                 "status": status or "open",
             })
         return out

@@ -490,6 +490,8 @@ class ExecutionEngine:
                             strategy_time_ms=strategy_ms,
                             broker_latency_ms=oms_wait_ms,
                             total_latency_ms=total_latency_ms,
+                            strategy_id=item.get("strategy_id"),
+                            intent_id=intent_id,
                         )
                         self.engine_logger.log(
                             "latency_breakdown",

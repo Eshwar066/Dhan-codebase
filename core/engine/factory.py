@@ -124,6 +124,9 @@ class EngineFactory:
             position_manager=position_manager,
             intent_store=intent_store,
         )
+        _loaded_strategies_bt = [config.strategy_name] + list(
+            getattr(config, "strategy_names", None) or []
+        )
         order_router = OrderRouter(
             risk_manager=risk_manager,
             broker=broker,
@@ -132,6 +135,7 @@ class EngineFactory:
             instrument_store=instrument_store,
             engine_id=getattr(config, "engine_id", None),
             strategy_id=config.strategy_name,
+            known_strategies=_loaded_strategies_bt,
         )
         broker.set_order_router(order_router)
         position_manager.rebuild_position_metadata_from_intent_store(intent_store)
@@ -239,11 +243,15 @@ class EngineFactory:
             open_positions_csv_path=_open_positions_csv,
         )
         intent_store = IntentStore()
+        _loaded_strategies = [config.strategy_name] + list(
+            getattr(config, "strategy_names", None) or []
+        )
         engine_logger = EngineLogger(
             engine_id=config.engine_id,
             venue=config.broker_name,
             strategy=config.strategy_name,
             telegram_alert=telegram_alert,
+            known_strategies=_loaded_strategies,
         )
         risk_manager = RiskManager(
             position_manager=position_manager,
@@ -293,6 +301,7 @@ class EngineFactory:
             slippage_threshold_pct=getattr(config, "slippage_threshold_pct", None),
             engine_id=getattr(config, "engine_id", None),
             strategy_id=config.strategy_name,
+            known_strategies=_loaded_strategies,
         )
         # Option shorting: validate SPAN + exposure margin when broker supports it (unless disabled in config)
         if getattr(config, "check_short_option_margin_enabled", True) is not False:
