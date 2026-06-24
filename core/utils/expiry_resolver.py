@@ -1,7 +1,7 @@
 import datetime as dt
 import calendar
 import math
-from typing import Any
+from typing import Any, Optional
 
 import pandas as pd
 
@@ -279,6 +279,16 @@ class ExpiryResolver:
         return pd.Timestamp(value).date()
 
     @staticmethod
+    def _parse_expiry_list(expiries) -> list[tuple[int, dt.date]]:
+        parsed: list[tuple[int, dt.date]] = []
+        for i, raw in enumerate(expiries):
+            try:
+                parsed.append((i, ExpiryResolver.as_calendar_date(raw)))
+            except (TypeError, ValueError):
+                continue
+        return parsed
+
+    @staticmethod
     def index_in_expiry_list(expiries, target_date) -> int:
         """
         Index of ``target_date`` in a sorted Dhan expiry list (exact match, else nearest
@@ -287,12 +297,7 @@ class ExpiryResolver:
         if not expiries:
             return 0
         target = ExpiryResolver.as_calendar_date(target_date)
-        parsed: list[tuple[int, dt.date]] = []
-        for i, raw in enumerate(expiries):
-            try:
-                parsed.append((i, ExpiryResolver.as_calendar_date(raw)))
-            except (TypeError, ValueError):
-                continue
+        parsed = ExpiryResolver._parse_expiry_list(expiries)
         if not parsed:
             return 0
         for i, d in parsed:
@@ -302,6 +307,27 @@ class ExpiryResolver:
         if future:
             return min(future, key=lambda x: x[1])[0]
         return max(parsed, key=lambda x: x[1])[0]
+
+    @staticmethod
+    def index_in_expiry_list_same_month(expiries, target_date) -> Optional[int]:
+        """
+        Index for a calendar-month hedge leg: exact date if present, else the latest
+        expiry in the target month. Returns None when that month is absent (do not snap
+        forward to LEAPS / next-month series).
+        """
+        if not expiries:
+            return None
+        target = ExpiryResolver.as_calendar_date(target_date)
+        parsed = ExpiryResolver._parse_expiry_list(expiries)
+        if not parsed:
+            return None
+        for i, d in parsed:
+            if d == target:
+                return i
+        same_month = [(i, d) for i, d in parsed if d.year == target.year and d.month == target.month]
+        if same_month:
+            return max(same_month, key=lambda x: x[1])[0]
+        return None
 
     @staticmethod
     def dhan_expiry_index_to_date(trade_date, expiry_index: Any, monthly_expiry_weekday: int = 3):

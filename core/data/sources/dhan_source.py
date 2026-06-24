@@ -460,6 +460,7 @@ class DhanSource:
         strikes_around_atm,
         expiry_flag,
         expiry_date=None,
+        expiry_match_same_month: bool = False,
     ):
         """
         Engine-friendly option chain.
@@ -484,19 +485,47 @@ class DhanSource:
             return None
 
         if expiry_date is not None:
-            ei = ExpiryResolver.index_in_expiry_list(expiries, expiry_date)
-            resolved = ExpiryResolver.as_calendar_date(expiries[ei])
             target = ExpiryResolver.as_calendar_date(expiry_date)
+            if expiry_match_same_month:
+                ei = ExpiryResolver.index_in_expiry_list_same_month(expiries, expiry_date)
+                if ei is None:
+                    logger.warning(
+                        "get_live_option_chain: no expiry in %04d-%02d for target=%s "
+                        "(symbol=%s exchange=%s list=%s)",
+                        target.year,
+                        target.month,
+                        target,
+                        symbol,
+                        exchange,
+                        expiries,
+                    )
+                    return None
+            else:
+                ei = ExpiryResolver.index_in_expiry_list(expiries, expiry_date)
+            resolved = ExpiryResolver.as_calendar_date(expiries[ei])
             if resolved != target:
-                logger.warning(
-                    "get_live_option_chain: expiry_date=%s resolved to list[%s]=%s "
-                    "(symbol=%s exchange=%s)",
-                    target,
-                    ei,
-                    resolved,
-                    symbol,
-                    exchange,
-                )
+                if expiry_match_same_month and (
+                    resolved.year == target.year and resolved.month == target.month
+                ):
+                    logger.info(
+                        "get_live_option_chain: expiry_date=%s matched same-month list[%s]=%s "
+                        "(symbol=%s exchange=%s)",
+                        target,
+                        ei,
+                        resolved,
+                        symbol,
+                        exchange,
+                    )
+                else:
+                    logger.warning(
+                        "get_live_option_chain: expiry_date=%s resolved to list[%s]=%s "
+                        "(symbol=%s exchange=%s)",
+                        target,
+                        ei,
+                        resolved,
+                        symbol,
+                        exchange,
+                    )
         else:
             ei = int(expiry_index) if expiry_index is not None else 0
             if ei < 0:

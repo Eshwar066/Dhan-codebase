@@ -44,6 +44,8 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     option_chain_ideal_premium = 350
     # Monthly hedge expiry cutoff (readme): before 15th → current month; on/after 15th → next month.
     hedge_monthly_rollover_after_calendar_day = 15
+    # NIFTY index monthly F&O expires last Tuesday (Mon=0 … Sun=6).
+    hedge_monthly_expiry_weekday = 1
     # Match ``refresh_leaps_rsi_from_yahoo.py`` (8-period EMA on high/low).
     ema_period = 8
 
@@ -85,9 +87,10 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         """
         _ = parent_expiry
         cutoff = int(getattr(self, "hedge_monthly_rollover_after_calendar_day", 15) or 15)
+        exp_wd = int(getattr(self, "hedge_monthly_expiry_weekday", 1) or 1) % 7
         if trade_date.day < cutoff:
-            return ExpiryResolver.current_month_expiry(trade_date)
-        return ExpiryResolver.next_month_expiry(trade_date)
+            return ExpiryResolver.current_month_expiry(trade_date, weekday=exp_wd)
+        return ExpiryResolver.next_month_expiry(trade_date, weekday=exp_wd)
 
     #option chain snapshot
     def _candle_close_ts_ist(self, candle: dict) -> pd.Timestamp:
@@ -169,6 +172,8 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             "instrument": "OPTIDX",
             "expiry_flag": "MONTH",
             "strikes": 60,
+            # Do not snap Jul hedge to Aug LEAPS when weekday differs from broker list.
+            "expiry_match_same_month": True,
         }
         if extra_snapshot_params:
             params.update(extra_snapshot_params)

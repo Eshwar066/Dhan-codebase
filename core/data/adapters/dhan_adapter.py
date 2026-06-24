@@ -36,6 +36,7 @@ class DhanAdapter(BaseAdapter):
             strikes_around_atm=strikes,
             expiry_flag=params.get("expiry_flag", "MONTH"),
             expiry_date=expiry_date,
+            expiry_match_same_month=bool(params.get("expiry_match_same_month", False)),
         )
 
     def get_historical_option_chain(self, ctx: StrategyContext, params: dict):
