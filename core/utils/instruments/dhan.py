@@ -99,7 +99,11 @@ class DhanInstrumentStore(BaseInstrumentStore):
         if val is None:
             return None
         v = pd.to_numeric(val, errors="coerce")
-        return None if pd.isna(v) else float(v)
+        if pd.isna(v):
+            return None
+        from core.utils.price_tick import normalize_dhan_tick_size
+
+        return normalize_dhan_tick_size(float(v))
 
     def get_lot_size(self, symbol: str) -> Optional[int]:
         """Return lot size for symbol from instrument data (LOT_SIZE / SEM_LOT_UNITS); None if not found."""
@@ -121,7 +125,16 @@ class DhanInstrumentStore(BaseInstrumentStore):
         return None
 
     def map_row_to_instrument(self, row) -> Instrument:
+        from core.utils.price_tick import normalize_dhan_tick_size
+
         lot = row.get("LOT_SIZE", row.get("SEM_LOT_UNITS", 1))
+        raw_tick = row.get("SEM_TICK_SIZE")
+        tick_size = None
+        if raw_tick is not None:
+            try:
+                tick_size = normalize_dhan_tick_size(float(raw_tick))
+            except (TypeError, ValueError):
+                tick_size = None
         return Instrument(
             trading_symbol=row["SEM_TRADING_SYMBOL"],
             custom_symbol=row["SEM_CUSTOM_SYMBOL"],
@@ -134,6 +147,7 @@ class DhanInstrumentStore(BaseInstrumentStore):
             lot_size=int(lot) if lot is not None else 1,
             instrument_id=row.get("INSTRUMENT_ID") or row.get("SEM_SMST_SECURITY_ID"),
             series=row.get("SEM_SERIES"),
+            tick_size=tick_size,
         )
 
     def equity_intent_creation_details(

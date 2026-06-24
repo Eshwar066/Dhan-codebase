@@ -27,6 +27,7 @@ class Instrument:
         option_type=None,
         instrument_id=None,
         series=None,
+        tick_size=None,
     ):
         self.trading_symbol = trading_symbol
         self.custom_symbol = custom_symbol
@@ -38,6 +39,7 @@ class Instrument:
         self.option_type = option_type
         self.instrument_id = instrument_id
         self.series = series
+        self.tick_size = tick_size
         self.lot_size = lot_size
         self.contract_multiplier = contract_multiplier
 

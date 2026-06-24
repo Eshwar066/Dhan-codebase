@@ -24,6 +24,7 @@ from run.config import RUN_MODE, RunMode
 from core.strategies.base import BaseStrategy
 from core.strategies.IndiaMktMixins import IST, IndiaMktMixins
 from core.utils.expiry_resolver import ExpiryResolver
+from core.utils.price_tick import resolve_tick_size, round_by_tick_size
 
 ENTRY_TIME = time(9, 20)
 EXIT_TIME = time(9, 25)
@@ -333,6 +334,22 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         self._evaluated_signal_keys.add(eval_key)
         return True
 
+    def _round_order_price(
+        self,
+        price: float,
+        trading_symbol: str,
+        ctx: Any,
+        *,
+        instrument: Any = None,
+        side: str = "BUY",
+    ) -> float:
+        """Round to NSE tick (e.g. 0.05 for index options) to avoid EXCH:16283 rejections."""
+        store = getattr(ctx, "instrument_store", None)
+        tick = resolve_tick_size(trading_symbol, store, instrument=instrument)
+        mode = "ceil" if str(side).upper() == "BUY" else "floor"
+        rounded = round_by_tick_size(float(price), tick, floor_or_ceil=mode)
+        return float(rounded if rounded is not None else price)
+
     def _build_entry_intent(
         self,
         candle: dict,
@@ -401,7 +418,13 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         ref_premium = float(ref_premium or 0.0)
         if ref_premium <= 0:
             return None
-        limit_price = ref_premium * LIMIT_PREM_MULT
+        limit_price = self._round_order_price(
+            ref_premium * LIMIT_PREM_MULT,
+            trading_symbol,
+            ctx,
+            instrument=inst,
+            side="BUY",
+        )
 
         meta = _BtstLegMeta(
             symbol=symbol,
@@ -499,7 +522,15 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         meta = self._meta_by_structure_id.get(sid)
         if meta is None:
             return []
-        sl_trigger = float(meta.limit_price * SL_OF_LIMIT)
+        store = getattr(ctx, "instrument_store", None)
+        sym = getattr(instrument, "trading_symbol", None) or meta.symbol
+        sl_trigger = self._round_order_price(
+            float(meta.limit_price * SL_OF_LIMIT),
+            sym,
+            ctx,
+            instrument=instrument,
+            side="SELL",
+        )
         fill_qty = kwargs.get("qty")
         ref = SimpleNamespace(
             instrument=instrument,

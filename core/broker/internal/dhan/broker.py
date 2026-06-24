@@ -11,9 +11,46 @@ from core.broker.base import BaseBroker
 from core.broker.internal.dhan import mappings as dhan_mappings
 from core.broker.internal.dhan.mappings import dhan_correlation_id, parse_dhan_api_error
 from core.utils.global_rate_limiter import DHAN_ORDER_API, GlobalRateLimiter
+from core.utils.price_tick import resolve_tick_size, round_by_tick_size
 
 
-def _order_intent_to_payload(intent, execution_price=None):
+def _quantize_order_prices(
+    payload: Dict[str, Any],
+    *,
+    instrument: Any = None,
+    instrument_store: Any = None,
+    side: str = "",
+) -> Dict[str, Any]:
+    """Ensure limit/trigger prices are valid multiples of exchange tick size."""
+    sym = str(payload.get("tradingsymbol") or "").strip()
+    if not sym:
+        return payload
+    tick = resolve_tick_size(sym, instrument_store, instrument=instrument)
+    side_u = str(side or payload.get("transaction_type") or "").upper()
+    buy_mode = "ceil" if side_u == "BUY" else "floor"
+    sell_mode = "floor" if side_u == "SELL" else "ceil"
+    order_type = str(payload.get("order_type") or "").upper()
+    out = dict(payload)
+    for key, mode in (
+        ("price", buy_mode if side_u != "SELL" else sell_mode),
+        ("trigger_price", sell_mode if "SL" in order_type else buy_mode),
+    ):
+        raw = out.get(key)
+        if raw is None:
+            continue
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if val <= 0:
+            continue
+        rounded = round_by_tick_size(val, tick, floor_or_ceil=mode)
+        if rounded is not None:
+            out[key] = rounded
+    return out
+
+
+def _order_intent_to_payload(intent, execution_price=None, instrument_store=None):
     """Convert OrderIntent to dict for Dhan payload."""
     inst = intent.instrument
     segment = getattr(inst, "segment", "NFO")
@@ -29,7 +66,7 @@ def _order_intent_to_payload(intent, execution_price=None):
     trigger = float(getattr(intent, "trigger_price", 0) or 0)
     if execution_mode == "GTT" and trigger <= 0:
         trigger = float(price or 0)
-    return {
+    payload = {
         "tradingsymbol": inst.place_order_symbol(),
         "exchange": exchange,
         "quantity": total_qty,
@@ -50,6 +87,12 @@ def _order_intent_to_payload(intent, execution_price=None):
         "execution_mode": execution_mode,
         "order_flag": str(extras.get("order_flag") or "SINGLE").upper(),
     }
+    return _quantize_order_prices(
+        payload,
+        instrument=inst,
+        instrument_store=instrument_store,
+        side=intent.side,
+    )
 
 
 class DhanBroker(BaseBroker):
@@ -64,9 +107,14 @@ class DhanBroker(BaseBroker):
         self._dhan_modify_counts: Dict[str, int] = {}
         self._last_place_order_failure: Optional[Dict[str, Any]] = None
 
+    def _instrument_store(self):
+        router = getattr(self, "order_router", None)
+        return getattr(router, "instrument_store", None) if router else None
+
     def _build_payload(self, intent, execution_price=None):
+        store = self._instrument_store()
         if hasattr(intent, "instrument"):
-            return _order_intent_to_payload(intent, execution_price)
+            return _order_intent_to_payload(intent, execution_price, instrument_store=store)
         segment = intent.get("segment", "EQ")
         exchange = dhan_mappings.internal_segment_to_exchange_arg(str(segment))
         required = ["trading_symbol", "side", "qty"]
@@ -77,7 +125,7 @@ class DhanBroker(BaseBroker):
         lot_size = int(intent.get("lot_size", 1))
         total_qty = qty * lot_size
         price = execution_price if execution_price is not None else float(intent.get("price", 0) or 0)
-        return {
+        payload = {
             "tradingsymbol": intent["trading_symbol"],
             "exchange": exchange,
             "quantity": total_qty,
@@ -96,6 +144,11 @@ class DhanBroker(BaseBroker):
             "intent_id": intent.get("intent_id"),
             "correlation_id": intent.get("intent_id"),
         }
+        return _quantize_order_prices(
+            payload,
+            instrument_store=store,
+            side=str(intent.get("side") or ""),
+        )
 
     def get_balance_snapshot(self) -> Optional[Dict[str, Any]]:
         """
