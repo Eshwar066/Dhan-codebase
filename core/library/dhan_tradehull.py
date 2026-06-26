@@ -587,9 +587,13 @@ class Tradehull:
 
         Tries, in order: DhanContext.get_dhan_http(), dhanhq.dhan_http, then a session
         adapter for dhanhq 2.x (PyPI package without dhan_http on the client object).
+
+        Retries resolution when the cached client is None (e.g. forever-order API called
+        before login finished) instead of permanently caching unavailability.
         """
-        if getattr(self, "_dhan_http_resolved", False):
-            return getattr(self, "_dhan_http_client", None)
+        cached = getattr(self, "_dhan_http_client", None)
+        if cached is not None:
+            return cached
 
         http = None
         ctx = getattr(self, "dhan_context", None)
@@ -605,8 +609,8 @@ class Tradehull:
             if dhan is not None and hasattr(dhan, "session") and hasattr(dhan, "base_url"):
                 http = _DhanRestHttp(dhan)
 
-        self._dhan_http_client = http
-        self._dhan_http_resolved = True
+        if http is not None:
+            self._dhan_http_client = http
         return http
 
     def get_instrument_file(self):

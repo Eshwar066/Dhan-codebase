@@ -613,8 +613,23 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 "Position mismatch; syncing PM to broker", details={"diff": diff}
             )
 
-        strategy_name = getattr(self.strategy, "name", None)
         intent_store = getattr(self.order_router, "intent_store", None)
+        adopt_fn = getattr(
+            self.order_router, "adopt_pending_entries_from_broker_positions", None
+        )
+        if callable(adopt_fn) and resolved_broker_positions:
+            try:
+                n = adopt_fn(resolved_broker_positions)
+                if n and self.engine_logger:
+                    self.engine_logger.reconciliation(
+                        f"Adopted {n} pending GTT ENTRY fill(s) from broker positions"
+                    )
+            except Exception as exc:
+                if self.engine_logger:
+                    self.engine_logger.reconciliation(
+                        f"GTT position adopt failed: {exc}"
+                    )
+
         if intent_store and hasattr(
             self.position_manager, "rebuild_position_metadata_from_intent_store"
         ):
@@ -639,7 +654,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 exchange=self._live_exchange or "NSE",
             )
         self.position_manager.reconcile_with_broker(
-            resolved_broker_positions, strategy=strategy_name
+            resolved_broker_positions, strategy=None
         )
         restore_fn = getattr(self.strategy, "restore_state_on_startup", None)
         if callable(restore_fn):
@@ -657,15 +672,67 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             )
         return True
 
+    def _resolve_position_ownership_from_intent_store(
+        self, sym: str, pos: Any, intent_store: Any
+    ) -> None:
+        """Attach strategy/structure_id/intent_id from intent_store when reconcile lacked metadata."""
+        if intent_store is None:
+            return
+        router = getattr(self, "order_router", None)
+        find_fn = getattr(router, "find_entry_intent_for_symbol", None)
+        rec = find_fn(sym) if callable(find_fn) else None
+        if not rec:
+            return
+        payload = rec.get("payload") or {}
+        meta_bucket = self.position_manager.get_position_metadata(sym) or {}
+        strategy = (
+            rec.get("strategy")
+            or payload.get("strategy_id")
+            or meta_bucket.get("strategy")
+        )
+        structure_id = (
+            rec.get("structure_id")
+            or payload.get("structure_id")
+            or meta_bucket.get("structure_id")
+        )
+        intent_id = rec.get("intent_id") or meta_bucket.get("intent_id")
+        strategy_meta = payload.get("strategy_meta") or meta_bucket.get("strategy_meta")
+        if strategy and not getattr(pos, "strategy", None):
+            pos.strategy = strategy
+        if structure_id and not getattr(pos, "structure_id", None):
+            pos.structure_id = structure_id
+        if intent_id and not getattr(pos, "intent_id", None):
+            pos.intent_id = intent_id
+        if not getattr(pos, "tag", None):
+            pos.tag = rec.get("tag") or payload.get("tag") or "MAIN"
+        if strategy or structure_id or intent_id or strategy_meta:
+            self.position_manager._merge_position_metadata(
+                sym,
+                strategy=strategy,
+                structure_id=structure_id,
+                tag=pos.tag,
+                intent_id=intent_id,
+                metadata_extras=strategy_meta,
+            )
+
     def _ensure_bracket_legs_after_reconcile(self) -> None:
         """If MAIN is open but bracket legs missing (restart), re-arm per strategy."""
         intent_store = getattr(self.order_router, "intent_store", None)
         if not intent_store:
             return
         broker = getattr(self.order_router, "broker", None)
-        for strategy_obj in self.strategies:
-            strategy_name = str(getattr(strategy_obj, "name", "") or "")
+        for sym, pos in list(self.position_manager.positions.items()):
+            if int(pos.net_qty or 0) == 0:
+                continue
+            self._resolve_position_ownership_from_intent_store(sym, pos, intent_store)
+            strategy_name = str(getattr(pos, "strategy", None) or "").strip()
             if not strategy_name:
+                meta_bucket = self.position_manager.get_position_metadata(sym) or {}
+                strategy_name = str(meta_bucket.get("strategy") or "").strip()
+            if not strategy_name:
+                continue
+            strategy_obj = self._strategy_obj_for_name(strategy_name)
+            if strategy_obj is None:
                 continue
             restore_hooks = [
                 getattr(strategy_obj, "_restore_odml_meta_from_position", None),
@@ -676,58 +743,59 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 getattr(strategy_obj, "bracket_leg_tags", None)
                 or ["MAIN_SL", "MAIN_TARGET"]
             )
-            for sym, pos in list(self.position_manager.positions.items()):
-                if int(pos.net_qty or 0) == 0:
-                    continue
-                if getattr(pos, "strategy", None) != strategy_name:
-                    continue
-                if str(getattr(pos, "tag", "") or "").upper() != "MAIN":
-                    continue
-                struct_id = getattr(pos, "structure_id", None)
-                if not struct_id:
-                    continue
-                for restore_fn in restore_hooks:
-                    if callable(restore_fn):
-                        try:
-                            restore_fn(pos, self.position_manager)
-                        except Exception:
-                            pass
-                sim_brackets_ok = True
-                if self.run_mode == RunMode.PAPER and broker is not None:
-                    pending_sl = getattr(broker, "_pending_sl", {}) or {}
-                    pending_tgt = getattr(broker, "_pending_target", {}) or {}
-                    sim_brackets_ok = all(
-                        str(struct_id) in (pending_sl if tag == "MAIN_SL" else pending_tgt)
-                        for tag in bracket_tags
-                    )
-                else:
-                    sim_brackets_ok = all(
-                        intent_store.has_pending_intent(
-                            strategy_name,
-                            struct_id,
-                            tags=[tag],
-                            actions=["FORCE_EXIT"],
-                        )
-                        for tag in bracket_tags
-                    )
-                if sim_brackets_ok:
-                    continue
+            if str(getattr(pos, "tag", "") or "").upper() != "MAIN":
+                continue
+            struct_id = getattr(pos, "structure_id", None)
+            if not struct_id:
                 meta_bucket = self.position_manager.get_position_metadata(sym) or {}
-                candle_ts = dt.datetime.now(dt.timezone.utc)
-                self._on_pm_main_entry_fill(
-                    instrument=pos.instrument,
-                    side="SELL" if pos.net_qty < 0 else "BUY",
-                    qty=abs(int(pos.net_qty)),
-                    price=float(pos.avg_price or 0),
-                    strategy=strategy_name,
-                    structure_id=struct_id,
-                    tag="MAIN",
-                    action="ENTRY",
-                    candle_ts=candle_ts,
-                    intent_id=getattr(pos, "intent_id", None)
-                    or meta_bucket.get("intent_id"),
-                    metadata_extras=meta_bucket.get("strategy_meta"),
+                struct_id = meta_bucket.get("structure_id")
+            if not struct_id:
+                continue
+            for restore_fn in restore_hooks:
+                if callable(restore_fn):
+                    try:
+                        restore_fn(pos, self.position_manager)
+                    except Exception:
+                        pass
+            sim_brackets_ok = True
+            if self.run_mode == RunMode.PAPER and broker is not None:
+                pending_sl = getattr(broker, "_pending_sl", {}) or {}
+                pending_tgt = getattr(broker, "_pending_target", {}) or {}
+                sim_brackets_ok = all(
+                    str(struct_id) in (pending_sl if tag == "MAIN_SL" else pending_tgt)
+                    for tag in bracket_tags
                 )
+            else:
+                sim_brackets_ok = all(
+                    intent_store.has_pending_intent(
+                        strategy_name,
+                        struct_id,
+                        tags=[tag],
+                        actions=["FORCE_EXIT"],
+                    )
+                    for tag in bracket_tags
+                )
+            if sim_brackets_ok:
+                continue
+            meta_bucket = self.position_manager.get_position_metadata(sym) or {}
+            candle_ts = dt.datetime.now(dt.timezone.utc)
+            inst = pos.instrument
+            lot_size = max(1, int(getattr(inst, "lot_size", 0) or 1))
+            fill_qty = max(1, abs(int(pos.net_qty)) // lot_size)
+            self._on_pm_main_entry_fill(
+                instrument=inst,
+                side="SELL" if pos.net_qty < 0 else "BUY",
+                qty=fill_qty,
+                price=float(pos.avg_price or 0),
+                strategy=strategy_name,
+                structure_id=struct_id,
+                tag="MAIN",
+                action="ENTRY",
+                candle_ts=candle_ts,
+                intent_id=getattr(pos, "intent_id", None)
+                or meta_bucket.get("intent_id"),
+                metadata_extras=meta_bucket.get("strategy_meta"),
+            )
 
     def _do_order_state_check(self) -> None:
         # PAPER: skip broker order comparison (SimulatedBroker has no real orders; avoids false mismatches).

@@ -161,6 +161,294 @@ class OrderRouter:
     def _intent_is_gtt(self, intent_rec: Dict[str, Any]) -> bool:
         return self._intent_execution_mode(intent_rec) == "GTT"
 
+    def _intent_trading_symbol(self, intent_rec: Dict[str, Any]) -> str:
+        if not isinstance(intent_rec, dict):
+            return ""
+        inst = intent_rec.get("instrument")
+        sym = self._instrument_trading_symbol(inst)
+        if sym:
+            return sym
+        payload = intent_rec.get("payload") or {}
+        return str(payload.get("symbol") or intent_rec.get("symbol") or "").strip()
+
+    def find_entry_intent_for_symbol(
+        self, trading_symbol: str, *, include_sent: bool = True
+    ) -> Optional[Dict[str, Any]]:
+        """Best-match MAIN ENTRY intent for a symbol (FILLED, else pending SENT/VALIDATED)."""
+        if not self.intent_store or not trading_symbol:
+            return None
+        sym_u = str(trading_symbol).strip().upper()
+        best: Optional[tuple] = None  # (rank, updated_at, rec)
+        statuses = [IntentStatus.FILLED]
+        if include_sent:
+            statuses.extend([IntentStatus.SENT, IntentStatus.VALIDATED])
+        for st in statuses:
+            rank = 0 if st == IntentStatus.FILLED else 1
+            for rec in self.intent_store.list_by_status(st):
+                payload = rec.get("payload") or {}
+                if str(payload.get("action") or rec.get("action") or "").upper() != "ENTRY":
+                    continue
+                tag = str(rec.get("tag") or payload.get("tag") or "MAIN").upper()
+                if tag != "MAIN":
+                    continue
+                tsym = self._intent_trading_symbol(rec).upper()
+                if tsym != sym_u:
+                    continue
+                upd = float(rec.get("updated_at") or rec.get("created_at") or 0)
+                if best is None or rank < best[0] or (rank == best[0] and upd >= best[1]):
+                    best = (rank, upd, rec)
+        return best[2] if best else None
+
+    def _apply_gtt_fill_from_intent(
+        self, intent_rec: Dict[str, Any], *, price: float, qty_lots: int, order_id: Any
+    ) -> bool:
+        """Apply a discovered GTT fill and run MAIN entry hooks (SL placement)."""
+        intent_id = str(intent_rec.get("intent_id") or "")
+        if not intent_id:
+            return False
+        if self._order_state.get(intent_id) in _TERMINAL_ORDER_STATES:
+            return True
+        instrument = intent_rec.get("instrument")
+        if not instrument:
+            return False
+        payload = intent_rec.get("payload") or {}
+        side = str(intent_rec.get("side") or payload.get("side") or "BUY").upper()
+        qty_lots = max(1, int(qty_lots))
+        price = float(price)
+        if price <= 0:
+            return False
+        sym = self._instrument_trading_symbol(instrument)
+        if not sym or not self.position_manager:
+            return False
+        local_units = int(self.position_manager.get_qty(sym))
+        lot_size = max(
+            1,
+            int(getattr(instrument, "lot_size", 0) or payload.get("lot_size") or 1),
+        )
+        broker_units = qty_lots * lot_size
+        signed_broker = broker_units if side == "BUY" else -broker_units
+        trade_id = f"GTT_SYNC:{intent_id}:{order_id or ''}:{qty_lots}:{price}"
+        if (
+            local_units != 0
+            and local_units == signed_broker
+            and not self._terminal_fill_reflected_in_pm(
+                instrument,
+                side,
+                qty_lots,
+                "ENTRY",
+                intent_id,
+                structure_id=intent_rec.get("structure_id")
+                or payload.get("structure_id"),
+            )
+        ):
+            if self.engine_logger:
+                self.engine_logger.log(
+                    "oms",
+                    f"GTT fill adopt {sym} intent_id={intent_id} "
+                    f"(broker qty already in PM; attaching metadata + SL)",
+                    strategy_id=self._intent_strategy_id(intent_id),
+                    intent_id=intent_id,
+                )
+            self._adopt_main_entry_shadow_fill(
+                instrument=instrument,
+                intent=intent_rec,
+                intent_id=intent_id,
+                side=side,
+                qty=qty_lots,
+                price=price,
+                order_id=order_id,
+                trade_id=trade_id,
+            )
+            return True
+        trade = {
+            "trade_id": trade_id,
+            "id": trade_id,
+            "order_id": str(order_id or intent_rec.get("broker_order_id") or ""),
+            "intent_id": intent_id,
+            "client_order_id": intent_id,
+            "tag": intent_id,
+            "price": price,
+            "size": float(qty_lots),
+            "side": side,
+            "action": "ENTRY",
+            "execution_source": "GTT_RECON",
+        }
+        if self.process_trade(trade):
+            if self.engine_logger:
+                self.engine_logger.log(
+                    "oms",
+                    f"GTT fill synced for {sym} intent_id={intent_id}",
+                    strategy_id=self._intent_strategy_id(intent_id),
+                    intent_id=intent_id,
+                )
+            return True
+        return False
+
+    def _try_sync_gtt_intent_fill(self, intent_rec: Dict[str, Any]) -> bool:
+        """Poll Forever order book / fills API for a single pending GTT intent."""
+        if not self._intent_is_gtt(intent_rec):
+            return False
+        intent_id = str(intent_rec.get("intent_id") or "")
+        if not intent_id:
+            return False
+        if self._order_state.get(intent_id) in _TERMINAL_ORDER_STATES:
+            return True
+
+        order = None
+        if hasattr(self.broker, "find_forever_order_by_client_id"):
+            try:
+                order = self.broker.find_forever_order_by_client_id(intent_id)
+            except Exception:
+                order = None
+        if not order and hasattr(self.broker, "find_order_by_client_id"):
+            try:
+                raw = self.broker.find_order_by_client_id(intent_id)
+                if raw:
+                    order = self._normalize_broker_order_for_recon(raw)
+            except Exception:
+                order = None
+
+        if order:
+            status = (order.get("status") or "").lower()
+            filled = float(order.get("filled_size") or 0)
+            size = float(order.get("size") or 0)
+            if status == "filled" or (size > 0 and filled >= size):
+                payload = intent_rec.get("payload") or {}
+                inst = intent_rec.get("instrument")
+                lot_size = max(
+                    1,
+                    int(
+                        getattr(inst, "lot_size", 0)
+                        or payload.get("lot_size")
+                        or 1
+                    ),
+                )
+                qty_lots = max(1, int(round(filled / lot_size))) if filled else 1
+                price = float(
+                    order.get("average_fill_price")
+                    or intent_rec.get("price")
+                    or payload.get("price")
+                    or 0
+                )
+                return self._apply_gtt_fill_from_intent(
+                    intent_rec,
+                    price=price,
+                    qty_lots=qty_lots,
+                    order_id=order.get("order_id"),
+                )
+
+        fill_info = None
+        if hasattr(self.broker, "get_fill_for_client_order_id"):
+            try:
+                fill_info = self.broker.get_fill_for_client_order_id(intent_id)
+            except Exception:
+                fill_info = None
+        if not fill_info and intent_rec.get("broker_order_id") and hasattr(
+            self.broker, "get_fill_by_order_id"
+        ):
+            try:
+                fill_info = self.broker.get_fill_by_order_id(
+                    str(intent_rec["broker_order_id"])
+                )
+            except Exception:
+                fill_info = None
+        if fill_info and float(fill_info.get("price") or 0) > 0:
+            payload = intent_rec.get("payload") or {}
+            inst = intent_rec.get("instrument")
+            lot_size = max(
+                1,
+                int(getattr(inst, "lot_size", 0) or payload.get("lot_size") or 1),
+            )
+            raw_size = float(fill_info.get("size") or 0)
+            qty_lots = max(1, int(round(raw_size / lot_size))) if raw_size else 1
+            return self._apply_gtt_fill_from_intent(
+                intent_rec,
+                price=float(fill_info["price"]),
+                qty_lots=qty_lots,
+                order_id=fill_info.get("order_id"),
+            )
+        return False
+
+    def _sync_gtt_pending_fills(self, local_pending: List[Dict[str, Any]]) -> int:
+        """Sync fills for pending GTT ENTRY intents; returns count applied."""
+        applied = 0
+        for rec in local_pending:
+            if not self._intent_is_gtt(rec):
+                continue
+            payload = rec.get("payload") or {}
+            if str(payload.get("action") or rec.get("action") or "").upper() != "ENTRY":
+                continue
+            if self._try_sync_gtt_intent_fill(rec):
+                applied += 1
+        return applied
+
+    def adopt_pending_entries_from_broker_positions(
+        self, broker_positions: Dict[str, Any]
+    ) -> int:
+        """
+        When broker holds qty for a symbol with a pending GTT ENTRY intent locally,
+        apply the fill (or adopt linkage) so MAIN_SL can be armed.
+        """
+        if not broker_positions or not self.intent_store:
+            return 0
+        local_pending = self.intent_store.list_by_status(
+            IntentStatus.SENT
+        ) + self.intent_store.list_by_status(IntentStatus.VALIDATED)
+        applied = 0
+        for rec in local_pending:
+            if not self._intent_is_gtt(rec):
+                continue
+            payload = rec.get("payload") or {}
+            if str(payload.get("action") or rec.get("action") or "").upper() != "ENTRY":
+                continue
+            sym = self._intent_trading_symbol(rec)
+            if not sym:
+                continue
+            bp = broker_positions.get(sym)
+            if not bp:
+                for b_sym, row in broker_positions.items():
+                    if str(b_sym).strip().upper() == sym.upper():
+                        bp = row
+                        break
+            if not bp:
+                continue
+            try:
+                broker_units = int(bp.get("qty") or 0)
+            except (TypeError, ValueError):
+                continue
+            if broker_units == 0:
+                continue
+            side = str(rec.get("side") or payload.get("side") or "BUY").upper()
+            if side == "BUY" and broker_units <= 0:
+                continue
+            if side == "SELL" and broker_units >= 0:
+                continue
+            inst = rec.get("instrument")
+            lot_size = max(
+                1,
+                int(
+                    getattr(inst, "lot_size", 0)
+                    or bp.get("lot_size")
+                    or payload.get("lot_size")
+                    or 1
+                ),
+            )
+            qty_lots = max(1, abs(broker_units) // lot_size)
+            price = float(
+                bp.get("avg_price")
+                or rec.get("price")
+                or payload.get("price")
+                or 0
+            )
+            if self._apply_gtt_fill_from_intent(
+                rec,
+                price=price,
+                qty_lots=qty_lots,
+                order_id=rec.get("broker_order_id"),
+            ):
+                applied += 1
+        return applied
+
     @staticmethod
     def _broker_tag_matches_intent(intent_id: str, broker_tag: str) -> bool:
         tag = str(broker_tag or "").strip()
@@ -1455,6 +1743,9 @@ class OrderRouter:
             IntentStatus.SENT
         ) + self.intent_store.list_by_status(IntentStatus.VALIDATED)
 
+        # GTT fills may not appear on regular open-order book; poll Forever + fills API.
+        self._sync_gtt_pending_fills(local_pending)
+
         broker_open = [
             self._normalize_broker_order_for_recon(o)
             for o in (broker_open_raw or [])
@@ -1613,11 +1904,11 @@ class OrderRouter:
                 if created_at > 0 and (now_ts - created_at) < self._force_exit_pending_max_wait_sec:
                     resolved_missing.add(str(intent_id))
                     continue
-            # GTT (Forever) orders live on /forever/orders, not the regular open-order book.
-            # After broker ack, trust placement + fills + cutoff cancel until terminal state.
+            # GTT: still poll Forever/fills when missing from regular open book (not blind trust).
             if self._intent_is_gtt(i) and i.get("broker_order_id"):
-                resolved_missing.add(str(intent_id))
-                continue
+                if self._try_sync_gtt_intent_fill(i):
+                    resolved_missing.add(str(intent_id))
+                    continue
             missing.append(i)
         missing_needing_poll = [
             i

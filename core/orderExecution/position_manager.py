@@ -596,7 +596,7 @@ class PositionManager:
         return self.position_metadata.get(trading_symbol)
 
     def rebuild_position_metadata_from_intent_store(self, intent_store) -> None:
-        """Best-effort: FILLED ENTRY rows in store → position_metadata by instrument symbol."""
+        """Best-effort: ENTRY rows in store (FILLED or pending GTT) → position_metadata by symbol."""
         if intent_store is None:
             return
         try:
@@ -604,13 +604,21 @@ class PositionManager:
         except ImportError:
             return
 
-        best = {}  # sym -> (updated_at, meta dict)
+        best = {}  # sym -> (rank, updated_at, meta dict); rank 0=FILLED, 1=SENT
         for intent_id, rec in intent_store.intents.items():
             st = rec.get("status")
-            if st != IntentStatus.FILLED and getattr(st, "value", st) != "FILLED":
+            is_filled = st == IntentStatus.FILLED or getattr(st, "value", st) == "FILLED"
+            is_sent = st == IntentStatus.SENT or getattr(st, "value", st) == "SENT"
+            is_validated = (
+                st == IntentStatus.VALIDATED or getattr(st, "value", st) == "VALIDATED"
+            )
+            if not is_filled and not is_sent and not is_validated:
                 continue
             payload = rec.get("payload") or {}
             if (rec.get("action") or payload.get("action") or "") != "ENTRY":
+                continue
+            tag = str(rec.get("tag") or payload.get("tag") or "MAIN").upper()
+            if tag != "MAIN":
                 continue
             inst = rec.get("instrument")
             sym = getattr(inst, "trading_symbol", None) or payload.get("symbol")
@@ -623,13 +631,14 @@ class PositionManager:
                 "strategy": rec.get("strategy") or payload.get("strategy_id"),
                 "strategy_meta": payload.get("strategy_meta"),
             }
+            rank = 0 if is_filled else 1
             upd = float(rec.get("updated_at") or rec.get("created_at") or 0)
             prev = best.get(sym)
-            if prev is None or upd >= prev[0]:
-                best[sym] = (upd, meta)
+            if prev is None or rank < prev[0] or (rank == prev[0] and upd >= prev[1]):
+                best[sym] = (rank, upd, meta)
 
         with self._lock:
-            for sym, (_t, meta) in best.items():
+            for sym, (_rank, _t, meta) in best.items():
                 self.position_metadata[sym] = meta
 
     def get_structure_slice(self, trading_symbol: str, structure_id: str) -> int:
@@ -956,7 +965,7 @@ class PositionManager:
                     pos = Position(inst)
                     pos.net_qty = bqty
                     pos.avg_price = float(bp.get("avg_price", 0))
-                    pos.strategy = strategy or meta_strategy
+                    pos.strategy = meta_strategy or strategy
                     pos.tag = tag_m
                     pos.structure_id = structure_id_m
                     pos.intent_id = intent_id_m
@@ -1008,7 +1017,7 @@ class PositionManager:
                 if not getattr(local, "intent_id", None):
                     local.intent_id = intent_id_m
                 if not getattr(local, "strategy", None):
-                    local.strategy = strategy or meta_strategy
+                    local.strategy = meta_strategy or strategy
 
             for sym in local_symbols - broker_symbols:
                 self.positions.pop(sym, None)

@@ -630,6 +630,82 @@ class DhanBroker(BaseBroker):
                 return None
         return None
 
+    def get_all_forever_orders_raw(self) -> List[Dict[str, Any]]:
+        """All Forever (GTT) orders including traded/cancelled (for fill detection)."""
+        if not getattr(self.api, "get_forever_orders", None):
+            return []
+        try:
+            orders = self.api.get_forever_orders() or []
+        except Exception as exc:
+            logger.warning("Dhan get_forever_orders failed: %s", exc)
+            return []
+        if isinstance(orders, list):
+            return [o for o in orders if isinstance(o, dict)]
+        return []
+
+    def _normalize_forever_order_for_recon(self, o: Dict[str, Any]) -> Dict[str, Any]:
+        """Map a raw Forever order row to reconciliation fields (incl. traded)."""
+        status = (o.get("orderStatus") or o.get("status") or "").lower()
+        try:
+            qty = float(o.get("quantity") or o.get("qty") or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        try:
+            filled = float(
+                o.get("tradedQty")
+                or o.get("traded_qty")
+                or o.get("filledQty")
+                or o.get("filled_qty")
+                or 0
+            )
+        except (TypeError, ValueError):
+            filled = 0.0
+        traded_statuses = {"traded", "complete", "completed"}
+        if status in traded_statuses and filled <= 0 and qty > 0:
+            filled = qty
+        if filled <= 0 and status in traded_statuses:
+            filled = qty
+        recon_status = status
+        if status in traded_statuses or (qty > 0 and filled >= qty):
+            recon_status = "filled"
+        try:
+            avg_px = float(
+                o.get("averageTradedPrice")
+                or o.get("average_traded_price")
+                or o.get("price")
+                or 0
+            )
+        except (TypeError, ValueError):
+            avg_px = 0.0
+        corr = o.get("correlationId") or o.get("tag") or ""
+        return {
+            "order_id": o.get("orderId") or o.get("order_id"),
+            "tag": corr,
+            "correlationId": corr,
+            "status": recon_status,
+            "quantity": qty,
+            "size": qty,
+            "filled_size": filled,
+            "filled": filled,
+            "average_fill_price": avg_px,
+            "is_forever": True,
+            "symbol": o.get("tradingSymbol") or o.get("trading_symbol"),
+        }
+
+    def find_forever_order_by_client_id(
+        self, client_order_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Find a Forever order by correlationId/tag (any status, incl. traded)."""
+        cid = str(client_order_id or "").strip()
+        if not cid:
+            return None
+        dhan_cid = dhan_correlation_id(cid)
+        for o in self.get_all_forever_orders_raw():
+            tag = str(o.get("correlationId") or o.get("tag") or "").strip()
+            if tag == cid or tag == dhan_cid:
+                return self._normalize_forever_order_for_recon(o)
+        return None
+
     def find_order_by_client_id(self, client_order_id):
         orders = self.api.get_order_list() or []
         cid = str(client_order_id or "").strip()
@@ -638,22 +714,13 @@ class DhanBroker(BaseBroker):
             tag = str(o.get("tag") or o.get("correlationId") or "").strip()
             if tag == cid or tag == dhan_cid:
                 return o
-        forever = self.get_forever_open_orders() or []
-        for o in forever:
-            tag = str(o.get("tag") or o.get("correlationId") or "").strip()
-            if tag == cid or tag == dhan_cid:
-                return o
+        forever = self.find_forever_order_by_client_id(client_order_id)
+        if forever:
+            return forever
         return None
 
     def get_forever_open_orders(self) -> List[Dict[str, Any]]:
         """Pending Forever (GTT) orders for reconciliation (not in regular order book)."""
-        if not getattr(self.api, "get_forever_orders", None):
-            return []
-        try:
-            orders = self.api.get_forever_orders() or []
-        except Exception as exc:
-            logger.warning("Dhan get_forever_orders failed: %s", exc)
-            return []
         closed_statuses = {
             "traded",
             "cancelled",
@@ -663,25 +730,12 @@ class DhanBroker(BaseBroker):
             "completed",
         }
         out: List[Dict[str, Any]] = []
-        for o in orders if isinstance(orders, list) else []:
-            if not isinstance(o, dict):
-                continue
+        for o in self.get_all_forever_orders_raw():
             status = (o.get("orderStatus") or o.get("status") or "").lower()
             if status in closed_statuses:
                 continue
-            corr = o.get("correlationId") or o.get("tag") or ""
-            out.append(
-                {
-                    "order_id": o.get("orderId") or o.get("order_id"),
-                    "tag": corr,
-                    "correlationId": corr,
-                    "status": status or "open",
-                    "quantity": o.get("quantity") or o.get("qty"),
-                    "filled_size": 0,
-                    "is_forever": True,
-                    "symbol": o.get("tradingSymbol") or o.get("trading_symbol"),
-                }
-            )
+            norm = self._normalize_forever_order_for_recon(o)
+            out.append(norm)
         return out
 
     def get_recent_fills(self, page_size: int = 50) -> List[Dict[str, Any]]:
