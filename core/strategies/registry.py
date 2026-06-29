@@ -4,7 +4,7 @@ from run.config import RunMode
 from core.strategies.Leaps.LeapsQuatery_RSI_52_32 import LeapsQuarterly
 from core.strategies.MagicalLines.MagicalLines import MagicalLines
 from core.strategies.MagicalLines.NiftyIntradayMagicalLine import NiftyIntradayMagicalLine
-from core.strategies.Intraday.oneDayMagicalLine import OneDayMagicalLine
+from core.strategies.crypto.oneDayMagicalLine import OneDayMagicalLine
 from core.strategies.OpenIntrest.OIPostionalBuy.OIPosBuy import OIPositionalBuy
 from core.strategies.OpenIntrest.optionbuildup import OptionBuildup
 from core.strategies.Futures.Futures_EMA.Futures_EMA import FuturesEMAHighLow
