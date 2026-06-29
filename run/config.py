@@ -1,49 +1,66 @@
 import os
+
 from enum import Enum
 
 
+
+
+
 class RunMode(str, Enum):
+
     BACKTEST = "BACKTEST"
+
     PAPER = "PAPER"
+
     LIVE = "LIVE"
 
 
-# 🔁 Default run mode when a job does not specify "run_mode".
+
+
+
+# Default run mode when an engine does not specify "run_mode".
+
 RUN_MODE = RunMode.LIVE
 
-# Global fallback: entry quantity in lots (used when a job does not override).
+
+
+# Global fallback: entry quantity in lots (used when engine/strategy does not override).
+
 ORDER_QTY_LOTS = 1
 
-# Default venue when job does not specify "venue". Used for single-venue runs.
+
+
+# Default venue when engine does not specify "venue".
+
 DEFAULT_VENUE = "DHAN"  # "DHAN" | "DELTA"
 
-# Stdlib logging defaults (override with job "log_level" / "library_log_level" or ALGO_LOG_LEVEL / ALGO_LIBRARY_LOG_LEVEL).
+
+
+# Stdlib logging defaults (override per engine or via ALGO_LOG_LEVEL / ALGO_LIBRARY_LOG_LEVEL).
+
 DEFAULT_ROOT_LOG_LEVEL = "INFO"
+
 DEFAULT_LIBRARY_LOG_LEVEL = "WARNING"
 
-# Global debug toggle for high-frequency diagnostic logs (e.g. per-tick logs).
+
+
 DEBUG_MODE = False
 
-# New architecture: one job per engine, multiple strategies per engine.
-# Each engine job shares venue/broker/risk/pipeline settings, and strategy list defines
-# what the engine loads concurrently.
+
+
+# One engine job = one OS process. Strategy-level settings live in run/strategy_profiles.py.
+
 ENGINE_JOBS = [
-    # LIVE
     {
         "engine_id": "dhan_leaps_rsi",
         "venue": "DHAN",
         "enabled": True,
         "run_mode": "LIVE",
-        "capital": 200000,
+        "capital": 200_000,
         "ORDER_QTY_LOTS": 1,
-        # BANKNIFTY is for BTST scheduled eval only (REST spot); WS subscribes NIFTY via feed_symbols.
-        "symbols": ["NIFTY", "BANKNIFTY"],
-        "exchange": "NSE",
-        # "symbols": ["GOLD"],
-        # "exchange": "MCX",
         "market_ws_stall_timeout_seconds": 0,
-        # LEAPS on_candle fetches main + hedge option chains; default 5s is too short.
         "strategy_timeout_seconds": 60,
+        "strategies": ["LEAPS_RSI", "BankNiftyBTST"],
         "telegram": {
             "bot_token": os.getenv(
                 "TELEGRAM_LEAPS_BOT_TOKEN",
@@ -51,35 +68,21 @@ ENGINE_JOBS = [
             ),
             "chat_id": os.getenv("TELEGRAM_LEAPS_CHAT_ID", "1021479950"),
         },
-        
-        "strategies": ["LEAPS_RSI", "BankNiftyBTST"],
-        # Per-strategy eval: live_feed = WS candles; scheduled = IST wall-clock + REST.
-        "strategy_eval": {
-            "LEAPS_RSI": "live_feed",
-            "BankNiftyBTST": "scheduled",
-        },
-        "live": {"exchange": "INDEX", "sector": "YES", "rsi": "YES"},
-        # "live": {"exchange": "MCX", "sector": "NO", "rsi": "YES"},
-        "backtest": {
-            "start_date": "2026-01-01",
-            "end_date": "2026-05-24",
-            "timeframe": "60",
-            "exchange": "INDEX",
-            "sector": "YES",
-        },
+
     },
-    # PAPER
     {
         "engine_id": "dhan_oi_positional_buy",
         "venue": "DHAN",
         "enabled": True,
         "run_mode": "PAPER",
-        "capital": 200000,
+        "capital": 200_000,
         "ORDER_QTY_LOTS": 1,
-        "symbols": ["NIFTY"],
-        "exchange": "NSE",
-        "strategies": ["OIPositionalBuy","NiftyIntradayMagicalLine","FuturesEMAHighLow","BankNiftyBTST"],
-        "live": {"exchange": "INDEX", "sector": "YES"},
+        "strategies": [
+            "OIPositionalBuy",
+            "NiftyIntradayMagicalLine",
+            "FuturesEMAHighLow",
+            "BankNiftyBTST",
+        ],
         "telegram": {
             "bot_token": os.getenv(
                 "TELEGRAM_OI_BOT_TOKEN",
@@ -87,223 +90,208 @@ ENGINE_JOBS = [
             ),
             "chat_id": os.getenv("TELEGRAM_OI_CHAT_ID", "1021479950"),
         },
-        "backtest": {
-            "start_date": "2026-04-01",
-            "end_date": "2026-04-28",
-            "timeframe": "15",
-            "exchange": "INDEX",
-            "sector": "YES",
-        },
     },
+
     {
+
         "engine_id": "delta_futures_ema_highlow",
+
         "venue": "DHAN",
+
         "enabled": False,
-        "capital": 200000,
+
         "run_mode": "BACKTEST",
-        # "symbols": ["BTCUSD"],
-        "symbols": ["NIFTY"],
-        "exchange": "NSE",
+
+        "capital": 200_000,
+
         "strategies": ["FuturesEMAHighLow"],
+
         "delta_india": False,
+
         "delta_testnet": False,
+
         "delta_leverage": 1,
-        "live": {"exchange": "INDEX", "sector": "YES"},
-        "backtest": {
-            "start_date": "2024-02-01",
-            "end_date": "2026-03-02",
-            "timeframe": "60",
-            "exchange": "INDEX",
-            "sector": "YES",
-        },
+
     },
+
     {
+
         "engine_id": "dhan_banknifty_btst",
+
         "venue": "DHAN",
+
         "enabled": True,
+
         "run_mode": "BACKTEST",
-        "capital": 200000,
+
+        "capital": 200_000,
+
         "ORDER_QTY_LOTS": 1,
-        "symbols": ["BANKNIFTY"],
-        "exchange": "NSE",
+
         "strategies": ["BankNiftyBTST"],
-        "live": {"exchange": "INDEX", "sector": "YES"},
-        "backtest": {
-            "start_date": "2026-01-02",
-            "end_date": "2026-02-19",
-            "timeframe": "5",
-            "exchange": "INDEX",
-            "sector": "YES",
-        },
+
     },
+
     {
+
         "engine_id": "dhan_nifty_intraday_magical",
+
         "venue": "DHAN",
+
         "enabled": False,
+
         "run_mode": "BACKTEST",
-        "capital": 200000,
+
+        "capital": 200_000,
+
         "ORDER_QTY_LOTS": 1,
-        "symbols": ["NIFTY"],
-        "exchange": "NSE",
+
         "strategies": ["NiftyIntradayMagicalLine"],
-        "live": {"exchange": "INDEX", "sector": "YES"},
-        "backtest": {
-            "start_date": "2026-01-02",
-            "end_date": "2026-02-19",
-            "timeframe": "15",
-            "exchange": "INDEX",
-            "sector": "YES",
-        },
+
     },
-    { # mutliple magical line
+
+    {
+
         "engine_id": "dhan_magicallines",
+
         "venue": "DHAN",
+
         "enabled": False,
-        "capital": 200000,
-        "symbols": ["NIFTY"],
+
+        "capital": 200_000,
+
         "strategies": ["MagicalLines"],
-        "live": {"exchange": "INDEX", "sector": "YES"},
-        "backtest": {
-            "start_date": "2026-01-01",
-            "end_date": "2026-02-19",
-            "timeframe": "DAY",
-            "exchange": "INDEX",
-            "sector": "YES",
-        },
+
     },
+
     {
+
         "engine_id": "dhan_ipo_breakout",
+
         "venue": "DHAN",
+
         "enabled": False,
-        "capital": 200000,
-        "symbols": None,
+
+        "capital": 200_000,
+
         "strategies": ["IPOBreakout"],
-        "backtest": {
-            "start_date": "2022-01-01",
-            "end_date": "2026-02-20",
-            "timeframe": "DAY",
-            "exchange": "NSE",
-            "sector": "NO",
-            "ipo_days": 365,
-            "ipo_filter": {"price_above": 200, "volume_above": 500000},
-            "ipo_max_symbols": 50,
-            "ipo_fallback_symbols": ["RELIANCE"],
-        },
-        "live": {
-            "exchange": "NSE",
-            "sector": "NO",
-            "ipo_days": 365,
-            "ipo_filter": {"price_above": 200, "volume_above": 500000},
-            "ipo_max_symbols": 50,
-        },
+
     },
+
     {
+
         "engine_id": "dhan_test_pipeline",
+
         "venue": "DHAN",
+
         "enabled": False,
+
         "run_mode": "LIVE",
-        "capital": 10000,
+
+        "capital": 10_000,
+
         "symbols": ["GOLD"],
+
         "exchange": "MCX",
+
         "market_ws_stall_timeout_seconds": 0,
+
         "strategies": ["SignalFloodTest"],
-        # Websocket-only run: keep core connectivity keys above and live config below.
-        # "daily_max_loss": 100,
-        # "max_open_positions": 1,
-        # "max_portfolio_exposure": 5000,
-        # "cooldown_seconds": 5,
-        # "risk_per_trade_percent": 0.5,
-        # "check_short_option_margin_enabled": False,
-        # "feed_stale_seconds": 30,
-        # "order_state_check_interval_min": 1,
-        # "memory_threshold_percent": 5,
-        # "latency_critical_ms": 50,
-        # "latency_critical_cycles": 1,
-        # "symbol_error_threshold": 2,
+
         "live": {"exchange": "MCX", "sector": "NO"},
-        # "backtest": {
-        #     "start_date": "2023-10-19",
-        #     "end_date": "2023-10-25",
-        #     "timeframe": "1",
-        #     "exchange": "MCX",
-        #     "sector": "NO",
-        # },
+
     },
+
     {
+
         "engine_id": "delta_oneday_magicalline",
+
         "venue": "DELTA",
+
         "enabled": False,
+
         "run_mode": "LIVE",
-        "capital": 200000,
-        "symbols": ["BTCUSD"],
+
+        "capital": 200_000,
+
         "strategies": ["OneDayMagicalLine"],
-        "delta_india": True,
-        "delta_testnet": False,
-        "delta_leverage": 10,
+
         "max_open_positions": 5,
-        "telegram": {
-            "bot_token": "8389724629:AAHY_CGcBF8HZCexedsEJFw80Mf6SxH5Bkk",
-            "chat_id": "1021479950",
-        },
+
         "check_short_option_margin_enabled": True,
-        "live": {"exchange": "DELTA", "sector": "YES"},
-        "backtest": {
-            "start_date": "2026-02-01",
-            "end_date": "2026-02-26",
-            "timeframe": "60",
-            "exchange": "DELTA",
-            "sector": "YES",
+
+        "telegram": {
+
+            "bot_token": "8389724629:AAHY_CGcBF8HZCexedsEJFw80Mf6SxH5Bkk",
+
+            "chat_id": "1021479950",
+
         },
+
     },
-    
-    
+
     {
+
         "engine_id": "delta_futures_ema_momentum",
+
         "venue": "DELTA",
+
         "enabled": False,
-        "capital": 200000000,
-        "symbols": ["BTCUSD"],
+
+        "capital": 200_000_000,
+
         "strategies": ["Futures_EMA_Momentum"],
-        "delta_india": True,
-        "delta_testnet": False,
-        "delta_leverage": 1,
-        "live": {"exchange": "INDEX", "sector": "YES"},
-        "backtest": {
-            "start_date": "2024-09-01",
-            "end_date": "2026-03-13",
-            "timeframe": "60",
-        },
+
     },
+
     {
+
         "engine_id": "delta_test_pipeline",
+
         "venue": "DELTA",
+
         "enabled": False,
+
         "run_mode": "LIVE",
-        "capital": 10000,
-        "symbols": ["BTCUSD"],
+
+        "capital": 10_000,
+
         "strategies": ["SignalFloodTest"],
-        "delta_india": True,
+
         "delta_testnet": True,
+
         "delta_leverage": 10,
-        "daily_max_loss": 10000,
+
+        "daily_max_loss": 10_000,
+
         "max_open_positions": 6,
+
         "max_portfolio_exposure": 1000,
+
         "cooldown_seconds": 5,
+
         "risk_per_trade_percent": 1.0,
+
         "check_short_option_margin_enabled": False,
+
         "feed_stale_seconds": 30,
+
         "order_state_check_interval_min": 1,
+
         "memory_threshold_percent": 5,
+
         "latency_critical_ms": 6000,
+
         "latency_critical_cycles": 6,
+
         "symbol_error_threshold": 6,
+
         "live": {"exchange": "DELTA", "sector": "YES"},
-        "backtest": {
-            "start_date": "2024-03-20",
-            "end_date": "2024-03-25",
-            "timeframe": "1",
-            "exchange": "DELTA",
-            "sector": "YES",
-        },
+
+        "symbols": ["BTCUSD"],
+
     },
+
 ]
+
+

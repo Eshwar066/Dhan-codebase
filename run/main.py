@@ -32,11 +32,12 @@ from run.config import (
 
 logger = logging.getLogger(__name__)
 from run.engine_config import EngineConfig, configure_process_logging
+from run.strategy_profiles import resolve_engine_job
 from core.engine.factory import EngineFactory
 
 
 def job_to_engine_config(job: dict) -> EngineConfig:
-    """Build EngineConfig from either ENGINE_JOBS or legacy STRATEGY_JOBS shape."""
+    """Build EngineConfig from a resolved engine job dict."""
     venue = job.get("venue", DEFAULT_VENUE)
     backtest = job.get("backtest") or {}
     live = job.get("live") or {}
@@ -183,7 +184,7 @@ def main():
     args = parser.parse_args()
 
     jobs = _select_jobs(args.engine_id, args.venue)
-    configs = [job_to_engine_config(job) for job in jobs]
+    configs = [job_to_engine_config(resolve_engine_job(job)) for job in jobs]
     if args.engine_id:
         for config in configs:
             config.enabled = True

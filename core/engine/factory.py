@@ -73,6 +73,15 @@ class EngineFactory:
     """
 
     @staticmethod
+    def _attach_engine_context(strategies: list, config: EngineConfig) -> None:
+        """Inject per-engine broker flags onto strategy instances (e.g. Delta testnet)."""
+        if str(config.broker_name).upper() != "DELTA":
+            return
+        for s in strategies:
+            setattr(s, "_engine_delta_testnet", bool(getattr(config, "delta_testnet", False)))
+            setattr(s, "_engine_delta_india", bool(getattr(config, "delta_india", False)))
+
+    @staticmethod
     def create_engine(config: EngineConfig) -> Union[BacktestEngine, LiveEngine]:
         """
         Build engine from config. Backtest vs Live is determined by config.run_mode.
@@ -98,6 +107,8 @@ class EngineFactory:
         strategy = cfg["strategy"]()
         if getattr(config, "order_qty_lots", None) is not None:
             setattr(strategy, "order_qty_lots", int(config.order_qty_lots))
+        strategies = [strategy]
+        EngineFactory._attach_engine_context(strategies, config)
 
         # ---------- Data (venue-specific) ----------
         if config.broker_name == "DELTA":
@@ -200,6 +211,7 @@ class EngineFactory:
             if getattr(config, "order_qty_lots", None) is not None:
                 setattr(extra_strategy, "order_qty_lots", int(config.order_qty_lots))
             strategies.append(extra_strategy)
+        EngineFactory._attach_engine_context(strategies, config)
 
         # ---------- Data (venue-specific) ----------
         if config.broker_name == "DELTA":

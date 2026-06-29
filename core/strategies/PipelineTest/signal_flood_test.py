@@ -6,8 +6,8 @@ SignalFloodTestStrategy: pipeline test strategy for both Delta and Dhan.
 - 10% of entries use oversized qty (to trigger risk rejection).
 - 10% of entries return duplicate intents (to trigger duplicate_signal_blocked).
 - Uses futures instrument and IndiaMktMixins for intent creation.
-- Risk limits (daily_max_loss, max_open_positions, max_portfolio_exposure) are set
-  in run/config.py per job; RiskManager blocks entries when limits are breached.
+-   Risk limits (daily_max_loss, max_open_positions, max_portfolio_exposure) are set
+  per engine in run/config.py; RiskManager blocks entries when limits are breached.
 """
 
 import random

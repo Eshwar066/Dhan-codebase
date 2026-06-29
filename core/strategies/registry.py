@@ -1,4 +1,5 @@
 # core/strategies/registry.py
+# Strategy-level defaults (symbols, live/backtest, eval mode): run/strategy_profiles.py
 from run.config import RunMode
 from core.strategies.Leaps.LeapsQuatery_RSI_52_32 import LeapsQuarterly
 from core.strategies.MagicalLines.MagicalLines import MagicalLines

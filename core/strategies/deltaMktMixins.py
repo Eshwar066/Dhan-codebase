@@ -18,7 +18,7 @@ import pdb
 
 from core.utils.expiry_resolver import ExpiryResolver
 from core.utils.lag_diag import lag_diag_enabled
-from run.config import RUN_MODE, RunMode, ENGINE_JOBS
+from run.config import RUN_MODE, RunMode
 
 logger = logging.getLogger(__name__)
 
@@ -1050,22 +1050,8 @@ class DeltaMktMixins:
         return strike, ltp, row
 
     def is_delta_testnet_enabled(self) -> bool:
-        """
-        Resolve whether current strategy job enables Delta testnet behavior.
-        Expects strategy class to define ``name``.
-        """
-        strategy_name = str(getattr(self, "name", ""))
-        if not strategy_name:
-            return False
-        for job in ENGINE_JOBS:
-            names = [str(job.get("name") or "")]
-            names.extend([str(s) for s in (job.get("strategies") or [])])
-            if strategy_name not in names:
-                continue
-            if str(job.get("venue", "")).upper() != "DELTA":
-                continue
-            return bool(job.get("delta_testnet", False))
-        return False
+        """Whether the current engine process runs Delta in testnet mode."""
+        return bool(getattr(self, "_engine_delta_testnet", False))
 
     def resolved_option_type_ce_pe(self, inst: Any) -> str:
         """

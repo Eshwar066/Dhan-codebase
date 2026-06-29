@@ -26,6 +26,7 @@ from core.data.feeds import DummyRealtimeFeed
 from core.engine.factory import EngineFactory
 from run.config import RunMode, ENGINE_JOBS
 from run.main import job_to_engine_config
+from run.strategy_profiles import resolve_engine_job
 
 
 def _parse_start_datetime(raw: str | None, tz_name: str) -> datetime | None:
@@ -139,7 +140,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    job = _resolve_job(args.job)
+    job = resolve_engine_job(_resolve_job(args.job))
     if args.symbols:
         job["symbols"] = [str(s).strip().upper() for s in args.symbols if str(s).strip()]
     symbols = list(job.get("symbols") or [])
