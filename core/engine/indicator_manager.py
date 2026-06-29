@@ -172,7 +172,14 @@ class IndicatorManager:
             warmup = int(getattr(strategy, "get_warmup_period", lambda: 0)() or 0)
         except Exception:
             warmup = 0
-        return max(150, warmup + 50)
+        structure_lb = 0
+        if getattr(strategy, "market_structure_enabled", False):
+            try:
+                fn = getattr(strategy, "get_structure_lookback", None)
+                structure_lb = int(fn() if callable(fn) else 0)
+            except Exception:
+                structure_lb = 0
+        return max(150, warmup + 50, structure_lb + 50)
 
     @staticmethod
     def _to_ist_iso(ts: Any) -> str:
@@ -307,6 +314,7 @@ class IndicatorManager:
         """Bootstrap OHLC frame from deduped RSI history closes when candle logs are short."""
         rows = self._load_rsi_history_rows(strategy_id, symbol, tf, max_rows=tail_rows)
         out = self._candle_rows_to_sorted_df(rows, symbol)
+        out = self._drop_future_bars(out, tf)
         return self._strip_same_day_bars(out)
 
     def _merge_rsi_history_into_base_df(
@@ -433,6 +441,35 @@ class IndicatorManager:
         out = out.drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
         if "symbol" in out.columns and out["symbol"].isna().all():
             out["symbol"] = symbol
+        return out
+
+    def _drop_future_bars(self, df: Any, tf: str) -> Any:
+        """Remove bars whose open is ahead of wall clock (bad IST seed rows)."""
+        import pandas as pd
+
+        if df is None or len(df) == 0 or "timestamp" not in df.columns:
+            return df
+        grace = float(self._timeframe_to_seconds(tf)) + 60.0
+        cutoff = dt.datetime.now(dt.timezone.utc).timestamp() + grace
+        tss = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        keep = []
+        for ts in tss:
+            if pd.isna(ts):
+                keep.append(False)
+                continue
+            try:
+                keep.append(float(ts.timestamp()) <= cutoff)
+            except (OSError, OverflowError, ValueError):
+                keep.append(False)
+        out = df.loc[keep].reset_index(drop=True)
+        dropped = len(df) - len(out)
+        if dropped > 0:
+            logger.info(
+                "BOOTSTRAP_DROP_FUTURE_BARS tf=%s dropped=%s kept=%s",
+                tf,
+                dropped,
+                len(out),
+            )
         return out
 
     def _load_candles_from_logs(
@@ -669,6 +706,7 @@ class IndicatorManager:
         df: Any = None
 
         if len(df_log) > 0:
+            df_log = self._drop_future_bars(df_log, tf)
             ok, reason = self._validate_log_candles(df_log, tf, exchange, window)
             if ok:
                 df = df_log.copy()
@@ -723,7 +761,8 @@ class IndicatorManager:
                 df = None
             source = "api"
             if df is not None and len(df) > 0:
-                df = self._strip_same_day_bars(df.copy())
+                df = self._drop_future_bars(df.copy(), tf)
+                df = self._strip_same_day_bars(df)
 
         if df is None or len(df) == 0:
             empty: Dict[str, Any] = {
@@ -740,6 +779,7 @@ class IndicatorManager:
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
             df = df.dropna(subset=["timestamp"]).reset_index(drop=True)
+        df = self._drop_future_bars(df, tf)
         df = self._merge_today_live_candles(df, symbol, tf, strategy_id=strategy_id)
         if "symbol" not in df.columns:
             df["symbol"] = symbol
@@ -833,6 +873,15 @@ class IndicatorManager:
             row_ts = row.get("timestamp")
             if pd.isna(row_ts):
                 return dict(candle)
+            if ind_hist.bar_timestamp_is_future(row_ts, tf):
+                logger.debug(
+                    "Skip live append future bar symbol=%s tf=%s bucket=%s",
+                    symbol,
+                    tf,
+                    bucket,
+                )
+                base_state["last_bucket"] = bucket
+                return dict(candle)
 
             if len(base_df) > 0 and "timestamp" in base_df.columns:
                 last_hist_ts = pd.to_datetime(base_df.iloc[-1].get("timestamp"), utc=True, errors="coerce")
@@ -884,14 +933,24 @@ class IndicatorManager:
                                 )
                                 self._startup_logged = True
                             if gap <= 0 or gap > (tf_secs * 3):
-                                logger.warning(
-                                    "Indicator continuity mismatch: symbol=%s tf=%s last_hist=%s first_live=%s gap_sec=%.1f",
-                                    symbol,
-                                    tf,
-                                    str(last_hist_ts),
-                                    str(row_ts),
-                                    float(gap),
-                                )
+                                if str(exchange).upper() == "DELTA":
+                                    logger.info(
+                                        "Indicator continuity gap (Delta 24x7, expected after downtime): symbol=%s tf=%s last_hist=%s first_live=%s gap_sec=%.1f",
+                                        symbol,
+                                        tf,
+                                        str(last_hist_ts),
+                                        str(row_ts),
+                                        float(gap),
+                                    )
+                                else:
+                                    logger.warning(
+                                        "Indicator continuity mismatch: symbol=%s tf=%s last_hist=%s first_live=%s gap_sec=%.1f",
+                                        symbol,
+                                        tf,
+                                        str(last_hist_ts),
+                                        str(row_ts),
+                                        float(gap),
+                                    )
                         base_state["continuity_checked"] = True
 
                     base_df = pd.concat([base_df, pd.DataFrame([row])], ignore_index=True)

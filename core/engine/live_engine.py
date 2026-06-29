@@ -149,6 +149,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self._dhan_feed_last_connect_generation_alerted: int = 0
         # Duplicate signal protection
         self._last_signal_hash_per_symbol: Dict[str, int] = {}
+        self._delta_align_log_keys: set[str] = set()
         # Time-of-day guard
         self.allowed_trading_hours = allowed_trading_hours or []
         # Order state check (Fix 2: Default to 1m if not set)
@@ -352,8 +353,18 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             sym = self.symbols[0]
         return sym
 
+    @staticmethod
+    def _is_continuous_market_venue(venue: Optional[str]) -> bool:
+        """24×7 venues (Delta crypto) skip NSE-style session alignment stitching."""
+        return str(venue or "").upper() == "DELTA"
+
     def _align_first_live_bar(
-        self, first_live_ts: Optional[int], last_hist_ts: Optional[int], tf_sec: int
+        self,
+        first_live_ts: Optional[int],
+        last_hist_ts: Optional[int],
+        tf_sec: int,
+        *,
+        continuous_market: bool = False,
     ) -> Optional[int]:
         if first_live_ts is None or last_hist_ts is None:
             return first_live_ts
@@ -362,6 +373,32 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         ):
             return first_live_ts
         if first_live_ts < last_hist_ts:
+            gap = int(last_hist_ts) - int(first_live_ts)
+            if continuous_market:
+                now_unix = int(time.time())
+                if int(last_hist_ts) > now_unix + int(tf_sec):
+                    key = f"future:{first_live_ts}:{last_hist_ts}"
+                    if key not in self._delta_align_log_keys:
+                        self._delta_align_log_keys.add(key)
+                        logger.warning(
+                            "DELTA_ALIGNMENT future last_hist=%s now=%s trust live bucket=%s tf_sec=%s",
+                            last_hist_ts,
+                            now_unix,
+                            first_live_ts,
+                            tf_sec,
+                        )
+                    return int(first_live_ts)
+                if gap > int(tf_sec) * 3:
+                    key = f"gap:{first_live_ts}:{last_hist_ts}"
+                    if key not in self._delta_align_log_keys:
+                        self._delta_align_log_keys.add(key)
+                        logger.info(
+                            "DELTA_ALIGNMENT gap_sec=%s trust live bucket=%s (skip strict stitch) tf_sec=%s",
+                            gap,
+                            first_live_ts,
+                            tf_sec,
+                        )
+                    return int(first_live_ts)
             aligned = int(last_hist_ts) + int(tf_sec)
             logger.warning(
                 "FORCING_LIVE_ALIGNMENT symbol_first_live=%s last_hist=%s aligned=%s tf_sec=%s",
@@ -413,14 +450,27 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             last_ts = df.iloc[-1].get("timestamp")
             if last_ts is None:
                 return None
-            if hasattr(last_ts, "to_pydatetime"):
-                last_ts = last_ts.to_pydatetime()
-            if isinstance(last_ts, dt.datetime):
-                if last_ts.tzinfo is None:
-                    last_ts = last_ts.replace(tzinfo=dt.timezone.utc)
-                return int(last_ts.astimezone(dt.timezone.utc).timestamp())
-            if isinstance(last_ts, (int, float)):
-                return int(float(last_ts))
+            # Walk backwards: skip future/corrupt tail rows (Delta IST-as-UTC seeds).
+            grace = float(self._timeframe_to_seconds(tf_s)) + 60.0
+            cutoff = time.time() + grace
+            for i in range(len(df) - 1, -1, -1):
+                last_ts = df.iloc[i].get("timestamp")
+                if last_ts is None:
+                    continue
+                if hasattr(last_ts, "to_pydatetime"):
+                    last_ts = last_ts.to_pydatetime()
+                if isinstance(last_ts, dt.datetime):
+                    if last_ts.tzinfo is None:
+                        last_ts = last_ts.replace(tzinfo=dt.timezone.utc)
+                    bt = int(last_ts.astimezone(dt.timezone.utc).timestamp())
+                elif isinstance(last_ts, (int, float)):
+                    bt = int(float(last_ts))
+                else:
+                    continue
+                if bt > cutoff:
+                    continue
+                return bt
+            return None
         except Exception:
             return None
         return None
@@ -2134,6 +2184,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             not self._first_live_alignment_done.get(symbol, False)
                             and eval_bucket is not None
                         ):
+                            continuous = self._is_continuous_market_venue(self.venue)
                             last_hist_ts = self._get_last_hist_bucket_ts(
                                 symbol=symbol,
                                 tf=str(tf),
@@ -2141,18 +2192,26 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                                 sector=sector,
                             )
                             aligned_first_live = self._align_first_live_bar(
-                                int(eval_bucket), last_hist_ts, tf_sec
+                                int(eval_bucket),
+                                last_hist_ts,
+                                tf_sec,
+                                continuous_market=continuous,
                             )
                             if (
                                 aligned_first_live is not None
                                 and eval_bucket < aligned_first_live
                             ):
-                                logger.warning(
-                                    "Skipping pre-alignment live bar symbol=%s bucket=%s aligned_start=%s",
-                                    symbol,
-                                    eval_bucket,
-                                    aligned_first_live,
-                                )
+                                skip_key = f"{symbol}|{tf}|{eval_bucket}|{aligned_first_live}"
+                                if skip_key not in self._delta_align_log_keys:
+                                    self._delta_align_log_keys.add(skip_key)
+                                    logger.warning(
+                                        "Skipping pre-alignment live bar symbol=%s bucket=%s aligned_start=%s",
+                                        symbol,
+                                        eval_bucket,
+                                        aligned_first_live,
+                                    )
+                                if continuous:
+                                    self._first_live_alignment_done[symbol] = True
                                 continue
                             self._first_live_alignment_done[symbol] = True
                         elif is_dummy_feed:

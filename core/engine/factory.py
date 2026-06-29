@@ -15,7 +15,7 @@ import os
 import queue
 from datetime import datetime
 from pathlib import Path
-from typing import Union
+from typing import Union, Optional
 
 from dotenv import load_dotenv
 
@@ -38,6 +38,7 @@ from core.data.candle_aggregator import (
     CandleAggregator,
     MCX_DEFAULT_SESSION_END_SEC,
     MCX_DEFAULT_SESSION_START_SEC,
+    _resolution_to_seconds,
 )
 from core.data.feeds import DeltaWebSocketFeed, DhanWebSocketFeed
 from core.data.feeds.dhan_order_update_feed import DhanOrderUpdateFeed
@@ -80,6 +81,21 @@ class EngineFactory:
         for s in strategies:
             setattr(s, "_engine_delta_testnet", bool(getattr(config, "delta_testnet", False)))
             setattr(s, "_engine_delta_india", bool(getattr(config, "delta_india", False)))
+
+    @staticmethod
+    def _strategy_feed_timeframe(strategies: list) -> str:
+        """Finest (smallest) strategy timeframe for Delta WS candle channel."""
+        best_tf: Optional[str] = None
+        best_sec: Optional[int] = None
+        for s in strategies:
+            tf = str(getattr(s, "timeframe", "") or "").strip()
+            if not tf:
+                continue
+            sec = int(_resolution_to_seconds(tf))
+            if best_sec is None or sec < best_sec:
+                best_sec = sec
+                best_tf = tf
+        return best_tf or "60"
 
     @staticmethod
     def create_engine(config: EngineConfig) -> Union[BacktestEngine, LiveEngine]:
@@ -374,7 +390,7 @@ class EngineFactory:
                 logger.warning("Delta credentials missing or invalid: %s", e)
                 api_key, api_secret = None, None
             if api_key and api_secret:
-                timeframe = config.backtest.get("timeframe", "60")
+                timeframe = EngineFactory._strategy_feed_timeframe(strategies)
                 eval_modes = getattr(config, "strategy_eval", None) or {}
                 feed_symbols = LiveEngine._collect_feed_symbols(
                     config.symbols or [], strategies, eval_modes

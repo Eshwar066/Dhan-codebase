@@ -232,6 +232,26 @@ ENGINE_JOBS = [
 
     {
 
+        "engine_id": "delta_rsi_bread_butter",
+
+        "venue": "DELTA",
+
+        "enabled": True,
+
+        "run_mode": "PAPER",
+
+        "capital": 200000,
+
+        "ORDER_QTY_LOTS": 1,
+
+        "strategies": ["RSIBreadAndButter"],
+
+        "delta_leverage": 5,
+
+    },
+
+    {
+
         "engine_id": "delta_futures_ema_momentum",
 
         "venue": "DELTA",

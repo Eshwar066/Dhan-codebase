@@ -5,14 +5,14 @@ Used by DeltaDataProvider (data layer) and DeltaBrokerApi (broker layer).
 
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 import requests
 import pandas as pd
-from datetime import datetime, date, timedelta
-from typing import Optional, Any
+from datetime import datetime, date, timedelta, timezone
 import pdb
 
 from core.utils.delta_env import get_delta_credentials
@@ -279,6 +279,57 @@ class DeltaSource:
         "1w": "1w",
     }
 
+    @classmethod
+    def _timeframe_seconds(cls, timeframe: str) -> int:
+        res = cls._RESOLUTION_MAP.get(str(timeframe or "").strip(), "5m")
+        if res.endswith("m"):
+            try:
+                return max(60, int(res[:-1]) * 60)
+            except ValueError:
+                return 300
+        if res.endswith("h"):
+            try:
+                return max(3600, int(res[:-1]) * 3600)
+            except ValueError:
+                return 3600
+        if res == "1d":
+            return 86400
+        if res == "1w":
+            return 7 * 86400
+        return 300
+
+    @staticmethod
+    def _cache_latest_timestamp(df: Optional[pd.DataFrame]) -> Optional[pd.Timestamp]:
+        if df is None or df.empty or "timestamp" not in df.columns:
+            return None
+        tss = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        if bool(tss.isna().all()):
+            return None
+        return tss.max()
+
+    def _intraday_tail_is_stale(
+        self,
+        df: Optional[pd.DataFrame],
+        end_d: date,
+        timeframe: str,
+        *,
+        force_refresh_tail: bool = False,
+    ) -> bool:
+        """True when cache tail is behind wall clock (same-day bars missing)."""
+        if force_refresh_tail:
+            return True
+        if end_d < date.today():
+            return False
+        latest = self._cache_latest_timestamp(df)
+        if latest is None:
+            return True
+        tf_sec = self._timeframe_seconds(timeframe)
+        stale_after = float(tf_sec) * 2.0 + 60.0
+        try:
+            return float(latest.timestamp()) < time.time() - stale_after
+        except (OSError, OverflowError, ValueError):
+            return True
+
     def _fetch_intraday_range(
         self,
         symbol: str,
@@ -342,6 +393,9 @@ class DeltaSource:
         start_date: str,
         end_date: str,
         timeframe: str,
+        *,
+        ignore_cache: bool = False,
+        force_refresh_tail: bool = False,
     ) -> Optional[pd.DataFrame]:
         """Long-term historical intraday. Cache key = symbol+timeframe. Returns requested range; fetches only missing dates and stitches into same cache file."""
         cache_name = cache_key_delta_intraday(symbol, str(timeframe))
@@ -350,7 +404,7 @@ class DeltaSource:
         if start_d is None or end_d is None:
             return None
 
-        cached = load_df(cache_name)
+        cached = None if ignore_cache else load_df(cache_name)
         stitched = cached.copy() if cached is not None and not cached.empty else None
 
         if (
@@ -367,6 +421,9 @@ class DeltaSource:
                 and pd.notna(latest)
                 and earliest <= start_d
                 and latest >= end_d
+                and not self._intraday_tail_is_stale(
+                    stitched, end_d, timeframe, force_refresh_tail=force_refresh_tail
+                )
             ):
                 out = stitched[
                     (stitched["timestamp"].dt.date >= start_d)
@@ -410,17 +467,36 @@ class DeltaSource:
             stitched["timestamp"] = pd.to_datetime(stitched["timestamp"], utc=True)
             stitched["time"] = stitched["timestamp"].dt.time
 
-        # Forward fetch: need data after current latest
-        cache_latest = (
+        # Forward fetch: later calendar days and/or same-day intraday tail refresh.
+        cache_latest_d = (
             stitched["timestamp"].dt.date.max()
             if stitched is not None and not stitched.empty
             else None
         )
-        if cache_latest is not None and pd.notna(cache_latest) and end_d > cache_latest:
-            fetch_start = cache_latest + timedelta(days=1)
+        latest_ts = self._cache_latest_timestamp(stitched)
+        after = None
+        if cache_latest_d is not None and pd.notna(cache_latest_d) and end_d > cache_latest_d:
+            fetch_start = cache_latest_d + timedelta(days=1)
             after = self._fetch_intraday_range(symbol, fetch_start, end_d, timeframe)
-            if after is not None and not after.empty:
-                stitched = pd.concat([stitched, after], ignore_index=True)
+        elif self._intraday_tail_is_stale(
+            stitched, end_d, timeframe, force_refresh_tail=force_refresh_tail
+        ):
+            fetch_start = cache_latest_d if cache_latest_d is not None else end_d
+            after = self._fetch_intraday_range(symbol, fetch_start, end_d, timeframe)
+            if (
+                after is not None
+                and not after.empty
+                and latest_ts is not None
+                and fetch_start == cache_latest_d
+            ):
+                after_ts = pd.to_datetime(after["timestamp"], utc=True, errors="coerce")
+                after = after.loc[after_ts > latest_ts].reset_index(drop=True)
+        if after is not None and not after.empty:
+            stitched = (
+                pd.concat([stitched, after], ignore_index=True)
+                if stitched is not None and not stitched.empty
+                else after
+            )
 
         if stitched is None or stitched.empty:
             return None

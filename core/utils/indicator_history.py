@@ -163,6 +163,44 @@ def row_timestamp_to_ist(row_ts: Any) -> Optional[datetime]:
     return parse_bar_timestamp_ist_to_aware(row_ts)
 
 
+def timeframe_grace_seconds(timeframe: str) -> int:
+    """Bar-length grace when rejecting future indicator-history rows."""
+    tf = str(timeframe or "").strip().lower()
+    if not tf:
+        return 120
+    if tf.endswith("h"):
+        try:
+            return max(3600, int(tf[:-1]) * 3600) + 60
+        except ValueError:
+            return 3660
+    if tf in ("1h",):
+        return 3660
+    if tf in ("1d", "day"):
+        return 86460
+    try:
+        return max(60, int(tf) * 60) + 60
+    except ValueError:
+        return 120
+
+
+def bar_timestamp_is_future(
+    row_timestamp: Any,
+    timeframe: str,
+    *,
+    grace_seconds: Optional[float] = None,
+) -> bool:
+    """True when bar open is ahead of wall clock (corrupt seed / TZ bug)."""
+    dt_ist = row_timestamp_to_ist(row_timestamp)
+    if dt_ist is None:
+        return False
+    grace = float(grace_seconds if grace_seconds is not None else timeframe_grace_seconds(timeframe))
+    try:
+        bar_utc = dt_ist.astimezone(timezone.utc).timestamp()
+    except (OSError, OverflowError, ValueError):
+        return False
+    return bar_utc > time.time() + grace
+
+
 def should_append_live_indicator_row(
     symbol: str,
     timeframe: str,
@@ -258,6 +296,8 @@ def load_indicator_history_rows(
                         continue
                     bar_dt = parse_bar_timestamp_ist_to_aware(ist_key)
                     if bar_dt is None:
+                        continue
+                    if bar_timestamp_is_future(bar_dt, tf_s):
                         continue
                     ohlc = payload.get("ohlc") if isinstance(payload.get("ohlc"), dict) else {}
                     try:
@@ -378,6 +418,16 @@ def append_indicator_history_row(
         ts.astimezone(IST).strftime("%Y-%m-%d %H:%M") if hasattr(ts, "astimezone") else ts
     )
     if not ist_ts:
+        return
+    if bar_timestamp_is_future(ts, timeframe):
+        if source in ("historical_seed", "delta_refresh", "yahoo_refresh"):
+            logger.debug(
+                "Reject future indicator row symbol=%s tf=%s source=%s ist=%s",
+                symbol,
+                timeframe,
+                source,
+                ist_ts,
+            )
         return
     sym_u = str(symbol or "").strip().upper()
     tf_s = str(timeframe or "").strip()

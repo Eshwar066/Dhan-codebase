@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Any, List
+from typing import Any, List, Optional
+
+from core.utils.structure import (
+    MarketStructureConfig,
+    add_market_structure,
+    market_structure_column_names,
+    structure_signature,
+)
 
 
 def add_bollinger_bands(
@@ -46,3 +53,23 @@ def default_persisted_keys_for_ema_high_low() -> List[str]:
 
 def default_persisted_keys_for_bollinger(prefix: str = "bb") -> List[str]:
     return [f"{prefix}_upper", f"{prefix}_mid", f"{prefix}_lower"]
+
+
+def default_persisted_keys_for_market_structure(
+    config: Optional[MarketStructureConfig] = None,
+) -> List[str]:
+    return market_structure_column_names(config)
+
+
+def prepare_market_structure(
+    df: Any,
+    config: Optional[MarketStructureConfig] = None,
+) -> Any:
+    """Alias for ``add_market_structure`` — use inside ``prepare_indicators``."""
+    return add_market_structure(df, config=config)
+
+
+def shared_signature_for_market_structure(
+    config: Optional[MarketStructureConfig] = None,
+) -> str:
+    return structure_signature(config)

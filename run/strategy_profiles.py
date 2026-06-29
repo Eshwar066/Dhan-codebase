@@ -145,6 +145,18 @@ STRATEGY_PROFILES: Dict[str, Dict[str, Any]] = {
             "sector": "YES",
         },
     },
+    "RSIBreadAndButter": {
+        "symbols": ["BTCUSD"], # ,"ETHUSD"
+        "delta": {"india": True, "testnet": False, "leverage": 5},
+        "live": {"exchange": "DELTA", "sector": "YES"},
+        "backtest": {
+            "start_date": "2026-01-01",
+            "end_date": "2026-06-01",
+            "timeframe": "1",
+            "exchange": "DELTA",
+            "sector": "YES",
+        },
+    },
 }
 
 
