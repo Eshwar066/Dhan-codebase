@@ -41,6 +41,7 @@ DEFAULT_SIGNAL_TF_MINUTES = 1
 PARTIAL_BOOK_FRAC = 0.60
 DEFAULT_ORDER_QTY = 1
 SIGNAL_MAX_AGE_BARS = 100  # entry-TF bars to act after signal-TF divergence
+MAX_STOP_POINTS = 500.0  # max SL distance from entry (price units)
 META_KEY = "rsi_bread_butter"
 
 
@@ -342,6 +343,13 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
             return float(sw)
         return entry * 1.005
 
+    @staticmethod
+    def _cap_stop_distance(side: str, entry: float, stop: float) -> float:
+        """Tighten structure stop so risk does not exceed MAX_STOP_POINTS."""
+        if side == "LONG":
+            return max(float(stop), entry - MAX_STOP_POINTS)
+        return min(float(stop), entry + MAX_STOP_POINTS)
+
     def _build_structure_id(self, symbol: str, side: str) -> str:
         return f"{self.name}:{symbol}:{side}:{uuid.uuid4().hex[:8]}"
 
@@ -414,7 +422,9 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
                 return None
 
         entry = float(candle["close"])
-        stop = self._structure_stop(candle, side, entry)
+        stop = self._cap_stop_distance(
+            side, entry, self._structure_stop(candle, side, entry)
+        )
         risk = abs(entry - stop)
         if risk <= 0:
             return None
