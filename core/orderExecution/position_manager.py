@@ -475,12 +475,15 @@ class PositionManager:
                         "intent_id": intent_id,
                         "metadata_extras": metadata_extras,
                     }
-            if prev_qty != 0 and new_qty == 0:
-                if str(tag or "").upper() in [
-                    "MAIN_EXIT",
-                    "MAIN_SL",
-                    "MAIN_TARGET",
-                ] and str(action or "").upper() in ["EXIT", "FORCE_EXIT"]:
+            tag_u = str(tag or "").upper()
+            act_exit = str(action or "").upper() in ("EXIT", "FORCE_EXIT")
+            if prev_qty != 0 and act_exit and tag_u in (
+                "MAIN_EXIT",
+                "MAIN_SL",
+                "MAIN_TARGET",
+            ):
+                # Full close, or partial MAIN_TARGET book (trail remainder stays open).
+                if new_qty == 0 or tag_u == "MAIN_TARGET":
                     hook_main_exit = {
                         "instrument": instrument,
                         "side": side,
@@ -494,6 +497,8 @@ class PositionManager:
                         "intent_id": intent_id,
                         "metadata_extras": metadata_extras,
                     }
+                    if new_qty != 0 and tag_u == "MAIN_TARGET":
+                        pos.tag = "MAIN"
 
             result = (position_closed, realized_pnl_for_risk)
 

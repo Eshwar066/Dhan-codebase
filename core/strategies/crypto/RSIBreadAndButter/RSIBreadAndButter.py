@@ -39,7 +39,7 @@ RSI_OVERBOUGHT = 70.0
 RSI_OVERSOLD = 30.0
 DEFAULT_SIGNAL_TF_MINUTES = 1
 PARTIAL_BOOK_FRAC = 0.60
-DEFAULT_ORDER_QTY = 1
+DEFAULT_ORDER_QTY = 4  # fallback when engine ``ORDER_QTY_LOTS`` is unset
 SIGNAL_MAX_AGE_BARS = 100  # entry-TF bars to act after signal-TF divergence
 MAX_STOP_POINTS = 500.0  # max SL distance from entry (price units)
 META_KEY = "rsi_bread_butter"
@@ -115,6 +115,13 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
 
     def _sync_entry_timeframe(self) -> None:
         self.timeframe = str(self.entry_timeframe_minutes())
+
+    def _entry_order_qty(self, inst) -> int:
+        """Lots: engine ``ORDER_QTY_LOTS`` → ``order_qty_lots``; else ``DEFAULT_ORDER_QTY``."""
+        engine_lots = getattr(self, "order_qty_lots", None)
+        if engine_lots is not None:
+            return max(1, int(engine_lots))
+        return max(1, int(DEFAULT_ORDER_QTY))
 
     def market_structure_config(self) -> MarketStructureConfig:
         return MarketStructureConfig(
@@ -447,7 +454,7 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
         self._meta_by_structure_id[structure_id] = meta
         self._active_signal.pop(symbol, None)
 
-        qty = max(1, int(getattr(self, "order_qty_lots", None) or DEFAULT_ORDER_QTY))
+        qty = self._entry_order_qty(inst)
         intent = self.create_order_intent(
             inst=inst,
             side=order_side,
@@ -503,10 +510,8 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
             meta.target_price = fill_px - meta.risk
             meta.stop_price = fill_px + meta.risk
 
-        total_qty = self._normalize_order_qty(
-            instrument, kwargs.get("qty") or DEFAULT_ORDER_QTY
-        )
-        book_qty, _ = self._normalize_qty(total_qty)
+        total_qty = self._normalize_order_qty(instrument, kwargs.get("qty"))
+        book_qty, trail_qty = self._normalize_qty(total_qty)
         exit_side = "SELL" if meta.side == "LONG" else "BUY"
 
         ref = SimpleNamespace(
@@ -549,13 +554,15 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
             ),
         ]
         logger.info(
-            "RSIBreadAndButter bracket sid=%s %s entry=%.2f SL=%.2f TARGET=%.2f book_qty=%s",
+            "RSIBreadAndButter bracket sid=%s %s entry=%.2f SL=%.2f TARGET=%.2f total_qty=%s book_qty=%s trail_qty=%s",
             sid,
             meta.side,
             fill_px,
             meta.stop_price,
             meta.target_price,
+            total_qty,
             book_qty,
+            trail_qty,
         )
         return out
 

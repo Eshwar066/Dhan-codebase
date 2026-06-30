@@ -16,6 +16,14 @@ _MIN_BACKTEST_BARS = 50
 _DELTA_IST_AS_UTC_OFFSET = pd.Timedelta(hours=5, minutes=30)
 
 
+def _position_allows_strategy_exit(pos: Any) -> bool:
+    """MAIN book and post-partial trail legs (tag may become MAIN_TARGET after TARGET fill)."""
+    tag_u = str(getattr(pos, "tag", None) or "").upper()
+    if tag_u == "HEDGE":
+        return False
+    return tag_u == "MAIN" or tag_u.startswith("MAIN_")
+
+
 class BacktestEngine(BaseEngine):
     def __init__(
         self,
@@ -517,7 +525,9 @@ class BacktestEngine(BaseEngine):
 
         # ---------- FORCED / STRATEGY EXITS ----------
         for pos in open_positions:
-            if pos.tag == "MAIN" and self.strategy.should_exit(pos, candle, ctx):
+            if _position_allows_strategy_exit(pos) and self.strategy.should_exit(
+                pos, candle, ctx
+            ):
                 exit_intents = self.strategy.on_position_exit(pos, candle, ctx) or []
                 for intent in exit_intents:
                     # dot notation since intent is now an object
