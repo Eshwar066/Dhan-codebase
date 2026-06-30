@@ -14,7 +14,7 @@ import logging
 import math
 import os
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -267,6 +267,8 @@ def load_indicator_history_rows(
     """
     Load merged rows (one per bar timestamp) with keys:
     timestamp (UTC aware), open, high, low, close, volume, symbol, exchange, indicators.
+
+    ``max_rows``: tail cap; ``0`` means no cap (use for backtest range loads).
     """
     sym_u = str(symbol or "").strip().upper()
     tf_s = str(timeframe or "").strip()
@@ -335,9 +337,95 @@ def load_indicator_history_rows(
 
     rows = list(by_ist.values())
     rows.sort(key=lambda r: r["timestamp"])
-    if len(rows) > max_rows:
+    if max_rows > 0 and len(rows) > max_rows:
         rows = rows[-max_rows:]
     return rows
+
+
+def _parse_calendar_date(value: Any) -> Optional[date]:
+    if value is None:
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def load_indicator_history_bars_for_backtest(
+    symbol: str,
+    timeframe: str,
+    start_date: str,
+    end_date: str,
+    *,
+    log_root: str = DEFAULT_LOG_ROOT,
+    strategy_id: Optional[str] = None,
+    exchange_default: Optional[str] = None,
+    context_bars: int = 0,
+) -> List[Dict[str, Any]]:
+    """
+    OHLC (+ optional stored indicators) from indicator history for backtest.
+
+    Filters to inclusive IST calendar days ``[start_date, end_date]``. When
+    ``context_bars`` > 0, prepends that many bars immediately before ``start_date``
+    so ``prepare_indicators`` has swing/RSI context matching the seed file.
+    """
+    start_d = _parse_calendar_date(start_date)
+    end_d = _parse_calendar_date(end_date)
+    if start_d is None or end_d is None:
+        return []
+
+    merged = load_indicator_history_rows(
+        symbol,
+        timeframe,
+        max_rows=0,
+        log_root=log_root,
+        strategy_id=strategy_id,
+    )
+    ex_default = str(exchange_default or "").strip().upper() or "INDEX"
+    prefix: List[Dict[str, Any]] = []
+    in_range: List[Dict[str, Any]] = []
+    ctx_cap = max(0, int(context_bars or 0))
+
+    items = [
+        item
+        for item in merged
+        if isinstance(item.get("timestamp"), datetime)
+    ]
+    items.sort(key=lambda x: x["timestamp"])
+
+    for item in items:
+        ts = item["timestamp"]
+        bar_d = ts.astimezone(IST).date()
+        ind = item.get("indicators") if isinstance(item.get("indicators"), dict) else {}
+        row: Dict[str, Any] = {
+            "timestamp": ts.astimezone(timezone.utc),
+            "open": float(item["open"]),
+            "high": float(item["high"]),
+            "low": float(item["low"]),
+            "close": float(item["close"]),
+            "volume": float(item.get("volume") or 0),
+            "symbol": str(item.get("symbol") or symbol).strip().upper(),
+            "exchange": str(item.get("exchange") or ex_default).strip().upper(),
+        }
+        for k, v in ind.items():
+            row[k] = v
+        if bar_d < start_d:
+            prefix.append(row)
+        elif bar_d > end_d:
+            continue
+        else:
+            in_range.append(row)
+
+    if ctx_cap > 0 and prefix:
+        prefix = prefix[-ctx_cap:]
+    else:
+        prefix = []
+    return prefix + in_range
 
 
 def hydrate_session_keys_from_disk(

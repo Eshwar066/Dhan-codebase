@@ -28,6 +28,7 @@ from core.strategies.market_structure_mixin import MarketStructureMixin
 from core.utils.structure import MarketStructureConfig
 from core.utils.structure.rsi_divergence import add_rsi_divergence
 from core.utils.structure.swings import add_swing_points
+from core.utils import indicator_history as ind_hist
 
 if TYPE_CHECKING:
     from core.models.strategy_context import StrategyContext
@@ -39,7 +40,7 @@ RSI_OVERSOLD = 30.0
 DEFAULT_SIGNAL_TF_MINUTES = 1
 PARTIAL_BOOK_FRAC = 0.60
 DEFAULT_ORDER_QTY = 1
-SIGNAL_MAX_AGE_BARS = 12  # entry-TF bars to act after signal-TF divergence
+SIGNAL_MAX_AGE_BARS = 100  # entry-TF bars to act after signal-TF divergence
 META_KEY = "rsi_bread_butter"
 
 
@@ -200,15 +201,35 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
                     self._restore_meta(structure_id, raw)
 
     @staticmethod
+    def _candle_row_timestamp(c: dict) -> Optional[pd.Timestamp]:
+        """IST bar open — same key as indicator_history ``candle_timestamp_ist``."""
+        ist_key = c.get("candle_timestamp_ist")
+        if ist_key:
+            aware = ind_hist.parse_bar_timestamp_ist_to_aware(ist_key)
+            if aware is not None:
+                return pd.Timestamp(aware)
+        ts = c.get("timestamp")
+        if ts is None:
+            return None
+        parsed = pd.to_datetime(ts, utc=True, errors="coerce")
+        if parsed is not None and not bool(pd.isna(parsed)):
+            return parsed.tz_convert(ind_hist.IST)
+        aware_ist = ind_hist.row_timestamp_to_ist(ts)
+        if aware_ist is not None:
+            return pd.Timestamp(aware_ist)
+        return None
+
+    @staticmethod
     def _candles_to_df(candles: List[dict]) -> pd.DataFrame:
         rows = []
         for c in candles:
-            ts = pd.to_datetime(c.get("timestamp"), utc=True, errors="coerce")
-            if pd.isna(ts):
+            ts = RSIBreadAndButter._candle_row_timestamp(c)
+            if ts is None:
                 continue
             rows.append(
                 {
                     "timestamp": ts,
+                    "candle_timestamp_ist": ind_hist.normalize_ist_bar_key(ts),
                     "open": float(c.get("open", c.get("close", 0)) or 0),
                     "high": float(c.get("high", c.get("close", 0)) or 0),
                     "low": float(c.get("low", c.get("close", 0)) or 0),
@@ -244,10 +265,23 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
         """Return ``LONG`` / ``SHORT`` when signal-TF RSI divergence fires."""
         signal_m = self.signal_timeframe_minutes_resolved()
         entry_m = self.entry_timeframe_minutes()
+
+        # 1m signal on 1m engine candles: use indicators already on buffered candles
+        # (from indicator_history overlay / prepare_indicators), not a short-window recompute.
+        if signal_m <= entry_m and candles:
+            last = candles[-1]
+            rsi = float(pd.to_numeric(last.get("rsi"), errors="coerce") or float("nan"))
+            bull = bool(int(pd.to_numeric(last.get("rsi_div_bull"), errors="coerce") or 0))
+            bear = bool(int(pd.to_numeric(last.get("rsi_div_bear"), errors="coerce") or 0))
+            if bull and rsi <= RSI_OVERSOLD + 5:
+                return "LONG"
+            if bear and rsi >= RSI_OVERBOUGHT - 5:
+                return "SHORT"
+            return None
+
         df = self._candles_to_df(candles)
         if len(df) < 20:
             return None
-        # Resample only when signal TF is coarser than entry/engine candles.
         if signal_m > entry_m:
             df = self._resample_ohlc(df, signal_m)
         if len(df) < 15:
@@ -349,6 +383,7 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
         if len(recent) < 30:
             return None
 
+        # === Scan signal timeframe ===
         sig_side = self._scan_signal_timeframe(recent)
         if sig_side:
             self._set_active_signal(symbol, sig_side)

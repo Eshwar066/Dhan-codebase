@@ -1,9 +1,19 @@
+import logging
+
 import pandas as pd
 import datetime as dt
 from collections import deque
-from typing import Any
+from typing import Any, Optional
 
+from core.data.candle_aggregator import _bucket_ts, _resolution_to_seconds
 from core.engine.base_engine import BaseEngine
+from core.utils import indicator_history as ind_hist
+
+logger = logging.getLogger(__name__)
+
+_MIN_BACKTEST_BARS = 50
+# Delta intraday cache sometimes stores IST wall-clock as UTC (+5:30 duplicate buckets).
+_DELTA_IST_AS_UTC_OFFSET = pd.Timedelta(hours=5, minutes=30)
 
 
 class BacktestEngine(BaseEngine):
@@ -112,12 +122,296 @@ class BacktestEngine(BaseEngine):
             candle, recent_candles=recent_candles, intent_store=intent_store
         )
 
+    @staticmethod
+    def _rows_to_ohlc_df(rows: list) -> Optional[pd.DataFrame]:
+        if not rows:
+            return None
+        df = pd.DataFrame(rows)
+        if df.empty or "timestamp" not in df.columns:
+            return None
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        df = df.dropna(subset=["timestamp"])
+        df = (
+            df.sort_values("timestamp")
+            .drop_duplicates(subset=["timestamp"], keep="last")
+            .reset_index(drop=True)
+        )
+        return df if len(df) > 0 else None
+
+    @staticmethod
+    def _persisted_indicator_keys(strategy: Any) -> list:
+        fn = getattr(strategy, "persisted_indicator_keys", None)
+        if not callable(fn):
+            return []
+        try:
+            return [str(k) for k in (fn() or []) if k]
+        except Exception:
+            return []
+
+    @staticmethod
+    def _overlay_stored_indicators(
+        df: pd.DataFrame,
+        stored: Optional[pd.DataFrame],
+        keys: list,
+    ) -> pd.DataFrame:
+        """Prefer indicator_history.jsonl values over recomputed columns."""
+        if (
+            stored is None
+            or df is None
+            or len(df) == 0
+            or len(stored) == 0
+            or not keys
+        ):
+            return df
+        out = df.copy()
+        out["_ts_key"] = pd.to_datetime(out["timestamp"], utc=True).astype("int64")
+        st = stored.copy()
+        st["_ts_key"] = pd.to_datetime(st["timestamp"], utc=True).astype("int64")
+        st = st.drop_duplicates(subset=["_ts_key"], keep="last").set_index("_ts_key")
+        for k in keys:
+            if k not in st.columns:
+                continue
+            mapped = out["_ts_key"].map(st[k])
+            if k in out.columns:
+                out[k] = mapped.combine_first(out[k])
+            else:
+                out[k] = mapped
+        return out.drop(columns=["_ts_key"])
+
+    @staticmethod
+    def _filter_df_calendar_range(
+        df: pd.DataFrame, start_date: str, end_date: str
+    ) -> pd.DataFrame:
+        start_d = ind_hist._parse_calendar_date(start_date)
+        end_d = ind_hist._parse_calendar_date(end_date)
+        if start_d is None or end_d is None:
+            return df
+        ts_ist = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(ind_hist.IST)
+        mask = (ts_ist.dt.date >= start_d) & (ts_ist.dt.date <= end_d)
+        return df.loc[mask].reset_index(drop=True)
+
+    @staticmethod
+    def _hist_covers_calendar_range(
+        df_hist: Optional[pd.DataFrame], start_date: str, end_date: str
+    ) -> bool:
+        if df_hist is None or len(df_hist) == 0:
+            return False
+        start_d = ind_hist._parse_calendar_date(start_date)
+        end_d = ind_hist._parse_calendar_date(end_date)
+        if start_d is None or end_d is None:
+            return False
+        tss = pd.to_datetime(df_hist["timestamp"], utc=True, errors="coerce")
+        tss = tss.dropna()
+        if tss.empty:
+            return False
+        earliest = tss.min().astimezone(ind_hist.IST).date()
+        latest = tss.max().astimezone(ind_hist.IST).date()
+        return earliest <= start_d and latest >= end_d
+
+    @staticmethod
+    def _drop_delta_ist_wall_clock_as_utc_api_bars(
+        df_api: pd.DataFrame, df_hist: pd.DataFrame
+    ) -> pd.DataFrame:
+        """Drop API rows whose UTC label is IST wall-clock when history has the real UTC bar."""
+        if df_api is None or df_api.empty or df_hist is None or df_hist.empty:
+            return df_api
+        api = df_api.copy()
+        hist = df_hist.copy()
+        api["timestamp"] = pd.to_datetime(api["timestamp"], utc=True, errors="coerce")
+        hist["timestamp"] = pd.to_datetime(hist["timestamp"], utc=True, errors="coerce")
+        api = api.dropna(subset=["timestamp"])
+        hist = hist.dropna(subset=["timestamp"])
+        if api.empty or hist.empty:
+            return api
+        hist_keys = set(hist["timestamp"].astype("int64"))
+        shifted = api["timestamp"] - _DELTA_IST_AS_UTC_OFFSET
+        dup_mask = shifted.astype("int64").isin(hist_keys)
+        dropped = int(dup_mask.sum())
+        if dropped > 0:
+            logger.info(
+                "Backtest dropped %s Delta API bars with IST wall-clock stored as UTC",
+                dropped,
+            )
+        return api.loc[~dup_mask].reset_index(drop=True)
+
+    @staticmethod
+    def _merge_backtest_ohlc(
+        df_hist: Optional[pd.DataFrame],
+        df_api: Optional[pd.DataFrame],
+        *,
+        prefer_hist: bool = True,
+        exchange: Optional[str] = None,
+    ) -> Optional[pd.DataFrame]:
+        """Merge OHLC; when ``prefer_hist``, indicator history wins on duplicate buckets."""
+        parts = [d for d in (df_hist, df_api) if d is not None and len(d) > 0]
+        if not parts:
+            return None
+        if len(parts) == 1:
+            return parts[0].copy()
+
+        hist = df_hist.copy()
+        api = df_api.copy()
+        if str(exchange or "").upper() == "DELTA":
+            api = BacktestEngine._drop_delta_ist_wall_clock_as_utc_api_bars(api, hist)
+            if api is None or api.empty:
+                return hist.sort_values("timestamp").reset_index(drop=True)
+
+        hist["timestamp"] = pd.to_datetime(hist["timestamp"], utc=True, errors="coerce")
+        api["timestamp"] = pd.to_datetime(api["timestamp"], utc=True, errors="coerce")
+        hist = hist.dropna(subset=["timestamp"])
+        api = api.dropna(subset=["timestamp"])
+
+        if prefer_hist and len(hist) > 0:
+            hist_keys = set(hist["timestamp"].astype("int64"))
+            api_gap = api.loc[~api["timestamp"].astype("int64").isin(hist_keys)]
+            if len(api_gap) == 0:
+                return (
+                    hist.sort_values("timestamp").reset_index(drop=True)
+                )
+            merged = pd.concat([hist, api_gap], ignore_index=True)
+            return merged.sort_values("timestamp").reset_index(drop=True)
+
+        merged = pd.concat([hist, api], ignore_index=True)
+        merged = (
+            merged.sort_values("timestamp")
+            .drop_duplicates(subset=["timestamp"], keep="first")
+            .reset_index(drop=True)
+        )
+        return merged
+
+    def _load_backtest_ohlc(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        timeframe: str,
+        exchange: str,
+        sector: str,
+    ) -> Optional[pd.DataFrame]:
+        """Prefer shared indicator history (live bootstrap file), then API."""
+        strategy_id = getattr(self.strategy, "name", None)
+        context_bars = 0
+        try:
+            fn = getattr(self.strategy, "get_structure_lookback", None)
+            if callable(fn):
+                context_bars = max(0, int(fn() or 0))
+        except (TypeError, ValueError):
+            context_bars = 0
+        hist_rows = ind_hist.load_indicator_history_bars_for_backtest(
+            symbol,
+            str(timeframe),
+            start_date,
+            end_date,
+            strategy_id=strategy_id,
+            exchange_default=exchange,
+            context_bars=context_bars,
+        )
+        df_hist = self._rows_to_ohlc_df(hist_rows)
+        df_api = self.data.get_intraday(
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            timeframe=timeframe,
+            exchange=exchange,
+            sector=sector,
+        )
+        if df_api is not None and len(df_api) > 0:
+            df_api = df_api.copy()
+            df_api["timestamp"] = pd.to_datetime(df_api["timestamp"], utc=True, errors="coerce")
+            df_api = df_api.dropna(subset=["timestamp"]).reset_index(drop=True)
+
+        n_hist = len(df_hist) if df_hist is not None else 0
+        n_api = len(df_api) if df_api is not None else 0
+        is_delta = str(exchange or "").upper() == "DELTA"
+
+        if (
+            n_hist >= _MIN_BACKTEST_BARS
+            and is_delta
+            and self._hist_covers_calendar_range(df_hist, start_date, end_date)
+        ):
+            logger.info(
+                "Backtest OHLC source=indicator_history symbol=%s tf=%s rows=%s range=%s..%s (delta range covered)",
+                symbol,
+                timeframe,
+                n_hist,
+                start_date,
+                end_date,
+            )
+            return df_hist
+
+        if n_hist >= _MIN_BACKTEST_BARS and n_api == 0:
+            logger.info(
+                "Backtest OHLC source=indicator_history symbol=%s tf=%s rows=%s range=%s..%s",
+                symbol,
+                timeframe,
+                n_hist,
+                start_date,
+                end_date,
+            )
+            return df_hist
+
+        if n_hist >= _MIN_BACKTEST_BARS and n_api > 0:
+            df = self._merge_backtest_ohlc(
+                df_hist, df_api, prefer_hist=True, exchange=exchange
+            )
+            n_gap = 0 if df is None else max(0, len(df) - n_hist)
+            logger.info(
+                "Backtest OHLC source=indicator_history+api_gap symbol=%s tf=%s hist=%s api=%s merged=%s api_only=%s",
+                symbol,
+                timeframe,
+                n_hist,
+                n_api,
+                len(df) if df is not None else 0,
+                n_gap,
+            )
+            return df
+
+        if n_api >= _MIN_BACKTEST_BARS:
+            logger.info(
+                "Backtest OHLC source=api symbol=%s tf=%s rows=%s range=%s..%s",
+                symbol,
+                timeframe,
+                n_api,
+                start_date,
+                end_date,
+            )
+            return df_api
+
+        if n_hist > 0 or n_api > 0:
+            df = self._merge_backtest_ohlc(
+                df_hist, df_api, exchange=exchange
+            )
+            if df is not None and len(df) > 0:
+                logger.warning(
+                    "Backtest OHLC sparse symbol=%s tf=%s hist=%s api=%s merged=%s (min=%s)",
+                    symbol,
+                    timeframe,
+                    n_hist,
+                    n_api,
+                    len(df),
+                    _MIN_BACKTEST_BARS,
+                )
+                return df
+
+        hist_path = ind_hist.indicator_history_path(symbol, str(timeframe))
+        logger.warning(
+            "Backtest OHLC missing symbol=%s tf=%s range=%s..%s hist_file=%s hist_rows=%s api_rows=%s",
+            symbol,
+            timeframe,
+            start_date,
+            end_date,
+            hist_path,
+            n_hist,
+            n_api,
+        )
+        return None
+
     # ==========================================================
     # MAIN RUN LOOP
     # ==========================================================
     def run(self, symbols, start_date, end_date, timeframe, exchange, sector):
         for symbol in symbols:
-            df = self.data.get_intraday(
+            df = self._load_backtest_ohlc(
                 symbol=symbol,
                 start_date=start_date,
                 end_date=end_date,
@@ -125,12 +419,15 @@ class BacktestEngine(BaseEngine):
                 exchange=exchange,
                 sector=sector,
             )
-            # df1 = self.data.get_products()
-            # df2 = self.data.product_id_for_symbol("BTCUSD")
-            # df3 = self.data.get_latest_candles({"BTCUSD", "ETHUSD"})
-            # df4 = self.data.get_live_expiry("BTCUSD")
 
-            if df is None or len(df) < 50:
+            if df is None or len(df) < _MIN_BACKTEST_BARS:
+                logger.warning(
+                    "Backtest skip symbol=%s tf=%s rows=%s (need >= %s)",
+                    symbol,
+                    timeframe,
+                    0 if df is None else len(df),
+                    _MIN_BACKTEST_BARS,
+                )
                 continue
 
             df["symbol"] = symbol
@@ -139,11 +436,28 @@ class BacktestEngine(BaseEngine):
             # -------- Indicators (strategy computes htf_trend in prepare_indicators) --------
 
             ts_col = pd.to_datetime(df["timestamp"], utc=True)
-            df["timestamp"] = ts_col.dt.tz_convert("Asia/Kolkata")
+            # IST labels match indicator_history.jsonl ``candle_timestamp_ist`` keys.
+            df["timestamp"] = ts_col.dt.tz_convert(ind_hist.IST)
             if "time" in df.columns:
                 df["time"] = df["timestamp"].dt.time
 
+            tf_sec = int(_resolution_to_seconds(str(timeframe)))
+            is_delta = (
+                str(self.broker_name or "").upper() == "DELTA"
+                or str(exchange or "").upper() == "DELTA"
+            )
+
+            ind_keys = self._persisted_indicator_keys(self.strategy)
+            key_cols = [k for k in ind_keys if k in df.columns]
+            stored_ind = (
+                df[["timestamp"] + key_cols].copy() if key_cols else None
+            )
+
             df = self.strategy.prepare_indicators(df)
+            if stored_ind is not None and len(key_cols) > 0:
+                df = self._overlay_stored_indicators(df, stored_ind, key_cols)
+
+            df = self._filter_df_calendar_range(df, start_date, end_date)
             warmup = self.strategy.get_warmup_period()
             # Include macro EMA warmup so first ~50 (slope) or ~100 (ema) candles are stable
             macro_slope = getattr(self.strategy, "macro_ema_slope_period", None)
@@ -157,7 +471,15 @@ class BacktestEngine(BaseEngine):
             # -------- Candle loop (candle["htf_trend"] already set above for macro filter) --------
             for _, row in df.iterrows():
                 candle = row.to_dict()
-                ts = pd.to_datetime(candle["timestamp"])
+                ts = pd.to_datetime(candle["timestamp"], utc=True)
+                try:
+                    candle["bucket_ts"] = _bucket_ts(float(ts.timestamp()), tf_sec)
+                except (OSError, OverflowError, TypeError, ValueError):
+                    candle["bucket_ts"] = None
+                if is_delta:
+                    candle["candle_timestamp_ist"] = ind_hist.normalize_ist_bar_key(
+                        ts.tz_convert(ind_hist.IST)
+                    )
                 if "htf_trend" not in candle or pd.isna(candle.get("htf_trend")):
                     candle["htf_trend"] = None
 
