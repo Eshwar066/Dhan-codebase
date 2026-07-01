@@ -1338,9 +1338,12 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 continue
             response_q = task["response_q"]
             candle = task["candle"]
+            recent_candles = task.get("recent_candles")
             try:
                 t0 = time.perf_counter()
-                ctx = self.build_context_only(candle)
+                ctx = self.build_context_only(
+                    candle, recent_candles=recent_candles
+                )
                 intent = strategy.on_candle(candle, ctx)
                 strategy_time_ms = (time.perf_counter() - t0) * 1000
                 response_q.put(
@@ -1695,6 +1698,26 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             allow_live_persist=allow_live_persist,
         )
 
+    def _recent_candles_for_strategy(
+        self, strategy: Any, candle: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """Rolling enriched buffer for live ``on_candle`` (backtest parity)."""
+        sym = str(candle.get("symbol") or "").strip()
+        if not sym:
+            return []
+        try:
+            n_need = int(getattr(strategy, "get_warmup_period", lambda: 50)() or 50)
+        except Exception:
+            n_need = 50
+        ex = str(
+            candle.get("exchange")
+            or getattr(self, "_live_exchange", None)
+            or "DELTA"
+        )
+        return self.indicator_manager.get_recent_enriched_candles(
+            strategy, sym, n_need, exchange=ex
+        )
+
     def _should_process_nse_60m_closed_bar(
         self, candle: Dict[str, Any], timeframe: str
     ) -> bool:
@@ -1761,7 +1784,14 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     )
             self._ensure_strategy_worker(strategy)
             strategy_id = str(getattr(strategy, "name", "unknown_strategy"))
-            task = {"candle": dict(strategy_candle), "response_q": response_q}
+            recent_candles = self._recent_candles_for_strategy(
+                strategy, strategy_candle
+            )
+            task = {
+                "candle": dict(strategy_candle),
+                "recent_candles": recent_candles,
+                "response_q": response_q,
+            }
             if self._safe_queue_put(
                 self._strategy_task_queues[strategy_id],
                 task,

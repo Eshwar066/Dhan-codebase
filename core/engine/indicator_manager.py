@@ -1125,3 +1125,67 @@ class IndicatorManager:
             out_meta["bar_closed_for_append"] = bool(bar_closed_for_append)
         return out
 
+    def get_recent_enriched_candles(
+        self,
+        strategy: Any,
+        symbol: str,
+        max_rows: int,
+        exchange: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Last ``max_rows`` enriched bars for strategy eval (mirrors backtest candle buffer).
+        Rows come from per-strategy indicator dataframe after ``enrich_candle_for_strategy``.
+        """
+        import pandas as pd
+
+        tf = str(getattr(strategy, "timeframe", "") or "")
+        if not tf or max_rows <= 0:
+            return []
+        sym = str(symbol or "").strip()
+        if not sym:
+            return []
+
+        strategy_key = self._key_strategy_symbol_tf(strategy, sym, tf)
+        strategy_state = self._strategy_indicator_state.get(strategy_key)
+        if not strategy_state:
+            return []
+        df = strategy_state.get("df")
+        if df is None or len(df) == 0:
+            return []
+
+        n = min(int(max_rows), len(df))
+        ex = str(exchange or self._live_exchange or "DELTA")
+        out: List[Dict[str, Any]] = []
+        for _, row in df.iloc[-n:].iterrows():
+            raw = row.to_dict() if hasattr(row, "to_dict") else dict(row)
+            candle: Dict[str, Any] = {"symbol": sym, "exchange": ex}
+            ts = raw.get("timestamp")
+            if ts is not None:
+                ts_p = pd.to_datetime(ts, utc=True, errors="coerce")
+                if not pd.isna(ts_p):
+                    candle["timestamp"] = ts_p
+                    candle["bucket_ts"] = int(ts_p.timestamp())
+                    candle["candle_timestamp_ist"] = ind_hist.normalize_ist_bar_key(ts_p)
+            for k in ("open", "high", "low", "close", "volume"):
+                v = raw.get(k)
+                if v is not None and not (isinstance(v, float) and pd.isna(v)):
+                    candle[k] = v
+            skip = {
+                "timestamp",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "symbol",
+                "exchange",
+            }
+            for k, v in raw.items():
+                if k in skip or v is None:
+                    continue
+                if isinstance(v, float) and pd.isna(v):
+                    continue
+                candle[k] = v
+            out.append(candle)
+        return out
+

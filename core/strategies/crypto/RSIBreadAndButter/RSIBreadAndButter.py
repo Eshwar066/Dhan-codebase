@@ -399,9 +399,26 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
 
         self._tick_signal_age(symbol)
         n_need = self.get_warmup_period()
-        recent = ctx.get_recent_candles(n_need) if ctx else []
+        recent = list(ctx.get_recent_candles(n_need) if ctx else [])
         if len(recent) < 30:
             return None
+        # Live eval passes enriched ``candle`` separately; keep last buffer row in sync.
+        bucket = candle.get("bucket_ts")
+        if bucket is not None and recent:
+            try:
+                b = int(bucket)
+            except (TypeError, ValueError):
+                b = None
+            if b is not None:
+                last_b = recent[-1].get("bucket_ts")
+                try:
+                    last_b = int(last_b) if last_b is not None else None
+                except (TypeError, ValueError):
+                    last_b = None
+                if last_b == b:
+                    recent[-1] = {**recent[-1], **candle}
+                elif last_b is not None and last_b < b:
+                    recent.append(dict(candle))
 
         # === Scan signal timeframe ===
         sig_side = self._scan_signal_timeframe(recent)
