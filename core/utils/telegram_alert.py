@@ -1,6 +1,8 @@
 """
 Send alerts via Telegram bot. Used by Delta (and optionally Dhan) for order placement,
 errors, and slippage notifications. Logic mirrors dhan_tradehull.send_telegram_alert.
+
+Closed-candle rows are not sent to Telegram for DELTA (see EngineLogger._send_telegram_alert).
 """
 
 import logging

@@ -78,7 +78,9 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
         self._meta_by_structure_id: Dict[str, _LegMeta] = {}
         self._active_signal: Dict[str, Dict[str, Any]] = {}
         self._signal_bar_counter: Dict[str, int] = {}
-        self._last_eval_bucket: Dict[str, int] = {}
+        # symbol|bucket_ts — one on_candle eval per closed bar (no re-eval on missing bucket_ts).
+        self._evaluated_bar_keys: set[str] = set()
+        self._divergence_logged_keys: set[str] = set()
         self._sync_entry_timeframe()
 
     @staticmethod
@@ -374,15 +376,18 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
     def should_evaluate(self, candle: dict) -> bool:
         if candle.get("close") is None:
             return False
-        sym = str(candle.get("symbol") or "").strip().upper()
         bucket = candle.get("bucket_ts")
         if bucket is None:
-            return True
-        b = int(bucket)
-        prev = self._last_eval_bucket.get(sym)
-        if prev is not None and b <= prev:
             return False
-        self._last_eval_bucket[sym] = b
+        try:
+            b = int(bucket)
+        except (TypeError, ValueError):
+            return False
+        sym = str(candle.get("symbol") or "").strip().upper()
+        key = f"{sym}|{b}"
+        if key in self._evaluated_bar_keys:
+            return False
+        self._evaluated_bar_keys.add(key)
         return True
 
     def on_candle(
@@ -401,6 +406,22 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
         # === Scan signal timeframe ===
         sig_side = self._scan_signal_timeframe(recent)
         if sig_side:
+            bucket = candle.get("bucket_ts")
+            div_key = f"{symbol}|{sig_side}|{bucket}"
+            if div_key not in self._divergence_logged_keys:
+                self._divergence_logged_keys.add(div_key)
+                last = recent[-1] if recent else {}
+                logger.info(
+                    "RSIBreadAndButter divergence %s %s rsi=%s rsi_div_bull=%s "
+                    "rsi_div_bear=%s bos=%s bucket=%s",
+                    symbol,
+                    sig_side,
+                    last.get("rsi"),
+                    last.get("rsi_div_bull"),
+                    last.get("rsi_div_bear"),
+                    candle.get("bos"),
+                    bucket,
+                )
             self._set_active_signal(symbol, sig_side)
 
         active = self._active_signal_side(symbol)

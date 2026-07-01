@@ -280,6 +280,7 @@ class EngineFactory:
             strategy=config.strategy_name,
             telegram_alert=telegram_alert,
             known_strategies=_loaded_strategies,
+            debug_mode=bool(getattr(config, "debug_mode", False)),
         )
         risk_manager = RiskManager(
             position_manager=position_manager,

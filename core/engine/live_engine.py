@@ -1741,27 +1741,24 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 )
             if not strategy.should_evaluate(strategy_candle):
                 continue
-            # >>Signal Generation msg and logger print
-            if self.engine_logger:
-                strategy_id = str(getattr(strategy, "name", "unknown_strategy"))
-                sig_symbol = str(strategy_candle.get("symbol") or candle.get("symbol") or "")
+            log_msg_fn = getattr(strategy, "eval_signal_log_message", None)
+            if self.engine_logger and callable(log_msg_fn):
                 try:
-                    sig_rsi = strategy_candle.get("rsi")
-                    sig_prev = strategy_candle.get("prev_rsi")
-                    msg = (
-                        "Signal condition met"
-                        f" rsi={sig_rsi} prev_rsi={sig_prev}"
-                        f" timeframe={getattr(strategy, 'timeframe', '')}"
-                    )
+                    sig_msg = log_msg_fn(strategy_candle)
                 except Exception:
-                    msg = "Signal condition met"
-                self.engine_logger.log(
-                    "signal_generated",
-                    msg,
-                    strategy_id=strategy_id,
-                    symbol=sig_symbol,
-                    timeframe=str(getattr(strategy, "timeframe", "") or ""),
-                )
+                    sig_msg = None
+                if sig_msg:
+                    strategy_id = str(getattr(strategy, "name", "unknown_strategy"))
+                    sig_symbol = str(
+                        strategy_candle.get("symbol") or candle.get("symbol") or ""
+                    )
+                    self.engine_logger.log(
+                        "signal_generated",
+                        sig_msg,
+                        strategy_id=strategy_id,
+                        symbol=sig_symbol,
+                        timeframe=str(getattr(strategy, "timeframe", "") or ""),
+                    )
             self._ensure_strategy_worker(strategy)
             strategy_id = str(getattr(strategy, "name", "unknown_strategy"))
             task = {"candle": dict(strategy_candle), "response_q": response_q}

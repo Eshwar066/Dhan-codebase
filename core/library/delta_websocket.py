@@ -65,7 +65,7 @@ DELTA_WS_GLOBAL_TEST = "wss://socket.testnet.delta.exchange"
 # Heartbeat: server sends every 30s; client should reconnect if no heartbeat in 35s
 HEARTBEAT_TIMEOUT_SEC = 35
 # Warn if no tick/candle received for this many seconds (feed stall)
-FEED_STALL_SEC = 10
+FEED_STALL_SEC = 90
 # Reconnect backoff after 429
 RECONNECT_AFTER_429_SEC = 300  # 5 min
 # Stop reconnecting after this many consecutive connection failures (e.g. DNS unreachable)

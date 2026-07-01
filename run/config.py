@@ -231,23 +231,18 @@ ENGINE_JOBS = [
     },
 
     {
-
         "engine_id": "delta_rsi_bread_butter",
-
         "venue": "DELTA",
-
         "enabled": True,
-
-        "run_mode": "PAPER",
-
+        "run_mode": "LIVE",
         "capital": 200000,
-
         "ORDER_QTY_LOTS": 1,
-
         "strategies": ["RSIBreadAndButter"],
-
-        "delta_leverage": 5,
-
+        "delta_leverage": 10,
+        "telegram": {
+            "bot_token": "8389724629:AAHY_CGcBF8HZCexedsEJFw80Mf6SxH5Bkk",
+            "chat_id": "1021479950",
+        },
     },
 
     {

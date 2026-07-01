@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import threading
+import time
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -93,6 +94,27 @@ TELEGRAM_ALERT_EVENTS = {
     "candle_closed",
 }
 
+# DELTA: 24/7 1m bars — candle_closed Telegram spam is not useful; file logs remain.
+TELEGRAM_ALERT_EVENTS_DELTA_EXCLUDE = frozenset({"candle_closed"})
+
+# Routine heartbeat / per-bar noise — omitted from strategy *.log unless debug_mode.
+FILE_LOG_VERBOSE_EVENTS = frozenset(
+    {
+        "pipeline_state",
+        "strategy_evaluated",
+        "candle_skipped",
+        "candle_closed_skipped",
+        "closed_candle_skip_summary",
+        "latency",
+        "oms",
+        "scheduled_eval",
+        "scheduled_eval_skipped",
+        "tick_gap_detected",
+        "candle_building",
+        "session_end_candle_flush",
+    }
+)
+
 
 def _safe_dir_name(name: Optional[str]) -> str:
     raw = str(name or "GLOBAL").strip() or "GLOBAL"
@@ -112,10 +134,12 @@ class EngineLogger:
         log_dir: Optional[str] = None,
         telegram_alert: Optional[Callable[[str], None]] = None,
         known_strategies: Optional[Sequence[str]] = None,
+        debug_mode: bool = False,
     ):
         self.engine_id = engine_id
         self.venue = venue
         self.strategy = strategy
+        self._debug_mode = bool(debug_mode)
         self._telegram_alert = telegram_alert
         self._base_log_root = log_dir or LOGS_DIR
         self._known_strategies: List[str] = []
@@ -129,6 +153,9 @@ class EngineLogger:
         self._lock = threading.Lock()
         self._line_formatter = logging.Formatter("%(message)s")
         self._file_handlers: Dict[str, TimedRotatingFileHandler] = {}
+        # symbol -> {count, window_start, last_emit, last_ohlc}
+        self._integrity_error_stats: Dict[str, Dict[str, Any]] = {}
+        self._integrity_error_interval_sec = 300.0
 
     def _strategy_log_dir(self, strategy_id: str) -> str:
         return os.path.join(self._base_log_root, _safe_dir_name(strategy_id))
@@ -296,12 +323,18 @@ class EngineLogger:
         self._validate_correlation(payload)
         if round_json_floats is not None:
             payload = round_json_floats(payload)
-        line = json.dumps(payload, default=str) + "\n"
-        target_strategy = str(payload.get("strategy_id") or self.strategy).strip() or self.strategy
-        target_path = self._event_log_path(target_strategy)
-        with self._lock:
-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
-            self._emit_line(target_path, line)
+        write_file = (
+            self._debug_mode or event_type not in FILE_LOG_VERBOSE_EVENTS
+        )
+        if write_file:
+            line = json.dumps(payload, default=str) + "\n"
+            target_strategy = (
+                str(payload.get("strategy_id") or self.strategy).strip() or self.strategy
+            )
+            target_path = self._event_log_path(target_strategy)
+            with self._lock:
+                os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                self._emit_line(target_path, line)
         self._send_telegram_alert(payload)
 
     def error(self, event_type: str, message: str = "", **kwargs) -> None:
@@ -317,6 +350,11 @@ class EngineLogger:
             return
         event_type = str(payload.get("event_type") or "")
         if event_type not in TELEGRAM_ALERT_EVENTS:
+            return
+        if (
+            str(self.venue or "").upper() == "DELTA"
+            and event_type in TELEGRAM_ALERT_EVENTS_DELTA_EXCLUDE
+        ):
             return
         parts = [
             f"[{self.venue}] {self.engine_id}",
@@ -644,8 +682,58 @@ class EngineLogger:
     def graceful_shutdown(self, message: str = "Graceful shutdown", snapshot_path: Optional[str] = None) -> None:
         self.log("graceful_shutdown", message=message, snapshot_path=snapshot_path)
 
-    def candle_integrity_error(self, message: str, symbol: Optional[str] = None, details: Optional[Dict] = None) -> None:
-        self.log("candle_integrity_error", message=message, symbol=symbol, **(details or {}))
+    def candle_integrity_error(
+        self,
+        message: str,
+        symbol: Optional[str] = None,
+        details: Optional[Dict] = None,
+        *,
+        force: bool = False,
+    ) -> None:
+        """Log OHLC integrity failure; rate-limited to one summary per symbol per 5 minutes."""
+        sym_key = str(symbol or "unknown").strip().upper() or "unknown"
+        now = time.time()
+        extra = dict(details or {})
+        with self._lock:
+            st = self._integrity_error_stats.get(sym_key)
+            if st is None:
+                st = {
+                    "count": 0,
+                    "window_start": now,
+                    "last_emit": 0.0,
+                    "last_ohlc": {},
+                }
+                self._integrity_error_stats[sym_key] = st
+            st["count"] = int(st.get("count", 0)) + 1
+            st["last_ohlc"] = {
+                k: extra.get(k)
+                for k in ("open", "high", "low", "close")
+                if extra.get(k) is not None
+            }
+            if not force:
+                interval = float(self._integrity_error_interval_sec)
+                if now - float(st.get("last_emit", 0.0)) < interval:
+                    return
+                window_sec = max(1, int(now - float(st.get("window_start", now))))
+                count = int(st.get("count", 1))
+                msg = (
+                    f"{message} ({count} rejects in last {window_sec}s)"
+                    if count > 1
+                    else message
+                )
+                emit_extra = {**st.get("last_ohlc", {}), "reject_count": count}
+                st["count"] = 0
+                st["window_start"] = now
+                st["last_emit"] = now
+            else:
+                msg = message
+                emit_extra = extra
+        self.log(
+            "candle_integrity_error",
+            message=msg,
+            symbol=symbol,
+            **emit_extra,
+        )
 
     def symbol_paused(self, symbol: str, reason: str) -> None:
         self.log("symbol_paused", message=reason, symbol=symbol)

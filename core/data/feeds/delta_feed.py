@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 from core.data.feeds.base_feed import RealtimeFeed
 
 logger = logging.getLogger(__name__)
-from core.library.delta_websocket import DeltaWebSocket
+from core.library.delta_websocket import FEED_STALL_SEC, DeltaWebSocket
 
 # Map strategy timeframe to Delta candlestick channel name
 RESOLUTION_MAP = {
@@ -123,7 +123,7 @@ class DeltaWebSocketFeed(RealtimeFeed):
             # Watchdog: force reconnect once per stall window.
             if (
                 self._ws
-                and stall_sec >= 10
+                and stall_sec >= FEED_STALL_SEC
                 and not self._stall_reconnect_triggered
             ):
                 self._stall_reconnect_triggered = True

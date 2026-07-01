@@ -48,3 +48,10 @@ class BaseStrategy:
     def on_forced_exit(self, **kwargs: Any) -> None:
         """Optional: broker-driven close (liquidation, orphan fill, etc.). Override to sync strategy state."""
         return None
+
+    def eval_signal_log_message(self, candle: Any) -> Optional[str]:
+        """
+        Optional hook: return a message for ``signal_generated`` JSON logs when
+        ``should_evaluate`` passes. Return ``None`` to skip (default).
+        """
+        return None

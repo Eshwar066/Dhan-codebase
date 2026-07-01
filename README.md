@@ -260,6 +260,11 @@ python -m run.main --venue DELTA
 ```bash
 sudo systemctl daemon-reload          # after editing unit files
 sudo systemctl restart dhan-leaps-rsi.service
+
+
+sudo systemctl enable --now delta.service
+python3 utils/delta/refresh_crypto_indicator_history.py --only 1 --days 60
+
 sudo systemctl start dhan-oi-positional-buy.service
 sudo systemctl enable option-buildup-scheduler.service
 sudo systemctl list-units 'dhan*' 'option-buildup*' 'delta*'

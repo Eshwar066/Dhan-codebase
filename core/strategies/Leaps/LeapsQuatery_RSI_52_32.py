@@ -294,6 +294,17 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         self._evaluated_signal_keys.add(eval_key)
         return True
 
+    def eval_signal_log_message(self, candle) -> Optional[str]:
+        rsi = candle.get("rsi")
+        prev = candle.get("prev_rsi")
+        if pd.isna(rsi) or pd.isna(prev):
+            return None
+        return (
+            "Signal condition met"
+            f" rsi={rsi} prev_rsi={prev}"
+            f" timeframe={getattr(self, 'timeframe', '')}"
+        )
+
     # ==================================================
     # ENTRY
     # ==================================================
