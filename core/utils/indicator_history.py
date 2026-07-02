@@ -46,6 +46,19 @@ def indicator_history_path(
     return os.path.join(log_root, "indicators", safe_sym, tf, "indicator_history.jsonl")
 
 
+_OHLC_SOURCE_PRIORITY = {
+    "delta_refresh": 100,
+    "yahoo_refresh": 80,
+    "historical_seed": 60,
+    "legacy_rsi": 40,
+    "live_append": 10,
+}
+
+
+def _ohlc_source_rank(source: Any) -> int:
+    return _OHLC_SOURCE_PRIORITY.get(str(source or "").strip().lower(), 50)
+
+
 def legacy_rsi_history_path(strategy_id: str, log_root: str = DEFAULT_LOG_ROOT) -> str:
     sid = str(strategy_id or "GLOBAL").strip() or "GLOBAL"
     safe = sid.replace("/", "_").replace("\\", "_").replace(" ", "_")
@@ -310,9 +323,19 @@ def load_indicator_history_rows(
                     h = float(ohlc.get("high", close) if ohlc else payload.get("high", close))
                     l = float(ohlc.get("low", close) if ohlc else payload.get("low", close))
                     ind = _extract_indicators_from_payload(payload)
-                    prev = by_ist.get(ist_key, {})
-                    prev_ind = dict(prev.get("indicators") or {})
-                    prev_ind.update(ind)
+                    new_src = str(
+                        payload.get("source") or ("legacy_rsi" if is_legacy else "")
+                    )
+                    prev = by_ist.get(ist_key)
+                    if prev is not None:
+                        prev_rank = _ohlc_source_rank(prev.get("source"))
+                        new_rank = _ohlc_source_rank(new_src)
+                        if new_rank < prev_rank:
+                            continue
+                        if new_rank == prev_rank:
+                            prev_ind = dict(prev.get("indicators") or {})
+                            prev_ind.update(ind)
+                            ind = prev_ind
                     by_ist[ist_key] = {
                         "timestamp": bar_dt.astimezone(timezone.utc),
                         "open": o,
@@ -322,10 +345,12 @@ def load_indicator_history_rows(
                         "volume": float(payload.get("volume") or 0),
                         "symbol": sym_u,
                         "exchange": str(
-                            payload.get("exchange") or prev.get("exchange") or "INDEX"
+                            payload.get("exchange")
+                            or (prev.get("exchange") if prev else None)
+                            or "INDEX"
                         ),
-                        "indicators": prev_ind,
-                        "source": payload.get("source") or ("legacy_rsi" if is_legacy else ""),
+                        "indicators": ind,
+                        "source": new_src,
                     }
         except OSError:
             logger.exception("Failed reading indicator history: %s", path)
@@ -513,24 +538,25 @@ def append_indicator_history_row(
     logged_keys: Optional[set] = None,
     round_fn: Any = None,
     exchange: Optional[str] = None,
-) -> None:
+    allow_live_overwrite: bool = False,
+) -> bool:
     """Append one JSONL line; indicator_keys selects columns from row (Series/dict)."""
     if not indicator_keys:
-        return
+        return False
     ts = row.get("timestamp") if hasattr(row, "get") else None
     if ts is None:
-        return
+        return False
     if source == "live_append" and not should_append_live_indicator_row(
         symbol, timeframe, ts, exchange=exchange
     ):
-        return
+        return False
     if hasattr(ts, "to_pydatetime"):
         ts = ts.to_pydatetime()
     ist_ts = normalize_ist_bar_key(
         ts.astimezone(IST).strftime("%Y-%m-%d %H:%M") if hasattr(ts, "astimezone") else ts
     )
     if not ist_ts:
-        return
+        return False
     if bar_timestamp_is_future(ts, timeframe):
         if source in ("historical_seed", "delta_refresh", "yahoo_refresh"):
             logger.debug(
@@ -540,13 +566,15 @@ def append_indicator_history_row(
                 source,
                 ist_ts,
             )
-        return
+        return False
     sym_u = str(symbol or "").strip().upper()
     tf_s = str(timeframe or "").strip()
     dedupe_key = (sym_u, tf_s, ist_ts, source)
     if logged_keys is not None:
-        if dedupe_key in logged_keys:
-            return
+        if dedupe_key in logged_keys and not (
+            allow_live_overwrite and source == "live_append"
+        ):
+            return False
         logged_keys.add(dedupe_key)
 
     indicators: Dict[str, Any] = {}
@@ -565,7 +593,7 @@ def append_indicator_history_row(
         indicators[key] = norm
 
     if not indicators and source == "live_append":
-        return
+        return False
 
     path = indicator_history_path(sym_u, tf_s, log_root=log_root)
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -587,5 +615,7 @@ def append_indicator_history_row(
         pl = round_fn(payload) if round_fn is not None else payload
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(pl, default=str) + "\n")
+        return True
     except OSError:
         logger.exception("Failed writing indicator history: %s", path)
+    return False

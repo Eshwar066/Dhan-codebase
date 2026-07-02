@@ -53,6 +53,8 @@ class IndicatorManager:
         self._rsi_debug_printed = False
         # Extra bars loaded beyond strategy window for continuity / validation slack.
         self._log_bootstrap_buffer = 50
+        # (symbol, timeframe, ist_bar) → fingerprint of last persisted live_append row.
+        self._live_persist_fingerprints: Dict[Tuple[str, str, str], tuple] = {}
 
     def set_runtime_context(self, exchange: str, sector: str) -> None:
         self._live_exchange = str(exchange or "INDEX")
@@ -66,6 +68,171 @@ class IndicatorManager:
     def _key_strategy_symbol_tf(strategy: Any, symbol: str, tf: str) -> str:
         strategy_id = str(getattr(strategy, "name", "unknown_strategy"))
         return f"{strategy_id}|{symbol}|{tf}"
+
+    @staticmethod
+    def _sanitize_delta_ohlc_row(
+        row: Dict[str, Any],
+        *,
+        max_wick_frac: float = 0.004,
+        ref_close: Optional[float] = None,
+        max_ref_dev: float = 0.005,
+    ) -> Dict[str, Any]:
+        """Clamp absurd tick wicks on 1m crypto bars (e.g. 58300 / 61437 on ~61100)."""
+        try:
+            o = float(row.get("open") or 0)
+            h = float(row.get("high") or o)
+            l = float(row.get("low") or o)
+            c = float(row.get("close") or o)
+        except (TypeError, ValueError):
+            return row
+        if o <= 0 or c <= 0:
+            return row
+        body_low = min(o, c)
+        body_high = max(o, c)
+        min_low = body_low * (1.0 - max_wick_frac)
+        max_high = body_high * (1.0 + max_wick_frac)
+        if ref_close is not None and ref_close > 0:
+            min_low = max(min_low, ref_close * (1.0 - max_ref_dev))
+            max_high = min(max_high, ref_close * (1.0 + max_ref_dev))
+        if l < min_low:
+            l = min_low
+        if h > max_high:
+            h = max_high
+        if h < l:
+            h, l = body_high, body_low
+        out = dict(row)
+        out["open"], out["high"], out["low"], out["close"] = o, h, l, c
+        return out
+
+    def _sanitize_delta_ohlc_df(self, df: Any) -> Any:
+        if df is None or len(df) == 0:
+            return df
+        if str(self._live_exchange or "").upper() != "DELTA":
+            return df
+        out = df.copy()
+        for col in ("open", "high", "low", "close"):
+            if col not in out.columns:
+                return df
+        prev_close: Optional[float] = None
+        for idx in out.index:
+            row = self._sanitize_delta_ohlc_row(
+                out.loc[idx].to_dict(),
+                ref_close=prev_close,
+            )
+            for col in ("open", "high", "low", "close"):
+                out.at[idx, col] = row[col]
+            try:
+                prev_close = float(row.get("close") or 0) or prev_close
+            except (TypeError, ValueError):
+                pass
+        return out
+
+    @staticmethod
+    def _structure_confirm_delay_bars(strategy: Any) -> int:
+        """Bars to wait after close before persisting (fractal ``swing_right``)."""
+        fn = getattr(strategy, "market_structure_config", None)
+        if callable(fn):
+            try:
+                return max(0, int(fn().swing_right))
+            except Exception:
+                pass
+        return 2
+
+    @staticmethod
+    def _structure_confirm_tail_rows(strategy: Any) -> int:
+        """Bars to re-persist after each close (swing_right + 1 for fractal confirmation lag)."""
+        fn = getattr(strategy, "market_structure_config", None)
+        if callable(fn):
+            try:
+                return max(1, int(fn().swing_right) + 1)
+            except Exception:
+                pass
+        return 3
+
+    @staticmethod
+    def _ist_bar_key_from_row(row: Any) -> Optional[str]:
+        import pandas as pd
+
+        ts = row.get("timestamp") if hasattr(row, "get") else None
+        if ts is None:
+            return None
+        try:
+            ts_p = pd.to_datetime(ts, utc=True, errors="coerce")
+        except Exception:
+            return None
+        if pd.isna(ts_p):
+            return None
+        return ind_hist.normalize_ist_bar_key(ts_p.tz_convert(IST).strftime("%Y-%m-%d %H:%M"))
+
+    def _live_row_fingerprint(self, row: Any, indicator_keys: List[str]) -> tuple:
+        parts: List[Any] = []
+        for col in ("open", "high", "low", "close", "volume"):
+            try:
+                parts.append((col, round(float(row.get(col) or 0), 6)))
+            except (TypeError, ValueError):
+                parts.append((col, None))
+        for key in indicator_keys:
+            try:
+                val = row[key] if hasattr(row, "__getitem__") else getattr(row, key, None)
+            except (KeyError, TypeError):
+                val = None
+            parts.append((key, ind_hist.normalize_indicator_scalar(val)))
+        return tuple(parts)
+
+    @staticmethod
+    def _row_has_confirmed_structure(row: Any) -> bool:
+        for key in ("swing_low", "swing_high", "rsi_div_bull", "rsi_div_bear"):
+            try:
+                val = row.get(key) if hasattr(row, "get") else None
+            except (TypeError, KeyError):
+                val = None
+            if val is None:
+                continue
+            try:
+                if float(val) != 0.0:
+                    return True
+            except (TypeError, ValueError):
+                if bool(val):
+                    return True
+        return False
+
+    @staticmethod
+    def _apply_lag_divergence_to_candle(out: Dict[str, Any], df: Any, strategy: Any) -> None:
+        """Copy confirmed swing/divergence flags from lagged pivot rows onto the eval candle."""
+        import pandas as pd
+
+        if df is None or len(df) == 0 or strategy is None:
+            return
+        tail = IndicatorManager._structure_confirm_tail_rows(strategy)
+        start = max(0, len(df) - tail)
+        for i in range(start, len(df)):
+            row = df.iloc[i]
+            bull = row.get("rsi_div_bull")
+            bear = row.get("rsi_div_bear")
+            try:
+                bull_on = bool(bull) and float(bull) != 0.0
+            except (TypeError, ValueError):
+                bull_on = bool(bull)
+            try:
+                bear_on = bool(bear) and float(bear) != 0.0
+            except (TypeError, ValueError):
+                bear_on = bool(bear)
+            if bull_on:
+                out["rsi_div_bull"] = bull
+                rsi = row.get("rsi")
+                if rsi is not None and not (isinstance(rsi, float) and pd.isna(rsi)):
+                    out["rsi"] = rsi
+                for k in ("swing_low", "swing_low_price", "last_swing_low"):
+                    if k in row.index and row.get(k) is not None:
+                        out[k] = row.get(k)
+            if bear_on:
+                out["rsi_div_bear"] = bear
+                rsi = row.get("rsi")
+                if rsi is not None and not (isinstance(rsi, float) and pd.isna(rsi)):
+                    out["rsi"] = rsi
+                for k in ("swing_high", "swing_high_price", "last_swing_high"):
+                    if k in row.index and row.get(k) is not None:
+                        out[k] = row.get(k)
 
     @staticmethod
     def _strategy_requires_rsi(strategy: Any) -> bool:
@@ -358,7 +525,13 @@ class IndicatorManager:
         hdf["timestamp"] = pd.to_datetime(hdf["timestamp"], utc=True, errors="coerce")
         hdf = hdf.dropna(subset=["timestamp"])
         merged = pd.concat([hdf, base], ignore_index=True)
-        merged = merged.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+        merged = merged.sort_values("timestamp")
+        if str(self._live_exchange or "").upper() == "DELTA":
+            merged = self._sanitize_delta_ohlc_df(merged)
+            # Prefer seeded history OHLC over live-appended rows for the same bar.
+            merged = merged.drop_duplicates(subset=["timestamp"], keep="first")
+        else:
+            merged = merged.drop_duplicates(subset=["timestamp"], keep="last")
         cap = max(max_rows, len(base) + 80)
         if len(merged) > cap:
             merged = merged.iloc[-cap:].reset_index(drop=True)
@@ -570,22 +743,36 @@ class IndicatorManager:
             return
         source = "live_append" if seeded else "historical_seed"
         if seeded:
-            row = df.iloc[-1]
-            # prev_rsi must be the prior bar's RSI, not a stale column from history merge.
-            if len(df) > 1 and "rsi" in df.columns:
+            # Persist each bar once, after fractal confirmation lag (not on close + backfill).
+            delay = self._structure_confirm_delay_bars(strategy)
+            persist_idx = len(df) - 1 - delay
+            if persist_idx < 0:
+                self._rsi_seeded_streams.add(stream_key)
+                return
+            row = df.iloc[persist_idx]
+            row = row.copy() if hasattr(row, "copy") else dict(row)
+            if persist_idx > 0 and "rsi" in df.columns:
                 try:
-                    prev_rsi = df["rsi"].iloc[-2]
-                    if prev_rsi == prev_rsi:  # not NaN
-                        row = row.copy()
+                    prev_rsi = df["rsi"].iloc[persist_idx - 1]
+                    if prev_rsi == prev_rsi:
                         row["prev_rsi"] = float(prev_rsi)
                 except (TypeError, ValueError, IndexError):
                     pass
-            rows = [row]
+            rows_to_write = [(row, False)]
         else:
-            rows = [r for _, r in df.iterrows()]
+            rows_to_write = [(r, False) for _, r in df.iterrows()]
 
-        for row in rows:
-            ind_hist.append_indicator_history_row(
+        sym_u = str(symbol or "").strip().upper()
+        tf_s = str(tf or "").strip()
+        for row, _is_backfill in rows_to_write:
+            ist_key = self._ist_bar_key_from_row(row)
+            fp = self._live_row_fingerprint(row, keys)
+            if seeded:
+                if not ist_key:
+                    continue
+                if self._live_persist_fingerprints.get((sym_u, tf_s, ist_key)) == fp:
+                    continue
+            wrote = ind_hist.append_indicator_history_row(
                 symbol,
                 tf,
                 row,
@@ -595,7 +782,10 @@ class IndicatorManager:
                 logged_keys=self._rsi_logged_keys,
                 round_fn=round_json_floats,
                 exchange=exchange,
+                allow_live_overwrite=False,
             )
+            if seeded and ist_key and wrote:
+                self._live_persist_fingerprints[(sym_u, tf_s, ist_key)] = fp
         self._rsi_seeded_streams.add(stream_key)
 
     def _load_today_live_candles(
@@ -613,6 +803,45 @@ class IndicatorManager:
         )
         return self._candle_rows_to_sorted_df(rows, symbol)
 
+    def _load_today_from_indicator_history(self, symbol: str, tf: str) -> Any:
+        """Today's OHLC from shared indicator history (delta_refresh wins over live_append)."""
+        import pandas as pd
+
+        symbol_u = str(symbol or "").strip().upper()
+        tf_s = str(tf or "").strip()
+        if not symbol_u or not tf_s:
+            return pd.DataFrame()
+        ist_today = dt.datetime.now(IST).date()
+        rows = ind_hist.load_indicator_history_rows(
+            symbol_u,
+            tf_s,
+            max_rows=2000,
+            log_root=self._rsi_log_root,
+        )
+        filtered: List[Dict[str, Any]] = []
+        for item in rows:
+            ts = item.get("timestamp")
+            if ts is None:
+                continue
+            try:
+                if ts.astimezone(IST).date() != ist_today:
+                    continue
+            except Exception:
+                continue
+            filtered.append(
+                {
+                    "timestamp": ts,
+                    "open": item.get("open"),
+                    "high": item.get("high"),
+                    "low": item.get("low"),
+                    "close": item.get("close"),
+                    "volume": item.get("volume", 0),
+                    "symbol": symbol_u,
+                    "exchange": item.get("exchange") or self._live_exchange,
+                }
+            )
+        return self._candle_rows_to_sorted_df(filtered, symbol_u)
+
     def _merge_today_live_candles(
         self, df: Any, symbol: str, tf: str, strategy_id: Optional[str] = None
     ) -> Any:
@@ -620,7 +849,10 @@ class IndicatorManager:
 
         if df is None or len(df) == 0 or "timestamp" not in df.columns:
             return df
-        live_df = self._load_today_live_candles(symbol, tf, strategy_id=strategy_id)
+        if str(self._live_exchange or "").upper() == "DELTA":
+            live_df = self._load_today_from_indicator_history(symbol, tf)
+        else:
+            live_df = self._load_today_live_candles(symbol, tf, strategy_id=strategy_id)
         if live_df is None or len(live_df) == 0:
             return df
 
@@ -637,7 +869,20 @@ class IndicatorManager:
             merged = pd.concat([merged, live_only], axis=0)
         merged = merged.reset_index().sort_values("timestamp")
         merged = merged.drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
+        if str(self._live_exchange or "").upper() == "DELTA":
+            merged = self._sanitize_delta_ohlc_df(merged)
         return merged
+
+    def _finalize_delta_base_df(self, base_state: Dict[str, Any]) -> None:
+        """Re-sanitize rolling OHLC and invalidate indicator cache after bar append."""
+        if str(self._live_exchange or "").upper() != "DELTA":
+            return
+        df = base_state.get("df")
+        if df is None or len(df) == 0:
+            return
+        cleaned = self._sanitize_delta_ohlc_df(df)
+        base_state["df"] = cleaned
+        base_state["update_seq"] = int(base_state.get("update_seq", 0)) + 1
 
     @staticmethod
     def _strip_same_day_bars(df: Any) -> Any:
@@ -787,6 +1032,7 @@ class IndicatorManager:
             df["exchange"] = exchange
         if len(df) > window:
             df = df.iloc[-window:].reset_index(drop=True)
+        df = self._sanitize_delta_ohlc_df(df)
 
         boot_ist = dt.datetime.now(IST).isoformat()
         new_state: Dict[str, Any] = {
@@ -848,6 +1094,11 @@ class IndicatorManager:
         if base_df is None:
             return dict(candle)
 
+        if str(exchange).upper() == "DELTA" and not base_state.get("delta_resanitized"):
+            self._finalize_delta_base_df(base_state)
+            base_state["delta_resanitized"] = True
+            base_df = base_state.get("df")
+
         bucket = candle.get("bucket_ts")
         if bucket is None:
             bucket = candle_bucket_fn(candle)
@@ -870,6 +1121,14 @@ class IndicatorManager:
                 "symbol": symbol,
                 "exchange": exchange,
             }
+            if str(exchange).upper() == "DELTA":
+                ref_close = None
+                if len(base_df) > 0:
+                    try:
+                        ref_close = float(base_df.iloc[-1].get("close"))
+                    except (TypeError, ValueError):
+                        ref_close = None
+                row = self._sanitize_delta_ohlc_row(row, ref_close=ref_close)
             row_ts = row.get("timestamp")
             if pd.isna(row_ts):
                 return dict(candle)
@@ -974,6 +1233,10 @@ class IndicatorManager:
                 if out_meta is not None:
                     out_meta["bar_closed_for_append"] = True
 
+            if str(exchange).upper() == "DELTA":
+                self._finalize_delta_base_df(base_state)
+                base_df = base_state.get("df")
+
         strategy_key = self._key_strategy_symbol_tf(strategy, symbol, tf)
         strategy_state = self._strategy_indicator_state.get(strategy_key)
         base_df_for_sig = base_state.get("df")
@@ -1001,7 +1264,7 @@ class IndicatorManager:
 
             if not cache_hit:
                 compute_start = time.time()
-                work_df = df.copy()
+                work_df = self._sanitize_delta_ohlc_df(df.copy())
                 merge_cap = max(400, int(window or 0))
                 if self._strategy_uses_indicator_history(strategy):
                     work_df = self._merge_rsi_history_into_base_df(
@@ -1123,6 +1386,7 @@ class IndicatorManager:
             if k in preserve:
                 continue
             out[k] = v
+        self._apply_lag_divergence_to_candle(out, df, strategy)
         if out_meta is not None:
             out_meta["bar_closed_for_append"] = bool(bar_closed_for_append)
         return out

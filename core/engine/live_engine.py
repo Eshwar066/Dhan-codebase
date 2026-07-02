@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 from run.config import RunMode
 from core.engine.base_engine import BaseEngine
 from core.data.candle_aggregator import _bucket_ts, _resolution_to_seconds
+from core.data.feeds.delta_candlestick import engine_timeframe_to_delta_resolution
 from core.engine.live_engine_common import (
     DEFAULT_FEED_STALE_SECONDS,
     LiveEngineHelpersMixin,
@@ -1204,6 +1205,59 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     return out, f"aggregator_alias:{k}"
         return None, "aggregator:empty"
 
+    def _get_exchange_closed_candle(
+        self, symbol: str, tf: Any, bucket_ts: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Delta: closed bar OHLC from WS candlestick cache (authoritative vs aggregator)."""
+        if str(self.venue or "").upper() != "DELTA":
+            return None
+        feed = self.realtime_feed
+        if feed is None:
+            return None
+        supports = getattr(feed, "is_exchange_candle_timeframe", None)
+        if not callable(supports) or not supports(tf):
+            return None
+        getter = getattr(feed, "get_exchange_candle_for_bucket", None)
+        if not callable(getter):
+            return None
+        bucket = bucket_ts
+        if bucket is None:
+            tf_sec = max(60, int(_resolution_to_seconds(str(tf))))
+            now = int(time.time())
+            bucket = now - (now % tf_sec) - tf_sec
+        ex = getter(symbol, int(bucket), timeframe=str(tf))
+        if not ex:
+            return None
+        out = {
+            "symbol": symbol,
+            "bucket_ts": int(ex.get("bucket_ts") or bucket),
+            "open": ex.get("open"),
+            "high": ex.get("high"),
+            "low": ex.get("low"),
+            "close": ex.get("close"),
+            "volume": ex.get("volume", 0),
+            "timestamp": int(ex.get("bucket_ts") or bucket),
+        }
+        ca = self.candle_aggregator
+        apply_fn = getattr(ca, "apply_exchange_candle", None) if ca else None
+        if callable(apply_fn):
+            res = engine_timeframe_to_delta_resolution(str(tf))
+            if res:
+                try:
+                    apply_fn(
+                        symbol,
+                        res,
+                        int(out["bucket_ts"]),
+                        float(out["open"]),
+                        float(out["high"]),
+                        float(out["low"]),
+                        float(out["close"]),
+                        float(out.get("volume") or 0),
+                    )
+                except (TypeError, ValueError):
+                    pass
+        return out
+
     def _reconcile_candle_with_exchange(
         self, symbol: str, candle: Dict[str, Any], tf: Any
     ) -> Dict[str, Any]:
@@ -1233,6 +1287,24 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             if val is not None:
                 out[key] = val
         out["bucket_ts"] = int(ex.get("bucket_ts") or bucket)
+        ca = self.candle_aggregator
+        apply_fn = getattr(ca, "apply_exchange_candle", None) if ca else None
+        if callable(apply_fn):
+            res = engine_timeframe_to_delta_resolution(str(tf))
+            if res:
+                try:
+                    apply_fn(
+                        symbol,
+                        res,
+                        int(out["bucket_ts"]),
+                        float(out["open"]),
+                        float(out["high"]),
+                        float(out["low"]),
+                        float(out["close"]),
+                        float(out.get("volume") or 0),
+                    )
+                except (TypeError, ValueError):
+                    pass
         return out
 
     # >> Session end candle flush function
@@ -2171,7 +2243,16 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         candle, candle_source = self._get_last_closed_from_aggregator(
                             symbol, tf
                         )
-                        if candle:
+                        agg_bucket = (
+                            self._candle_bucket_start_unix(candle) if candle else None
+                        )
+                        ex_candle = self._get_exchange_closed_candle(
+                            symbol, tf, bucket_ts=agg_bucket
+                        )
+                        if ex_candle:
+                            candle = ex_candle
+                            candle_source = "exchange_ws"
+                        elif candle:
                             reconciled = self._reconcile_candle_with_exchange(
                                 symbol, candle, tf
                             )

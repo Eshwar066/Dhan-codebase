@@ -294,15 +294,18 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
             rsi_period=cfg.rsi_period,
             lookback_swings=cfg.rsi_lookback_swings,
         )
-        row = df.iloc[-1]
-        rsi = float(row.get("rsi") or float("nan"))
-        if pd.isna(rsi):
-            return None
-
-        if bool(row.get("rsi_div_bull")) and rsi <= RSI_OVERSOLD + 5:
-            return "LONG"
-        if bool(row.get("rsi_div_bear")) and rsi >= RSI_OVERBOUGHT - 5:
-            return "SHORT"
+        # Fractal swings (right=2) confirm on a lagged bar — scan the confirm tail, not only iloc[-1].
+        tail = max(1, int(cfg.swing_right) + 1)
+        start = max(0, len(df) - tail)
+        for i in range(start, len(df)):
+            row = df.iloc[i]
+            rsi = float(row.get("rsi") or float("nan"))
+            if pd.isna(rsi):
+                continue
+            if bool(row.get("rsi_div_bull")) and rsi <= RSI_OVERSOLD + 5:
+                return "LONG"
+            if bool(row.get("rsi_div_bear")) and rsi >= RSI_OVERBOUGHT - 5:
+                return "SHORT"
         return None
 
     def _tick_signal_age(self, symbol: str) -> None:

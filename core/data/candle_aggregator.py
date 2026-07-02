@@ -49,6 +49,8 @@ TIMEFRAME_SECONDS = {
 }
 SECONDS_1M = 60
 MAX_CLOSED_LEN = 300
+# Reject tick prices this far from the current bar close (bad WS prints).
+MAX_TICK_DEVIATION_FRAC = 0.01
 IST_TZ = timezone(timedelta(hours=5, minutes=30))
 
 # MCX regular session (Asia/Kolkata), aligned with core/utils/session/market_calendar.MARKET_SESSIONS["MCX"].
@@ -143,6 +145,15 @@ class CandleAggregator:
         self._tick_count_by_symbol_bucket: Dict[str, int] = {}
         # symbol|YYYY-MM-DD (IST): session-end flush already applied for that local day.
         self._session_end_flush_done: set[str] = set()
+        # When set, ``on_tick`` does not mutate OHLC for that TF (WS candlestick is authoritative).
+        self._exchange_native_tf_seconds: set[int] = set()
+
+    def set_exchange_native_resolutions(self, resolutions: List[str]) -> None:
+        """Mark resolutions whose OHLC comes from exchange candlestick WS, not ticks."""
+        for raw in resolutions or []:
+            r = str(raw or "").strip().lower()
+            if r:
+                self._exchange_native_tf_seconds.add(_resolution_to_seconds(r))
 
     def _prune_session_end_flush_keys(self, dt_ist: datetime) -> None:
         if len(self._session_end_flush_done) <= 400:
@@ -224,6 +235,28 @@ class CandleAggregator:
             }
         return self._state[symbol][tf_seconds]
 
+    def _tick_price_sane(self, symbol: str, price: float, bucket_1m: int) -> bool:
+        """Drop outlier ticks that would poison 1m high/low (e.g. 58300 on ~61100)."""
+        if price <= 0:
+            return False
+        cell_1m = self._state.get(symbol, {}).get(SECONDS_1M)
+        ref = None
+        if cell_1m:
+            cur = cell_1m.get("current")
+            if cur is not None and int(cur.get("bucket_ts") or 0) == bucket_1m:
+                try:
+                    ref = float(cur.get("close") or cur.get("open") or 0)
+                except (TypeError, ValueError):
+                    ref = None
+            if (ref is None or ref <= 0) and cell_1m.get("closed"):
+                try:
+                    ref = float(cell_1m["closed"][-1].get("close") or 0)
+                except (TypeError, ValueError, IndexError):
+                    ref = None
+        if ref is None or ref <= 0:
+            return True
+        return abs(price - ref) / ref <= MAX_TICK_DEVIATION_FRAC
+
     def on_tick(self, symbol: str, price: float, volume: float, timestamp_sec: float) -> None:
         """
         Process one tick. O(1). Updates only 1m current; closes 1m and propagates when bucket changes.
@@ -253,6 +286,9 @@ class CandleAggregator:
                 )
         self._last_tick_ts_by_symbol[symbol] = ts
 
+        if SECONDS_1M in self._exchange_native_tf_seconds:
+            return
+
         cell_1m = self._ensure_symbol_tf(symbol, SECONDS_1M)
         cur = cell_1m["current"]
         bucket_1m = _bucket_ts(
@@ -269,6 +305,9 @@ class CandleAggregator:
                 cell_1m["closed"].append(closed_1m)
                 cell_1m["current"] = None
                 self._propagate_from_closed_1m(symbol, closed_1m)
+            return
+
+        if not self._tick_price_sane(symbol, price, bucket_1m):
             return
 
         if cur is None:
@@ -408,22 +447,59 @@ class CandleAggregator:
         if close <= 0:
             return False
         tf_sec = _resolution_to_seconds(resolution)
+        bucket = int(bucket_ts)
         cell = self._ensure_symbol_tf(symbol, tf_sec)
         replacement = _candle_to_dict(
-            symbol, open_p, high, low, close, volume, int(bucket_ts)
+            symbol, open_p, high, low, close, volume, bucket
         )
         closed = cell["closed"]
-        if closed and int(closed[-1].get("bucket_ts") or 0) == int(bucket_ts):
+        cur = cell["current"]
+
+        def _finalize_current() -> None:
+            nonlocal cur
+            if cur is None:
+                return
+            prev = dict(cur)
+            prev_b = int(prev.get("bucket_ts") or 0)
+            if closed and int(closed[-1].get("bucket_ts") or 0) == prev_b:
+                closed[-1] = prev
+            else:
+                closed.append(prev)
+            if tf_sec == SECONDS_1M:
+                self._propagate_from_closed_1m(symbol, prev)
+            cell["current"] = None
+            cur = None
+
+        if cur is not None:
+            cur_b = int(cur.get("bucket_ts") or 0)
+            if cur_b < bucket:
+                _finalize_current()
+                cell["current"] = replacement
+                return True
+            if cur_b == bucket:
+                cell["current"] = replacement
+                return True
+            if cur_b > bucket:
+                for i in range(len(closed) - 1, max(-1, len(closed) - 8), -1):
+                    if int(closed[i].get("bucket_ts") or 0) == bucket:
+                        closed[i] = replacement
+                        return True
+                return False
+
+        if closed and int(closed[-1].get("bucket_ts") or 0) == bucket:
             closed[-1] = replacement
             return True
-        cur = cell["current"]
-        if cur is not None and int(cur.get("bucket_ts") or 0) == int(bucket_ts):
+        last_closed_b = int(closed[-1].get("bucket_ts") or 0) if closed else 0
+        if bucket > last_closed_b:
             cell["current"] = replacement
             return True
-        for i in range(len(closed) - 1, max(-1, len(closed) - 6), -1):
-            if int(closed[i].get("bucket_ts") or 0) == int(bucket_ts):
+        for i in range(len(closed) - 1, max(-1, len(closed) - 8), -1):
+            if int(closed[i].get("bucket_ts") or 0) == bucket:
                 closed[i] = replacement
                 return True
+        if not closed:
+            cell["current"] = replacement
+            return True
         return False
 
     def apply_exchange_1m_candle(

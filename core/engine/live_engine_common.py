@@ -985,7 +985,6 @@ class LiveEngineHelpersMixin:
         """Drain tick queue into candle_aggregator (single state owner). Non-blocking; cap per cycle."""
         if not self.tick_queue or not self.candle_aggregator:
             return
-        self._drain_candle_queue()
         if not hasattr(self, "_tick_debug_count"):
             self._tick_debug_count = 0
             self._tick_debug_last_log = time.time()
@@ -1036,6 +1035,7 @@ class LiveEngineHelpersMixin:
                     )
                 else:
                     logger.exception("Aggregator error for symbol=%s", s)
+        self._drain_candle_queue()
 
     def _drain_candle_queue(self) -> None:
         """Apply Delta exchange candlestick OHLC over tick-built bars (per resolution)."""

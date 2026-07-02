@@ -437,6 +437,11 @@ class EngineFactory:
                         )
                         realtime_feed.set_tick_queue(tick_queue)
                         realtime_feed.set_candle_queue(candle_queue)
+                        mark_native = getattr(
+                            candle_aggregator, "set_exchange_native_resolutions", None
+                        )
+                        if callable(mark_native) and candlestick_resolutions:
+                            mark_native(candlestick_resolutions)
                     realtime_feed.start()
                     if hasattr(broker, "set_realtime_feed"):
                         broker.set_realtime_feed(realtime_feed)
