@@ -41,6 +41,7 @@ from core.data.candle_aggregator import (
     _resolution_to_seconds,
 )
 from core.data.feeds import DeltaWebSocketFeed, DhanWebSocketFeed
+from core.data.feeds.delta_candlestick import resolutions_from_engine_timeframes
 from core.data.feeds.dhan_order_update_feed import DhanOrderUpdateFeed
 from core.broker import (
     DhanBroker,
@@ -383,6 +384,7 @@ class EngineFactory:
         realtime_feed = None
         dhan_order_update_feed = None
         tick_queue = None
+        candle_queue = None
         candle_aggregator = None
         if config.broker_name == "DELTA":
             try:
@@ -396,6 +398,18 @@ class EngineFactory:
                 feed_symbols = LiveEngine._collect_feed_symbols(
                     config.symbols or [], strategies, eval_modes
                 )
+                engine_timeframes = LiveEngine._collect_engine_timeframes_from_strategies(
+                    strategies, strategy, eval_modes
+                )
+                candlestick_resolutions, unsupported_tfs = (
+                    resolutions_from_engine_timeframes(engine_timeframes)
+                )
+                for tf in unsupported_tfs:
+                    logger.warning(
+                        "Delta WS has no candlestick channel for strategy timeframe %s; "
+                        "bars will be built from v2/ticker ticks",
+                        tf,
+                    )
                 if not feed_symbols:
                     logger.info(
                         "Delta market WS skipped: no candle-based feed symbols for engine %s",
@@ -407,6 +421,7 @@ class EngineFactory:
                         api_secret=api_secret,
                         symbols=feed_symbols,
                         timeframe=timeframe,
+                        candlestick_resolutions=candlestick_resolutions,
                         testnet=config.delta_testnet,
                         india=config.delta_india,
                         subscribe_private=True,
@@ -415,12 +430,16 @@ class EngineFactory:
                     )
                     if LiveEngine.needs_candle_aggregator(strategies, eval_modes):
                         tick_queue = queue.Queue(maxsize=TICK_QUEUE_MAXSIZE)
+                        candle_queue = queue.Queue(maxsize=5000)
                         candle_aggregator = CandleAggregator(
                             engine_logger=engine_logger,
                             debug_mode=bool(getattr(config, "debug_mode", False)),
                         )
                         realtime_feed.set_tick_queue(tick_queue)
+                        realtime_feed.set_candle_queue(candle_queue)
                     realtime_feed.start()
+                    if hasattr(broker, "set_realtime_feed"):
+                        broker.set_realtime_feed(realtime_feed)
             elif not api_key or not api_secret:
                 logger.warning("Delta realtime feed skipped: missing API credentials")
         elif config.broker_name == "DHAN":
@@ -507,6 +526,7 @@ class EngineFactory:
             position_manager=position_manager,
             realtime_feed=realtime_feed,
             tick_queue=tick_queue,
+            candle_queue=candle_queue,
             candle_aggregator=candle_aggregator,
             engine_id=config.engine_id,
             venue=config.broker_name,

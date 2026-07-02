@@ -38,6 +38,14 @@ TIMEFRAME_SECONDS = {
     "4": 14400,
     "1d": 86400,
     "d": 86400,
+    "3m": 180,
+    "3": 180,
+    "6h": 21600,
+    "6": 21600,
+    "12h": 43200,
+    "12": 43200,
+    "1w": 604800,
+    "w": 604800,
 }
 SECONDS_1M = 60
 MAX_CLOSED_LEN = 300
@@ -370,6 +378,68 @@ class CandleAggregator:
                 closed_1m["volume"],
                 target_bucket,
             )
+
+    def apply_exchange_candle(
+        self,
+        symbol: str,
+        resolution: str,
+        bucket_ts: int,
+        open_p: float,
+        high: float,
+        low: float,
+        close: float,
+        volume: float = 0.0,
+    ) -> bool:
+        """
+        Overwrite tick-built OHLC with Delta exchange candlestick data for ``bucket_ts``.
+        Used for any WS-native resolution (1m, 5m, 1h, …). Non-native TFs stay tick-built.
+        """
+        symbol = str(symbol).strip()
+        if not symbol or bucket_ts <= 0:
+            return False
+        try:
+            open_p = float(open_p)
+            high = float(high)
+            low = float(low)
+            close = float(close)
+            volume = float(volume or 0.0)
+        except (TypeError, ValueError):
+            return False
+        if close <= 0:
+            return False
+        tf_sec = _resolution_to_seconds(resolution)
+        cell = self._ensure_symbol_tf(symbol, tf_sec)
+        replacement = _candle_to_dict(
+            symbol, open_p, high, low, close, volume, int(bucket_ts)
+        )
+        closed = cell["closed"]
+        if closed and int(closed[-1].get("bucket_ts") or 0) == int(bucket_ts):
+            closed[-1] = replacement
+            return True
+        cur = cell["current"]
+        if cur is not None and int(cur.get("bucket_ts") or 0) == int(bucket_ts):
+            cell["current"] = replacement
+            return True
+        for i in range(len(closed) - 1, max(-1, len(closed) - 6), -1):
+            if int(closed[i].get("bucket_ts") or 0) == int(bucket_ts):
+                closed[i] = replacement
+                return True
+        return False
+
+    def apply_exchange_1m_candle(
+        self,
+        symbol: str,
+        bucket_ts: int,
+        open_p: float,
+        high: float,
+        low: float,
+        close: float,
+        volume: float = 0.0,
+    ) -> bool:
+        """Backward-compatible alias for 1m exchange candle apply."""
+        return self.apply_exchange_candle(
+            symbol, "1m", bucket_ts, open_p, high, low, close, volume
+        )
 
     def get_last_closed_candle(self, symbol: str, resolution: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """

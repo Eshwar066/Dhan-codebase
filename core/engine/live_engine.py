@@ -79,6 +79,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         latency_critical_cycles: int = 3,
         symbol_error_threshold: int = 5,
         tick_queue: Optional[Any] = None,
+        candle_queue: Optional[Any] = None,
         candle_aggregator: Optional[Any] = None,
         universe_service: Optional[Any] = None,
         run_mode: Optional[RunMode] = None,
@@ -134,6 +135,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self.position_manager.on_main_exit_fill = self._on_pm_main_exit_fill
         self.realtime_feed = realtime_feed
         self.tick_queue = tick_queue
+        self.candle_queue = candle_queue
         self.candle_aggregator = candle_aggregator
         self.engine_id = engine_id or "live"
         self.venue = venue or ""
@@ -1202,6 +1204,37 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     return out, f"aggregator_alias:{k}"
         return None, "aggregator:empty"
 
+    def _reconcile_candle_with_exchange(
+        self, symbol: str, candle: Dict[str, Any], tf: Any
+    ) -> Dict[str, Any]:
+        """Delta-only: use WS candlestick OHLC when this TF has a native exchange channel."""
+        if str(self.venue or "").upper() != "DELTA":
+            return candle
+        feed = self.realtime_feed
+        if feed is None:
+            return candle
+        supports = getattr(feed, "is_exchange_candle_timeframe", None)
+        if not callable(supports) or not supports(tf):
+            return candle
+        getter = getattr(feed, "get_exchange_candle_for_bucket", None)
+        if not callable(getter):
+            return candle
+        bucket = candle.get("bucket_ts")
+        if bucket is None:
+            bucket = self._candle_bucket_start_unix(candle)
+        if bucket is None:
+            return candle
+        ex = getter(symbol, int(bucket), timeframe=str(tf))
+        if not ex:
+            return candle
+        out = dict(candle)
+        for key in ("open", "high", "low", "close", "volume"):
+            val = ex.get(key)
+            if val is not None:
+                out[key] = val
+        out["bucket_ts"] = int(ex.get("bucket_ts") or bucket)
+        return out
+
     # >> Session end candle flush function
     def _maybe_flush_session_end_candles(self) -> None:
         """
@@ -2116,6 +2149,13 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         candle, candle_source = self._get_last_closed_from_aggregator(
                             symbol, tf
                         )
+                        if candle:
+                            reconciled = self._reconcile_candle_with_exchange(
+                                symbol, candle, tf
+                            )
+                            if reconciled is not candle:
+                                candle = reconciled
+                                candle_source = f"{candle_source}+exchange"
 
                         if candle:
                             self._last_candle_timestamp[symbol] = time.time()

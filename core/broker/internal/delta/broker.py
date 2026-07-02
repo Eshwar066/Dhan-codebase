@@ -89,6 +89,11 @@ class DeltaBroker(BaseBroker):
     def __init__(self, api, position_manager=None, intent_store=None):
         super().__init__(position_manager=position_manager, intent_store=intent_store)
         self.api = api
+        self._realtime_feed: Optional[Any] = None
+
+    def set_realtime_feed(self, feed: Any) -> None:
+        """Attach Delta WS feed for orders/positions (REST remains fallback)."""
+        self._realtime_feed = feed
 
     @staticmethod
     def _wallet_available(wallet: Optional[Dict[str, Any]]) -> Optional[float]:
@@ -499,6 +504,18 @@ class DeltaBroker(BaseBroker):
 
     # used in live engine
     def get_positions_for_recon(self):
+        feed = self._realtime_feed
+        if feed is not None and hasattr(feed, "get_positions_for_recon"):
+            try:
+                if feed.is_connected() and feed.ws_positions_ready():
+                    ws_positions = feed.get_positions_for_recon()
+                    if ws_positions is not None:
+                        return ws_positions
+            except Exception as e:
+                logger.debug(
+                    "Delta WS positions unavailable, using REST fallback: %s", e
+                )
+
         positions = self.api.get_positions()
         if not positions:
             return {}
@@ -528,27 +545,41 @@ class DeltaBroker(BaseBroker):
         """
         Returns normalized list of open/pending orders.
 
-        Used for:
-        - Engine restart reconciliation
-        - PositionManager consistency checks
-        - Preventing duplicate orders
+        Prefers Delta WebSocket orders snapshot when ready; falls back to REST live orders.
         """
+        feed = self._realtime_feed
+        if feed is not None and hasattr(feed, "get_open_orders_ws"):
+            try:
+                if feed.is_connected() and feed.ws_open_orders_ready():
+                    ws_orders = feed.get_open_orders_ws()
+                    if ws_orders is not None:
+                        return self._normalize_open_orders(ws_orders)
+            except Exception as e:
+                logger.debug(
+                    "Delta WS open orders unavailable, using REST fallback: %s", e
+                )
 
         orders = self.api.get_order_list() or []
-        # pdb.set_trace()
-        open_states = {"open", "pending", "placed", "trigger pending"}
+        return self._normalize_open_orders(orders)
 
-        normalized_orders = []
-
-        for o in orders:
-
+    @staticmethod
+    def _normalize_open_orders(orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        open_states = {
+            "open",
+            "pending",
+            "placed",
+            "trigger pending",
+            "live",
+            "untriggered",
+        }
+        normalized_orders: List[Dict[str, Any]] = []
+        for o in orders or []:
+            if not isinstance(o, dict):
+                continue
             status = (o.get("status") or "").lower()
-
             if status not in open_states:
                 continue
-
             product_id = o.get("product_id") or o.get("symbol")
-
             normalized_orders.append(
                 {
                     "order_id": o.get("order_id"),
@@ -561,7 +592,6 @@ class DeltaBroker(BaseBroker):
                     "reduce_only": o.get("reduce_only"),
                 }
             )
-
         return normalized_orders
 
     def update_order_price(

@@ -971,6 +971,7 @@ class LiveEngineHelpersMixin:
         """Drain tick queue into candle_aggregator (single state owner). Non-blocking; cap per cycle."""
         if not self.tick_queue or not self.candle_aggregator:
             return
+        self._drain_candle_queue()
         if not hasattr(self, "_tick_debug_count"):
             self._tick_debug_count = 0
             self._tick_debug_last_log = time.time()
@@ -1021,3 +1022,34 @@ class LiveEngineHelpersMixin:
                     )
                 else:
                     logger.exception("Aggregator error for symbol=%s", s)
+
+    def _drain_candle_queue(self) -> None:
+        """Apply Delta exchange candlestick OHLC over tick-built bars (per resolution)."""
+        if not self.candle_queue or not self.candle_aggregator:
+            return
+        apply_fn = getattr(self.candle_aggregator, "apply_exchange_candle", None)
+        if not callable(apply_fn):
+            return
+        for _ in range(200):
+            try:
+                row = self.candle_queue.get_nowait()
+            except Exception:
+                break
+            try:
+                sym = row.get("symbol")
+                bucket = row.get("bucket_ts")
+                resolution = row.get("resolution")
+                if sym is None or bucket is None or not resolution:
+                    continue
+                apply_fn(
+                    sym,
+                    str(resolution),
+                    int(bucket),
+                    row.get("open"),
+                    row.get("high"),
+                    row.get("low"),
+                    row.get("close"),
+                    row.get("volume", 0),
+                )
+            except Exception as e:
+                logger.debug("Exchange candle apply failed: %s", e)

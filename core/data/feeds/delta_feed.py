@@ -15,22 +15,11 @@ from core.data.feeds.base_feed import RealtimeFeed
 logger = logging.getLogger(__name__)
 from core.library.delta_websocket import FEED_STALL_SEC, DeltaWebSocket
 
-# Map strategy timeframe to Delta candlestick channel name
-RESOLUTION_MAP = {
-    "1": "1m",
-    "3": "3m",
-    "5": "5m",
-    "15": "15m",
-    "30": "30m",
-    "60": "1h",
-    "1h": "1h",
-    "2h": "2h",
-    "4h": "4h",
-    "6h": "6h",
-    "12h": "12h",
-    "1d": "1d",
-    "1w": "1w",
-}
+from core.data.feeds.delta_candlestick import (
+    delta_ws_supports_timeframe,
+    engine_timeframe_to_delta_resolution,
+    resolution_to_seconds,
+)
 
 
 class DeltaWebSocketFeed(RealtimeFeed):
@@ -45,6 +34,7 @@ class DeltaWebSocketFeed(RealtimeFeed):
         api_secret: str,
         symbols: List[str],
         timeframe: str = "60",
+        candlestick_resolutions: Optional[List[str]] = None,
         testnet: bool = True,
         india: bool = True,
         subscribe_private: bool = True,
@@ -55,6 +45,9 @@ class DeltaWebSocketFeed(RealtimeFeed):
         self.api_secret = api_secret
         self.symbols = list(symbols) if symbols else []
         self.timeframe = str(timeframe)
+        self._candlestick_resolutions = self._normalize_candlestick_resolutions(
+            candlestick_resolutions, timeframe=self.timeframe
+        )
         self.testnet = testnet
         self.india = india
         self.subscribe_private = subscribe_private
@@ -70,6 +63,7 @@ class DeltaWebSocketFeed(RealtimeFeed):
         self._ws: Optional[DeltaWebSocket] = None
         self._auth_done = False
         self._tick_queue: Optional[Any] = None
+        self._candle_queue: Optional[Any] = None
         self._public_sub_gen_applied: int = -1
         self._stall_reconnect_triggered: bool = False
         self._user_trade_callback: Optional[Any] = None
@@ -77,6 +71,40 @@ class DeltaWebSocketFeed(RealtimeFeed):
     def set_tick_queue(self, queue: Any) -> None:
         """Push normalized ticks to queue for CandleAggregator. Set before start()."""
         self._tick_queue = queue
+
+    def set_candle_queue(self, queue: Any) -> None:
+        """Push exchange candlestick OHLC (matches REST) into the live candle pipeline."""
+        self._candle_queue = queue
+
+    def _push_candle(self, symbol: str, candle: Dict[str, Any]) -> None:
+        if self._candle_queue is None:
+            return
+        bucket_ts = candle.get("bucket_ts")
+        resolution = candle.get("resolution")
+        if bucket_ts is None or not resolution:
+            return
+        try:
+            self._candle_queue.put_nowait(
+                {
+                    "symbol": symbol,
+                    "resolution": str(resolution),
+                    "bucket_ts": int(bucket_ts),
+                    "open": candle.get("open"),
+                    "high": candle.get("high"),
+                    "low": candle.get("low"),
+                    "close": candle.get("close"),
+                    "volume": candle.get("volume", 0),
+                }
+            )
+        except queue.Full:
+            if self._engine_logger:
+                self._engine_logger.log(
+                    "candle_dropped_queue_full",
+                    f"Delta candle dropped due to full queue symbol={symbol}",
+                    symbol=symbol,
+                )
+        except Exception as e:
+            logger.debug("Delta feed: candle queue put failed: %s", e)
 
     def _push_tick(
         self, symbol: str, price: float, volume: float, timestamp_sec: float
@@ -102,14 +130,47 @@ class DeltaWebSocketFeed(RealtimeFeed):
         except Exception as e:
             logger.debug("Delta feed: tick queue put failed: %s", e)
 
-    def _channel_candlestick(self) -> str:
-        res = RESOLUTION_MAP.get(self.timeframe, "1h")
-        return f"candlestick_{res}"
+    @staticmethod
+    def _normalize_candlestick_resolutions(
+        resolutions: Optional[List[str]],
+        *,
+        timeframe: str,
+    ) -> List[str]:
+        """Unique, sorted Delta candlestick channel suffixes (e.g. 1m, 5m)."""
+        out: List[str] = []
+        seen: set[str] = set()
+        for raw in resolutions or []:
+            res = engine_timeframe_to_delta_resolution(str(raw or "").strip())
+            if res and res not in seen:
+                seen.add(res)
+                out.append(res)
+        if not out:
+            fallback = engine_timeframe_to_delta_resolution(timeframe)
+            if fallback:
+                out = [fallback]
+        out.sort(key=resolution_to_seconds)
+        return out
+
+    def _channel_candlestick(self, resolution: str) -> str:
+        return f"candlestick_{resolution}"
+
+    def _candlestick_channels(
+        self, symbols: List[str], resolutions: List[str]
+    ) -> List[Dict[str, Any]]:
+        return [
+            {"name": self._channel_candlestick(res), "symbols": symbols}
+            for res in resolutions
+        ]
+
+    def is_exchange_candle_timeframe(self, timeframe: Optional[str]) -> bool:
+        """Delta-only: TF has a native WS candlestick channel (else use tick aggregator)."""
+        return delta_ws_supports_timeframe(timeframe)
 
     def start(self) -> None:
         if self._ws:
             return
         on_tick = self._push_tick if self._tick_queue else None
+        on_candle = self._push_candle if self._candle_queue else None
 
         def _on_feed_stall(stall_sec: float) -> None:
             msg = f"Delta feed stall: no ticks received for {stall_sec:.0f}s"
@@ -168,6 +229,7 @@ class DeltaWebSocketFeed(RealtimeFeed):
             on_auth=self._on_auth,
             on_subscriptions=_on_subscriptions,
             on_tick=on_tick,
+            on_candle=on_candle,
             on_feed_stall=(
                 _on_feed_stall
                 if (self._engine_logger or self._telegram_alert)
@@ -213,7 +275,7 @@ class DeltaWebSocketFeed(RealtimeFeed):
             return
         channels = [
             {"name": "v2/ticker", "symbols": symbols},
-            {"name": self._channel_candlestick(), "symbols": symbols},
+            *self._candlestick_channels(symbols, self._candlestick_resolutions),
             {"name": "l2_orderbook", "symbols": symbols},
         ]
         self._ws.subscribe(channels)
@@ -222,7 +284,11 @@ class DeltaWebSocketFeed(RealtimeFeed):
             "Delta feed: re-subscribed public channels after reconnect (gen=%s)",
             gen,
         )
-        logger.info("Delta feed: subscribed symbols=%s", symbols)
+        logger.info(
+            "Delta feed: subscribed symbols=%s candlestick_resolutions=%s",
+            symbols,
+            list(self._candlestick_resolutions),
+        )
         with self._l2_sub_lock:
             self._subscribed_l2_symbols = {str(s).strip().upper() for s in symbols}
             self._l2_gen_applied = gen
@@ -309,12 +375,45 @@ class DeltaWebSocketFeed(RealtimeFeed):
             "timestamp": raw.get("timestamp"),
         }
 
+    def get_exchange_candle_for_bucket(
+        self,
+        symbol: str,
+        bucket_ts: int,
+        timeframe: Optional[str] = None,
+        resolution: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Delta WS candlestick OHLC for a bucket (same source as REST historical)."""
+        if not self._ws:
+            return None
+        res = resolution or engine_timeframe_to_delta_resolution(timeframe)
+        if not res:
+            return None
+        raw = self._ws.get_candle_for_bucket(symbol, int(bucket_ts), res)
+        if not raw:
+            return None
+        try:
+            return {
+                "symbol": raw.get("symbol", symbol),
+                "resolution": res,
+                "bucket_ts": int(raw.get("bucket_ts") or bucket_ts),
+                "open": float(raw.get("open") or 0),
+                "high": float(raw.get("high") or 0),
+                "low": float(raw.get("low") or 0),
+                "close": float(raw.get("close") or 0),
+                "volume": float(raw.get("volume") or 0),
+            }
+        except (TypeError, ValueError):
+            return None
+
     def get_last_candle(
         self, symbol: str, resolution: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         if not self._ws:
             return None
-        raw = self._ws.get_last_candle(symbol)
+        res = engine_timeframe_to_delta_resolution(resolution) if resolution else None
+        if not res:
+            res = engine_timeframe_to_delta_resolution(self.timeframe)
+        raw = self._ws.get_last_candle(symbol, res)
         if not raw:
             return None
         ts = raw.get("timestamp")
@@ -390,14 +489,55 @@ class DeltaWebSocketFeed(RealtimeFeed):
         return None
 
     def get_orders(self, symbol: str) -> List[Dict[str, Any]]:
+        """Open orders for symbol from WS snapshot (empty when WS not ready)."""
         if not self._ws:
             return []
-        return self._ws.get_orders(symbol)
+        return self._ws.get_open_orders_ws(symbol=symbol)
+
+    def get_open_orders_ws(self) -> Optional[List[Dict[str, Any]]]:
+        """
+        All open orders from Delta WS snapshot.
+        Returns None when WS is not connected or orders snapshot not received yet (caller should use REST).
+        """
+        if not self._ws or not self._ws.is_connected() or not self._ws.ws_open_orders_ready():
+            return None
+        return self._ws.get_open_orders_ws()
+
+    def ws_open_orders_ready(self) -> bool:
+        return bool(
+            self._ws and self._ws.is_connected() and self._ws.ws_open_orders_ready()
+        )
+
+    def ws_positions_ready(self) -> bool:
+        return bool(
+            self._ws and self._ws.is_connected() and self._ws.ws_positions_ready()
+        )
 
     def get_positions(self) -> Dict[str, Dict[str, Any]]:
         if not self._ws:
             return {}
         return self._ws.get_positions()
+
+    def get_positions_for_recon(self) -> Optional[Dict[str, Dict[str, Any]]]:
+        """
+        Broker-style position map from WS snapshot.
+        Returns None when WS positions snapshot is not ready (caller should use REST).
+        """
+        if not self._ws or not self._ws.is_connected() or not self._ws.ws_positions_ready():
+            return None
+        rows = self._ws.get_positions_rows_ws()
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            sym = str(row.get("tradingSymbol") or "").strip()
+            if not sym:
+                continue
+            out[sym] = {
+                "qty": int(row.get("netQty", 0)),
+                "avg_price": float(row.get("avgPrice", 0)),
+                "segment": row.get("segment", "DELTA"),
+                "lot_size": int(row.get("lotSize", 1)),
+            }
+        return out
 
     def get_recent_user_trades(self, limit: int = 200) -> List[Dict[str, Any]]:
         """Drain recent private user-trade events from WebSocket buffer."""
