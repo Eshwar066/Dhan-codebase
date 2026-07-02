@@ -253,6 +253,20 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
         except (TypeError, ValueError):
             return default
 
+    def _signal_from_candle(self, candle: dict) -> Optional[str]:
+        """Use enriched / backtest-prepared indicator columns when present."""
+        rsi_raw = pd.to_numeric(candle.get("rsi"), errors="coerce")
+        if pd.isna(rsi_raw):
+            return None
+        rsi = float(rsi_raw)
+        bull = bool(self._numeric_flag(candle.get("rsi_div_bull")))
+        bear = bool(self._numeric_flag(candle.get("rsi_div_bear")))
+        if bull and rsi <= RSI_OVERSOLD + 5:
+            return "LONG"
+        if bear and rsi >= RSI_OVERBOUGHT - 5:
+            return "SHORT"
+        return None
+
     def _scan_signal_timeframe(
         self, candles: List[dict]
     ) -> Optional[str]:
@@ -260,18 +274,7 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
         if not candles:
             return None
 
-        last = candles[-1]
-        rsi_raw = pd.to_numeric(last.get("rsi"), errors="coerce")
-        if not pd.isna(rsi_raw):
-            rsi = float(rsi_raw)
-            bull = bool(self._numeric_flag(last.get("rsi_div_bull")))
-            bear = bool(self._numeric_flag(last.get("rsi_div_bear")))
-            if bull and rsi <= RSI_OVERSOLD + 5:
-                return "LONG"
-            if bear and rsi >= RSI_OVERBOUGHT - 5:
-                return "SHORT"
-
-        # Fallback: recompute from buffered OHLC when overlay/jsonl flags are missing.
+        # Always derive RSI + divergence from OHLC — live_append/jsonl overlays can be stale.
         df = self._candles_to_df(candles)
         if len(df) < 15:
             return None
@@ -287,6 +290,7 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
             swing_high_price_col="swing_high_price",
             swing_low_price_col="swing_low_price",
             rsi_period=cfg.rsi_period,
+            lookback_swings=cfg.rsi_lookback_swings,
         )
         row = df.iloc[-1]
         rsi = float(row.get("rsi") or float("nan"))
@@ -376,13 +380,12 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
             return None
 
         self._tick_signal_age(symbol)
-        n_need = self.get_warmup_period()
-        recent = ctx.get_recent_candles(n_need) if ctx else []
-        if len(recent) < 30:
-            return None
-
-        # === Scan signal timeframe ===
-        sig_side = self._scan_signal_timeframe(recent)
+        sig_side = self._signal_from_candle(candle)
+        if not sig_side:
+            n_need = self.get_structure_lookback()
+            recent = ctx.get_recent_candles(n_need) if ctx else []
+            if len(recent) >= 30:
+                sig_side = self._scan_signal_timeframe(recent)
         if sig_side:
             self._set_active_signal(symbol, sig_side)
 

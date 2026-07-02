@@ -82,12 +82,18 @@ def add_market_structure(
     Full SMC-style feature pass on OHLCV dataframe.
 
     Safe to call from ``strategy.prepare_indicators`` (live + backtest).
-    """
+  """
     if df is None or len(df) == 0:
         return df
 
     cfg = config or MarketStructureConfig()
     p = cfg.swing_prefix
+
+    # Drop prior structure columns so stale jsonl/live_append values cannot
+    # pollute RSI (add_rsi_divergence reuses an existing ``rsi`` column).
+    stale = [c for c in market_structure_column_names(cfg) if c in df.columns]
+    if stale:
+        df = df.drop(columns=stale)
 
     out = add_swing_points(
         df,
