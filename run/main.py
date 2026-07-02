@@ -125,11 +125,16 @@ def run_engine(config: EngineConfig) -> None:
 
     if config.run_mode == RunMode.BACKTEST:
         bt = config.backtest or {}
+        tf = bt.get("timeframe")
+        if not tf:
+            fn = getattr(getattr(engine, "strategy", None), "entry_timeframe_minutes", None)
+            if callable(fn):
+                tf = str(fn())
         engine.run(
             symbols=symbols,
             start_date=bt.get("start_date", ""),
             end_date=bt.get("end_date", ""),
-            timeframe=bt.get("timeframe", "60"),
+            timeframe=tf or "60",
             exchange=bt.get("exchange", "INDEX"),
             sector=bt.get("sector", "NO"),
         )

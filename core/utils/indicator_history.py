@@ -411,6 +411,7 @@ def load_indicator_history_bars_for_backtest(
             "volume": float(item.get("volume") or 0),
             "symbol": str(item.get("symbol") or symbol).strip().upper(),
             "exchange": str(item.get("exchange") or ex_default).strip().upper(),
+            "indicator_source": str(item.get("source") or ""),
         }
         for k, v in ind.items():
             row[k] = v
@@ -478,6 +479,29 @@ def hydrate_session_keys_from_disk(
     return count
 
 
+def normalize_indicator_scalar(val: Any) -> Optional[Any]:
+    """
+    Match ``delta_refresh`` JSONL scalars: bools as 0.0/1.0 floats, not strings/JSON bools.
+
+    Mirrors ``utils.delta.refresh_crypto_indicator_history._float_or_none`` for disk rows.
+    """
+    if val is None:
+        return None
+    if isinstance(val, str):
+        low = val.strip().lower()
+        if low == "true":
+            return 1.0
+        if low == "false":
+            return 0.0
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return val
+    if math.isnan(f) or math.isinf(f):
+        return None
+    return round(f, 6)
+
+
 def append_indicator_history_row(
     symbol: str,
     timeframe: str,
@@ -535,12 +559,10 @@ def append_indicator_history_row(
             val = None
         if val is None:
             continue
-        try:
-            if isinstance(val, float) and math.isnan(val):
-                continue
-        except Exception:
-            pass
-        indicators[key] = val
+        norm = normalize_indicator_scalar(val)
+        if norm is None:
+            continue
+        indicators[key] = norm
 
     if not indicators and source == "live_append":
         return

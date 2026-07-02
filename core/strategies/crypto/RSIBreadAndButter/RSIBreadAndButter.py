@@ -2,8 +2,8 @@
 RSI Bread & Butter — Delta crypto futures (BTC, ETH, …).
 
 Rules
-- Signal TF (1m or 5m): RSI(14) regular divergence near 70/30 zones.
-- Entry TF: same as signal when signal is 1m; otherwise 1m BOS after 5m signal.
+- Signal TF (1m, 5m, …): RSI(14) regular divergence near 70/30 zones.
+- Entry TF: same as signal — RSI divergence and BOS on one timeframe.
 - Exit: 1:1 target — book 60% size; trail remainder on structure (last swing).
 
 python utils/delta/refresh_crypto_indicator_history.py --only 1
@@ -70,7 +70,7 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
     market_structure_enabled = True
     bracket_leg_tags = ["MAIN_SL", "MAIN_TARGET"]
 
-    # 1 or 5 — RSI divergence on this TF (see ``entry_timeframe_minutes`` for BOS entry TF).
+    # Minutes per bar for RSI divergence + BOS entry (also sets ``self.timeframe``).
     signal_timeframe_minutes: int = DEFAULT_SIGNAL_TF_MINUTES
 
     def __init__(self, *args, **kwargs):
@@ -104,16 +104,8 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
         return max(1, int(self.signal_timeframe_minutes))
 
     def entry_timeframe_minutes(self) -> int:
-        """
-        Engine / BOS timeframe.
-
-        1m signal → 1m entry (same TF for RSI divergence and BOS).
-        Higher signal TF (e.g. 5m) → 1m BOS entry after divergence.
-        """
-        sig = self.signal_timeframe_minutes_resolved()
-        if sig <= 1:
-            return 1
-        return 1
+        """Engine candle TF — RSI divergence and BOS entry use the same resolution."""
+        return self.signal_timeframe_minutes_resolved()
 
     def _sync_entry_timeframe(self) -> None:
         self.timeframe = str(self.entry_timeframe_minutes())
@@ -252,48 +244,40 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
         df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
         return df
 
-    def _resample_ohlc(self, df: pd.DataFrame, minutes: int) -> pd.DataFrame:
-        if df.empty or minutes <= 1:
-            return df
-        tmp = df.set_index("timestamp")
-        rule = f"{int(minutes)}min"
-        out = tmp.resample(rule, label="left", closed="left").agg(
-            {
-                "open": "first",
-                "high": "max",
-                "low": "min",
-                "close": "last",
-                "volume": "sum",
-            }
-        )
-        out = out.dropna(subset=["close"]).reset_index()
-        return out
+    @staticmethod
+    def _numeric_flag(val: Any, default: int = 0) -> int:
+        """Coerce indicator column to int; NaN / missing -> default."""
+        n = pd.to_numeric(val, errors="coerce")
+        if pd.isna(n):
+            return default
+        try:
+            return int(n)
+        except (TypeError, ValueError):
+            return default
+
+    def _signal_from_candle(self, candle: dict) -> Optional[str]:
+        """Use enriched / backtest-prepared indicator columns when present."""
+        rsi_raw = pd.to_numeric(candle.get("rsi"), errors="coerce")
+        if pd.isna(rsi_raw):
+            return None
+        rsi = float(rsi_raw)
+        bull = bool(self._numeric_flag(candle.get("rsi_div_bull")))
+        bear = bool(self._numeric_flag(candle.get("rsi_div_bear")))
+        if bull and rsi <= RSI_OVERSOLD + 5:
+            return "LONG"
+        if bear and rsi >= RSI_OVERBOUGHT - 5:
+            return "SHORT"
+        return None
 
     def _scan_signal_timeframe(
         self, candles: List[dict]
     ) -> Optional[str]:
-        """Return ``LONG`` / ``SHORT`` when signal-TF RSI divergence fires."""
-        signal_m = self.signal_timeframe_minutes_resolved()
-        entry_m = self.entry_timeframe_minutes()
-
-        # 1m signal on 1m engine candles: use indicators already on buffered candles
-        # (from indicator_history overlay / prepare_indicators), not a short-window recompute.
-        if signal_m <= entry_m and candles:
-            last = candles[-1]
-            rsi = float(pd.to_numeric(last.get("rsi"), errors="coerce") or float("nan"))
-            bull = bool(int(pd.to_numeric(last.get("rsi_div_bull"), errors="coerce") or 0))
-            bear = bool(int(pd.to_numeric(last.get("rsi_div_bear"), errors="coerce") or 0))
-            if bull and rsi <= RSI_OVERSOLD + 5:
-                return "LONG"
-            if bear and rsi >= RSI_OVERBOUGHT - 5:
-                return "SHORT"
+        """Return ``LONG`` / ``SHORT`` when RSI divergence fires on the engine TF."""
+        if not candles:
             return None
 
+        # Always derive RSI + divergence from OHLC — live_append/jsonl overlays can be stale.
         df = self._candles_to_df(candles)
-        if len(df) < 20:
-            return None
-        if signal_m > entry_m:
-            df = self._resample_ohlc(df, signal_m)
         if len(df) < 15:
             return None
 
@@ -308,9 +292,12 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
             swing_high_price_col="swing_high_price",
             swing_low_price_col="swing_low_price",
             rsi_period=cfg.rsi_period,
+            lookback_swings=cfg.rsi_lookback_swings,
         )
         row = df.iloc[-1]
         rsi = float(row.get("rsi") or float("nan"))
+        if pd.isna(rsi):
+            return None
 
         if bool(row.get("rsi_div_bull")) and rsi <= RSI_OVERSOLD + 5:
             return "LONG"
@@ -398,11 +385,9 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
             return None
 
         self._tick_signal_age(symbol)
-        n_need = self.get_warmup_period()
+        n_need = self.get_structure_lookback()
         recent = list(ctx.get_recent_candles(n_need) if ctx else [])
-        if len(recent) < 30:
-            return None
-        # Live eval passes enriched ``candle`` separately; keep last buffer row in sync.
+        # Live eval passes enriched ``candle`` separately; keep buffer row in sync.
         bucket = candle.get("bucket_ts")
         if bucket is not None and recent:
             try:
@@ -420,14 +405,15 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
                 elif last_b is not None and last_b < b:
                     recent.append(dict(candle))
 
-        # === Scan signal timeframe ===
-        sig_side = self._scan_signal_timeframe(recent)
+        sig_side = self._signal_from_candle(candle)
+        if not sig_side and len(recent) >= 30:
+            sig_side = self._scan_signal_timeframe(recent)
         if sig_side:
             bucket = candle.get("bucket_ts")
             div_key = f"{symbol}|{sig_side}|{bucket}"
             if div_key not in self._divergence_logged_keys:
                 self._divergence_logged_keys.add(div_key)
-                last = recent[-1] if recent else {}
+                last = recent[-1] if recent else candle
                 logger.info(
                     "RSIBreadAndButter divergence %s %s rsi=%s rsi_div_bull=%s "
                     "rsi_div_bear=%s bos=%s bucket=%s",
@@ -445,7 +431,7 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
         if not active:
             return None
 
-        bos = int(pd.to_numeric(candle.get("bos"), errors="coerce") or 0)
+        bos = self._numeric_flag(candle.get("bos"))
         if active == "LONG" and bos != 1:
             return None
         if active == "SHORT" and bos != -1:

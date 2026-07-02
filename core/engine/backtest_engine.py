@@ -14,6 +14,22 @@ logger = logging.getLogger(__name__)
 _MIN_BACKTEST_BARS = 50
 # Delta intraday cache sometimes stores IST wall-clock as UTC (+5:30 duplicate buckets).
 _DELTA_IST_AS_UTC_OFFSET = pd.Timedelta(hours=5, minutes=30)
+_LIVE_APPEND_SOURCE = "live_append"
+# Recompute these on OHLC during backtest; do not trust ``live_append`` disk rows.
+_STRUCTURE_SIGNAL_KEYS = frozenset(
+    {
+        "rsi",
+        "rsi_div_bull",
+        "rsi_div_bear",
+        "bos",
+        "choch",
+        "structure_trend",
+        "swing_high",
+        "swing_low",
+        "last_swing_high",
+        "last_swing_low",
+    }
+)
 
 
 def _position_allows_strategy_exit(pos: Any) -> bool:
@@ -161,6 +177,9 @@ class BacktestEngine(BaseEngine):
         df: pd.DataFrame,
         stored: Optional[pd.DataFrame],
         keys: list,
+        *,
+        source_col: Optional[str] = None,
+        skip_live_append_keys: Optional[frozenset] = None,
     ) -> pd.DataFrame:
         """Prefer indicator_history.jsonl values over recomputed columns."""
         if (
@@ -176,12 +195,22 @@ class BacktestEngine(BaseEngine):
         st = stored.copy()
         st["_ts_key"] = pd.to_datetime(st["timestamp"], utc=True).astype("int64")
         st = st.drop_duplicates(subset=["_ts_key"], keep="last").set_index("_ts_key")
+        live_src = None
+        if (
+            source_col
+            and source_col in st.columns
+            and skip_live_append_keys
+        ):
+            live_src = out["_ts_key"].map(st[source_col]) == _LIVE_APPEND_SOURCE
         for k in keys:
             if k not in st.columns:
                 continue
             mapped = out["_ts_key"].map(st[k])
-            if k in out.columns:
-                out[k] = mapped.combine_first(out[k])
+            recomputed = out[k] if k in out.columns else None
+            if live_src is not None and k in skip_live_append_keys:
+                mapped = mapped.where(~live_src, recomputed)
+            if recomputed is not None:
+                out[k] = mapped.combine_first(recomputed)
             else:
                 out[k] = mapped
         return out.drop(columns=["_ts_key"])
@@ -456,14 +485,25 @@ class BacktestEngine(BaseEngine):
             )
 
             ind_keys = self._persisted_indicator_keys(self.strategy)
-            key_cols = [k for k in ind_keys if k in df.columns]
-            stored_ind = (
-                df[["timestamp"] + key_cols].copy() if key_cols else None
-            )
-
-            df = self.strategy.prepare_indicators(df)
-            if stored_ind is not None and len(key_cols) > 0:
-                df = self._overlay_stored_indicators(df, stored_ind, key_cols)
+            store_cols = ["timestamp", "indicator_source"] + [
+                k for k in ind_keys if k in df.columns
+            ]
+            stored_ind = df[store_cols].copy() if ind_keys else None
+            prep_cols = [
+                c
+                for c in df.columns
+                if c not in ind_keys and c != "indicator_source"
+            ]
+            df = self.strategy.prepare_indicators(df[prep_cols].copy())
+            if stored_ind is not None and ind_keys:
+                overlay_keys = [k for k in ind_keys if k in stored_ind.columns]
+                df = self._overlay_stored_indicators(
+                    df,
+                    stored_ind,
+                    overlay_keys,
+                    source_col="indicator_source",
+                    skip_live_append_keys=_STRUCTURE_SIGNAL_KEYS,
+                )
 
             df = self._filter_df_calendar_range(df, start_date, end_date)
             warmup = self.strategy.get_warmup_period()
@@ -473,8 +513,15 @@ class BacktestEngine(BaseEngine):
             macro_warmup = max(warmup, macro_slope or 0, macro_ema or 0)
             df = df.iloc[macro_warmup:].reset_index(drop=True)
 
-            # Rolling buffer of recent candles for this symbol (max 50)
-            candle_buffer = deque(maxlen=220)
+            lookback = 0
+            try:
+                fn = getattr(self.strategy, "get_structure_lookback", None)
+                if callable(fn):
+                    lookback = int(fn() or 0)
+            except (TypeError, ValueError):
+                lookback = 0
+            buf_size = max(220, lookback + 20)
+            candle_buffer = deque(maxlen=buf_size)
 
             # -------- Candle loop (candle["htf_trend"] already set above for macro filter) --------
             for _, row in df.iterrows():

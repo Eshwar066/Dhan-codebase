@@ -1002,12 +1002,14 @@ class IndicatorManager:
             if not cache_hit:
                 compute_start = time.time()
                 work_df = df.copy()
+                merge_cap = max(400, int(window or 0))
                 if self._strategy_uses_indicator_history(strategy):
                     work_df = self._merge_rsi_history_into_base_df(
                         work_df,
                         strategy_id=str(getattr(strategy, "name", "unknown_strategy")),
                         symbol=symbol,
                         tf=tf,
+                        max_rows=merge_cap,
                     )
                 try:
                     work_df = strategy.prepare_indicators(work_df)
