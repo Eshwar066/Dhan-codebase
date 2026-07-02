@@ -1306,7 +1306,14 @@ class Tradehull:
                     return nested
             return []
         except Exception as e:
-            self.logger.warning("Dhan get_forever_orders failed: %s", e)
+            err = str(e)
+            if "HTTP client unavailable" in err or "DH-901" in err:
+                self._dhan_http_client = None
+            now = time.time()
+            last = float(getattr(self, "_last_forever_orders_warn_ts", 0.0) or 0.0)
+            if now - last >= 60.0:
+                self._last_forever_orders_warn_ts = now
+                self.logger.warning("Dhan get_forever_orders failed: %s", e)
             return []
 
     def place_slice_order(

@@ -861,12 +861,74 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         ):
             return
         self._last_order_state_check_time = now
-        ok, _ = self.order_router.verify_open_orders_with_broker()
+        ok, details = self.order_router.verify_open_orders_with_broker()
         if not ok:
-            self._entries_paused_order_mismatch = True
-            self.reconcile_positions_on_start()
+            transient = self._is_transient_broker_reconcile_error(details)
+            if transient:
+                logger.warning(
+                    "Broker order-state check skipped (transient); entries not paused: %s",
+                    (details or {}).get("error") or details,
+                )
+                if self._entries_paused_order_mismatch:
+                    self._entries_paused_order_mismatch = False
+                    logger.info(
+                        "Cleared entries_paused_order_mismatch after transient broker error"
+                    )
+            else:
+                self._entries_paused_order_mismatch = True
+                self.reconcile_positions_on_start()
         else:
             self._entries_paused_order_mismatch = False
+
+    @staticmethod
+    def _is_transient_broker_reconcile_error(details: Optional[Dict[str, Any]]) -> bool:
+        err = str((details or {}).get("error") or "").upper()
+        return (
+            "DH-901" in err
+            or "INVALID_AUTHENTICATION" in err
+            or "HTTP CLIENT UNAVAILABLE" in err
+            or "FAILED TO FETCH BROKER OPEN ORDERS" in err
+        )
+
+    def _entry_pause_reasons(self) -> List[str]:
+        reasons: List[str] = []
+        if self._entries_paused_feed_stale:
+            reasons.append("feed_stale")
+        if self._entries_paused_order_mismatch:
+            reasons.append("order_mismatch")
+        if self._entries_paused_memory:
+            reasons.append("memory")
+        if self._entries_paused_latency:
+            reasons.append("latency")
+        return reasons
+
+    def _log_entry_skipped_if_paused(
+        self,
+        *,
+        strategy: Any,
+        symbol: str,
+        intent: Any,
+    ) -> bool:
+        """Log and return True when ENTRY routing is blocked by engine pause flags."""
+        if not intent or not self._intent_has_entry(intent):
+            return False
+        reasons = self._entry_pause_reasons()
+        if not reasons:
+            return False
+        msg = (
+            f"ENTRY skipped strategy={getattr(strategy, 'name', '')} "
+            f"symbol={symbol} reasons={','.join(reasons)}"
+        )
+        if self.engine_logger:
+            self.engine_logger.log(
+                "entry_skipped",
+                msg,
+                strategy_id=str(getattr(strategy, "name", "") or ""),
+                symbol=symbol,
+            )
+        else:
+            logger.warning("%s", msg)
+        return True
 
     def _normalize_delta_ws_trade(self, raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Normalize Delta user-trade websocket payload to OrderRouter.process_trade shape."""
@@ -1248,8 +1310,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         return
                     pm = self._resolve_entry_price_map(intent, symbol, candle)
                     if pm is None:
-                        valid_group = []
-                        break
+                        singles.append(intent)
+                        continue
                     trading_sym = next(iter(pm))
                     self._validate_lot_size(intent, trading_sym)
                     merged_map.update(pm)
@@ -1270,7 +1332,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             strategy_id=str(getattr(strategy, "name", "") or ""),
                         )
                     continue
-                group = valid_group if valid_group else group
+                singles.extend(valid_group)
+                continue
             singles.extend(group)
 
         for single_intent in singles:
@@ -1646,17 +1709,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         symbol=sym,
                     )
                 intent = eval_result.get("intent")
-                if intent and self._entries_paused_feed_stale:
-                    continue
-                intent_has_entry = self._intent_has_entry(intent)
-                if (
-                    intent
-                    and intent_has_entry
-                    and (
-                        self._entries_paused_order_mismatch
-                        or self._entries_paused_memory
-                        or self._entries_paused_latency
-                    )
+                if self._log_entry_skipped_if_paused(
+                    strategy=eval_strategy,
+                    symbol=sym,
+                    intent=intent,
                 ):
                     continue
                 self._run_strategy(
@@ -1811,6 +1867,21 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 logger.exception("Strategy evaluation failed: %s", item["error"])
                 continue
             out.append(item)
+        if len(out) < expected and expected > 0:
+            logger.warning(
+                "Strategy evaluation timed out: got %s/%s responses within %.1fs",
+                len(out),
+                expected,
+                timeout,
+            )
+            if self.engine_logger:
+                self.engine_logger.log(
+                    "strategy_timeout",
+                    (
+                        f"Strategy worker timeout responses={len(out)}/{expected} "
+                        f"threshold_sec={timeout:.1f}"
+                    ),
+                )
         return out
 
     def _log_intent_filled(self, trade: Dict[str, Any]) -> None:
@@ -2330,17 +2401,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                                 symbol=symbol,
                             )
                         intent = eval_result["intent"]
-                        if intent and self._entries_paused_feed_stale:
-                            continue
-                        intent_has_entry = self._intent_has_entry(intent)
-                        if (
-                            intent
-                            and intent_has_entry
-                            and (
-                                self._entries_paused_order_mismatch
-                                or self._entries_paused_memory
-                                or self._entries_paused_latency
-                            )
+                        if self._log_entry_skipped_if_paused(
+                            strategy=eval_strategy,
+                            symbol=symbol,
+                            intent=intent,
                         ):
                             continue
                         self._run_strategy(
@@ -2560,6 +2624,17 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         )
             else:
                 self._latency_critical_count = 0
+        else:
+            trading_sym = self._intent_place_order_symbol(single_intent, symbol)
+            logger.warning(
+                "ENTRY skipped: no executable price symbol=%s trading_sym=%s "
+                "strategy=%s tag=%s intent_price=%s",
+                symbol,
+                trading_sym,
+                getattr(strategy, "name", ""),
+                getattr(single_intent, "tag", ""),
+                getattr(single_intent, "price", None),
+            )
 
     def _run_strategy(
         self,

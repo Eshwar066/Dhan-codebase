@@ -357,7 +357,15 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             candle, ctx, option_type, min_prem=min_prem, max_prem=max_prem
         )
         if result is None:
-            print(f"⚠️ No valid strike found at {candle['timestamp']}")
+            logger.warning(
+                "LEAPS entry skipped: no valid strike sym=%s opt=%s ts=%s "
+                "premium_band=%s-%s",
+                candle.get("symbol"),
+                option_type,
+                candle.get("timestamp"),
+                min_prem,
+                max_prem,
+            )
             return None
 
         strike, premium, row = result
@@ -366,7 +374,11 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
 
         expiry_for_symbol = self._expiry_from_option_chain()
         if expiry_for_symbol is None:
-            print(f"⚠️ No expiry on option chain at {candle['timestamp']}")
+            logger.warning(
+                "LEAPS entry skipped: no expiry on option chain sym=%s ts=%s",
+                candle.get("symbol"),
+                candle.get("timestamp"),
+            )
             return None
 
         # Build the trading symbol
@@ -375,8 +387,9 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             expiry_for_symbol,
             strike,
             option_type,
+            include_year=True,
         )
-       
+
         # Fetch Instrument object from InstrumentStore
         inst = ctx.instrument_store.intent_creation_details(
             trading_symbol,
@@ -387,7 +400,15 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         )
 
         if inst is None:
-            print(f"❌ Instrument not found for {trading_symbol}")
+            logger.warning(
+                "LEAPS entry skipped: instrument not found sym=%s trading_symbol=%s "
+                "expiry=%s strike=%s opt=%s",
+                candle.get("symbol"),
+                trading_symbol,
+                expiry_for_symbol,
+                strike,
+                option_type,
+            )
             return None
 
         # Main sell intent as OrderIntent

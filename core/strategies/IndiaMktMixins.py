@@ -1191,18 +1191,33 @@ class IndiaMktMixins:
                         ask_num = pd.to_numeric(live_df[ask_col], errors="coerce")
                         prem_num = (prem_num + ask_num) / 2.0
                 prem_num = prem_num.fillna(0)
-                row = live_df[prem_num.between(float(min_prem), float(max_prem), inclusive="both")]
+                in_band = live_df[
+                    prem_num.between(float(min_prem), float(max_prem), inclusive="both")
+                ]
+                row = in_band
                 if row.empty:
                     row = live_df[prem_num > 0]
+                    if not row.empty:
+                        skip_premium_check = True
                 if row.empty:
                     row = live_df
+                    if not row.empty:
+                        skip_premium_check = True
 
             if row.empty:
                 return None
 
             row = self._sort_rows_by_ideal_premium(row, premium_col)
             r0 = row.iloc[0]
-            premium = float(pd.to_numeric(r0[premium_col], errors="coerce") or 0.0)
+            if not use_delta or not delta_in_chain_live:
+                try:
+                    premium = float(prem_num.loc[r0.name])
+                except (KeyError, TypeError, ValueError):
+                    premium = float(
+                        pd.to_numeric(r0[premium_col], errors="coerce") or 0.0
+                    )
+            else:
+                premium = float(pd.to_numeric(r0[premium_col], errors="coerce") or 0.0)
             selected_strike = r0[strike_col]
         else:
             chain = self._coerce_backtest_option_chain_df(chain, option_type)
