@@ -1695,10 +1695,32 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             return
 
         symbols = sorted({item[1] for item in due})
-        ohlc = None
-        if self.data and hasattr(self.data, "get_latest_candles"):
+        ohlc: Dict[str, Any] = {}
+        rest_symbols: List[str] = []
+        if self.realtime_feed and self.realtime_feed.is_connected():
+            for sym in symbols:
+                ticker = self.realtime_feed.get_last_ticker(sym)
+                close = None
+                if ticker:
+                    close = ticker.get("close") or ticker.get("last_price")
+                if close is not None:
+                    ohlc[sym] = {
+                        "open": ticker.get("open") or close,
+                        "high": ticker.get("high") or close,
+                        "low": ticker.get("low") or close,
+                        "close": close,
+                        "volume": ticker.get("volume", 0),
+                    }
+                else:
+                    rest_symbols.append(sym)
+        else:
+            rest_symbols = list(symbols)
+
+        if rest_symbols and self.data and hasattr(self.data, "get_latest_candles"):
             try:
-                ohlc = self.data.get_latest_candles(symbols)
+                fetched = self.data.get_latest_candles(rest_symbols)
+                if isinstance(fetched, dict):
+                    ohlc.update(fetched)
             except Exception as exc:
                 logger.warning("Scheduled eval spot fetch failed: %s", exc)
 

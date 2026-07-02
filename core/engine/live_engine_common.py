@@ -100,11 +100,18 @@ class LiveEngineHelpersMixin:
         return self._tick_cache[symbol]
 
     def get_price_map(self, symbol):
+        sym_key = str(symbol or "").strip().upper()
         if self.realtime_feed and self.realtime_feed.is_connected():
             ticker = self.realtime_feed.get_last_ticker(symbol)
             if ticker and ticker.get("close") is not None:
                 print(">>exit ticker price ", ticker["close"])
                 return ticker["close"]
+        if not hasattr(self, "_rest_spot_cache"):
+            self._rest_spot_cache = {}
+        now = time.time()
+        cached = self._rest_spot_cache.get(sym_key)
+        if cached and (now - cached[0]) < 15.0:
+            return cached[1]
         if self.data:
             candles = self.data.get_latest_candles([symbol])
             if (
@@ -112,7 +119,14 @@ class LiveEngineHelpersMixin:
                 and symbol in candles
                 and candles[symbol].get("close") is not None
             ):
-                return candles[symbol]["close"]
+                close = candles[symbol]["close"]
+                self._rest_spot_cache[sym_key] = (now, close)
+                return close
+            sym_u = sym_key
+            if sym_u in candles and candles[sym_u].get("close") is not None:
+                close = candles[sym_u]["close"]
+                self._rest_spot_cache[sym_key] = (now, close)
+                return close
         return None
 
     # ---------- Execution helpers ----------

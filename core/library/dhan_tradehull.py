@@ -17,7 +17,7 @@ import json
 from pprint import pprint
 import logging
 import warnings
-from typing import Tuple, Dict
+from typing import Any, Dict, Optional, Tuple
 from collections import Counter
 import urllib.parse
 import threading
@@ -131,6 +131,23 @@ def _dhan_invalid_auth_hint(payload) -> str:
     return ""
 
 
+def _dhan_is_rate_limited(payload: Any) -> bool:
+    """True when Dhan returns HTTP 805 / too-many-requests style errors."""
+    if not isinstance(payload, dict):
+        return False
+    blob = json.dumps(payload, default=str).lower()
+    if "too many requests" in blob:
+        return True
+    if '"805"' in blob or "'805'" in blob:
+        return True
+    data = payload.get("data")
+    if isinstance(data, dict):
+        inner = data.get("data")
+        if isinstance(inner, dict) and "805" in inner:
+            return True
+    return False
+
+
 class _DhanRestHttp:
     """
     REST POST helper for dhanhq 2.x clients (session + base_url, no dhan_http attribute).
@@ -158,6 +175,24 @@ class _DhanRestHttp:
         response = self._client.session.post(
             url,
             data=json.dumps(body),
+            headers=self._client.header,
+            timeout=getattr(self._client, "timeout", 60),
+            verify=not getattr(self._client, "disable_ssl", False),
+        )
+        try:
+            body = json.loads(response.content) if response.content else {}
+        except Exception:
+            body = {}
+        if response.status_code == 200:
+            return {"status": "success", "data": body}
+        return {"status": "failure", "data": body, "remarks": body}
+
+    def get(self, path: str, query: Optional[dict] = None) -> dict:
+        path = path if str(path).startswith("/") else f"/{path}"
+        url = f"{self._client.base_url.rstrip('/')}{path}"
+        response = self._client.session.get(
+            url,
+            params=query or None,
             headers=self._client.header,
             timeout=getattr(self._client, "timeout", 60),
             verify=not getattr(self._client, "disable_ssl", False),
@@ -574,12 +609,56 @@ class Tradehull:
             self.dhan_context = DhanContext(self.ClientCode, self.token_id)
             self.Dhan = dhanhq(self.dhan_context)
             self._last_dhan_api_error = None
+            self._ohlc_spot_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+            self._ohlc_backoff_until = 0.0
             self.instrument_df = self.get_instrument_file()
             print("Got the instrument file")
         except Exception as e:
             print(e)
             self.logger.exception(f"got exception in get_login as {e} ")
             traceback.print_exc()
+
+    def validate_api_credentials(self) -> None:
+        """Raise RuntimeError when DHAN token/client id are missing or rejected by Dhan."""
+        if not getattr(self, "Dhan", None):
+            raise RuntimeError(
+                "Dhan client not initialized — set DHAN_CLIENT_CODE and DHAN_ACCESS_TOKEN in .env"
+            )
+        try:
+            response = self.Dhan.get_fund_limits()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Dhan API credential check failed: {exc}"
+            ) from exc
+        if isinstance(response, dict) and response.get("status") == "failure":
+            raise RuntimeError(
+                f"Dhan API authentication failed{_dhan_invalid_auth_hint(response)}: {response}"
+            )
+
+    def _ohlc_cache_subset(self, names: list) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        cache = getattr(self, "_ohlc_spot_cache", {}) or {}
+        for raw in names or []:
+            key = str(raw or "").strip().upper()
+            if not key:
+                continue
+            row = cache.get(key)
+            if row:
+                out[key] = dict(row[1])
+        return out
+
+    def _ohlc_cache_store(self, ltp_data: Dict[str, Any]) -> None:
+        if not ltp_data:
+            return
+        now = time.time()
+        cache = getattr(self, "_ohlc_spot_cache", None)
+        if cache is None:
+            self._ohlc_spot_cache = {}
+            cache = self._ohlc_spot_cache
+        for sym, values in ltp_data.items():
+            key = str(sym or "").strip().upper()
+            if key and isinstance(values, dict):
+                cache[key] = (now, dict(values))
 
     def _get_dhan_http(self):
         """
@@ -3608,6 +3687,15 @@ class Tradehull:
 
     def get_ohlc_data(self, names, debug="NO"):
         try:
+            if not isinstance(names, list):
+                names = [names]
+            now = time.time()
+            if now < float(getattr(self, "_ohlc_backoff_until", 0.0) or 0.0):
+                cached = self._ohlc_cache_subset(names)
+                if cached:
+                    return cached
+                return dict()
+
             instrument_df = self.instrument_df.copy()
             instruments = {
                 "NSE_EQ": [],
@@ -3632,8 +3720,6 @@ class Tradehull:
                 "BANKEX": "BSE_IDX",
                 "INDIA VIX": "IDX_I",
             }
-            if not isinstance(names, list):
-                names = [names]
             for name in names:
                 try:
                     name = name.upper()
@@ -3720,7 +3806,6 @@ class Tradehull:
                 except Exception as e:
                     print(f"Exception for instrument name {name} as {e}")
                     continue
-            time.sleep(2)
             data = self.Dhan.ohlc_data(instruments)
 
             ltp_data = dict()
@@ -3734,14 +3819,34 @@ class Tradehull:
                     for key, values in all_values[exchange].items():
                         symbol = instrument_names[key]
                         ltp_data[symbol] = values
+                self._ohlc_cache_store(ltp_data)
             else:
+                if _dhan_is_rate_limited(data):
+                    self._ohlc_backoff_until = time.time() + 90.0
+                    self.logger.warning(
+                        "Dhan OHLC rate limited (805); backing off 90s — %s", data
+                    )
+                    cached = self._ohlc_cache_subset(names)
+                    if cached:
+                        return cached
                 raise Exception(data)
 
             return ltp_data
         except Exception as e:
+            payload = e if isinstance(e, dict) else None
+            if payload is None and isinstance(e, Exception) and e.args:
+                first = e.args[0]
+                if isinstance(first, dict):
+                    payload = first
+            if payload and _dhan_is_rate_limited(payload):
+                self._ohlc_backoff_until = time.time() + 90.0
+                cached = self._ohlc_cache_subset(names if isinstance(names, list) else [names])
+                if cached:
+                    return cached
             print(f"Exception at calling OHLC as {e}")
             self.logger.exception(f"Exception at calling OHLC as {e}")
-            return dict()
+            cached = self._ohlc_cache_subset(names if isinstance(names, list) else [names])
+            return cached if cached else dict()
 
     def heikin_ashi(self, df):
         try:

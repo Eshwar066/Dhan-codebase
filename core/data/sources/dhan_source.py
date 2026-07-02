@@ -8,6 +8,7 @@ go through this source; the data layer (DhanDataProvider) and broker layer
 import logging
 import os
 import sys
+import time
 import pandas as pd
 logger = logging.getLogger(__name__)
 from datetime import date, datetime, timedelta
@@ -65,6 +66,9 @@ class DhanSource:
         self._ensure_deps_path()
 
         self.tsl = Tradehull(client_id, access_token)
+        self.tsl.validate_api_credentials()
+        self._latest_candles_req_cache: dict = {}
+        self._latest_candles_backoff_until = 0.0
         self._marketfeed = DhanMarketFeedClient(
             client_id=client_id,
             access_token=access_token,
@@ -104,7 +108,24 @@ class DhanSource:
         """Latest OHLC/LTP per symbol. Returns dict { symbol: { open, high, low, close, ... } }."""
         if not isinstance(symbols, list):
             symbols = [symbols]
-        return self.tsl.get_ohlc_data(symbols, debug)
+        now = time.time()
+        cache_key = tuple(sorted(str(s).strip().upper() for s in symbols if str(s).strip()))
+        cached = self._latest_candles_req_cache.get(cache_key)
+        if cached and (now - cached[0]) < 15.0:
+            return dict(cached[1])
+        if now < float(self._latest_candles_backoff_until or 0.0):
+            if cached:
+                return dict(cached[1])
+            return {}
+        data = self.tsl.get_ohlc_data(symbols, debug) or {}
+        if data:
+            self._latest_candles_req_cache[cache_key] = (now, dict(data))
+        backoff = float(getattr(self.tsl, "_ohlc_backoff_until", 0.0) or 0.0)
+        if backoff > now:
+            self._latest_candles_backoff_until = backoff
+        elif cached and not data:
+            return dict(cached[1])
+        return data
 
     def _normalize_intraday_df(self, df: pd.DataFrame) -> pd.DataFrame | None:
         """Normalize raw API df: timestamp column, sort, time column. Returns None if invalid."""
