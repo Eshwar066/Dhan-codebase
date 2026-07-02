@@ -508,7 +508,45 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         ctx = self.build_context_only(candle)
         intents = fn(ctx=ctx, **kwargs) or []
         risk_manager = getattr(self.order_router, "risk", None)
-        for intent in intents:
+        bracket_tags = {"MAIN_SL", "MAIN_TARGET"}
+        bracket_intents = [
+            i
+            for i in intents
+            if str(getattr(i, "tag", "") or "").upper() in bracket_tags
+        ]
+        other_intents = [i for i in intents if i not in bracket_intents]
+        broker = getattr(self.order_router, "broker", None)
+        use_delta_bundle = (
+            len(bracket_intents) == 2
+            and broker is not None
+            and callable(getattr(broker, "place_combined_bracket_orders", None))
+        )
+        if use_delta_bundle:
+            merged_map: Dict[str, float] = {}
+            valid_brackets = []
+            for intent in bracket_intents:
+                pm = self._resolve_entry_price_map(intent, sym, candle)
+                if pm is None:
+                    other_intents.append(intent)
+                    continue
+                trading_sym = next(iter(pm))
+                self._validate_lot_size(intent, trading_sym)
+                merged_map.update(pm)
+                valid_brackets.append(intent)
+            if len(valid_brackets) == 2:
+                stid = getattr(valid_brackets[0], "structure_id", None)
+                self._enqueue_intent_bundle(
+                    strategy=strategy_obj,
+                    intents=valid_brackets,
+                    price_map=merged_map,
+                    structure_id=str(stid or ""),
+                )
+            else:
+                other_intents.extend(valid_brackets)
+        else:
+            other_intents = list(intents)
+
+        for intent in other_intents:
             self._process_entry_like_intent(
                 intent,
                 strategy_obj,
@@ -768,6 +806,105 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 metadata_extras=strategy_meta,
             )
 
+    def _bracket_leg_satisfied(
+        self,
+        strategy_name: str,
+        structure_id: str,
+        tag: str,
+        intent_store: Any,
+        broker: Any,
+        symbol: Optional[str],
+    ) -> bool:
+        if intent_store.has_pending_intent(
+            strategy_name,
+            structure_id,
+            tags=[tag],
+            actions=["FORCE_EXIT"],
+        ):
+            return True
+        if broker is None or not symbol:
+            return False
+        has_leg = getattr(broker, "has_bracket_leg_on_exchange", None)
+        if callable(has_leg) and has_leg(symbol, tag):
+            find_oid = getattr(broker, "find_bracket_leg_order_id", None)
+            if callable(find_oid):
+                oid = find_oid(symbol, tag)
+                if oid:
+                    self._adopt_exchange_bracket_leg(
+                        strategy_name,
+                        structure_id,
+                        tag,
+                        symbol,
+                        oid,
+                        intent_store,
+                    )
+            return True
+        return False
+
+    def _adopt_exchange_bracket_leg(
+        self,
+        strategy_name: str,
+        structure_id: str,
+        tag: str,
+        symbol: str,
+        broker_order_id: str,
+        intent_store: Any,
+    ) -> None:
+        """Link a manually placed or recovered exchange bracket leg into OMS."""
+        from core.orderExecution.intent_store import IntentStatus
+        from core.orderExecution.order_router import OrderState
+
+        pending = (
+            list(intent_store.list_by_status(IntentStatus.SENT))
+            + list(intent_store.list_by_status(IntentStatus.VALIDATED))
+            + list(intent_store.list_by_status(IntentStatus.CREATED))
+            + list(intent_store.list_by_status(IntentStatus.REJECTED))
+        )
+        for rec in pending:
+            payload = rec.get("payload") or {}
+            if payload.get("structure_id") != structure_id:
+                continue
+            if str(payload.get("tag") or "").upper() != str(tag).upper():
+                continue
+            if rec.get("broker_order_id"):
+                return
+            intent_id = rec.get("intent_id")
+            if not intent_id:
+                continue
+            intent_store.update(
+                intent_id,
+                IntentStatus.SENT,
+                broker_order_id=str(broker_order_id),
+                order_state=OrderState.SENT,
+            )
+            router = getattr(self, "order_router", None)
+            if router is not None:
+                router._set_order_state(
+                    intent_id,
+                    OrderState.SENT,
+                    action="adopt_exchange_bracket",
+                    message=f"order_id={broker_order_id}",
+                )
+                reg = getattr(router, "bracket_registry", None)
+                if reg is not None:
+                    reg.register_structure(str(structure_id))
+                    reg.link_leg(
+                        str(structure_id),
+                        str(tag).upper(),
+                        intent_id=str(intent_id),
+                        broker_order_id=str(broker_order_id),
+                    )
+            if self.engine_logger:
+                self.engine_logger.log(
+                    "oms",
+                    f"Adopted exchange bracket leg tag={tag} order_id={broker_order_id} "
+                    f"symbol={symbol} structure_id={structure_id}",
+                    strategy_id=strategy_name,
+                    intent_id=intent_id,
+                    symbol=symbol,
+                )
+            return
+
     def _ensure_bracket_legs_after_reconcile(self) -> None:
         """If MAIN is open but bracket legs missing (restart), re-arm per strategy."""
         intent_store = getattr(self.order_router, "intent_store", None)
@@ -811,6 +948,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     except Exception:
                         pass
             sim_brackets_ok = True
+            sym = getattr(getattr(pos, "instrument", None), "trading_symbol", None) or sym
             if self.run_mode == RunMode.PAPER and broker is not None:
                 pending_sl = getattr(broker, "_pending_sl", {}) or {}
                 pending_tgt = getattr(broker, "_pending_target", {}) or {}
@@ -820,11 +958,13 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 )
             else:
                 sim_brackets_ok = all(
-                    intent_store.has_pending_intent(
+                    self._bracket_leg_satisfied(
                         strategy_name,
                         struct_id,
-                        tags=[tag],
-                        actions=["FORCE_EXIT"],
+                        tag,
+                        intent_store,
+                        broker,
+                        sym,
                     )
                     for tag in bracket_tags
                 )

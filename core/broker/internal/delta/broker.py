@@ -67,29 +67,43 @@ def _intent_to_delta_payload(intent, execution_price=None):
     }
 
 
-def _delta_required_notional(intent, execution_price=None):
-    """Estimate required margin as notional (qty * price) for funds check."""
+def _delta_required_margin(intent, execution_price=None, leverage: int = 1):
+    """Estimate initial margin: contract notional divided by configured leverage."""
+    lev = max(1, int(leverage or 1))
     if hasattr(intent, "instrument"):
         inst = intent.instrument
         qty = int(getattr(intent, "qty", getattr(inst, "lot_size", 1)))
         lot = int(getattr(inst, "lot_size", 1))
         price = execution_price if execution_price is not None else (intent.price or 0)
         mult = getattr(inst, "contract_multiplier", 1)
-        return abs(qty) * lot * price * mult
-    return (
+        notional = abs(qty) * lot * float(price) * float(mult)
+        return notional / lev
+    notional = (
         int(intent.get("qty", 1))
         * int(intent.get("lot_size", 1))
         * float(execution_price or intent.get("price") or 0)
     )
+    return notional / lev
 
 
 class DeltaBroker(BaseBroker):
     """Order placement via Delta Exchange. Uses DeltaBrokerApi (DeltaSource / delta_rest_client)."""
 
-    def __init__(self, api, position_manager=None, intent_store=None):
+    def __init__(
+        self,
+        api,
+        position_manager=None,
+        intent_store=None,
+        default_leverage: int = 1,
+    ):
         super().__init__(position_manager=position_manager, intent_store=intent_store)
         self.api = api
         self._realtime_feed: Optional[Any] = None
+        self.default_leverage = max(1, int(default_leverage or 1))
+        self._last_place_order_failure: Optional[Dict[str, Any]] = None
+
+    def supports_combined_bracket(self) -> bool:
+        return hasattr(self.api, "place_bracket_tp_sl")
 
     def set_realtime_feed(self, feed: Any) -> None:
         """Attach Delta WS feed for orders/positions (REST remains fallback)."""
@@ -153,9 +167,11 @@ class DeltaBroker(BaseBroker):
         """
         # pdb.set_trace()
         try:
-            required = _delta_required_notional(intent, execution_price)
+            required = _delta_required_margin(
+                intent, execution_price, leverage=self.default_leverage
+            )
         except Exception as e:
-            logger.warning("Delta funds check: failed to compute required notional: %s", e)
+            logger.warning("Delta funds check: failed to compute required margin: %s", e)
             return None
 
         snapshot = self.get_balance_snapshot()
@@ -212,6 +228,7 @@ class DeltaBroker(BaseBroker):
         execution_price: Optional[float] = None,
         retries: int = 0,
     ) -> Optional[str]:
+        self._last_place_order_failure = None
         payload = _intent_to_delta_payload(intent, execution_price)
         for attempt in range(retries + 1):
             try:
@@ -282,15 +299,28 @@ class DeltaBroker(BaseBroker):
                     if self.intent_store and payload.get("tag"):
                         self.intent_store.update(payload["tag"], "SENT")
                     return result.get("order_id")
+                err_txt = str(result).lower()
+                self._last_place_order_failure = {
+                    "message": str(result),
+                    "error_code": ((result or {}).get("error") or {}).get("code")
+                    if isinstance((result or {}).get("error"), dict)
+                    else None,
+                    "retryable": "no_open_position" in err_txt,
+                }
                 logger.warning("Delta place_order returned error: %s", result)
                 return None
             except Exception as e:
+                err_txt = str(e).lower()
                 if attempt == retries:
                     ot = str(payload.get("order_type") or "MARKET").upper()
-                    err_txt = str(e).lower()
                     if ot in {"SL", "SL-M", "STOP", "STOP_MARKET", "STOP_LIMIT"} and (
                         "no_open_position" in err_txt
                     ):
+                        self._last_place_order_failure = {
+                            "message": str(e),
+                            "error_code": "no_open_position",
+                            "retryable": True,
+                        }
                         logger.warning(
                             "Delta stop-order no_open_position for %s after 3 attempts; "
                             "skipping broker-side SL intent and relying on strategy exit logic. error=%s",
@@ -299,8 +329,28 @@ class DeltaBroker(BaseBroker):
                         )
                         return None
                     if ot in {"SL", "SL-M", "STOP", "STOP_MARKET", "STOP_LIMIT"} and (
+                        "bracket_order_exists" in err_txt
+                    ):
+                        self._last_place_order_failure = {
+                            "message": str(e),
+                            "error_code": "bracket_order_exists",
+                            "retryable": False,
+                        }
+                        logger.warning(
+                            "Delta bracket already exists for %s; "
+                            "use combined TP+SL placement instead. error=%s",
+                            payload.get("tradingsymbol"),
+                            e,
+                        )
+                        return None
+                    if ot in {"SL", "SL-M", "STOP", "STOP_MARKET", "STOP_LIMIT"} and (
                         "unsupported" in err_txt or "400" in err_txt
                     ):
+                        self._last_place_order_failure = {
+                            "message": str(e),
+                            "error_code": "unsupported_stop",
+                            "retryable": False,
+                        }
                         logger.warning(
                             "Delta stop-order unsupported for %s on current environment; "
                             "skipping broker-side SL intent and relying on strategy exit logic. error=%s",
@@ -541,6 +591,164 @@ class DeltaBroker(BaseBroker):
         if broker_positions:
             self.position_manager.reconcile_with_broker(broker_positions)
 
+    @staticmethod
+    def _bracket_leg_type_for_tag(tag: str) -> Optional[str]:
+        tag_u = str(tag or "").upper()
+        if tag_u == "MAIN_SL":
+            return "stop_loss_order"
+        if tag_u == "MAIN_TARGET":
+            return "take_profit_order"
+        return None
+
+    def _live_orders_for_symbol(self, tradingsymbol: str) -> List[Dict[str, Any]]:
+        sym_u = str(tradingsymbol or "").upper()
+        orders: List[Dict[str, Any]] = []
+        try:
+            raw = self.api.get_order_list() or []
+        except Exception:
+            raw = []
+        for o in raw or []:
+            if not isinstance(o, dict):
+                continue
+            o_sym = str(o.get("symbol") or "").upper()
+            if o_sym == sym_u:
+                orders.append(o)
+        return orders
+
+    def has_bracket_leg_on_exchange(self, tradingsymbol: str, tag: str) -> bool:
+        """True if Delta already has a resting bracket leg for this symbol/tag."""
+        leg_type = self._bracket_leg_type_for_tag(tag)
+        if not leg_type:
+            return False
+        open_states = {
+            "open",
+            "pending",
+            "placed",
+            "trigger pending",
+            "live",
+            "untriggered",
+        }
+        for o in self._live_orders_for_symbol(tradingsymbol):
+            if str(o.get("stop_order_type") or "") != leg_type:
+                continue
+            if (o.get("status") or "").lower() in open_states:
+                return True
+        return False
+
+    def find_bracket_leg_order_id(self, tradingsymbol: str, tag: str) -> Optional[str]:
+        leg_type = self._bracket_leg_type_for_tag(tag)
+        if not leg_type:
+            return None
+        open_states = {
+            "open",
+            "pending",
+            "placed",
+            "trigger pending",
+            "live",
+            "untriggered",
+        }
+        for o in self._live_orders_for_symbol(tradingsymbol):
+            if str(o.get("stop_order_type") or "") != leg_type:
+                continue
+            if (o.get("status") or "").lower() in open_states:
+                oid = o.get("order_id")
+                return str(oid) if oid is not None else None
+        return None
+
+    def place_combined_bracket_orders(
+        self,
+        sl_intent: Any,
+        target_intent: Any,
+        sl_execution_price: Optional[float] = None,
+        target_execution_price: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Place MAIN_SL + MAIN_TARGET as one Delta bracket (required by exchange API).
+        Returns {ok, sl_order_id, tp_order_id, reason, message}.
+        """
+        self._last_place_order_failure = None
+        sl_payload = _intent_to_delta_payload(sl_intent, sl_execution_price)
+        tgt_payload = _intent_to_delta_payload(target_intent, target_execution_price)
+        stop_retries = 5
+        last_err: Optional[str] = None
+        for attempt in range(stop_retries):
+            try:
+                result = self.api.place_bracket_tp_sl(
+                    tradingsymbol=sl_payload["tradingsymbol"],
+                    quantity=sl_payload["quantity"],
+                    transaction_type=sl_payload["transaction_type"],
+                    stop_loss_trigger=sl_payload["trigger_price"]
+                    or sl_payload["price"],
+                    take_profit_trigger=tgt_payload["trigger_price"]
+                    or tgt_payload["price"],
+                    stop_trigger_method="mark_price",
+                    tag=sl_payload.get("tag"),
+                )
+            except Exception as e:
+                last_err = str(e)
+                err_txt = last_err.lower()
+                if "no_open_position" in err_txt and attempt < (stop_retries - 1):
+                    logger.warning(
+                        "Delta combined bracket no_open_position for %s "
+                        "(attempt %s/%s); retrying in 2s",
+                        sl_payload.get("tradingsymbol"),
+                        attempt + 1,
+                        stop_retries,
+                    )
+                    time.sleep(2)
+                    continue
+                if "bracket_order_exists" in err_txt:
+                    sl_oid = self.find_bracket_leg_order_id(
+                        sl_payload["tradingsymbol"], "MAIN_SL"
+                    )
+                    tp_oid = self.find_bracket_leg_order_id(
+                        sl_payload["tradingsymbol"], "MAIN_TARGET"
+                    )
+                    if sl_oid or tp_oid:
+                        return {
+                            "ok": True,
+                            "sl_order_id": sl_oid,
+                            "tp_order_id": tp_oid,
+                            "reason": "bracket_already_exists",
+                        }
+                self._last_place_order_failure = {
+                    "message": last_err,
+                    "retryable": "no_open_position" in err_txt,
+                }
+                return {
+                    "ok": False,
+                    "sl_order_id": None,
+                    "tp_order_id": None,
+                    "reason": "broker_error",
+                    "message": last_err,
+                }
+
+            if result.get("status") == "success":
+                return {
+                    "ok": True,
+                    "sl_order_id": result.get("sl_order_id") or result.get("order_id"),
+                    "tp_order_id": result.get("tp_order_id"),
+                    "reason": "order_placed",
+                }
+            last_err = str(result)
+            err_txt = last_err.lower()
+            if "no_open_position" in err_txt and attempt < (stop_retries - 1):
+                time.sleep(2)
+                continue
+            break
+
+        self._last_place_order_failure = {
+            "message": last_err or "combined bracket failed",
+            "retryable": False,
+        }
+        return {
+            "ok": False,
+            "sl_order_id": None,
+            "tp_order_id": None,
+            "reason": "no_order_id",
+            "message": last_err or "combined bracket failed",
+        }
+
     def get_open_orders(self):
         """
         Returns normalized list of open/pending orders.
@@ -590,6 +798,7 @@ class DeltaBroker(BaseBroker):
                     "side": (o.get("side") or "").lower(),
                     "qty": int(o.get("qty") or 0),
                     "reduce_only": o.get("reduce_only"),
+                    "stop_order_type": o.get("stop_order_type"),
                 }
             )
         return normalized_orders

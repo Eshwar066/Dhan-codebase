@@ -94,14 +94,60 @@ class DeltaBrokerApi:
             stop_trigger_method=stop_trigger_method,
             client_order_id=tag,
         )
-        sl = (raw or {}).get("stop_loss_order") or {}
-        oid = (
-            sl.get("id")
-            or sl.get("order_id")
-            or (raw or {}).get("id")
-            or (raw or {}).get("order_id")
+        return self._normalize_bracket_response(raw)
+
+    def place_bracket_tp_sl(
+        self,
+        tradingsymbol: str,
+        quantity: int,
+        transaction_type: str = "BUY",
+        stop_loss_trigger: float = 0,
+        take_profit_trigger: float = 0,
+        stop_loss_limit: Optional[float] = None,
+        take_profit_limit: Optional[float] = None,
+        stop_trigger_method: str = "mark_price",
+        tag: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Single Delta bracket with both stop-loss and take-profit legs."""
+        product_id = self._source.product_id_for_symbol(tradingsymbol)
+        if product_id is None:
+            return {
+                "status": "error",
+                "order_id": None,
+                "message": f"Unknown symbol: {tradingsymbol}",
+            }
+        side = (transaction_type or "BUY").lower()
+        raw = self._source.place_bracket_tp_sl(
+            product_id=int(product_id),
+            size=int(quantity),
+            side="buy" if side == "buy" else "sell",
+            stop_loss_price=float(stop_loss_trigger),
+            take_profit_price=float(take_profit_trigger),
+            stop_loss_limit_price=stop_loss_limit,
+            take_profit_limit_price=take_profit_limit,
+            stop_trigger_method=stop_trigger_method,
+            client_order_id=tag,
         )
-        return {"status": "success", "order_id": str(oid) if oid is not None else None}
+        return self._normalize_bracket_response(raw, combined=True)
+
+    @staticmethod
+    def _normalize_bracket_response(
+        raw: Any, *, combined: bool = False
+    ) -> Dict[str, Any]:
+        sl = (raw or {}).get("stop_loss_order") or {}
+        tp = (raw or {}).get("take_profit_order") or {}
+        sl_oid = sl.get("id") or sl.get("order_id")
+        tp_oid = tp.get("id") or tp.get("order_id")
+        oid = sl_oid or (raw or {}).get("id") or (raw or {}).get("order_id")
+        out: Dict[str, Any] = {
+            "status": "success" if oid is not None else "error",
+            "order_id": str(oid) if oid is not None else None,
+            "raw": raw,
+        }
+        if combined:
+            out["sl_order_id"] = str(sl_oid) if sl_oid is not None else None
+            out["tp_order_id"] = str(tp_oid) if tp_oid is not None else None
+        return out
 
     def get_orders_history(
         self, page_size: int = 50

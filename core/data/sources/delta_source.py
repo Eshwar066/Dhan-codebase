@@ -764,6 +764,7 @@ class DeltaSource:
                         "remaining_qty": int(o.get("unfilled_size") or 0),
                         "price": float(o.get("limit_price") or 0),
                         "reduce_only": bool(o.get("reduce_only")),
+                        "stop_order_type": o.get("stop_order_type"),
                         "created_at": o.get("created_at"),
                     }
                 )
@@ -784,6 +785,19 @@ class DeltaSource:
     # -------------------------------------------------------------------------
     # Advanced: stop orders, leverage, margin, batch, history
     # -------------------------------------------------------------------------
+    @staticmethod
+    def _bracket_leg_payload(
+        stop_price: float,
+        limit_price: Optional[float] = None,
+    ) -> Dict[str, str]:
+        leg: Dict[str, str] = {
+            "order_type": "limit_order" if limit_price is not None else "market_order",
+            "stop_price": str(stop_price),
+        }
+        if limit_price is not None:
+            leg["limit_price"] = str(limit_price)
+        return leg
+
     def place_bracket_stop_loss(
         self,
         product_id: int,
@@ -796,19 +810,45 @@ class DeltaSource:
         source: str = "desktop",
         client_order_id: Optional[str] = None,
     ) -> Any:
-        stop_loss_order: Dict[str, str] = {
-            "order_type": "limit_order" if limit_price is not None else "market_order",
-            "stop_price": str(stop_price),
-        }
-        if limit_price is not None:
-            stop_loss_order["limit_price"] = str(limit_price)
-
         payload = {
             "product_id": int(product_id),
             "size": int(size),
             "side": side.lower(),
             "bracket_stop_trigger_method": stop_trigger_method,
-            "stop_loss_order": stop_loss_order,
+            "stop_loss_order": self._bracket_leg_payload(stop_price, limit_price),
+            "order_source": order_source,
+            "source": source,
+        }
+        if client_order_id:
+            payload["client_order_id"] = str(client_order_id)
+        return self._client.place_bracket_order(payload)
+
+    def place_bracket_tp_sl(
+        self,
+        product_id: int,
+        size: int,
+        side: str,
+        stop_loss_price: float,
+        take_profit_price: float,
+        stop_loss_limit_price: Optional[float] = None,
+        take_profit_limit_price: Optional[float] = None,
+        stop_trigger_method: str = "mark_price",
+        order_source: str = "positions_TP_SL_order",
+        source: str = "desktop",
+        client_order_id: Optional[str] = None,
+    ) -> Any:
+        """Place SL + TP on an existing position in one Delta bracket request."""
+        payload = {
+            "product_id": int(product_id),
+            "size": int(size),
+            "side": side.lower(),
+            "bracket_stop_trigger_method": stop_trigger_method,
+            "stop_loss_order": self._bracket_leg_payload(
+                stop_loss_price, stop_loss_limit_price
+            ),
+            "take_profit_order": self._bracket_leg_payload(
+                take_profit_price, take_profit_limit_price
+            ),
             "order_source": order_source,
             "source": source,
         }

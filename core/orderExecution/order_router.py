@@ -820,6 +820,7 @@ class OrderRouter:
         raise_on_retryable_failure: bool = False,
         skip_margin_check: bool = False,
         bundle_margin_result: Optional[Dict[str, Any]] = None,
+        defer_broker_place: bool = False,
     ):
         intent_engine_id = getattr(intent, "engine_id", None) or self.engine_id
         intent_strategy_id = (
@@ -1130,6 +1131,8 @@ class OrderRouter:
             exec_price=exec_price,
             qty=qty,
         )
+        if defer_broker_place:
+            return {"ok": True, "retryable": False, "reason": "deferred"}
         tag_bracket = str(getattr(intent, "tag", "") or "").upper()
         stid_bracket = getattr(intent, "structure_id", None)
         if tag_bracket == "MAIN_EXIT" and stid_bracket:
@@ -1385,10 +1388,17 @@ class OrderRouter:
     ) -> Dict[str, Any]:
         """
         Process multiple ENTRY legs (e.g. hedge + main) with one multi-order margin check.
+        Delta FORCE_EXIT bracket legs (MAIN_SL + MAIN_TARGET) use one combined bracket API call.
         """
         legs = bundle_item.get("intent_bundle") or []
         if not legs:
             return {"ok": False, "retryable": False, "reason": "empty_bundle"}
+
+        if self._should_use_delta_combined_bracket(legs):
+            return self._process_delta_bracket_bundle(
+                bundle_item,
+                raise_on_retryable_failure=raise_on_retryable_failure,
+            )
 
         price_map = dict(bundle_item.get("price_map") or {})
         idempotency_key = bundle_item.get("idempotency_key")
@@ -1505,6 +1515,183 @@ class OrderRouter:
         if broker_sent_ts is not None:
             last_result["broker_sent_ts"] = broker_sent_ts
         return last_result
+
+    @staticmethod
+    def _should_use_delta_combined_bracket(legs: List[Any]) -> bool:
+        if len(legs) != 2:
+            return False
+        tags = {str(getattr(i, "tag", "") or "").upper() for i in legs}
+        actions = {str(getattr(i, "action", "") or "").upper() for i in legs}
+        return tags == {"MAIN_SL", "MAIN_TARGET"} and actions == {"FORCE_EXIT"}
+
+    def _process_delta_bracket_bundle(
+        self,
+        bundle_item: Dict[str, Any],
+        *,
+        raise_on_retryable_failure: bool = False,
+    ) -> Dict[str, Any]:
+        legs = list(bundle_item.get("intent_bundle") or [])
+        price_map = dict(bundle_item.get("price_map") or {})
+        idempotency_key = bundle_item.get("idempotency_key")
+        sl_intent = next(
+            i for i in legs if str(getattr(i, "tag", "")).upper() == "MAIN_SL"
+        )
+        tgt_intent = next(
+            i for i in legs if str(getattr(i, "tag", "")).upper() == "MAIN_TARGET"
+        )
+        resolved: List[Tuple[Any, float]] = []
+        for intent in (sl_intent, tgt_intent):
+            sym = (
+                getattr(intent.instrument, "trading_symbol", None)
+                if getattr(intent, "instrument", None)
+                else ""
+            )
+            exec_price = price_map.get(sym) if sym else None
+            if exec_price is None:
+                exec_price = getattr(intent, "price", None)
+            exec_price = self._coerce_positive_exec_price(exec_price)
+            if exec_price is None:
+                return {"ok": False, "retryable": False, "reason": "no_price"}
+            exec_price = self.slippage_model(exec_price)
+            if sym:
+                price_map[sym] = exec_price
+            resolved.append((intent, exec_price))
+
+        broker = self.broker
+        place_fn = getattr(broker, "place_combined_bracket_orders", None)
+        if not callable(place_fn):
+            last_result: Dict[str, Any] = {
+                "ok": True,
+                "retryable": False,
+                "reason": "bundle_placed",
+            }
+            broker_sent_ts = None
+            for intent, exec_price in resolved:
+                result = self.process_intent(
+                    intent,
+                    price_map,
+                    idempotency_key=idempotency_key,
+                    raise_on_retryable_failure=raise_on_retryable_failure,
+                    skip_margin_check=True,
+                )
+                last_result = result
+                if not result.get("ok", True):
+                    return result
+                broker_sent_ts = result.get("broker_sent_ts") or broker_sent_ts
+            if broker_sent_ts is not None:
+                last_result["broker_sent_ts"] = broker_sent_ts
+            return last_result
+
+        for intent, exec_price in resolved:
+            prep = self.process_intent(
+                intent,
+                price_map,
+                idempotency_key=idempotency_key,
+                raise_on_retryable_failure=raise_on_retryable_failure,
+                skip_margin_check=True,
+                defer_broker_place=True,
+            )
+            if not prep.get("ok", True):
+                return prep
+
+        sl_intent, sl_price = resolved[0]
+        tgt_intent, tgt_price = resolved[1]
+        combo = place_fn(
+            sl_intent,
+            tgt_intent,
+            sl_execution_price=sl_price,
+            target_execution_price=tgt_price,
+        )
+        if not combo.get("ok"):
+            fail_msg = str(combo.get("message") or combo.get("reason") or "combined bracket failed")
+            for intent, _ in resolved:
+                self.intent_store.update(
+                    intent.intent_id,
+                    IntentStatus.REJECTED,
+                    order_state=OrderState.REJECTED,
+                )
+                self._set_order_state(
+                    intent.intent_id,
+                    OrderState.REJECTED,
+                    action="broker_no_order_id",
+                    message=fail_msg,
+                )
+            return {
+                "ok": False,
+                "retryable": bool(combo.get("retryable")),
+                "reason": combo.get("reason") or "no_order_id",
+            }
+
+        stid = getattr(sl_intent, "structure_id", None)
+        broker_sent_ts = time.time()
+        leg_orders = {
+            "MAIN_SL": combo.get("sl_order_id"),
+            "MAIN_TARGET": combo.get("tp_order_id"),
+        }
+        for intent, exec_price in resolved:
+            tag_u = str(getattr(intent, "tag", "") or "").upper()
+            order_id = leg_orders.get(tag_u)
+            if not order_id:
+                continue
+            sym = (
+                getattr(intent.instrument, "trading_symbol", None)
+                if getattr(intent, "instrument", None)
+                else ""
+            )
+            side = getattr(intent, "side", "")
+            qty_lots = int(getattr(intent, "qty", 0) or 0)
+            intent_strategy_id = (
+                getattr(intent, "strategy_id", None)
+                or getattr(intent, "strategy_name", None)
+                or getattr(intent, "strategy", None)
+                or self.strategy_id
+            )
+            self._log_oms_step(
+                "place_order",
+                intent,
+                ok=True,
+                intent_strategy_id=intent_strategy_id,
+                exec_price=exec_price,
+                order_id=order_id,
+                reason=combo.get("reason") or "order_placed",
+            )
+            if stid and tag_u in BRACKET_TAGS:
+                self.bracket_registry.register_structure(str(stid))
+                self.bracket_registry.link_leg(
+                    str(stid),
+                    tag_u,
+                    intent_id=intent.intent_id,
+                    broker_order_id=str(order_id),
+                )
+            self._set_order_state(
+                intent.intent_id,
+                OrderState.SENT,
+                action="order_placed",
+                message=f"order_id={order_id}",
+            )
+            if self.engine_logger:
+                self.engine_logger.order_placed(
+                    symbol=sym,
+                    side=side,
+                    qty=qty_lots,
+                    price=exec_price,
+                    order_id=order_id,
+                    intent_id=getattr(intent, "intent_id", None),
+                    strategy_id=intent_strategy_id,
+                )
+            self.intent_store.update(
+                intent.intent_id,
+                IntentStatus.SENT,
+                broker_order_id=order_id,
+                order_state=OrderState.SENT,
+            )
+
+        return {
+            "ok": True,
+            "retryable": False,
+            "reason": combo.get("reason") or "bundle_placed",
+            "broker_sent_ts": broker_sent_ts,
+        }
 
     def cancel_unfilled_strategy_orders(
         self,
@@ -1897,13 +2084,30 @@ class OrderRouter:
             payload = i.get("payload") or {}
             action = str(payload.get("action") or i.get("action") or "").upper()
             # FORCE_EXIT (broker-side SL/trigger) may be absent from open/fills APIs
-            # until trigger/execution. If broker acknowledged with order_id, keep it
-            # as valid pending instead of flagging as missing every reconcile cycle.
-            if action == "FORCE_EXIT" and i.get("broker_order_id"):
-                created_at = float(i.get("created_at") or 0.0)
-                if created_at > 0 and (now_ts - created_at) < self._force_exit_pending_max_wait_sec:
-                    resolved_missing.add(str(intent_id))
-                    continue
+            # until trigger/execution. Delta bracket legs use stop_order_type and may
+            # not appear in the normalized open-order book.
+            if action == "FORCE_EXIT":
+                sym = payload.get("symbol") or i.get("symbol")
+                tag = str(payload.get("tag") or i.get("tag") or "").upper()
+                if i.get("broker_order_id"):
+                    if hasattr(self.broker, "find_order_by_client_id"):
+                        try:
+                            order = self.broker.find_order_by_client_id(str(intent_id))
+                        except Exception:
+                            order = None
+                        if order:
+                            resolved_missing.add(str(intent_id))
+                            continue
+                    has_leg = getattr(self.broker, "has_bracket_leg_on_exchange", None)
+                    if sym and callable(has_leg) and has_leg(sym, tag):
+                        resolved_missing.add(str(intent_id))
+                        continue
+                    created_at = float(i.get("created_at") or 0.0)
+                    if created_at > 0 and (
+                        now_ts - created_at
+                    ) < self._force_exit_pending_max_wait_sec:
+                        resolved_missing.add(str(intent_id))
+                        continue
             # GTT: still poll Forever/fills when missing from regular open book (not blind trust).
             if self._intent_is_gtt(i) and i.get("broker_order_id"):
                 if self._try_sync_gtt_intent_fill(i):

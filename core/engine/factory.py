@@ -311,6 +311,7 @@ class EngineFactory:
                 api=broker_api,
                 position_manager=position_manager,
                 intent_store=intent_store,
+                default_leverage=int(getattr(config, "delta_leverage", None) or 1),
             )
         else:
             broker_api = DhanBrokerApi(dhan_source)
