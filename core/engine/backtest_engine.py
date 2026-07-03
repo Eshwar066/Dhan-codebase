@@ -14,6 +14,8 @@ logger = logging.getLogger(__name__)
 _MIN_BACKTEST_BARS = 50
 # Delta intraday cache sometimes stores IST wall-clock as UTC (+5:30 duplicate buckets).
 _DELTA_IST_AS_UTC_OFFSET = pd.Timedelta(hours=5, minutes=30)
+from core.utils.structure.liquidity import liquidity_sweep_column_names
+
 _LIVE_APPEND_SOURCE = "live_append"
 # Recompute these on OHLC during backtest; do not trust ``live_append`` disk rows.
 _STRUCTURE_SIGNAL_KEYS = frozenset(
@@ -28,6 +30,7 @@ _STRUCTURE_SIGNAL_KEYS = frozenset(
         "swing_low",
         "last_swing_high",
         "last_swing_low",
+        *liquidity_sweep_column_names(),
     }
 )
 

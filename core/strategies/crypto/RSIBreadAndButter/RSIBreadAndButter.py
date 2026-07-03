@@ -118,11 +118,14 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
         return max(1, int(DEFAULT_ORDER_QTY))
 
     def market_structure_config(self) -> MarketStructureConfig:
+        ex = getattr(self, "_structure_session_exchange", None) or "DELTA"
         return MarketStructureConfig(
             swing_left=2,
             swing_right=2,
             include_fvg=False,
             include_order_blocks=False,
+            include_liquidity_sweeps=True,
+            liquidity_session_exchange=ex,
             rsi_period=14,
         )
 

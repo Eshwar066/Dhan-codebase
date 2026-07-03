@@ -6,6 +6,11 @@ from dataclasses import dataclass
 from typing import Any, List, Optional
 
 from core.utils.structure.fvg import add_fvg_columns
+from core.utils.structure.liquidity import (
+    LiquidityConfig,
+    add_liquidity_sweeps,
+    liquidity_column_names,
+)
 from core.utils.structure.order_blocks import add_order_blocks
 from core.utils.structure.rsi_divergence import add_rsi_divergence
 from core.utils.structure.structure_events import add_bos_choch
@@ -29,6 +34,26 @@ class MarketStructureConfig:
     include_bos_choch: bool = True
     include_order_blocks: bool = True
     include_rsi_divergence: bool = True
+    include_liquidity_sweeps: bool = True
+    liquidity_session_exchange: str = "DELTA"
+    liquidity_opening_range_minutes: int = 30
+    liquidity_equal_tolerance_pct: float = 0.0005
+    liquidity_equal_min_touches: int = 2
+    liquidity_equal_lookback_bars: int = 120
+    liquidity_round_step: Optional[float] = None
+    liquidity_min_pierce_pct: float = 0.0
+
+    def liquidity_config(self) -> LiquidityConfig:
+        return LiquidityConfig(
+            session_exchange=self.liquidity_session_exchange,
+            opening_range_minutes=self.liquidity_opening_range_minutes,
+            equal_tolerance_pct=self.liquidity_equal_tolerance_pct,
+            equal_min_touches=self.liquidity_equal_min_touches,
+            equal_lookback_bars=self.liquidity_equal_lookback_bars,
+            round_step=self.liquidity_round_step,
+            min_pierce_pct=self.liquidity_min_pierce_pct,
+            swing_prefix=self.swing_prefix,
+        )
 
 
 def market_structure_column_names(
@@ -71,6 +96,8 @@ def market_structure_column_names(
         )
     if cfg.include_rsi_divergence:
         cols.extend(["rsi", "rsi_div_bull", "rsi_div_bear"])
+    if cfg.include_liquidity_sweeps:
+        cols.extend(liquidity_column_names())
     return cols
 
 
@@ -127,6 +154,14 @@ def add_market_structure(
             rsi_period=cfg.rsi_period,
             lookback_swings=cfg.rsi_lookback_swings,
         )
+    if cfg.include_liquidity_sweeps:
+        out = add_liquidity_sweeps(
+            out,
+            config=cfg.liquidity_config(),
+            high_col="high",
+            low_col="low",
+            close_col="close",
+        )
     return out
 
 
@@ -134,7 +169,8 @@ def structure_signature(config: Optional[MarketStructureConfig] = None) -> str:
     """Stable cache key for ``IndicatorManager.shared_indicator_signature``."""
     cfg = config or MarketStructureConfig()
     return (
-        f"ms_v1_{cfg.swing_left}_{cfg.swing_right}_{int(cfg.include_fvg)}"
+        f"ms_v2_{cfg.swing_left}_{cfg.swing_right}_{int(cfg.include_fvg)}"
         f"_{int(cfg.include_bos_choch)}_{int(cfg.include_order_blocks)}"
-        f"_{int(cfg.include_rsi_divergence)}_rsi{cfg.rsi_period}"
+        f"_{int(cfg.include_rsi_divergence)}_{int(cfg.include_liquidity_sweeps)}"
+        f"_rsi{cfg.rsi_period}_liq{cfg.liquidity_opening_range_minutes}"
     )
