@@ -13,6 +13,9 @@ from core.strategies.Futures.Futures_EMA_Momentum.Futures_EMA_Momentum import (
     FuturesEMAMomentum,
 )
 from core.strategies.crypto.RSIBreadAndButter.RSIBreadAndButter import RSIBreadAndButter
+from core.strategies.crypto.LiquiditySweepStrategy.LiquiditySweepStrategy import (
+    LiquiditySweepStrategy,
+)
 from core.strategies.PipelineTest.signal_flood_test import SignalFloodTestStrategy
 from core.strategies.Equity.IPOBreakout.IPOBreakout import IPOBreakout
 from core.instruments import EquityInstrument, OptionInstrument, FutureInstrument
@@ -116,6 +119,15 @@ STRATEGY_MAP = {
     },
     "RSIBreadAndButter": {
         "strategy": RSIBreadAndButter,
+        "instrument": "FUTURE",
+        "allowed_modes": [
+            RunMode.BACKTEST,
+            RunMode.PAPER,
+            RunMode.LIVE,
+        ],
+    },
+    "LiquiditySweepStrategy": {
+        "strategy": LiquiditySweepStrategy,
         "instrument": "FUTURE",
         "allowed_modes": [
             RunMode.BACKTEST,
