@@ -41,6 +41,10 @@ class SessionManager:
     def is_market_open(exchange):
         exchange = SessionManager.normalize_exchange(exchange)
 
+        # Delta crypto perps trade 24/7 — do not apply NSE-style weekends/holidays.
+        if exchange == "DELTA":
+            return True
+
         now = SessionManager._now(exchange)
 
         if now.weekday() >= 5:
