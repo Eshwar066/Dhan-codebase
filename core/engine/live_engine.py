@@ -417,15 +417,18 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self, symbol: str, tf: str, exchange: str, sector: str
     ) -> Optional[int]:
         try:
-            strategy_id = str(getattr(self.strategy, "name", "") or "")
-            state = self.indicator_manager._bootstrap_base_candle_state(
-                symbol=symbol,
-                tf=tf,
-                exchange=exchange,
-                sector=sector,
-                window=self.indicator_manager.indicator_window_size(self.strategy),
-                strategy_id=strategy_id or None,
-            )
+            key = self.indicator_manager._key_symbol_tf(symbol, tf)
+            state = self.indicator_manager._base_candle_state.get(key)
+            if state is None:
+                strategy_id = str(getattr(self.strategy, "name", "") or "")
+                state = self.indicator_manager._bootstrap_base_candle_state(
+                    symbol=symbol,
+                    tf=tf,
+                    exchange=exchange,
+                    sector=sector,
+                    window=self.indicator_manager.indicator_window_size(self.strategy),
+                    strategy_id=strategy_id or None,
+                )
             df = state.get("df")
             if df is None or len(df) == 0 or "timestamp" not in df.columns:
                 return None

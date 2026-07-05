@@ -770,6 +770,10 @@ class IndicatorManager:
             if seeded:
                 if not ist_key:
                     continue
+                dedupe_key = (sym_u, tf_s, ist_key, source)
+                if self._rsi_logged_keys is not None and dedupe_key in self._rsi_logged_keys:
+                    self._live_persist_fingerprints[(sym_u, tf_s, ist_key)] = fp
+                    continue
                 if self._live_persist_fingerprints.get((sym_u, tf_s, ist_key)) == fp:
                     continue
             wrote = ind_hist.append_indicator_history_row(
@@ -934,6 +938,11 @@ class IndicatorManager:
         key = self._key_symbol_tf(symbol, tf)
         state = self._base_candle_state.get(key)
         if state:
+            live_active = int(state.get("update_seq", 0)) > 0 or state.get(
+                "last_bucket"
+            ) is not None
+            if live_active:
+                return state
             df0 = state.get("df")
             prev_w = int(state.get("window") or 0)
             if (
@@ -942,6 +951,8 @@ class IndicatorManager:
                 and len(df0) >= window
                 and prev_w >= window
             ):
+                if prev_w != window:
+                    state["window"] = window
                 return state
 
         buf = max(10, int(self._log_bootstrap_buffer))
@@ -1035,13 +1046,20 @@ class IndicatorManager:
         df = self._sanitize_delta_ohlc_df(df)
 
         boot_ist = dt.datetime.now(IST).isoformat()
+        prev_state = self._base_candle_state.get(key) or {}
+        prev_live = int(prev_state.get("update_seq", 0)) > 0 or prev_state.get(
+            "last_bucket"
+        ) is not None
         new_state: Dict[str, Any] = {
             "df": df,
-            "last_bucket": None,
+            "last_bucket": prev_state.get("last_bucket") if prev_live else None,
             "window": window,
             "bootstrap_source": source,
             "bootstrap_at_ist": boot_ist,
-            "update_seq": 0,
+            "update_seq": int(prev_state.get("update_seq", 0)) if prev_live else 0,
+            "continuity_checked": bool(prev_state.get("continuity_checked"))
+            if prev_live
+            else False,
         }
         self._base_candle_state[key] = new_state
         if source == "log":
@@ -1173,7 +1191,9 @@ class IndicatorManager:
                     base_state["df"] = base_df
                     base_state["last_bucket"] = bucket
                     base_state["update_seq"] = int(base_state.get("update_seq", 0)) + 1
-                    bar_closed_for_append = False
+                    bar_closed_for_append = True
+                    if out_meta is not None:
+                        out_meta["bar_closed_for_append"] = True
                 else:
                     # One-shot continuity validation between bootstrap history and first live append.
                     if not base_state.get("continuity_checked", False):

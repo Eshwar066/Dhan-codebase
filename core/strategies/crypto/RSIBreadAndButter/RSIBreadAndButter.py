@@ -63,7 +63,7 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
     """
 
     name = "RSIBreadAndButter"
-    underlying_symbols = ["BTCUSD", "ETHUSD"]
+    underlying_symbols = ["BTCUSD"] #, "ETHUSD"
     timeframe = "1"
     required_context = ["instrument_store"]
     api = "DELTA"
@@ -266,9 +266,9 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
         rsi = float(rsi_raw)
         bull = bool(self._numeric_flag(candle.get("rsi_div_bull")))
         bear = bool(self._numeric_flag(candle.get("rsi_div_bear")))
-        if bull and rsi <= RSI_OVERSOLD + 5:
+        if bull and rsi <= RSI_OVERSOLD:
             return "LONG"
-        if bear and rsi >= RSI_OVERBOUGHT - 5:
+        if bear and rsi >= RSI_OVERBOUGHT:
             return "SHORT"
         return None
 
