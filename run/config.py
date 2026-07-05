@@ -234,10 +234,12 @@ ENGINE_JOBS = [
         "engine_id": "delta_rsi_bread_butter",
         "venue": "DELTA",
         "enabled": True,
-        "run_mode": "LIVE",
+
+        "run_mode": "BACKTEST",
+
         "capital": 200000,
         "ORDER_QTY_LOTS": 1,
-        "strategies": ["RSIBreadAndButter"],
+        "strategies": ["LiquiditySweepStrategy"], #,"RSIBreadAndButter"
         "delta_leverage": 10,
         "telegram": {
             "bot_token": "8389724629:AAHY_CGcBF8HZCexedsEJFw80Mf6SxH5Bkk",

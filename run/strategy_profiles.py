@@ -157,6 +157,18 @@ STRATEGY_PROFILES: Dict[str, Dict[str, Any]] = {
             "sector": "YES",
         },
     },
+    "LiquiditySweepStrategy": {
+        "symbols": ["BTCUSD"],
+        "delta": {"india": True, "testnet": False, "leverage": 5},
+        "live": {"exchange": "DELTA", "sector": "YES"},
+        "backtest": {
+            "start_date": "2026-06-19",
+            "end_date": "2026-07-05",
+            "timeframe": "1",
+            "exchange": "DELTA",
+            "sector": "YES",
+        },
+    },
 }
 
 
