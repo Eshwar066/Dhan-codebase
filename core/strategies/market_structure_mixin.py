@@ -29,10 +29,23 @@ class MarketStructureMixin:
     """Add SMC-style features via ``prepare_indicators`` when enabled."""
 
     market_structure_enabled: bool = False
+    _structure_session_exchange: Optional[str] = None
+
+    def set_structure_session_exchange(self, exchange: Optional[str]) -> None:
+        """Live/backtest: align liquidity session/OR with venue (NSE vs DELTA)."""
+        self._structure_session_exchange = (
+            str(exchange or "").strip().upper() or None
+        )
 
     def market_structure_config(self) -> MarketStructureConfig:
-        """Override for custom swing/FVG/BOS parameters."""
-        return MarketStructureConfig()
+        """Override for custom swing/FVG/BOS/liquidity parameters."""
+        from dataclasses import replace
+
+        cfg = MarketStructureConfig()
+        ex = getattr(self, "_structure_session_exchange", None)
+        if ex:
+            cfg = replace(cfg, liquidity_session_exchange=ex)
+        return cfg
 
     def get_structure_lookback(self) -> int:
         """Bars of OHLC history ``IndicatorManager`` should retain."""

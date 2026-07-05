@@ -1295,6 +1295,9 @@ class IndicatorManager:
                         max_rows=merge_cap,
                     )
                 try:
+                    setter = getattr(strategy, "set_structure_session_exchange", None)
+                    if callable(setter):
+                        setter(exchange)
                     work_df = strategy.prepare_indicators(work_df)
                 except Exception:
                     pass
