@@ -762,7 +762,166 @@ class OrderRouter:
             self._order_state_log = log[-self._order_state_log_max :]
         else:
             self._order_state_log = log
+        self._reconcile_stale_bracket_order_states_on_startup()
         self._persist_order_state()
+
+    def _persisted_sent_has_filled_bracket_sibling(self, sent_intent_id: str) -> bool:
+        """True when another bracket leg from the same bundle is FILLED in persisted state."""
+        log = getattr(self, "_order_state_log", [])
+        sent_ts = None
+        for entry in log:
+            if (
+                entry.get("intent_id") == sent_intent_id
+                and entry.get("action") == "order_placed"
+            ):
+                sent_ts = str(entry.get("timestamp") or "")
+                break
+        if not sent_ts:
+            return False
+        try:
+            sent_epoch = datetime.datetime.fromisoformat(
+                sent_ts.replace("Z", "+00:00")
+            ).timestamp()
+        except (TypeError, ValueError):
+            return False
+        for entry in log:
+            if entry.get("action") != "order_placed":
+                continue
+            other_id = str(entry.get("intent_id") or "")
+            if not other_id or other_id == sent_intent_id:
+                continue
+            other_ts = str(entry.get("timestamp") or "")
+            try:
+                other_epoch = datetime.datetime.fromisoformat(
+                    other_ts.replace("Z", "+00:00")
+                ).timestamp()
+            except (TypeError, ValueError):
+                continue
+            if abs(other_epoch - sent_epoch) > 30.0:
+                continue
+            if self._order_state.get(other_id) == OrderState.FILLED:
+                return True
+        return False
+
+    def _reconcile_stale_bracket_order_states_on_startup(self) -> None:
+        """Clear stale SENT bracket legs after restart when sibling already FILLED."""
+        if self.intent_store:
+            for status in (IntentStatus.SENT, IntentStatus.VALIDATED):
+                for rec in self.intent_store.list_by_status(status):
+                    self._try_resolve_cancelled_bracket_sibling(rec)
+        for sent_id in list(self._order_state.keys()):
+            if self._order_state.get(sent_id) != OrderState.SENT:
+                continue
+            if self.intent_store and self.intent_store.exists(sent_id):
+                rec = self.intent_store.get(sent_id)
+                if rec and self._try_resolve_cancelled_bracket_sibling(rec):
+                    continue
+            if self._persisted_sent_has_filled_bracket_sibling(sent_id):
+                self._mark_intent_cancelled(
+                    sent_id,
+                    action="startup_sibling_filled_oco",
+                    message="Persisted SENT bracket leg; sibling already FILLED",
+                )
+
+    def _mark_intent_cancelled(
+        self, intent_id: str, *, action: str, message: str
+    ) -> None:
+        self._set_order_state(
+            intent_id, OrderState.CANCELLED, action=action, message=message
+        )
+        if self.intent_store:
+            self.intent_store.update(
+                intent_id, IntentStatus.CANCELLED, order_state=OrderState.CANCELLED
+            )
+
+    def _intent_is_terminal_filled(self, intent_id: str) -> bool:
+        if self._order_state.get(intent_id) == OrderState.FILLED:
+            return True
+        rec = self.intent_store.get(intent_id) if self.intent_store else None
+        if not rec:
+            return False
+        st = rec.get("status")
+        return str(getattr(st, "value", st)).upper() == "FILLED"
+
+    def _maybe_cancel_bracket_sibling_after_exit(
+        self,
+        position_closed: bool,
+        tag_fill: str,
+        structure_id: Optional[str],
+    ) -> None:
+        tag_u = str(tag_fill or "").upper()
+        stid = str(structure_id or "").strip()
+        if not position_closed or not stid or tag_u not in BRACKET_TAGS:
+            return
+        self.bracket_registry.cancel_sibling(
+            stid,
+            tag_u,
+            broker=self.broker,
+            order_router=self,
+            reason="sibling_fill",
+        )
+        self.bracket_registry.clear_structure(stid)
+
+    def _try_resolve_cancelled_bracket_sibling(
+        self, intent_record: Dict[str, Any]
+    ) -> bool:
+        """Resolve missing bracket leg when sibling filled and exchange OCO removed it."""
+        intent_id = str(intent_record.get("intent_id") or "")
+        if not intent_id:
+            return False
+        payload = intent_record.get("payload") or {}
+        tag_u = str(intent_record.get("tag") or payload.get("tag") or "").upper()
+        if tag_u not in BRACKET_TAGS:
+            return False
+        stid = intent_record.get("structure_id") or payload.get("structure_id")
+        if not stid:
+            return False
+        other_tag = "MAIN_TARGET" if tag_u == "MAIN_SL" else "MAIN_SL"
+        sibling_filled = False
+        sib = self.bracket_registry.get_sibling(str(stid), tag_u)
+        if sib and sib.get("intent_id"):
+            sibling_filled = self._intent_is_terminal_filled(str(sib["intent_id"]))
+        if not sibling_filled and self.intent_store:
+            for rec in self.intent_store.list_by_status(IntentStatus.FILLED):
+                rec_stid = rec.get("structure_id") or (rec.get("payload") or {}).get(
+                    "structure_id"
+                )
+                if str(rec_stid or "") != str(stid):
+                    continue
+                rec_tag = str(
+                    rec.get("tag") or (rec.get("payload") or {}).get("tag") or ""
+                ).upper()
+                if rec_tag == other_tag:
+                    sibling_filled = True
+                    break
+        if not sibling_filled:
+            return False
+        self._mark_intent_cancelled(
+            intent_id,
+            action="sibling_filled_oco",
+            message=f"Bracket sibling {other_tag} filled; leg removed on exchange",
+        )
+        return True
+
+    def _find_broker_order_for_intent(
+        self, intent_record: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        intent_id = str(intent_record.get("intent_id") or "")
+        order = None
+        if intent_id and hasattr(self.broker, "find_order_by_client_id"):
+            try:
+                order = self.broker.find_order_by_client_id(intent_id)
+            except Exception:
+                order = None
+        broker_oid = intent_record.get("broker_order_id")
+        if not order and broker_oid:
+            find_by_id = getattr(self.broker, "find_order_by_id", None)
+            if callable(find_by_id):
+                try:
+                    order = find_by_id(str(broker_oid))
+                except Exception:
+                    order = None
+        return order
 
     @staticmethod
     def _is_retryable_broker_error(exc: Exception) -> bool:
@@ -2127,181 +2286,173 @@ class OrderRouter:
             tag = i.get("intent_id")
             if self._order_state.get(tag) in _TERMINAL_ORDER_STATES:
                 continue  # Already resolved locally; no broker call
-            if hasattr(self.broker, "find_order_by_client_id"):
+            order = self._find_broker_order_for_intent(i)
+            if order:
                 try:
-                    order = self.broker.find_order_by_client_id(tag)
-                    if order:
-                        order = self._normalize_broker_order_for_recon(order)
-                        status = (order.get("status") or "").lower()
-                        filled = float(order.get("filled_size") or 0.0)
-                        size = float(order.get("size") or 0.0)
+                    order = self._normalize_broker_order_for_recon(order)
+                    status = (order.get("status") or "").lower()
+                    filled = float(order.get("filled_size") or 0.0)
+                    size = float(order.get("size") or 0.0)
 
-                        # Partial fill: filled > 0 and unfilled > 0 (filled < size)
-                        if size > 0 and filled > 0 and filled < size:
-                            prev_cum = float(
-                                self._last_applied_filled_by_intent.get(tag, 0.0)
+                    # Partial fill: filled > 0 and unfilled > 0 (filled < size)
+                    if size > 0 and filled > 0 and filled < size:
+                        prev_cum = float(
+                            self._last_applied_filled_by_intent.get(tag, 0.0)
+                        )
+                        delta = float(filled) - prev_cum
+                        self._set_order_state(
+                            tag,
+                            OrderState.PARTIAL,
+                            action="sync_partial",
+                            message=f"Polling: filled={filled} delta={delta} size={size}",
+                        )
+                        self.intent_store.update(
+                            tag,
+                            IntentStatus.SENT,  # Still in flight
+                            broker_order_id=order.get("order_id"),
+                            order_state=OrderState.PARTIAL,
+                        )
+                        if delta > 0 and self.position_manager:
+                            self.process_fill(
+                                instrument=i.get("instrument"),
+                                side=i.get("side"),
+                                qty=delta,
+                                price=float(
+                                    order.get("average_fill_price")
+                                    or i.get("price", 0)
+                                ),
+                                order_id=order.get("order_id"),
+                                intent_id=tag,
+                                strategy=i.get("strategy"),
+                                structure_id=i.get("structure_id"),
+                                tag=i.get("tag"),
+                                candle_ts=i.get("candle_ts"),
+                                action=i.get("action"),
                             )
-                            delta = float(filled) - prev_cum
-                            self._set_order_state(
-                                tag,
-                                OrderState.PARTIAL,
-                                action="sync_partial",
-                                message=f"Polling: filled={filled} delta={delta} size={size}",
+                            self._last_applied_filled_by_intent[tag] = float(filled)
+                        resolved_missing.add(str(tag))
+                    elif status == "filled" or (size > 0 and filled >= size):
+                        if self.engine_logger:
+                            self.engine_logger.log(
+                                "oms",
+                                f"Syncing fill for {tag} discovered via polling",
                             )
-                            self.intent_store.update(
-                                tag,
-                                IntentStatus.SENT,  # Still in flight
-                                broker_order_id=order.get("order_id"),
-                                order_state=OrderState.PARTIAL,
-                            )
-                            if delta > 0 and self.position_manager:
-                                self.process_fill(
-                                    instrument=i.get("instrument"),
-                                    side=i.get("side"),
-                                    qty=delta,
-                                    price=float(
-                                        order.get("average_fill_price")
-                                        or i.get("price", 0)
-                                    ),
-                                    order_id=order.get("order_id"),
-                                    intent_id=tag,
-                                    strategy=i.get("strategy"),
-                                    structure_id=i.get("structure_id"),
-                                    tag=i.get("tag"),
-                                    candle_ts=i.get("candle_ts"),
-                                    action=i.get("action"),
-                                )
-                                self._last_applied_filled_by_intent[tag] = float(filled)
-                            resolved_missing.add(str(tag))
-                        elif status == "filled" or (size > 0 and filled >= size):
-                            if self.engine_logger:
-                                self.engine_logger.log(
-                                    "oms",
-                                    f"Syncing fill for {tag} discovered via polling",
-                                )
 
-                            # Reconstruct fill from broker data and intent record
-                            # Note: In a real system, we'd ideally have the original OrderIntent object.
-                            # Since we don't have it here easily (intent_store stores dicts),
-                            # we'll use the values from the dict.
-                            payload = i.get("payload", {})
-                            instr = i.get(
-                                "instrument"
-                            )  # If stored in dict; depends on intent_store implementation
+                        if self.position_manager:
+                            self.process_fill(
+                                instrument=i.get("instrument"),
+                                side=i.get("side"),
+                                qty=filled,
+                                price=float(
+                                    order.get("average_fill_price")
+                                    or i.get("price", 0)
+                                ),
+                                order_id=order.get("order_id"),
+                                intent_id=tag,
+                                strategy=i.get("strategy"),
+                                structure_id=i.get("structure_id"),
+                                tag=i.get("tag"),
+                                candle_ts=i.get("candle_ts"),
+                                action=i.get("action"),
+                            )
+                        self._set_order_state(
+                            tag,
+                            OrderState.FILLED,
+                            action="sync_filled",
+                            message="Syncing fill discovered via polling",
+                        )
+                        self.intent_store.update(
+                            tag,
+                            IntentStatus.FILLED,
+                            broker_order_id=order.get("order_id"),
+                            order_state=OrderState.FILLED,
+                        )
+                        self._last_applied_filled_by_intent[tag] = float(size or filled)
+                        resolved_missing.add(str(tag))
 
-                            # Apply fill FIRST. Do not mark intent FILLED before process_fill:
-                            # process_fill used to see FILLED + skip, so on_fill never ran (no PM, no SL).
-                            if self.position_manager:
-                                self.process_fill(
-                                    instrument=i.get("instrument"),
-                                    side=i.get("side"),
-                                    qty=filled,
-                                    price=float(
-                                        order.get("average_fill_price")
-                                        or i.get("price", 0)
-                                    ),
-                                    order_id=order.get("order_id"),
-                                    intent_id=tag,
-                                    strategy=i.get("strategy"),
-                                    structure_id=i.get("structure_id"),
-                                    tag=i.get("tag"),
-                                    candle_ts=i.get("candle_ts"),
-                                    action=i.get("action"),
-                                )
-                            self._set_order_state(
-                                tag,
-                                OrderState.FILLED,
-                                action="sync_filled",
-                                message="Syncing fill discovered via polling",
+                    elif status in ("cancelled", "rejected", "expired"):
+                        ost = (
+                            OrderState.CANCELLED
+                            if status == "cancelled"
+                            else (
+                                OrderState.REJECTED
+                                if status == "rejected"
+                                else OrderState.EXPIRED
                             )
-                            self.intent_store.update(
-                                tag,
-                                IntentStatus.FILLED,
-                                broker_order_id=order.get("order_id"),
-                                order_state=OrderState.FILLED,
-                            )
-                            self._last_applied_filled_by_intent[tag] = float(size or filled)
-                            resolved_missing.add(str(tag))
-
-                        elif status in ("cancelled", "rejected", "expired"):
-                            ost = (
-                                OrderState.CANCELLED
-                                if status == "cancelled"
-                                else (
-                                    OrderState.REJECTED
-                                    if status == "rejected"
-                                    else OrderState.EXPIRED
-                                )
-                            )
-                            self._set_order_state(
-                                tag,
-                                ost,
-                                action="sync_terminal",
-                                message=f"Broker status={status!r}",
-                            )
-                            self.intent_store.update(
-                                tag, IntentStatus.REJECTED, order_state=ost
-                            )
-                            resolved_missing.add(str(tag))
-                    else:
-                        # Trade-led: order missing from open list. Resolve fill by client_order_id first,
-                        # then by broker order_id (fills API often returns only order_id, not client_order_id).
-                        fill_info = None
-                        if hasattr(self.broker, "get_fill_for_client_order_id"):
-                            try:
-                                fill_info = self.broker.get_fill_for_client_order_id(tag)
-                            except Exception:
-                                pass
-                        if not fill_info and i.get("broker_order_id") and hasattr(self.broker, "get_fill_by_order_id"):
-                            try:
-                                fill_info = self.broker.get_fill_by_order_id(str(i["broker_order_id"]))
-                            except Exception:
-                                pass
-                        if fill_info and float(fill_info.get("price") or 0) > 0:
-                            # Only apply trade if not already FILLED (e.g. by sync_trades)
-                            if self._order_state.get(tag) not in _TERMINAL_ORDER_STATES:
-                                trade = {
-                                    "trade_id": f"fill_{tag}_{fill_info.get('order_id', '')}",
-                                    "order_id": fill_info.get("order_id"),
-                                    "intent_id": tag,
-                                    "client_order_id": tag,
-                                    "tag": tag,
-                                    "price": float(fill_info["price"]),
-                                    "size": float(fill_info.get("size") or 0),
-                                    "side": (fill_info.get("side") or i.get("side") or "").upper(),
-                                }
-                                if self.process_trade(trade):
-                                    if self.engine_logger:
-                                        self.engine_logger.log(
-                                            "oms",
-                                            f"Missing order {tag}: applied trade from /v2/fills (trade-led)",
-                                        )
-                                    resolved_missing.add(str(tag))
-                            else:
-                                self._set_order_state(
-                                    tag,
-                                    OrderState.FILLED,
-                                    action="assume_filled",
-                                    message="Fill from API; trade already applied by sync_trades",
-                                )
-                                self.intent_store.update(
-                                    tag, IntentStatus.FILLED, order_state=OrderState.FILLED
-                                )
-                                resolved_missing.add(str(tag))
-                        else:
-                            # No trade found: do not update position or mark FILLED (trade-led: no trade → no position change)
-                            if self.engine_logger:
-                                self.engine_logger.log(
-                                    "oms",
-                                    f"Missing order {tag}: no fill in API; leaving state unchanged (trade-led OMS)",
-                                    strategy_id=self._intent_strategy_id(str(tag)),
-                                    intent_id=str(tag),
-                                )
+                        )
+                        ist = (
+                            IntentStatus.CANCELLED
+                            if status == "cancelled"
+                            else IntentStatus.REJECTED
+                        )
+                        self._set_order_state(
+                            tag,
+                            ost,
+                            action="sync_terminal",
+                            message=f"Broker status={status!r}",
+                        )
+                        self.intent_store.update(tag, ist, order_state=ost)
+                        resolved_missing.add(str(tag))
                 except Exception as e:
                     if self.engine_logger:
                         self.engine_logger.log(
                             "oms", f"Failed to sync status for {tag}: {e}"
                         )
+            else:
+                fill_info = None
+                if hasattr(self.broker, "get_fill_for_client_order_id"):
+                    try:
+                        fill_info = self.broker.get_fill_for_client_order_id(tag)
+                    except Exception:
+                        pass
+                if not fill_info and i.get("broker_order_id") and hasattr(
+                    self.broker, "get_fill_by_order_id"
+                ):
+                    try:
+                        fill_info = self.broker.get_fill_by_order_id(
+                            str(i["broker_order_id"])
+                        )
+                    except Exception:
+                        pass
+                if fill_info and float(fill_info.get("price") or 0) > 0:
+                    if self._order_state.get(tag) not in _TERMINAL_ORDER_STATES:
+                        trade = {
+                            "trade_id": f"fill_{tag}_{fill_info.get('order_id', '')}",
+                            "order_id": fill_info.get("order_id"),
+                            "intent_id": tag,
+                            "client_order_id": tag,
+                            "tag": tag,
+                            "price": float(fill_info["price"]),
+                            "size": float(fill_info.get("size") or 0),
+                            "side": (fill_info.get("side") or i.get("side") or "").upper(),
+                        }
+                        if self.process_trade(trade):
+                            if self.engine_logger:
+                                self.engine_logger.log(
+                                    "oms",
+                                    f"Missing order {tag}: applied trade from /v2/fills (trade-led)",
+                                )
+                            resolved_missing.add(str(tag))
+                    else:
+                        self._set_order_state(
+                            tag,
+                            OrderState.FILLED,
+                            action="assume_filled",
+                            message="Fill from API; trade already applied by sync_trades",
+                        )
+                        self.intent_store.update(
+                            tag, IntentStatus.FILLED, order_state=OrderState.FILLED
+                        )
+                        resolved_missing.add(str(tag))
+                elif self._try_resolve_cancelled_bracket_sibling(i):
+                    resolved_missing.add(str(tag))
+                elif self.engine_logger:
+                    self.engine_logger.log(
+                        "oms",
+                        f"Missing order {tag}: no fill in API; leaving state unchanged (trade-led OMS)",
+                        strategy_id=self._intent_strategy_id(str(tag)),
+                        intent_id=str(tag),
+                    )
 
         unresolved_orphan_tags = [
             str(o.get("tag"))
@@ -2714,19 +2865,9 @@ class OrderRouter:
             stid_fill = _rec_fill.get("structure_id") or (_rec_fill.get("payload") or {}).get(
                 "structure_id"
             )
-        if (
-            position_closed
-            and stid_fill
-            and tag_fill in BRACKET_TAGS
-        ):
-            self.bracket_registry.cancel_sibling(
-                str(stid_fill),
-                tag_fill,
-                broker=self.broker,
-                order_router=self,
-                reason="sibling_fill",
-            )
-            self.bracket_registry.clear_structure(str(stid_fill))
+        self._maybe_cancel_bracket_sibling_after_exit(
+            bool(position_closed), tag_fill, stid_fill
+        )
         sym = self._instrument_trading_symbol(instrument)
         self.report_fill(
             sym,
@@ -2917,6 +3058,8 @@ class OrderRouter:
                 return True
 
             execution_source = trade.get("execution_source") or "INTENT"
+            position_closed = False
+            realized_pnl = None
             position_closed, realized_pnl = self.position_manager.on_fill(
                 instrument=instrument,
                 side=side,
@@ -2942,6 +3085,17 @@ class OrderRouter:
             )
             if position_closed and realized_pnl is not None:
                 self.risk.record_realized_pnl(realized_pnl)
+            tag_fill = str(
+                intent.get("tag") or payload.get("tag") or trade.get("tag") or ""
+            ).upper()
+            stid_fill = (
+                intent.get("structure_id")
+                or payload.get("structure_id")
+                or trade.get("structure_id")
+            )
+            self._maybe_cancel_bracket_sibling_after_exit(
+                bool(position_closed), tag_fill, stid_fill
+            )
         sym = self._instrument_trading_symbol(instrument)
         self.report_fill(
             sym, side, int(size), trade.get("expected_price"), price,

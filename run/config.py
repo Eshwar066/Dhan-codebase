@@ -239,6 +239,8 @@ ENGINE_JOBS = [
         "ORDER_QTY_LOTS": 1,
         "strategies": ["RSIBreadAndButter"],
         "delta_leverage": 10,
+        "latency_critical_ms": 6000,
+        "latency_critical_cycles": 6,
         "telegram": {
             "bot_token": "8389724629:AAHY_CGcBF8HZCexedsEJFw80Mf6SxH5Bkk",
             "chat_id": "1021479950",

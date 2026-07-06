@@ -27,7 +27,7 @@ class ExecutionEngine:
         account_router: Any,
         engine_logger: Optional[Any],
         is_shutdown_requested: Callable[[], bool],
-        on_latency_critical: Optional[Callable[[], None]],
+        on_latency_critical: Optional[Callable[[float], None]],
         latency_critical_ms: float,
         worker_watchdog_interval_seconds: float,
         queue_overflow_policy: str,
@@ -525,7 +525,7 @@ class ExecutionEngine:
                         total_latency_ms > self._latency_critical_ms
                         and self._on_latency_critical is not None
                     ):
-                        self._on_latency_critical()
+                        self._on_latency_critical(total_latency_ms)
                 else:
                     self._log_oms_pipeline(
                         "process_complete",

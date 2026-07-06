@@ -173,6 +173,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self.latency_critical_ms = latency_critical_ms
         self.latency_critical_cycles = latency_critical_cycles
         self._latency_critical_count = 0
+        self._latency_recovery_count = 0
         self._entries_paused_latency = False
         # Symbol-level failure isolation
         self.symbol_error_threshold = symbol_error_threshold
@@ -273,7 +274,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             account_router=self.account_router,
             engine_logger=self.engine_logger,
             is_shutdown_requested=lambda: self._shutdown_requested,
-            on_latency_critical=lambda: setattr(self, "_entries_paused_latency", True),
+            on_latency_critical=self._on_latency_observed,
             latency_critical_ms=self.latency_critical_ms,
             worker_watchdog_interval_seconds=self._worker_watchdog_interval_seconds,
             queue_overflow_policy=self._queue_overflow_policy,
@@ -1035,6 +1036,39 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             or "HTTP CLIENT UNAVAILABLE" in err
             or "FAILED TO FETCH BROKER OPEN ORDERS" in err
         )
+
+    def _on_latency_observed(self, total_ms: float) -> None:
+        """Pause entries after N consecutive slow cycles; clear after N healthy ones."""
+        try:
+            total_ms = float(total_ms)
+        except (TypeError, ValueError):
+            return
+        if total_ms > self.latency_critical_ms:
+            self._latency_critical_count += 1
+            self._latency_recovery_count = 0
+            if (
+                self._latency_critical_count >= self.latency_critical_cycles
+                and not self._entries_paused_latency
+            ):
+                self._entries_paused_latency = True
+                if self.engine_logger:
+                    self.engine_logger.latency_critical_pause(
+                        f"Latency critical for {self.latency_critical_cycles} cycles "
+                        f"(last={total_ms:.0f}ms, threshold={self.latency_critical_ms:.0f}ms); "
+                        "entries paused"
+                    )
+        else:
+            self._latency_critical_count = 0
+            if self._entries_paused_latency:
+                self._latency_recovery_count += 1
+                if self._latency_recovery_count >= self.latency_critical_cycles:
+                    self._entries_paused_latency = False
+                    self._latency_recovery_count = 0
+                    if self.engine_logger:
+                        self.engine_logger.latency_pause_cleared(
+                            f"Latency recovered for {self.latency_critical_cycles} cycles "
+                            f"(last={total_ms:.0f}ms); entries resumed"
+                        )
 
     def _entry_pause_reasons(self) -> List[str]:
         reasons: List[str] = []
@@ -2900,16 +2934,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     total_latency_ms=total_ms,
                     strategy_id=str(getattr(strategy, "name", "") or ""),
                 )
-            if total_ms > self.latency_critical_ms:
-                self._latency_critical_count += 1
-                if self._latency_critical_count >= self.latency_critical_cycles:
-                    self._entries_paused_latency = True
-                    if self.engine_logger:
-                        self.engine_logger.latency_critical_pause(
-                            "Latency critical for N cycles; entries paused"
-                        )
-            else:
-                self._latency_critical_count = 0
+            self._on_latency_observed(total_ms)
         else:
             trading_sym = self._intent_place_order_symbol(single_intent, symbol)
             logger.warning(
