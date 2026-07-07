@@ -259,6 +259,7 @@ python -m run.main --venue DELTA
 
 ```bash
 sudo systemctl daemon-reload          # after editing unit files
+ps aux | grep 'run.main.*dhan' | grep -v grep
 sudo systemctl restart dhan-leaps-rsi.service
 
 
