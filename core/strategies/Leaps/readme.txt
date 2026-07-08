@@ -1,461 +1,141 @@
-LEAPS Quarterly RSI – Strategy module
+LEAPS RSI – Strategy module
 ======================================
 Implementation: LeapsQuatery_RSI_52_32.py (class LeapsQuarterly)
 Shared logic:   core/strategies/IndiaMktMixins.py (IndiaMktMixins)
 Registry:       core/strategies/registry.STRATEGY_MAP["LEAPS_RSI"]
+Engine job:     run/config.py → dhan_leaps_rsi
 
----
-wire parent–child linkage (parent_intent_id)
-
-enforce exactly one hedge per sell
-
-add hedge PnL attribution
-
-make rollover holiday-aware without Expiry_Calendar
-
-add regime lock (1 trade per regime)
-
-add hedge PnL attribution
-
-add delta-aware hedge distance
-
-add backtest sanity assertions
-====
-If nifty rsi is below 32 will sell call option in 1hr candle, until it crosses rsi 52
-
-If nifty rsi is above 52 will sell put option in 1hr candle, until it crosses rsi 32
-
-timeframe to check the logic is at 10:15,11:15,12:15,1:15,2:15,3:15 since we are using 1hr candle
-
-sell 500-1000 roundoff strikes in quaterly month
-jan-march, below 15th feb, take march strikes
-after 15th feb, sell June strikes
-april-June, in may after 15th we take september strikes
-july-september, in aug after 15th will take december strikes
-oct- decemeber, in nov after 15th will take march strikes
-
-Hedging in monthly of current expiry: Buy Monthly Hedge from nifty, approx 2per away from selling strike
-Rollover hedging on 18th of every month, if 18th is holiday or saturaday or sunday will do 1 day before
-
-if new tradas comes 15th or after that then take hedging of next month only
-
-
-In live: while placing order will get market_depth and place limit order for best price.
+==========================================================================================
+STRATEGY OVERVIEW
 ==========================================================================================
 
-"""
-LEAPS QUARTERLY RSI OPTION SELLING STRATEGY
-==========================================
+Regime-based NIFTY option selling on 1-hour RSI with monthly hedge protection.
 
-Strategy Type:
---------------
-Regime-based option selling using RSI on 1-hour candles.
+- RSI crosses below 32  → SELL CALL (MAIN) + BUY monthly CALL hedge
+- RSI crosses above 52  → SELL PUT  (MAIN) + BUY monthly PUT hedge
+- Exit when RSI crosses opposite band (MAIN + hedge)
 
-Underlying:
------------
-NIFTY
+Strategy is signal-only. Execution, risk, fills, and SL are handled by LiveEngine + OrderRouter.
 
-Core Logic:
------------
-- RSI < 32  → SELL CALL options
-- RSI > 52  → SELL PUT options
-- Maintain position until RSI crosses the opposite band
+==========================================================================================
+EVALUATION (LIVE)
+==========================================================================================
 
-Timeframe:
-----------
-1 Hour candles
+Timeframe: 60m NIFTY bars (closed bar only).
 
-Signal Evaluation Times (IST):
-------------------------------
-10:15
-11:15
-12:15
-13:15
-14:15
-15:15
+NSE hourly bar close window (IST) — evaluation allowed after bar close + grace:
+  10:15, 11:15, 12:15, 13:15, 14:15, 15:15, 16:15
 
-No trades outside these timestamps.
+Entry requires RSI CROSSOVER (not sustained level):
+  CALL entry: prev_rsi >= 32 and rsi < 32
+  PUT  entry: prev_rsi <= 52 and rsi > 52
 
-------------------------------------------------------------
-OPTION SELECTION RULES
-------------------------------------------------------------
+One evaluation per closed hourly bar (deduped by bar open key).
 
-1. Expiry Selection (Quarterly)
---------------------------------
-Quarterly expiries are chosen based on trade date:
+Live path:
+  1. CandleAggregator closed 60m bar
+  2. indicator_manager enriches RSI / EMA
+  3. LiveEngine._run_exits_and_rollover (exits + hedge rollover every closed bar)
+  4. should_evaluate → on_candle (entries on crossover only)
 
-Jan – Feb 15        → March expiry
-After Feb 15        → June expiry
+Backtest path:
+  BacktestEngine runs exit + rollover every candle; gates entry on should_evaluate.
 
-Apr – May 15        → June expiry
-After May 15        → September expiry
+==========================================================================================
+MAIN LEG EXPIRY — LEAPS_ROLL (not Mar/Jun/Sep/Dec quarterly)
+==========================================================================================
 
-Jul – Aug 15        → September expiry
-After Aug 15        → December expiry
+Code: expiryType = "LEAPS_ROLL" (ExpiryResolver._leaps_rollover_month_year)
 
-Oct – Nov 15        → December expiry
-After Nov 15        → March (next year)
+Monthly stepping calendar (cutoff = day 16 onward in code):
 
-Monthly cutoff date: 15th of the mid-month.
+  Month   Days 1–15 → sell expiry in   Days 16–end → sell expiry in
+  Jan     February                  March
+  Feb     March                     April
+  Jul     August                    September
+  Nov     December                  January (next year)
+  …       (see ExpiryResolver.LEAPS_ROLL roll table)
 
-------------------------------------------------------------
+Expiry date = last Tuesday of target month.
 
-2. Strike Selection
--------------------
-- Only round strikes (multiples of 500 / 1000)
-- Premium filters:
-    CALL → LTP between 300–400
-    PUT  → LTP between 200–400
+NOTE: Older docs described Mar/Jun/Sep/Dec quarterly — that is QUARTERLY mode,
+not what LEAPS_RSI runs today. To use classic quarterly, change expiryType to
+"QUARTERLY" in LeapsQuatery_RSI_52_32.py (separate strategy decision).
 
-Strike closest to ideal premium (~350) is selected.
+==========================================================================================
+STRIKE SELECTION
+==========================================================================================
 
-------------------------------------------------------------
-TRADE RULES
-------------------------------------------------------------
+- NIFTY LEAPS grid: 500-point steps (22000, 22500, 23000, …)
+- Premium bands (on_candle):
+    CALL → 200–400 (ideal ~350)
+    PUT  → 200–400 (ideal ~350)
+- Closest to ideal premium in band is selected.
 
-SELL CALL CONDITIONS:
----------------------
-- RSI < 32
-- Trade only at valid timestamps
-- Sell quarterly CALL option
-- Hold until RSI > 52
+==========================================================================================
+HEDGING
+==========================================================================================
 
-SELL PUT CONDITIONS:
---------------------
-- RSI > 52
-- Trade only at valid timestamps
-- Sell quarterly PUT option
-- Hold until RSI < 32
+- BUY monthly option (~2% OTM from sold strike; 500-step grid)
+  CALL main 24500 → hedge ~25000
+  PUT  main 24500 → hedge ~24000
 
-------------------------------------------------------------
-HEDGING RULES
-------------------------------------------------------------
+- Hedge expiry (resolve_hedge_expiry):
+    trade before 15th → current month (last Tuesday)
+    trade on/after 15th → next month
 
-Hedge Type:
------------
-BUY Monthly option (not quarterly)
+- Separate option chain fetch for hedge (hedge_option_chain_snapshots/).
 
-Hedge Distance:
----------------
-~2% away from the sold strike
-for eg:
-For Call Strike 
-  Main strike is 24500 then hedge should be 25000
-for Put 
-  main strike is 24500 then hedge strike should be 24000
+- parent_intent_id links hedge ENTRY to MAIN sell intent.
 
-Expiry:
--------
-- Use current month hedge
-- If new trade occurs on or after 15th:
-  → Use NEXT month hedge
+==========================================================================================
+HEDGE ROLLOVER (LIVE + BACKTEST)
+==========================================================================================
 
-------------------------------------------------------------
+IndiaMktMixins.on_candle_rollover — wired in LiveEngine._run_exits_and_rollover.
 
-Hedge Rollover:
----------------
-- Roll hedge on 18th of every month
-- If 18th is Holiday / Saturday / Sunday:
-  → Roll one working day earlier
+Window: calendar days 15–18 of month.
+Roll when: current date >= adjusted 18th (Fri→Thu, Sun→Fri).
+Action: HEDGE_EXIT (sell old hedge) + new HEDGE ENTRY.
+Deduped: one roll per structure per calendar day (rolled_hedges set).
 
-------------------------------------------------------------
+==========================================================================================
+EXECUTION (LIVE)
+==========================================================================================
+
+- HEDGE + MAIN ENTRY: fill-gated bundle on Dhan (hedge BUY → wait fill → MAIN SELL)
+- Hedge auto-retry with refreshed bid/ask (LEAPS_RSI only, up to 3 attempts)
+- LIMIT prices from live depth (engine price_map → OrderRouter)
+- Hedge exit / MAIN exit: depth-based limit at eval bar
+
+==========================================================================================
 EXIT RULES
-------------------------------------------------------------
+==========================================================================================
 
-Exit position if:
------------------
-1. RSI regime flips
-   - CALL → RSI > 52
-   - PUT  → RSI < 32
+MAIN (should_exit):
+  Short CALL → exit when RSI > 52
+  Short PUT  → exit when RSI < 32
 
-2. Hedge rollover day
+on_position_exit: MAIN_EXIT + HEDGE_EXIT intents (structure unwind).
 
-3. Forced risk / engine exit
+==========================================================================================
+ROADMAP / NOT YET IMPLEMENTED
+==========================================================================================
 
-------------------------------------------------------------
-EXECUTION (LIVE MODE)
-------------------------------------------------------------
+- Regime lock (one open structure per regime globally)
+- Hedge PnL attribution
+- Delta-aware hedge distance
+- Holiday-aware rollover without Expiry_Calendar dependency
 
-- Fetch market depth
-- Place LIMIT orders only
-- Price = best bid/ask
-- Avoid market orders to reduce slippage
+==========================================================================================
+INTENT REFERENCE
+==========================================================================================
 
-------------------------------------------------------------
-RISK CHARACTERISTICS
-------------------------------------------------------------
+Structure ID: LEAPS_RSI:NIFTY:{RSI_LT_32|RSI_GT_52}
+Tags: MAIN (sell), HEDGE (buy), HEDGE_EXIT, MAIN_EXIT
 
-- Low frequency
-- Directional regime based
-- Quarterly decay advantage
-- Monthly hedge protection
-- Controlled rollover logic
+Example MAIN sell intent fields: side=SELL, action=ENTRY, tag=MAIN, trade_type=MARGIN
 
-------------------------------------------------------------
-INTENT FORMAT (REFERENCE)
-------------------------------------------------------------
-
-Example intent produced by strategy:
-
-{
-    "intent_id": "<uuid>",
-    "symbol": "NIFTY",
-    "trading_symbol": "NIFTY 30 MAR 25000 PUT",
-    "side": "SELL",
-    "option_type": "PUT",
-    "strike": 25000,
-    "expiry": "2026-03-30",
-    "qty": 1,
-    "price": 350,
-    "strategy": "LEAPS_RSI",
-    "trade_type": "MARGIN",
-    "exchange": "NSE",
-    "segment": "D",
-    "lot_size": 65
-}
-
-------------------------------------------------------------
-IMPORTANT NOTES
-------------------------------------------------------------
-
-- Strategy is SIGNAL ONLY
-- Execution, risk checks, and order placement handled by engine
-- No overtrading due to fixed time evaluation
-- Designed for capital-efficient, slow theta harvesting
-
-============================================================
+==========================================================================================
 END OF STRATEGY SPEC
-============================================================
-=============================================================
-============================================================
-============================================================
-==============================================================
-
-
-
-
-
-
-
-"""
-📘 LEAPS Quarterly RSI Option Selling Strategy
-Strategy Name
-
-LEAPS_RSI
-
-Strategy Type
-
-Regime-based quarterly option selling with monthly hedging
-
-Underlying
-
-NIFTY Index
-
-1. Strategy Overview
-
-The LEAPS Quarterly RSI Strategy is a low-frequency, regime-based options selling system designed to harvest long-dated theta while maintaining controlled risk using monthly hedges.
-
-The strategy uses RSI on 1-hour candles to determine whether the market is in a bullish or bearish regime and sells quarterly options accordingly.
-
-Execution, risk checks, position sizing, and order placement are handled by the engine.
-The strategy itself is signal-only.
-
-2. Market Regime Logic
-RSI Condition	Action
-RSI < 32	Sell CALL option
-RSI > 52	Sell PUT option
-Between 32–52	No new trades
-
-Positions are held until the RSI crosses the opposite band.
-
-3. Timeframe & Evaluation Schedule
-Candle Timeframe
-
-1 Hour
-
-Allowed Evaluation Times (IST)
-
-Signals are evaluated only at the following times:
-
-10:15
-
-11:15
-
-12:15
-
-13:15
-
-14:15
-
-15:15
-
-This prevents overtrading and ensures consistent signal timing.
-
-4. Expiry Selection Logic (Quarterly)
-
-The strategy always sells quarterly expiry options, determined dynamically based on the trade date.
-
-Quarterly Expiry Rules
-Trade Period	Before 15th	After 15th
-Jan – Feb	March	June
-Apr – May	June	September
-Jul – Aug	September	December
-Oct – Nov	December	March (next year)
-
-The cutoff day is 15th of the mid-month.
-
-5. Strike Selection Rules
-Strike Constraints
-
-Only round strikes (multiples of 500 / 1000)
-
-Strike must be near ATM
-
-Premium Filters
-Option Type	Premium Range
-CALL	300 – 400
-PUT	200 – 400
-
-From the filtered strikes, the strike closest to premium ≈ 350 is selected.
-
-6. Trade Entry Rules
-Sell CALL
-
-RSI < 32
-
-Valid evaluation time
-
-Quarterly expiry
-
-Premium filter satisfied
-
-Sell PUT
-
-RSI > 52
-
-Valid evaluation time
-
-Quarterly expiry
-
-Premium filter satisfied
-
-Only one position per signal is generated.
-
-7. Hedging Rules
-Hedge Type
-
-BUY Monthly option
-
-Hedge Distance
-
-Approximately 2% away from the sold strike
-
-Hedge Expiry
-
-Default: Current month
-
-If new trade occurs on or after 15th:
-
-Hedge is taken in next month expiry
-
-8. Hedge Rollover Rules
-
-Hedge rollover date: 18th of every month
-
-If 18th is:
-
-Holiday
-
-Saturday
-
-Sunday
-→ Rollover is done one trading day earlier
-
-Hedge rollover forces an exit of the existing hedge and creation of a new hedge.
-
-9. Exit Conditions
-
-A position is exited if any of the following occur:
-
-RSI Regime Exit
-Position	Exit Condition
-CALL	RSI > 52
-PUT	RSI < 32
-Hedge Rollover Exit
-
-On hedge rollover day
-
-Engine / Risk Exit
-
-Risk limits breached
-
-Forced system exit
-
-10. Execution Rules (Live Mode)
-
-Orders are placed as LIMIT orders
-
-Market depth is fetched before placing orders
-
-Best bid/ask is used as limit price
-
-Market orders are avoided to reduce slippage
-
-11. Risk Characteristics
-
-Low trade frequency
-
-Long-dated theta decay advantage
-
-Monthly hedge for tail risk
-
-No intraday churn
-
-Capital-efficient structure
-
-This strategy is designed for steady drawdown-controlled returns, not aggressive scalping.
-
-12. Intent Structure (Reference)
-
-Example intent generated by the strategy:
-
-{
-  "intent_id": "uuid",
-  "symbol": "NIFTY",
-  "trading_symbol": "NIFTY 30 MAR 25000 PUT",
-  "side": "SELL",
-  "option_type": "PUT",
-  "strike": 25000,
-  "expiry": "2026-03-30",
-  "qty": 1,
-  "price": 350,
-  "strategy": "LEAPS_RSI",
-  "trade_type": "MARGIN",
-  "exchange": "NSE",
-  "segment": "D",
-  "lot_size": 65
-}
-
-13. Design Philosophy
-
-Strategy generates intent only
-
-No broker-specific logic
-
-Fully engine-driven execution
-
-Deterministic decision points
-
-Easy to audit and backtest
-
-14. Disclaimer
-
-This strategy is for educational and system-design purposes.
-Live trading involves risk. Always validate with paper trading and strict risk limits.
-
-15. Versioning
-
-Strategy Version: 1.0
-
-Engine Compatibility: Codebase v3.1+
-
+==========================================================================================

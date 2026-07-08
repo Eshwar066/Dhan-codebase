@@ -10,6 +10,8 @@ Used by **LiveEngine** for real-time market data (and optional account updates) 
 
 - **DhanWebSocketFeed** – Dhan Live Market Feed WebSocket (`wss://api-feed.dhan.co`). Subscribes by ExchangeSegment + SecurityId (from `instrument_store.get_feed_instruments(symbols)`). Binary packets: Ticker, Quote, Full, OI, Prev close. Instantiated in `EngineFactory.create_live_engine()` when broker is DHAN and credentials are set.
 
+- **DhanDepthFeed** – Optional depth channel used by `live_engine_common` for best bid/ask when placing or refreshing orders.
+
 ## Interface: `RealtimeFeed`
 
 - `start()` / `stop()` – connect/disconnect
@@ -20,50 +22,21 @@ Used by **LiveEngine** for real-time market data (and optional account updates) 
 
 LiveEngine uses the feed when `realtime_feed` is set and `is_connected()`; otherwise it falls back to `CandleService` / `data.get_latest_candles()`.
 
+## Quote subscription (HYBRID_GTT)
 
+`GttFallbackBook` registers option symbols via `LiveEngine._gtt_fallback_subscribe` → `replace_instruments` on the Dhan feed. Scheduled strategies still subscribe **underlying** index symbols for spot at eval slots.
 
-cd /d "c:\Users\eshwa\Desktop\Dhan\Algo" && python -c "
-from core.data.feeds import RealtimeFeed, DeltaWebSocketFeed
-from core.library.delta_websocket import DeltaWebSocket
-print('DeltaWebSocketFeed', DeltaWebSocketFeed)
-print('DeltaWebSocket', DeltaWebSocket)
-print('OK')
-"
+## Smoke test
 
-cd "c:\Users\eshwa\Desktop\Dhan\Algo"; python -c "from core.data.feeds import RealtimeFeed, DeltaWebSocketFeed; from core.library.delta_websocket import DeltaWebSocket; print('OK')"
+```bash
+cd /root/Dhan-codebase
+source .venv/bin/activate
+python -c "from core.data.feeds import DeltaWebSocketFeed; print('OK', DeltaWebSocketFeed)"
+```
 
+## Operational notes
 
-<!-- Next plans -->
-⚠ Architectural Weaknesses
-1️⃣ while True + sleep(1) is blocking
-
-This limits:
-
-Scalability
-
-Latency
-
-Multi-symbol expansion
-
-Async would be better.
-
-2️⃣ No duplicate candle guard
-
-If feed returns same closed candle twice,
-strategy may trigger twice.
-
-You should store last processed timestamp per symbol.
-
-3️⃣ No reconnection logic shown
-
-If feed disconnects mid-loop,
-behavior depends on is_connected().
-
-Better to auto-reconnect.
-
-4️⃣ No position sync on restart
-
-If engine restarts,
-does it reload open positions?
-
-Important for live trading.
+- Main live loop uses `sleep(1)`; quote-driven strategies (HYBRID_GTT) poll inside `GttFallbackBook.tick()` — see `docs/EVENT_DRIVEN_STRATEGY_GUIDE.md` for push-based quote events (roadmap).
+- Candle dedup: engine tracks last processed bar keys per strategy/symbol where applicable.
+- Feed reconnect behavior is implementation-specific; monitor `feed_health_warning` in engine logs.
+- On restart, broker position reconcile runs at engine startup (`OrderRouter` / `PositionManager`).
