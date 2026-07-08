@@ -100,6 +100,13 @@ class DhanBroker(BaseBroker):
 
     # Dhan docs: max 25 modifications per order — switch to cancel + re-place before hard failure.
     DHAN_MODIFY_WARN_THRESHOLD = 20
+    supports_hedge_fill_gated_bundles = True
+    hedge_fill_wait_timeout_sec = 120.0
+    hedge_fill_poll_interval_sec = 0.5
+    hedge_fill_margin_settle_sec = 0.5
+    hedge_fill_retry_max_attempts = 3
+    hedge_fill_retry_per_attempt_sec = 40.0
+    hedge_fill_retry_strategy_ids = frozenset({"LEAPS_RSI"})
 
     def __init__(self, api, position_manager=None, intent_store=None):
         super().__init__(position_manager=position_manager, intent_store=intent_store)
@@ -380,6 +387,65 @@ class DhanBroker(BaseBroker):
             "leg_count": len(legs),
             "message": msg,
         }
+
+    def modify_order_price(
+        self,
+        intent,
+        broker_order_id: str,
+        execution_price: Optional[float] = None,
+    ) -> bool:
+        """Modify a pending Dhan limit order to a new price (hedge retry)."""
+        oid = str(broker_order_id or "").strip()
+        if not oid:
+            return False
+        if not self.note_dhan_modify(oid):
+            return False
+        try:
+            payload = self._build_payload(intent, execution_price)
+        except Exception as exc:
+            logger.warning("modify_order_price build_payload failed: %s", exc)
+            return False
+        source = getattr(self.api, "_source", None)
+        tsl = getattr(source, "tsl", None) if source is not None else None
+        if tsl is None or not getattr(tsl, "modify_order", None):
+            return False
+        try:
+            GlobalRateLimiter.instance().acquire(DHAN_ORDER_API, 0.11)
+            result = tsl.modify_order(
+                order_id=oid,
+                order_type=str(payload.get("order_type") or "LIMIT"),
+                quantity=int(payload.get("quantity") or 0),
+                price=float(payload.get("price") or 0),
+                trigger_price=float(payload.get("trigger_price") or 0),
+                disclosed_quantity=int(payload.get("disclosed_quantity") or 0),
+                validity=str(payload.get("validity") or "DAY"),
+            )
+            return bool(result)
+        except Exception as exc:
+            logger.warning(
+                "Dhan modify_order_price failed order_id=%s intent_id=%s: %s",
+                oid,
+                getattr(intent, "intent_id", None),
+                exc,
+            )
+            return False
+
+    def order_is_open(self, broker_order_id: str) -> bool:
+        row = self.find_order_by_id(broker_order_id)
+        if not isinstance(row, dict):
+            return False
+        status = str(row.get("orderStatus") or row.get("status") or "").lower()
+        closed = {
+            "filled",
+            "traded",
+            "complete",
+            "completed",
+            "cancelled",
+            "rejected",
+            "expired",
+            "trigger cancelled",
+        }
+        return status not in closed
 
     def cancel_order_by_id(
         self,
@@ -704,6 +770,24 @@ class DhanBroker(BaseBroker):
             tag = str(o.get("correlationId") or o.get("tag") or "").strip()
             if tag == cid or tag == dhan_cid:
                 return self._normalize_forever_order_for_recon(o)
+        return None
+
+    def find_order_by_id(self, broker_order_id: str) -> Optional[Dict[str, Any]]:
+        """Lookup order by Dhan orderId (REST GET /orders/{id})."""
+        oid = str(broker_order_id or "").strip()
+        if not oid:
+            return None
+        fn = getattr(self.api, "get_order_by_id", None)
+        if callable(fn):
+            try:
+                row = fn(oid)
+                if isinstance(row, dict) and row:
+                    return row
+            except Exception as exc:
+                logger.warning("Dhan find_order_by_id failed order_id=%s: %s", oid, exc)
+        for o in self.api.get_order_list() or []:
+            if str(o.get("orderId") or o.get("order_id") or "") == oid:
+                return o
         return None
 
     def find_order_by_client_id(self, client_order_id):

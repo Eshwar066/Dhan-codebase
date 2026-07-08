@@ -843,6 +843,32 @@ class DhanSource:
     def get_positions(self, debug="NO"):
         return self.tsl.get_positions(debug=debug)
 
+    def get_order_by_id(self, order_id: str):
+        """Fetch a single order by broker order id (no tradehull status-poll sleep)."""
+        oid = str(order_id or "").strip()
+        if not oid:
+            return None
+        try:
+            response = self.tsl.Dhan.get_order_by_id(oid)
+            if isinstance(response, dict) and response.get("status") == "success":
+                data = response.get("data")
+                if isinstance(data, list) and data:
+                    return data[0]
+                if isinstance(data, dict):
+                    return data
+            http = self.tsl._get_dhan_http()
+            if http is not None:
+                parsed = http.get(f"/orders/{oid}")
+                if isinstance(parsed, dict) and parsed.get("status") == "success":
+                    data = parsed.get("data")
+                    if isinstance(data, list) and data:
+                        return data[0]
+                    if isinstance(data, dict):
+                        return data
+        except Exception as exc:
+            logger.warning("Dhan get_order_by_id failed order_id=%s: %s", oid, exc)
+        return None
+
     def get_order_list(self):
         """Order list for idempotency / lookup. Uses Tradehull get_orderbook."""
         try:

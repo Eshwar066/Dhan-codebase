@@ -122,6 +122,10 @@ class OrderRouter:
         # Fills before this instant are ignored for orphan EXTERNAL_CLOSE / LIQUIDATION / ADL paths.
         self._oms_session_start_unix = time.time()
         self.bracket_registry = BracketLegRegistry()
+        # Optional: (bundle_item, intents, price_map) -> None; refreshes limit prices from live depth.
+        self.bundle_price_refresher: Optional[
+            Callable[[Dict[str, Any], List[Any], Dict[str, float]], None]
+        ] = None
 
     def reset_oms_session_boundary(self) -> None:
         """Call when starting a new trading session (same process) to tighten orphan fill acceptance."""
@@ -1540,6 +1544,603 @@ class OrderRouter:
             "broker_sent_ts": broker_sent_ts,
         }
 
+    def _broker_hedge_fill_gate_enabled(self) -> bool:
+        return bool(getattr(self.broker, "supports_hedge_fill_gated_bundles", False))
+
+    @staticmethod
+    def _partition_hedge_gated_legs(
+        resolved: List[Tuple[Any, float]],
+    ) -> Tuple[List[Tuple[Any, float]], List[Tuple[Any, float]]]:
+        hedge_legs: List[Tuple[Any, float]] = []
+        follow_legs: List[Tuple[Any, float]] = []
+        for intent, exec_price in resolved:
+            tag_u = str(getattr(intent, "tag", "") or "").upper()
+            if tag_u == "HEDGE":
+                hedge_legs.append((intent, exec_price))
+            else:
+                follow_legs.append((intent, exec_price))
+        return hedge_legs, follow_legs
+
+    @staticmethod
+    def _should_use_dhan_hedge_fill_gate(
+        resolved: List[Tuple[Any, float]],
+        actions: Set[str],
+    ) -> bool:
+        if len(resolved) < 2 or not actions <= {"ENTRY"}:
+            return False
+        tags = {str(getattr(i, "tag", "") or "").upper() for i, _ in resolved}
+        return "HEDGE" in tags and bool(tags - {"HEDGE"})
+
+    def _reject_bundle_legs(
+        self,
+        legs: List[Tuple[Any, float]],
+        *,
+        reason: str,
+        message: str,
+        bundle_item: Dict[str, Any],
+    ) -> None:
+        for intent, _ in legs:
+            self.intent_store.update(
+                intent.intent_id,
+                IntentStatus.REJECTED,
+                order_state=OrderState.REJECTED,
+            )
+            self._set_order_state(
+                intent.intent_id,
+                OrderState.REJECTED,
+                action=reason,
+                message=message,
+            )
+            if self.engine_logger:
+                self.engine_logger.log(
+                    "order_failed",
+                    (
+                        f"ORDER_FAILED intent_id={intent.intent_id} "
+                        f"reason={reason} bundle=true | {message}"
+                    ),
+                    intent_id=intent.intent_id,
+                    strategy_id=bundle_item.get("strategy_id"),
+                    structure_id=bundle_item.get("structure_id"),
+                )
+
+    def _log_bundle_margin_check(
+        self,
+        *,
+        bundle_item: Dict[str, Any],
+        resolved: List[Tuple[Any, float]],
+        bundle_margin: Optional[Dict[str, Any]],
+        label: str,
+    ) -> bool:
+        if bundle_margin is None:
+            return True
+        margin_ok = bool(bundle_margin.get("ok", True))
+        primary = resolved[0][0]
+        self._log_oms_step(
+            "margin_check",
+            primary,
+            ok=margin_ok,
+            message=bundle_margin.get("message")
+            or (f"{label} margin_ok" if margin_ok else "insufficient_funds"),
+            intent_strategy_id=getattr(primary, "strategy_id", None)
+            or bundle_item.get("strategy_id"),
+            required_margin=bundle_margin.get("required_margin"),
+            available=bundle_margin.get("available"),
+            shortfall=bundle_margin.get("shortfall"),
+            span_margin=bundle_margin.get("span_margin"),
+            reason="insufficient_funds" if not margin_ok else None,
+        )
+        if self.engine_logger:
+            self.engine_logger.log(
+                "oms",
+                (
+                    f"Bundle margin_check {label} legs={len(resolved)} "
+                    f"ok={margin_ok} required={bundle_margin.get('required_margin')} "
+                    f"available={bundle_margin.get('available')} "
+                    f"hedge_benefit={bundle_margin.get('hedge_benefit')}"
+                ),
+                strategy_id=bundle_item.get("strategy_id"),
+                structure_id=bundle_item.get("structure_id"),
+            )
+        return margin_ok
+
+    def _poll_and_sync_intent_terminal(
+        self, intent_record: Dict[str, Any]
+    ) -> Optional[OrderState]:
+        """Poll broker for one intent; sync fill/reject into intent_store when terminal."""
+        tag = intent_record.get("intent_id")
+        if not tag:
+            return None
+        cached = self._order_state.get(tag)
+        if cached in _TERMINAL_ORDER_STATES:
+            return cached
+
+        order = self._find_broker_order_for_intent(intent_record)
+        if not order:
+            return None
+        order = self._normalize_broker_order_for_recon(order)
+        status = (order.get("status") or "").lower()
+        filled = float(order.get("filled_size") or 0)
+        size = float(order.get("size") or 0)
+        avg_px = float(
+            order.get("average_fill_price")
+            or order.get("averageTradedPrice")
+            or order.get("average_traded_price")
+            or intent_record.get("price")
+            or 0
+        )
+
+        if status in ("cancelled", "rejected", "expired"):
+            ost = (
+                OrderState.CANCELLED
+                if status == "cancelled"
+                else OrderState.EXPIRED
+                if status == "expired"
+                else OrderState.REJECTED
+            )
+            intent_st = (
+                IntentStatus.CANCELLED
+                if status == "cancelled"
+                else IntentStatus.EXPIRED
+                if status == "expired"
+                else IntentStatus.REJECTED
+            )
+            self._set_order_state(
+                tag,
+                ost,
+                action=f"sync_{status}",
+                message=f"Polling discovered {status}",
+            )
+            self.intent_store.update(
+                tag,
+                intent_st,
+                broker_order_id=order.get("order_id"),
+                order_state=ost,
+            )
+            return ost
+
+        is_filled = status in ("filled", "traded", "complete", "completed") or (
+            size > 0 and filled >= size
+        )
+        if is_filled:
+            payload = intent_record.get("payload") or {}
+            action_eff = intent_record.get("action") or payload.get("action")
+            fill_qty = filled if filled > 0 else size
+            if self.position_manager and fill_qty > 0:
+                stid0 = intent_record.get("structure_id") or payload.get("structure_id")
+                if not self._terminal_fill_reflected_in_pm(
+                    intent_record.get("instrument"),
+                    intent_record.get("side"),
+                    int(fill_qty),
+                    str(action_eff or ""),
+                    tag,
+                    structure_id=stid0,
+                ):
+                    self.process_fill(
+                        instrument=intent_record.get("instrument"),
+                        side=intent_record.get("side"),
+                        qty=fill_qty,
+                        price=avg_px,
+                        order_id=order.get("order_id"),
+                        intent_id=tag,
+                        strategy=intent_record.get("strategy"),
+                        structure_id=stid0,
+                        tag=intent_record.get("tag"),
+                        candle_ts=intent_record.get("candle_ts"),
+                        action=action_eff,
+                    )
+            self._set_order_state(
+                tag,
+                OrderState.FILLED,
+                action="sync_filled",
+                message="Polling discovered fill",
+            )
+            self.intent_store.update(
+                tag,
+                IntentStatus.FILLED,
+                broker_order_id=order.get("order_id"),
+                order_state=OrderState.FILLED,
+            )
+            self._last_applied_filled_by_intent[tag] = float(fill_qty)
+            return OrderState.FILLED
+
+        if size > 0 and filled > 0 and filled < size:
+            self._set_order_state(
+                tag,
+                OrderState.PARTIAL,
+                action="sync_partial",
+                message=f"Polling: partial fill filled={filled} size={size}",
+            )
+            self.intent_store.update(
+                tag,
+                IntentStatus.SENT,
+                broker_order_id=order.get("order_id"),
+                order_state=OrderState.PARTIAL,
+            )
+        return None
+
+    def _await_intent_terminal(
+        self,
+        intent_id: str,
+        *,
+        timeout_sec: float,
+        poll_interval: float,
+    ) -> Dict[str, Any]:
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            rec = self.intent_store.get(intent_id)
+            if not rec:
+                return {
+                    "ok": False,
+                    "status": "missing",
+                    "reason": "intent_not_found",
+                    "retryable": False,
+                }
+            ost = self._order_state.get(intent_id)
+            if ost == OrderState.FILLED:
+                return {"ok": True, "status": "filled", "reason": "filled", "retryable": False}
+            if ost in (
+                OrderState.REJECTED,
+                OrderState.CANCELLED,
+                OrderState.EXPIRED,
+            ):
+                return {
+                    "ok": False,
+                    "status": str(ost.value).lower(),
+                    "reason": str(ost.value).lower(),
+                    "retryable": False,
+                }
+            synced = self._poll_and_sync_intent_terminal(rec)
+            if synced == OrderState.FILLED:
+                return {"ok": True, "status": "filled", "reason": "filled", "retryable": False}
+            if synced in (
+                OrderState.REJECTED,
+                OrderState.CANCELLED,
+                OrderState.EXPIRED,
+            ):
+                return {
+                    "ok": False,
+                    "status": str(synced.value).lower(),
+                    "reason": str(synced.value).lower(),
+                    "retryable": False,
+                }
+            time.sleep(max(0.05, float(poll_interval)))
+        return {
+            "ok": False,
+            "status": "timeout",
+            "reason": "hedge_fill_timeout",
+            "retryable": False,
+        }
+
+    def _hedge_fill_retry_enabled(self, bundle_item: Dict[str, Any]) -> bool:
+        if not self._broker_hedge_fill_gate_enabled():
+            return False
+        sid = str(bundle_item.get("strategy_id") or "").strip()
+        allowed = getattr(self.broker, "hedge_fill_retry_strategy_ids", None)
+        if allowed is None:
+            return sid == "LEAPS_RSI"
+        if isinstance(allowed, (set, frozenset, list, tuple)):
+            return sid in allowed
+        return False
+
+    def _refresh_bundle_entry_prices(
+        self,
+        bundle_item: Dict[str, Any],
+        intents: List[Any],
+        price_map: Dict[str, float],
+    ) -> bool:
+        refresher = self.bundle_price_refresher
+        if not callable(refresher):
+            return False
+        try:
+            refresher(bundle_item, intents, price_map)
+            return True
+        except Exception as exc:
+            logger.warning("bundle_price_refresher failed: %s", exc)
+            return False
+
+    def _reprice_resolved_list(
+        self,
+        resolved: List[Tuple[Any, float]],
+        price_map: Dict[str, float],
+    ) -> List[Tuple[Any, float]]:
+        out: List[Tuple[Any, float]] = []
+        for intent, _ in resolved:
+            sym = (
+                getattr(intent.instrument, "trading_symbol", None)
+                if getattr(intent, "instrument", None)
+                else ""
+            )
+            exec_price = price_map.get(sym) if sym else None
+            if exec_price is None:
+                exec_price = getattr(intent, "price", None)
+            exec_price = self._coerce_positive_exec_price(exec_price)
+            if exec_price is not None:
+                exec_price = self.slippage_model(exec_price)
+                if sym:
+                    price_map[sym] = exec_price
+                try:
+                    intent.price = exec_price
+                except Exception:
+                    pass
+            out.append((intent, exec_price))
+        return out
+
+    def _prepare_intent_reorder(self, intent_id: str) -> None:
+        if self.intent_store and self.intent_store.prepare_reorder(intent_id):
+            self._order_state[intent_id] = OrderState.NEW
+            self._last_applied_filled_by_intent.pop(intent_id, None)
+
+    def _submit_hedge_with_retry_price(
+        self,
+        intent: Any,
+        exec_price: Optional[float],
+        price_map: Dict[str, float],
+        *,
+        attempt: int,
+        idempotency_key: Optional[str],
+        raise_on_retryable_failure: bool,
+        skip_margin_check: bool,
+        bundle_item: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        intent_id = str(getattr(intent, "intent_id", "") or "")
+        rec = self.intent_store.get(intent_id) if self.intent_store else None
+        broker_oid = (rec or {}).get("broker_order_id")
+        ost = self._order_state.get(intent_id)
+
+        if ost == OrderState.FILLED:
+            return {"ok": True, "retryable": False, "reason": "already_filled"}
+
+        modify_fn = getattr(self.broker, "modify_order_price", None)
+        is_open_fn = getattr(self.broker, "order_is_open", None)
+        cancel_fn = getattr(self.broker, "cancel_order_by_id", None)
+
+        if attempt > 1:
+            if broker_oid and callable(is_open_fn) and is_open_fn(str(broker_oid)):
+                if (
+                    exec_price is not None
+                    and callable(modify_fn)
+                    and modify_fn(intent, str(broker_oid), exec_price)
+                ):
+                    if self.engine_logger:
+                        self.engine_logger.log(
+                            "oms",
+                            (
+                                f"Hedge retry modify attempt={attempt} "
+                                f"intent_id={intent_id} price={exec_price}"
+                            ),
+                            intent_id=intent_id,
+                            strategy_id=bundle_item.get("strategy_id"),
+                            structure_id=bundle_item.get("structure_id"),
+                        )
+                    return {"ok": True, "retryable": False, "reason": "hedge_modified"}
+                if callable(cancel_fn):
+                    cancel_fn(
+                        str(broker_oid),
+                        intent_id=intent_id,
+                        reason="hedge_retry_requote",
+                    )
+                self._prepare_intent_reorder(intent_id)
+            elif ost in (
+                OrderState.REJECTED,
+                OrderState.CANCELLED,
+                OrderState.EXPIRED,
+                OrderState.SENT,
+                OrderState.PARTIAL,
+                OrderState.OPEN,
+            ):
+                if broker_oid and callable(cancel_fn):
+                    cancel_fn(
+                        str(broker_oid),
+                        intent_id=intent_id,
+                        reason="hedge_retry_requote",
+                    )
+                self._prepare_intent_reorder(intent_id)
+
+        if exec_price is None:
+            return {"ok": False, "retryable": False, "reason": "no_price"}
+
+        return self.process_intent(
+            intent,
+            price_map,
+            idempotency_key=idempotency_key,
+            raise_on_retryable_failure=raise_on_retryable_failure,
+            skip_margin_check=skip_margin_check,
+        )
+
+    def _process_dhan_hedge_gated_bundle(
+        self,
+        bundle_item: Dict[str, Any],
+        resolved: List[Tuple[Any, float]],
+        *,
+        raise_on_retryable_failure: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Dhan: place HEDGE BUY, wait for fill, re-check margin with open positions,
+        then place MAIN / follow legs so RMS sees the hedge in portfolio.
+        """
+        price_map = dict(bundle_item.get("price_map") or {})
+        idempotency_key = bundle_item.get("idempotency_key")
+        hedge_legs, follow_legs = self._partition_hedge_gated_legs(resolved)
+        if not hedge_legs or not follow_legs:
+            return {"ok": False, "retryable": False, "reason": "invalid_hedge_bundle"}
+
+        retry_enabled = self._hedge_fill_retry_enabled(bundle_item)
+        max_attempts = (
+            int(getattr(self.broker, "hedge_fill_retry_max_attempts", 3) or 3)
+            if retry_enabled
+            else 1
+        )
+        per_attempt_sec = float(
+            getattr(self.broker, "hedge_fill_retry_per_attempt_sec", 40.0) or 40.0
+            if retry_enabled
+            else getattr(self.broker, "hedge_fill_wait_timeout_sec", 120.0) or 120.0
+        )
+        poll_interval = float(
+            getattr(self.broker, "hedge_fill_poll_interval_sec", 0.5) or 0.5
+        )
+        multi_check = getattr(self.broker, "check_funds_before_orders", None)
+
+        if multi_check and hedge_legs:
+            hedge_margin = multi_check(hedge_legs)
+            if not self._log_bundle_margin_check(
+                bundle_item=bundle_item,
+                resolved=hedge_legs,
+                bundle_margin=hedge_margin,
+                label="hedge_pre",
+            ):
+                msg = (hedge_margin or {}).get("message") or "Insufficient funds for hedge"
+                self._reject_bundle_legs(
+                    hedge_legs + follow_legs,
+                    reason="insufficient_funds",
+                    message=msg,
+                    bundle_item=bundle_item,
+                )
+                return {"ok": False, "retryable": False, "reason": "insufficient_funds"}
+
+        broker_sent_ts = None
+        all_intents = [i for i, _ in hedge_legs + follow_legs]
+        for hedge_intent, _ in hedge_legs:
+            hedge_filled = False
+            last_wait: Dict[str, Any] = {"ok": False, "reason": "hedge_fill_failed"}
+            for attempt in range(1, max_attempts + 1):
+                if retry_enabled:
+                    self._refresh_bundle_entry_prices(
+                        bundle_item, all_intents, price_map
+                    )
+                    resolved = self._reprice_resolved_list(resolved, price_map)
+                    hedge_legs, follow_legs = self._partition_hedge_gated_legs(resolved)
+                    hedge_intent, hedge_price = hedge_legs[0]
+                else:
+                    hedge_price = hedge_legs[0][1]
+
+                result = self._submit_hedge_with_retry_price(
+                    hedge_intent,
+                    hedge_price,
+                    price_map,
+                    attempt=attempt,
+                    idempotency_key=idempotency_key,
+                    raise_on_retryable_failure=raise_on_retryable_failure,
+                    skip_margin_check=bool(multi_check),
+                    bundle_item=bundle_item,
+                )
+                if not result.get("ok", True):
+                    last_wait = {
+                        "ok": False,
+                        "status": "place_failed",
+                        "reason": str(result.get("reason") or "hedge_place_failed"),
+                    }
+                    if attempt >= max_attempts:
+                        self._reject_bundle_legs(
+                            follow_legs,
+                            reason=last_wait["reason"],
+                            message="Hedge leg failed; follow legs not sent",
+                            bundle_item=bundle_item,
+                        )
+                        return result
+                    time.sleep(max(0.05, poll_interval))
+                    continue
+
+                broker_sent_ts = result.get("broker_sent_ts") or broker_sent_ts
+                wait = self._await_intent_terminal(
+                    hedge_intent.intent_id,
+                    timeout_sec=per_attempt_sec,
+                    poll_interval=poll_interval,
+                )
+                last_wait = wait
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "oms",
+                        (
+                            f"Hedge fill_gate attempt={attempt}/{max_attempts} "
+                            f"intent_id={hedge_intent.intent_id} ok={wait.get('ok')} "
+                            f"status={wait.get('status')} reason={wait.get('reason')}"
+                        ),
+                        intent_id=hedge_intent.intent_id,
+                        strategy_id=bundle_item.get("strategy_id"),
+                        structure_id=bundle_item.get("structure_id"),
+                    )
+                if wait.get("ok"):
+                    hedge_filled = True
+                    break
+                if attempt < max_attempts and retry_enabled:
+                    continue
+
+            if not hedge_filled:
+                msg = (
+                    f"Hedge leg did not fill (status={last_wait.get('status')}); "
+                    "follow legs not sent"
+                )
+                self._reject_bundle_legs(
+                    follow_legs,
+                    reason=str(last_wait.get("reason") or "hedge_fill_failed"),
+                    message=msg,
+                    bundle_item=bundle_item,
+                )
+                return {
+                    "ok": False,
+                    "retryable": False,
+                    "reason": last_wait.get("reason") or "hedge_fill_failed",
+                }
+
+        settle_sec = float(
+            getattr(self.broker, "hedge_fill_margin_settle_sec", 0.5) or 0.0
+        )
+        if settle_sec > 0:
+            time.sleep(settle_sec)
+
+        if retry_enabled:
+            self._refresh_bundle_entry_prices(bundle_item, all_intents, price_map)
+            resolved = self._reprice_resolved_list(resolved, price_map)
+            hedge_legs, follow_legs = self._partition_hedge_gated_legs(resolved)
+
+        follow_margin: Optional[Dict[str, Any]] = None
+        if multi_check and follow_legs:
+            follow_margin = multi_check(
+                follow_legs,
+                include_position=True,
+                include_orders=True,
+            )
+            if not self._log_bundle_margin_check(
+                bundle_item=bundle_item,
+                resolved=follow_legs,
+                bundle_margin=follow_margin,
+                label="post_hedge",
+            ):
+                msg = (
+                    (follow_margin or {}).get("message")
+                    or "Insufficient funds for main leg after hedge fill"
+                )
+                self._reject_bundle_legs(
+                    follow_legs,
+                    reason="insufficient_funds",
+                    message=msg,
+                    bundle_item=bundle_item,
+                )
+                return {"ok": False, "retryable": False, "reason": "insufficient_funds"}
+
+        last_result: Dict[str, Any] = {
+            "ok": True,
+            "retryable": False,
+            "reason": "bundle_placed",
+        }
+        for intent, _ in follow_legs:
+            result = self.process_intent(
+                intent,
+                price_map,
+                idempotency_key=idempotency_key,
+                raise_on_retryable_failure=raise_on_retryable_failure,
+                skip_margin_check=bool(follow_margin),
+                bundle_margin_result=follow_margin,
+            )
+            last_result = result
+            if not result.get("ok", True):
+                return result
+            broker_sent_ts = result.get("broker_sent_ts") or broker_sent_ts
+
+        if broker_sent_ts is not None:
+            last_result["broker_sent_ts"] = broker_sent_ts
+        return last_result
+
     def process_intent_bundle(
         self,
         bundle_item: Dict[str, Any],
@@ -1587,6 +2188,16 @@ class OrderRouter:
         actions = {
             str(getattr(i, "action", "ENTRY") or "ENTRY").upper() for i, _ in resolved
         }
+        if (
+            self._broker_hedge_fill_gate_enabled()
+            and self._should_use_dhan_hedge_fill_gate(resolved, actions)
+        ):
+            return self._process_dhan_hedge_gated_bundle(
+                bundle_item,
+                resolved,
+                raise_on_retryable_failure=raise_on_retryable_failure,
+            )
+
         bundle_margin: Optional[Dict[str, Any]] = None
         if actions <= {"ENTRY"} and len(resolved) > 1:
             multi_check = getattr(
@@ -2116,8 +2727,9 @@ class OrderRouter:
         resolved_missing: Set[str] = set()
         now_ts = time.time()
         for o in broker_open:
-            tag = o.get("tag")
-            if not tag:
+            tag = str(o.get("tag") or "").strip()
+            # Dhan returns literal "NA" for manual / untagged open orders.
+            if not tag or tag.upper() in {"NA", "NONE", "NULL", "N/A"}:
                 continue
             matched_intent = tag if tag in local_intent_ids else None
             if not matched_intent:
@@ -2129,83 +2741,96 @@ class OrderRouter:
                 matched_intent and self.intent_store.exists(matched_intent)
             ):
                 orphans.append(o)
-                # Orphan Adoption: Create local record for pre-existing broker order
-                b_sym = o.get("symbol") or o.get("product_symbol")
-                product_id = o.get("product_id")
+                try:
+                    b_sym = o.get("symbol") or o.get("product_symbol")
+                    product_id = o.get("product_id")
 
-                engine_sym = b_sym
-                instr = None
-                if self.instrument_store and b_sym:
-                    inst = None
-                    if hasattr(self.instrument_store, "get_by_symbol"):
-                        inst = self.instrument_store.get_by_symbol(b_sym)
-                    if (
-                        not inst
-                        and product_id
-                        and hasattr(self.instrument_store, "get_by_product_id")
-                    ):
-                        inst = self.instrument_store.get_by_product_id(product_id)
-                    if not inst and hasattr(
-                        self.instrument_store, "intent_creation_details"
-                    ):
-                        inst = self.instrument_store.intent_creation_details(
-                            b_sym, None, None, None, None
-                        )
-                    if not inst and hasattr(
-                        self.instrument_store, "futures_intent_creation_details"
-                    ):
-                        inst = self.instrument_store.futures_intent_creation_details(
-                            b_sym, "DELTA", None
-                        )
-                    if inst:
-                        engine_sym = inst.trading_symbol
-                        instr = inst
+                    engine_sym = b_sym
+                    instr = None
+                    if self.instrument_store and b_sym:
+                        inst = None
+                        if hasattr(self.instrument_store, "get_by_symbol"):
+                            inst = self.instrument_store.get_by_symbol(b_sym)
+                        if (
+                            not inst
+                            and product_id
+                            and hasattr(self.instrument_store, "get_by_product_id")
+                        ):
+                            inst = self.instrument_store.get_by_product_id(product_id)
+                        if not inst and hasattr(
+                            self.instrument_store, "intent_creation_details"
+                        ):
+                            inst = self.instrument_store.intent_creation_details(
+                                b_sym, None, None, None, None
+                            )
+                        if not inst and hasattr(
+                            self.instrument_store, "futures_intent_creation_details"
+                        ):
+                            inst = self.instrument_store.futures_intent_creation_details(
+                                b_sym, "DELTA", None
+                            )
+                        if inst:
+                            engine_sym = inst.trading_symbol
+                            instr = inst
 
-                # Detect EXIT vs ENTRY from broker (e.g. Delta reduce_only)
-                is_reduce = o.get("reduce_only") in (True, "true", "yes", 1)
-                action = "EXIT" if is_reduce else "ENTRY"
-                stub_payload = {
-                    "symbol": engine_sym,
-                    "side": (o.get("side") or "").upper(),
-                    "qty": int(o.get("qty") or 0),
-                    "action": action,
-                    "strategy": "recovery",
-                    "structure_id": f"recovered:{engine_sym}",
-                    "candle_ts": None,
-                    "engine_id": self.engine_id,
-                    "strategy_id": self.strategy_id,
-                }
+                    is_reduce = o.get("reduce_only") in (True, "true", "yes", 1)
+                    action = "EXIT" if is_reduce else "ENTRY"
+                    stub_payload = {
+                        "symbol": engine_sym,
+                        "side": (o.get("side") or "").upper(),
+                        "qty": int(o.get("qty") or 0),
+                        "action": action,
+                        "strategy": "recovery",
+                        "structure_id": f"recovered:{engine_sym}",
+                        "candle_ts": None,
+                        "engine_id": self.engine_id,
+                        "strategy_id": self.strategy_id,
+                    }
 
-                # Register in store
-                self.intent_store.create(payload=stub_payload, intent_id=tag)
-                self.intent_store.update(
-                    tag,
-                    IntentStatus.SENT,
-                    broker_order_id=o.get("order_id"),
-                    order_state=OrderState.OPEN,
-                )
-                self._set_order_state(
-                    tag,
-                    OrderState.OPEN,
-                    action="adopt_orphan",
-                    message="Order seen on broker open list; adopted as local intent",
-                )
-
-                # Augment record for process_fill
-                intent_record = self.intent_store.get(tag)
-                intent_record["instrument"] = instr
-                intent_record["side"] = (o.get("side") or "").upper()
-                intent_record["qty"] = int(o.get("qty") or 0)
-                intent_record["action"] = stub_payload["action"]
-                # EXIT orphans (e.g. open from yesterday): set last_price_update_ts=0 so next refresh run re-quotes immediately
-                if action == "EXIT":
-                    intent_record["last_price_update_ts"] = 0
-
-                if self.engine_logger:
-                    self.engine_logger.log(
-                        "oms", f"Adopted orphan order {tag} for {engine_sym}"
+                    self.intent_store.create(payload=stub_payload, intent_id=tag)
+                    self.intent_store.update(tag, IntentStatus.VALIDATED)
+                    self.intent_store.update(
+                        tag,
+                        IntentStatus.SENT,
+                        broker_order_id=o.get("order_id"),
+                        order_state=OrderState.OPEN,
                     )
-                resolved_orphans.add(str(tag))
+                    self._set_order_state(
+                        tag,
+                        OrderState.OPEN,
+                        action="adopt_orphan",
+                        message="Order seen on broker open list; adopted as local intent",
+                    )
+
+                    intent_record = self.intent_store.get(tag)
+                    if intent_record is None:
+                        continue
+                    intent_record["instrument"] = instr
+                    intent_record["side"] = (o.get("side") or "").upper()
+                    intent_record["qty"] = int(o.get("qty") or 0)
+                    intent_record["action"] = stub_payload["action"]
+                    if action == "EXIT":
+                        intent_record["last_price_update_ts"] = 0
+
+                    if self.engine_logger:
+                        self.engine_logger.log(
+                            "oms", f"Adopted orphan order {tag} for {engine_sym}"
+                        )
+                    resolved_orphans.add(str(tag))
+                except Exception as exc:
+                    logger.exception(
+                        "Orphan adopt failed tag=%s order_id=%s: %s",
+                        tag,
+                        o.get("order_id"),
+                        exc,
+                    )
+                    if self.engine_logger:
+                        self.engine_logger.log(
+                            "oms",
+                            f"Orphan adopt failed tag={tag}: {exc}",
+                            severity="error",
+                        )
+                    continue
 
             elif matched_intent and matched_intent in local_intent_ids:
                 # Local thinks it's pending, broker confirms it's open. Sync order ID and persist OPEN.

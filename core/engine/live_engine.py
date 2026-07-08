@@ -24,6 +24,14 @@ IST = ZoneInfo("Asia/Kolkata")
 
 logger = logging.getLogger(__name__)
 
+
+def _position_allows_strategy_exit(pos: Any) -> bool:
+    """MAIN book and post-partial trail legs (tag may become MAIN_TARGET after TARGET fill)."""
+    tag_u = str(getattr(pos, "tag", None) or "").upper()
+    if tag_u == "HEDGE":
+        return False
+    return tag_u == "MAIN" or tag_u.startswith("MAIN_")
+
 from run.config import RunMode
 from core.engine.base_engine import BaseEngine
 from core.data.candle_aggregator import _bucket_ts, _resolution_to_seconds
@@ -127,6 +135,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         )
         self.candle_service = candle_service
         self.order_router = order_router
+        self.order_router.bundle_price_refresher = self._refresh_bundle_entry_prices
         self.position_manager = position_manager
         self.position_manager.on_structure_exit = getattr(
             strategy, "on_structure_exit", None
@@ -1562,6 +1571,22 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         trading_sym = self._intent_place_order_symbol(single_intent, symbol)
         return {trading_sym: exec_price}
 
+    def _refresh_bundle_entry_prices(
+        self,
+        bundle_item: Dict[str, Any],
+        intents: List[Any],
+        price_map: Dict[str, float],
+    ) -> None:
+        """Refresh bundle leg limit prices from live best bid/ask (LEAPS hedge retry)."""
+        symbol = str(bundle_item.get("symbol") or "").strip()
+        for intent in intents or []:
+            sym = symbol
+            if not sym:
+                sym = str(getattr(intent, "symbol", "") or "").strip()
+            pm = self._resolve_entry_price_map(intent, sym, None)
+            if pm:
+                price_map.update(pm)
+
     def _enqueue_entry_intents_grouped(
         self,
         entry_intents: list,
@@ -1998,6 +2023,11 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     strategy=str(getattr(strategy, "name", "")),
                     symbol=sym,
                 )
+            recent = self._recent_candles_for_strategy(strategy, candle)
+            ctx_pre = self.build_context_only(candle, recent_candles=recent)
+            self._run_exits_and_rollover(
+                strategy, sym, candle, ctx_pre, timeframe=None
+            )
             for eval_result in self._evaluate_strategies_parallel(
                 candle, scheduled=True
             ):
@@ -2326,7 +2356,13 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         _rm = getattr(self.run_mode, "value", None) or str(self.run_mode or "")
         self._log_startup_balance_snapshot()
 
-        self._do_order_state_check()
+        try:
+            self._do_order_state_check()
+        except Exception:
+            logger.exception(
+                "Startup order-state check failed; continuing (entries may pause)"
+            )
+            self._entries_paused_order_mismatch = True
         if (
             str(self.venue or "").upper() == "DELTA"
             and self.realtime_feed
@@ -2706,6 +2742,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             )
 
                     self._enrich_candle_depth(symbol, candle)
+                    self._run_exits_and_rollover_for_closed_bar(
+                        symbol, candle, tf, enriched_candle=enriched_candle
+                    )
                     for eval_result in self._evaluate_strategies_parallel(
                         enriched_candle, timeframe=tf, already_enriched=True
                     ):
@@ -2834,6 +2873,243 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             except Exception:
                 pass
 
+    def _run_exits_and_rollover_for_closed_bar(
+        self,
+        symbol: str,
+        candle: Dict[str, Any],
+        timeframe: str,
+        enriched_candle: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Exits + monthly hedge rollover on every closed live-feed bar (backtest parity)."""
+        tf = str(timeframe or "").strip()
+        sym_u = str(symbol or "").strip().upper()
+        for strategy in self.strategies:
+            if self._is_scheduled_strategy(strategy, self.strategy_eval_modes):
+                continue
+            if str(getattr(strategy, "timeframe", "") or "").strip() != tf:
+                continue
+            if sym_u and not strategy.applies_to_symbol(sym_u):
+                continue
+            strategy_candle = enriched_candle
+            if strategy_candle is None:
+                strategy_candle = self._enrich_candle_for_strategy(
+                    strategy, candle, allow_live_persist=False
+                )
+            recent = self._recent_candles_for_strategy(strategy, strategy_candle)
+            ctx = self.build_context_only(
+                strategy_candle, recent_candles=recent
+            )
+            self._run_exits_and_rollover(
+                strategy, sym_u, strategy_candle, ctx, timeframe=tf
+            )
+
+    def _run_exits_and_rollover(
+        self,
+        strategy: Any,
+        symbol: str,
+        candle: Dict[str, Any],
+        ctx: Any,
+        timeframe: Optional[str] = None,
+        strategy_time_ms: Optional[float] = None,
+    ) -> None:
+        """Strategy exits and hedge rollover — always run before entry evaluation."""
+        risk_manager = getattr(self.order_router, "risk", None)
+        if risk_manager and risk_manager.is_engine_blocked():
+            return
+        self.evaluate_sim_broker_stops(candle, ctx)
+        open_positions = self.position_manager.get_open_positions(
+            underlying=symbol, strategy=strategy.name
+        )
+        exited_structures: set[str] = set()
+        for position in open_positions:
+            if not _position_allows_strategy_exit(position):
+                continue
+            if not strategy.should_exit(position, candle, ctx):
+                continue
+            sid = getattr(position, "structure_id", None)
+            if sid is not None:
+                exited_structures.add(str(sid))
+            exit_intents = strategy.on_position_exit(position, candle, ctx) or []
+            is_sell = position.net_qty > 0
+            required_exit_side = "SELL" if is_sell else "BUY"
+            if exit_intents and self.engine_logger:
+                self.engine_logger.exit_triggered(
+                    symbol,
+                    required_exit_side,
+                    abs(position.net_qty),
+                    "Strategy exit",
+                )
+            for raw_intent in exit_intents:
+                self._process_strategy_exit_intent(
+                    raw_intent,
+                    strategy,
+                    symbol,
+                    candle,
+                    position,
+                    required_exit_side,
+                    strategy_time_ms,
+                    timeframe,
+                    risk_manager,
+                )
+
+        rollover_fn = getattr(strategy, "on_candle_rollover", None)
+        if not callable(rollover_fn):
+            return
+        rollover_positions = (
+            [
+                p
+                for p in open_positions
+                if str(getattr(p, "structure_id", "") or "") not in exited_structures
+            ]
+            if exited_structures
+            else open_positions
+        )
+        rollover_intents = (
+            rollover_fn(
+                open_positions=rollover_positions, candle=candle, ctx=ctx
+            )
+            or []
+        )
+        if not rollover_intents:
+            return
+        if not self._within_trading_hours():
+            if self.engine_logger:
+                self.engine_logger.time_window_blocked(
+                    "Hedge rollover blocked: outside allowed trading hours"
+                )
+            return
+        if self.engine_logger:
+            self.engine_logger.log(
+                "hedge_rollover",
+                f"Hedge rollover {len(rollover_intents)} intent(s)",
+                strategy=strategy.name,
+                symbol=symbol,
+                intent_count=len(rollover_intents),
+            )
+        for raw_intent in rollover_intents:
+            self._process_rollover_intent(
+                raw_intent,
+                strategy,
+                symbol,
+                candle,
+                strategy_time_ms,
+                timeframe,
+                risk_manager,
+            )
+
+    def _process_strategy_exit_intent(
+        self,
+        raw_intent: Any,
+        strategy: Any,
+        symbol: str,
+        candle: Dict[str, Any],
+        position: Any,
+        required_exit_side: str,
+        strategy_time_ms: Optional[float],
+        timeframe: Optional[str],
+        risk_manager: Any,
+    ) -> None:
+        is_main_exit = (
+            str(getattr(raw_intent, "action", "") or "").upper() == "EXIT"
+            and str(getattr(raw_intent, "tag", "") or "").upper() == "MAIN_EXIT"
+        )
+        if not is_main_exit:
+            self._process_entry_like_intent(
+                raw_intent,
+                strategy,
+                symbol,
+                candle,
+                strategy_time_ms,
+                timeframe,
+                risk_manager,
+            )
+            return
+        exit_intent = raw_intent
+        if getattr(exit_intent, "side", None) != required_exit_side:
+            exit_intent = dataclasses.replace(exit_intent, side=required_exit_side)
+        self._log_signal(
+            exit_intent,
+            symbol,
+            action="EXIT",
+            qty_fallback=abs(position.net_qty),
+        )
+        trading_sym = self._intent_place_order_symbol(exit_intent, symbol)
+        is_sell = position.net_qty > 0
+        exit_price = (
+            self._exit_price_from_depth(trading_sym, is_sell)
+            or self.get_price_map(trading_sym)
+            or self.get_price_map(symbol)
+        )
+        if exit_price is None:
+            return
+        self._validate_lot_size(exit_intent, trading_sym)
+        price_map = {trading_sym: exit_price}
+        exit_idem_key = getattr(exit_intent, "idempotency_key", None) or self._signal_hash(
+            symbol, timeframe or "", candle.get("timestamp"), "exit"
+        )
+        self._enqueue_intent(
+            strategy=strategy,
+            intent=exit_intent,
+            price_map=price_map,
+            idempotency_key=exit_idem_key,
+            strategy_time_ms=strategy_time_ms,
+        )
+
+    def _process_rollover_intent(
+        self,
+        raw_intent: Any,
+        strategy: Any,
+        symbol: str,
+        candle: Dict[str, Any],
+        strategy_time_ms: Optional[float],
+        timeframe: Optional[str],
+        risk_manager: Any,
+    ) -> None:
+        action = str(getattr(raw_intent, "action", "") or "").upper()
+        tag = str(getattr(raw_intent, "tag", "") or "").upper()
+        if action == "EXIT" or tag.endswith("EXIT"):
+            side = str(getattr(raw_intent, "side", "") or "").upper()
+            is_sell = side == "SELL"
+            trading_sym = self._intent_place_order_symbol(raw_intent, symbol)
+            exit_price = (
+                self._exit_price_from_depth(trading_sym, is_sell)
+                or self._positive_price(getattr(raw_intent, "price", None))
+            )
+            if exit_price is None:
+                logger.warning(
+                    "Hedge rollover exit skipped: no executable price symbol=%s "
+                    "strategy=%s tag=%s",
+                    trading_sym,
+                    getattr(strategy, "name", ""),
+                    tag,
+                )
+                return
+            self._log_signal(raw_intent, symbol, action="EXIT")
+            self._validate_lot_size(raw_intent, trading_sym)
+            idem_key = getattr(raw_intent, "idempotency_key", None) or self._signal_hash(
+                symbol,
+                timeframe or "",
+                candle.get("timestamp"),
+                f"rollover_exit|{trading_sym}|{tag}",
+            )
+            self._enqueue_intent(
+                strategy=strategy,
+                intent=raw_intent,
+                price_map={trading_sym: exit_price},
+                idempotency_key=idem_key,
+                strategy_time_ms=strategy_time_ms,
+            )
+            return
+        self._process_entry_like_intent(
+            raw_intent,
+            strategy,
+            symbol,
+            candle,
+            strategy_time_ms,
+            timeframe,
+            risk_manager,
+        )
+
     def _process_entry_like_intent(
         self,
         single_intent,
@@ -2959,84 +3235,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
     ):
         strategy = strategy or self.strategy
         risk_manager = getattr(self.order_router, "risk", None)
-        self.evaluate_sim_broker_stops(candle, ctx)
-        open_positions = self.position_manager.get_open_positions(
-            underlying=symbol, strategy=strategy.name
-        )
-        for position in open_positions:
-            exit_signal = strategy.should_exit(position, candle, ctx)
-            if exit_signal:
-                exit_intents = (
-                    strategy.on_position_exit(position, candle, ctx) or []
-                )
-                is_sell = position.net_qty > 0
-                required_exit_side = "SELL" if is_sell else "BUY"
-                if exit_intents:
-                    if self.engine_logger:
-                        self.engine_logger.exit_triggered(
-                            symbol,
-                            required_exit_side,
-                            abs(position.net_qty),
-                            "Strategy exit",
-                        )
-                    for raw_intent in exit_intents:
-                        # e.g. OneDayMagicalLine reversal: MAIN_EXIT only here; ENTRY after exit fill
-                        is_main_exit = (
-                            str(getattr(raw_intent, "action", "") or "").upper()
-                            == "EXIT"
-                            and str(getattr(raw_intent, "tag", "") or "").upper()
-                            == "MAIN_EXIT"
-                        )
-                        if not is_main_exit:
-                            self._process_entry_like_intent(
-                                raw_intent,
-                                strategy,
-                                symbol,
-                                candle,
-                                strategy_time_ms,
-                                timeframe,
-                                risk_manager,
-                            )
-                            continue
-                        exit_intent = raw_intent
-                        # Position direction validation: exit side must match position (prevents accidental reversal)
-                        if getattr(exit_intent, "side", None) != required_exit_side:
-                            exit_intent = dataclasses.replace(
-                                exit_intent, side=required_exit_side
-                            )
-                        self._log_signal(
-                            exit_intent,
-                            symbol,
-                            action="EXIT",
-                            qty_fallback=abs(position.net_qty),
-                        )
-                        # Exit price from depth by intent's instrument and position direction (correct bid/ask for this contract)
-                        trading_sym = self._intent_place_order_symbol(
-                            exit_intent, symbol
-                        )
-                        exit_price = (
-                            self._exit_price_from_depth(trading_sym, is_sell)
-                            or self.get_price_map(trading_sym)
-                            or self.get_price_map(symbol)
-                        )
-                        if exit_price is None:
-                            continue
-                        self._validate_lot_size(exit_intent, trading_sym)
-                        price_map = {trading_sym: exit_price}
-                        # Fix 3: Ensure exit intents have idempotency keys for deduplication (pass in; intent is frozen)
-                        exit_idem_key = getattr(
-                            exit_intent, "idempotency_key", None
-                        ) or self._signal_hash(
-                            symbol, timeframe or "", candle.get("timestamp"), "exit"
-                        )
-                        self._enqueue_intent(
-                            strategy=strategy,
-                            intent=exit_intent,
-                            price_map=price_map,
-                            idempotency_key=exit_idem_key,
-                            strategy_time_ms=strategy_time_ms,
-                        )
-
         entry_intents = (
             [intent]
             if intent is not None and not isinstance(intent, list)

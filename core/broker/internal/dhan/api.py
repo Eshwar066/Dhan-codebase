@@ -91,6 +91,12 @@ class DhanBrokerApi:
     def get_order_list(self) -> List[Dict[str, Any]]:
         return getattr(self._source, "get_order_list", lambda: [])()
 
+    def get_order_by_id(self, order_id: str) -> Optional[Dict[str, Any]]:
+        fn = getattr(self._source, "get_order_by_id", None)
+        if not callable(fn):
+            return None
+        return fn(order_id)
+
     def get_fills(self, page_size: int = 50) -> List[Dict[str, Any]]:
         """Fills from order list (filled/TRADED orders) for trade-led OMS."""
         return getattr(self._source, "get_fills", lambda page_size=50: [])(page_size=page_size)

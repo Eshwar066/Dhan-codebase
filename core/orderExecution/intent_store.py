@@ -186,6 +186,21 @@ class IntentStore:
 
             return intent
 
+    def prepare_reorder(self, intent_id: str) -> bool:
+        """
+        Reset a hedge/main intent for cancel-and-replace or post-reject retry.
+        Bypasses VALID_TRANSITIONS (OMS-controlled re-entry only).
+        """
+        with self._lock:
+            if intent_id not in self.intents:
+                return False
+            intent = self.intents[intent_id]
+            intent["status"] = IntentStatus.VALIDATED
+            intent["order_state"] = "NEW"
+            intent["broker_order_id"] = None
+            intent["updated_at"] = time.time()
+            return True
+
     # -------------------------
     # LIST BY STATUS
     # -------------------------

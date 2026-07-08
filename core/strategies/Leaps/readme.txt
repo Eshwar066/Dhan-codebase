@@ -138,6 +138,11 @@ BUY Monthly option (not quarterly)
 Hedge Distance:
 ---------------
 ~2% away from the sold strike
+for eg:
+For Call Strike 
+  Main strike is 24500 then hedge should be 25000
+for Put 
+  main strike is 24500 then hedge strike should be 24000
 
 Expiry:
 -------

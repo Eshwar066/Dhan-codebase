@@ -1620,10 +1620,13 @@ class IndiaMktMixins:
         )
 
         if price is None:
-            print(
-                f"⚠️ No exit price for hedge {hedge.instrument.symbol} at {candle['timestamp']}"
-            )
-            return None
+            if RUN_MODE == RunMode.BACKTEST:
+                print(
+                    f"⚠️ No exit price for hedge {hedge.instrument.symbol} at {candle['timestamp']}"
+                )
+                return None
+            # Live: engine resolves executable price from depth at enqueue time.
+            price = 0
 
         return self.create_order_intent(
             inst=hedge.instrument,
