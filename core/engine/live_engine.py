@@ -1768,6 +1768,66 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         for strategy in self.strategies:
             self._ensure_strategy_worker(strategy)
 
+    def _configure_gtt_fallback_book(self) -> None:
+        book = getattr(self.order_router, "gtt_fallback_book", None)
+        if book is None:
+            return
+        from core.orderExecution.gtt_fallback_book import (
+            CompositeQuoteProvider,
+            FeedQuoteProvider,
+            RestQuoteProvider,
+        )
+
+        providers = []
+        if self.realtime_feed is not None:
+            providers.append(FeedQuoteProvider(self.realtime_feed))
+        data = getattr(self, "data", None)
+        store = getattr(self, "instrument_store", None)
+        if data is not None and store is not None and hasattr(data, "get_quote_v2"):
+            providers.append(RestQuoteProvider(data, store))
+        if providers:
+            book.set_quote_provider(CompositeQuoteProvider(*providers))
+        book.set_subscribe_callback(self._gtt_fallback_subscribe)
+        try:
+            book.restore_from_intent_store()
+        except Exception as exc:
+            logger.warning("GttFallbackBook restore failed: %s", exc)
+
+    @staticmethod
+    def _merge_feed_instruments(
+        existing: List[Dict[str, Any]], new_rows: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        merged: Dict[tuple, Dict[str, Any]] = {}
+        for row in list(existing or []) + list(new_rows or []):
+            if not isinstance(row, dict):
+                continue
+            key = (
+                str(row.get("ExchangeSegment") or ""),
+                str(row.get("SecurityId") or ""),
+            )
+            merged[key] = row
+        return list(merged.values())
+
+    def _gtt_fallback_subscribe(self, trading_symbols: List[str]) -> None:
+        feed = self.realtime_feed
+        store = self.instrument_store
+        if feed is None or store is None or not hasattr(feed, "replace_instruments"):
+            return
+        syms = [str(s).strip() for s in (trading_symbols or []) if str(s).strip()]
+        if not syms:
+            return
+        rows = store.get_feed_instruments(syms)
+        if not rows:
+            return
+        existing = list(getattr(feed, "instruments", None) or [])
+        feed.replace_instruments(self._merge_feed_instruments(existing, rows))
+
+    def _run_gtt_fallback_tick(self) -> None:
+        book = getattr(self.order_router, "gtt_fallback_book", None)
+        if book is None or not book.has_active_watches():
+            return
+        book.tick(self._current_ist_now())
+
 
     @staticmethod
     def _is_scheduled_timeframe(timeframe: Any) -> bool:
@@ -1825,9 +1885,11 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         """Symbols that require websocket tick aggregation (excludes scheduled-only underlyings)."""
         candle_syms: set[str] = set()
         for s in strategies or []:
-            if LiveEngine._is_scheduled_strategy(s, strategy_eval_modes):
-                continue
             allowed = getattr(s, "underlying_symbols", None) or []
+            if LiveEngine._is_scheduled_strategy(s, strategy_eval_modes):
+                for sym in allowed:
+                    candle_syms.add(str(sym).strip().upper())
+                continue
             if allowed:
                 for sym in allowed:
                     candle_syms.add(str(sym).strip().upper())
@@ -2387,6 +2449,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 self._dhan_order_ws_bound = True
             except Exception:
                 self._dhan_order_ws_bound = False
+        self._configure_gtt_fallback_book()
         primary_tf = getattr(self.strategy, "timeframe", None)
         engine_timeframes = list(self._engine_timeframes or [])
         if not engine_timeframes and primary_tf:
@@ -2413,6 +2476,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             self._sync_delta_ws_trades()
             self._retry_dhan_pending_fills()
             self._do_exit_order_refresh()
+            self._run_gtt_fallback_tick()
             self._maybe_run_scheduled_evaluations(exchange)
 
             # Export eod report funtion

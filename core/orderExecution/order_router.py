@@ -1,6 +1,7 @@
 import json
 import logging
 import time
+import uuid
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
@@ -19,7 +20,9 @@ except ImportError:
 
 from core.broker.internal.dhan.mappings import dhan_correlation_id, format_broker_failure_for_log
 from core.orderExecution.bracket_orders import BRACKET_TAGS, BracketLegRegistry
+from core.orderExecution.gtt_fallback_book import GttFallbackBook, GttFallbackWatch
 from core.orderExecution.intent_store import IntentStatus, IntentStore
+from core.models.order_intent import OrderIntent
 
 
 class OrderState(str, Enum):
@@ -122,6 +125,11 @@ class OrderRouter:
         # Fills before this instant are ignored for orphan EXTERNAL_CLOSE / LIQUIDATION / ADL paths.
         self._oms_session_start_unix = time.time()
         self.bracket_registry = BracketLegRegistry()
+        self.gtt_fallback_book = GttFallbackBook(
+            self,
+            instrument_store=instrument_store,
+            engine_logger=engine_logger,
+        )
         # Optional: (bundle_item, intents, price_map) -> None; refreshes limit prices from live depth.
         self.bundle_price_refresher: Optional[
             Callable[[Dict[str, Any], List[Any], Dict[str, float]], None]
@@ -163,7 +171,13 @@ class OrderRouter:
         return str(payload.get("execution_mode") or "").strip().upper()
 
     def _intent_is_gtt(self, intent_rec: Dict[str, Any]) -> bool:
-        return self._intent_execution_mode(intent_rec) == "GTT"
+        return self._intent_execution_mode(intent_rec) in ("GTT", "HYBRID_GTT")
+
+    def _intent_is_hybrid_gtt(self, intent: Any) -> bool:
+        extras = getattr(intent, "metadata_extras", None) or {}
+        if isinstance(extras, dict):
+            return str(extras.get("execution_mode") or "").upper() == "HYBRID_GTT"
+        return False
 
     def _intent_trading_symbol(self, intent_rec: Dict[str, Any]) -> str:
         if not isinstance(intent_rec, dict):
@@ -278,6 +292,9 @@ class OrderRouter:
             "execution_source": "GTT_RECON",
         }
         if self.process_trade(trade):
+            book = getattr(self, "gtt_fallback_book", None)
+            if book is not None:
+                book.on_fill(intent_id)
             if self.engine_logger:
                 self.engine_logger.log(
                     "oms",
@@ -1515,6 +1532,10 @@ class OrderRouter:
                 broker_order_id=order_id,
                 order_state=OrderState.SENT,
             )
+            if self._intent_is_hybrid_gtt(intent):
+                self.gtt_fallback_book.register_from_intent(
+                    intent, broker_order_id=order_id
+                )
             if getattr(intent, "action", "") == "EXIT":
                 sent_rec = self.intent_store.get(intent.intent_id)
                 if sent_rec:
@@ -2555,6 +2576,72 @@ class OrderRouter:
                 )
             cancelled += 1
         return cancelled
+
+    def cancel_gtt_fallback_watch(
+        self, watch: GttFallbackWatch, *, reason: str = "fallback"
+    ) -> bool:
+        """Cancel the broker Forever order for a hybrid GTT watch."""
+        store = self.intent_store
+        if not store or not watch.gtt_intent_id:
+            return False
+        rec = store.get(watch.gtt_intent_id)
+        if not rec:
+            return False
+        if rec.get("status") == IntentStatus.FILLED:
+            return True
+        broker_order_id = rec.get("broker_order_id") or watch.broker_order_id
+        if broker_order_id and self.broker and hasattr(self.broker, "cancel_order_by_id"):
+            ok = self.broker.cancel_order_by_id(
+                str(broker_order_id),
+                intent_id=str(watch.gtt_intent_id),
+                reason=reason,
+            )
+            if not ok:
+                return False
+        store.update(
+            watch.gtt_intent_id,
+            IntentStatus.CANCELLED,
+            order_state=OrderState.CANCELLED,
+        )
+        self._set_order_state(
+            watch.gtt_intent_id,
+            OrderState.CANCELLED,
+            action="gtt_fallback_cancel",
+            message=reason,
+        )
+        return True
+
+    def place_gtt_fallback_order(self, watch: GttFallbackWatch) -> Optional[str]:
+        """Place resting LIMIT fallback after GTT trigger; returns new intent_id."""
+        store = self.intent_store
+        if store is None or watch.instrument is None:
+            return None
+        meta = dict(watch.metadata_extras or {})
+        meta["execution_mode"] = "LIMIT"
+        meta["gtt_fallback_parent"] = watch.gtt_intent_id
+        fallback = OrderIntent(
+            intent_id=uuid.uuid4().hex,
+            instrument=watch.instrument,
+            side=watch.side,
+            qty=int(watch.qty or 1),
+            price=float(watch.limit_price),
+            order_type="LIMIT",
+            strategy=watch.strategy_id,
+            structure_id=watch.structure_id,
+            trade_type="MARGIN",
+            tag="MAIN",
+            symbol=watch.symbol,
+            action="ENTRY",
+            candle_ts=watch.candle_ts or datetime.datetime.utcnow(),
+            parent_intent_id=watch.gtt_intent_id,
+            metadata_extras=meta,
+            trigger_price=None,
+        )
+        sym = watch.trading_symbol
+        result = self.process_intent(fallback, {sym: float(watch.limit_price)})
+        if not isinstance(result, dict) or not result.get("ok"):
+            return None
+        return fallback.intent_id
 
     # working
     def refresh_stale_exit_orders(
@@ -3739,6 +3826,17 @@ class OrderRouter:
             broker_order_id=order_id,
             order_state=OrderState.FILLED,
         )
+        payload_done = intent.get("payload") or {}
+        act_done = str(
+            intent.get("action") or payload_done.get("action") or trade.get("action") or ""
+        ).upper()
+        tag_done = str(
+            intent.get("tag") or payload_done.get("tag") or trade.get("tag") or ""
+        ).upper()
+        if act_done == "ENTRY" and tag_done == "MAIN":
+            book = getattr(self, "gtt_fallback_book", None)
+            if book is not None:
+                book.on_fill(intent_id)
         self._processed_trade_ids.add(trade_id)
         if len(self._processed_trade_ids) > getattr(self, "_processed_trade_ids_max", 10000):
             self._processed_trade_ids = set(list(self._processed_trade_ids)[-self._processed_trade_ids_max // 2 :])

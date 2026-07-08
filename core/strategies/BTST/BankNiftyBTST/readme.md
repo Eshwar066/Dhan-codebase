@@ -2,7 +2,7 @@
 
 ## Rules (Indian market)
 
-1. **9:20 IST** — find Bank Nifty CE and PE strikes near **~100 premium**; place **GTT (Forever) LIMIT BUY** on both legs at **premium × 1.5** (e.g. premium 100 → limit 150).
+1. **9:20 IST** — find Bank Nifty CE and PE strikes near **~100 premium**; place **HYBRID GTT** (Dhan Forever + engine ask watch fallback) LIMIT BUY at **premium × 1.5**.
 2. **After fill** — arm **SL-M SELL** at **50% of limit price** (e.g. limit 150 → SL 75).
 3. **15:20 IST** — cancel any unfilled **ENTRY** limits from today.
 4. **If SL not hit** — exit next session at **9:25 IST** (BTST square-off).

@@ -64,7 +64,7 @@ def _order_intent_to_payload(intent, execution_price=None, instrument_store=None
     extras = getattr(intent, "metadata_extras", None) or {}
     execution_mode = str(extras.get("execution_mode") or "").strip().upper()
     trigger = float(getattr(intent, "trigger_price", 0) or 0)
-    if execution_mode == "GTT" and trigger <= 0:
+    if execution_mode in ("GTT", "HYBRID_GTT") and trigger <= 0:
         trigger = float(price or 0)
     payload = {
         "tradingsymbol": inst.place_order_symbol(),
@@ -487,7 +487,7 @@ class DhanBroker(BaseBroker):
                 logger.warning("Dhan cancel_order failed order_id=%s: %s", order_id, exc)
                 return False
 
-        if execution_mode == "GTT":
+        if execution_mode in ("GTT", "HYBRID_GTT"):
             return _cancel_forever() or _cancel_regular()
         if _cancel_regular():
             return True
@@ -597,7 +597,7 @@ class DhanBroker(BaseBroker):
         order_payload = self._build_payload(intent, execution_price)
         intent_id = order_payload["intent_id"]
         self._last_place_order_failure = None
-        if str(order_payload.get("execution_mode") or "").upper() == "GTT":
+        if str(order_payload.get("execution_mode") or "").upper() in ("GTT", "HYBRID_GTT"):
             return self._place_forever_order(order_payload, intent_id, retries)
         for attempt in range(retries + 1):
             try:
