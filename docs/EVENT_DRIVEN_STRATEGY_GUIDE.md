@@ -112,31 +112,21 @@ Chain fetch, expiry (`ExpiryResolver`), hedge intents, rollover, strike-in-premi
 | **LEAPS eval on every closed bar for exits** | Already in `_run_exits_and_rollover`; document | done in live_engine |
 | **Scheduled engines subscribe underlying** | BTST/OI get index WS for spot + GttFallback base | `_collect_feed_symbols` |
 
-### P1 — Event bus (medium effort, high leverage)
+### P1 — Event bus (implemented)
 
-Introduce a lightweight **in-process event bus** so components subscribe instead of `LiveEngine` calling everything:
+In-process bus: `core/events/`. Wired from `LiveEngine.start()` via `wire_event_bus()`.
 
-```python
-# Proposed: core/events/bus.py
-@dataclass
-class Event:
-    type: str
-    payload: dict
-    ts: float
-
-# Publishers: feed, aggregator, scheduler, order_router (fills)
-# Subscribers: strategies (filtered), GttFallbackBook, risk, logger
-```
-
-| Event type | Publisher | Subscribers |
-|------------|-----------|-------------|
-| `BarClosed` | CandleAggregator | LiveEngine → strategy workers |
+| Event | Publisher | Subscribers |
+|-------|-----------|-------------|
+| `BarClosed` | LiveEngine | Exits (p10) → Entries (p20) |
 | `ScheduledSlot` | LiveEngine clock | Scheduled strategies |
-| `QuoteUpdated` | Dhan feed | GttFallbackBook (push vs poll) |
-| `IntentFilled` | OrderRouter | Strategy hooks, bracket registry |
-| `PositionChanged` | PositionManager | Risk, reconcile |
+| `QuoteUpdated` | GTT poll | GttFallbackBook |
+| `IntentCreated` | Strategy eval | ExecutionEngine enqueue |
+| `IntentFilled` | OrderRouter | Audit / hooks |
+| `PositionClosed` | OrderRouter | Audit / risk |
+| `FeedDisconnected` / `FeedRecovered` | Feed supervisor | Entry pause flags |
 
-**Benefit:** Add strategies without editing `live_engine.py` main loop.
+See `docs/EVENT_BUS.md`. Audit: `logs/{engine_id}_events.jsonl` (`ALGO_EVENT_TAP=0` to disable).
 
 ### P2 — Strategy plugin manifest (implemented)
 

@@ -80,3 +80,15 @@ documentation:
   generate_readme: false
 
 # aliases: [OldStrategyName]
+
+# Event bus interest (optional). When omitted, inferred from schedule.eval_mode
+# and execution (GTT → QuoteUpdated). After editing, run:
+#   python -m tools.strategy_manifest generate
+# New strategies need no handler registration in LiveEngine / wiring.py.
+# subscriptions:
+#   BarClosed:
+#     enabled: true
+#     timeframes: ["60"]
+#     symbols: [NIFTY]
+#   ScheduledSlot: false
+#   QuoteUpdated: false

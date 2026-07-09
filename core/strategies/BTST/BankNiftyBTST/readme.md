@@ -12,7 +12,7 @@
 `execution_mode: HYBRID_GTT` via `GttFallbackBook` (`core/orderExecution/gtt_fallback_book.py`):
 
 1. Place Dhan **Forever (GTT)** LIMIT BUY at trigger/limit = limit_price.
-2. Engine watches **ask** on subscribed option symbols (websocket + REST fallback).
+2. Engine watches **ask** on subscribed option symbols via **push** `QuoteUpdated` from feed ticks (`source: feed` → `GttFallbackBook.on_quote`); REST/provider `tick()` only if feed quiet ≥3s.
 3. When **ask <= limit_price** and GTT still unfilled → cancel Forever order → place **resting LIMIT BUY @ limit_price**.
 4. Fill from either path triggers `on_main_entry_filled` → SL-M as above.
 

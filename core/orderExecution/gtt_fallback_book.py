@@ -288,6 +288,18 @@ class GttFallbackBook:
                 for w in self._watches.values()
             )
 
+    def active_trading_symbols(self) -> List[str]:
+        """Trading symbols with GTT/FALLBACK watches (for feed QuoteUpdated filters)."""
+        with self._lock:
+            return list(
+                {
+                    str(w.trading_symbol)
+                    for w in self._watches.values()
+                    if w.phase in (GttFallbackPhase.GTT, GttFallbackPhase.FALLBACK_SENT)
+                    and str(w.trading_symbol or "").strip()
+                }
+            )
+
     def register_from_intent(self, intent: OrderIntent, *, broker_order_id: Any = None) -> None:
         extras = dict(getattr(intent, "metadata_extras", None) or {})
         mode = str(extras.get("execution_mode") or "").upper()
@@ -466,6 +478,42 @@ class GttFallbackBook:
         return restored
 
     def tick(self, now_ist: Optional[datetime] = None) -> None:
+        """Full scan: fill sync, active_until, and quote triggers via QuoteProvider."""
+        self._run_watches(now_ist=now_ist, quote_override=None, symbols=None, check_quotes=True)
+
+    def maintenance_tick(self, now_ist: Optional[datetime] = None) -> None:
+        """Fill sync + active_until only (no quote trigger). Use when quotes are push-driven."""
+        self._run_watches(now_ist=now_ist, quote_override=None, symbols=None, check_quotes=False)
+
+    def on_quote(
+        self,
+        trading_symbol: str,
+        quote: Optional[BidAskLtp] = None,
+        now_ist: Optional[datetime] = None,
+    ) -> None:
+        """
+        Push path: evaluate watches for ``trading_symbol`` using the feed quote.
+
+        Prefer this over ``tick()`` when QuoteUpdated is published from feed callbacks.
+        """
+        sym = str(trading_symbol or "").strip()
+        if not sym:
+            return
+        self._run_watches(
+            now_ist=now_ist,
+            quote_override=quote,
+            symbols={sym.upper(), sym},
+            check_quotes=True,
+        )
+
+    def _run_watches(
+        self,
+        *,
+        now_ist: Optional[datetime],
+        quote_override: Optional[BidAskLtp],
+        symbols: Optional[set],
+        check_quotes: bool,
+    ) -> None:
         if now_ist is None:
             now_ist = datetime.now(IST)
         if not self.has_active_watches():
@@ -477,12 +525,30 @@ class GttFallbackBook:
                 if w.phase in (GttFallbackPhase.GTT, GttFallbackPhase.FALLBACK_SENT)
             ]
         for watch in active:
+            if symbols is not None:
+                wsym = str(watch.trading_symbol or "").strip()
+                if wsym not in symbols and wsym.upper() not in symbols:
+                    continue
             try:
-                self._tick_watch(watch, now_ist)
+                self._tick_watch(
+                    watch,
+                    now_ist,
+                    quote_override=quote_override,
+                    check_quotes=check_quotes,
+                )
             except Exception as exc:
-                logger.exception("GttFallback tick failed intent=%s: %s", watch.gtt_intent_id, exc)
+                logger.exception(
+                    "GttFallback tick failed intent=%s: %s", watch.gtt_intent_id, exc
+                )
 
-    def _tick_watch(self, watch: GttFallbackWatch, now_ist: datetime) -> None:
+    def _tick_watch(
+        self,
+        watch: GttFallbackWatch,
+        now_ist: datetime,
+        *,
+        quote_override: Optional[BidAskLtp] = None,
+        check_quotes: bool = True,
+    ) -> None:
         router = self._router
         store = getattr(router, "intent_store", None)
         rec = store.get(watch.gtt_intent_id) if store else None
@@ -509,9 +575,14 @@ class GttFallbackBook:
                     self.on_fill(watch.fallback_intent_id)
             return
 
-        if self._quote_provider is None:
+        if not check_quotes:
             return
-        quote = self._quote_provider.get_quote(watch.trading_symbol)
+
+        quote = quote_override
+        if quote is None:
+            if self._quote_provider is None:
+                return
+            quote = self._quote_provider.get_quote(watch.trading_symbol)
         if quote is None or not _trigger_met(watch, quote):
             return
 

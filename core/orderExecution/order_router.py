@@ -80,6 +80,7 @@ class OrderRouter:
         self.circuit_breaker_threshold = circuit_breaker_threshold
         self.slippage_threshold_pct = slippage_threshold_pct
         self.engine_id = engine_id
+        self.event_bus = None
         self.strategy_id = strategy_id
         self._known_strategies: List[str] = []
         seen_strats: Set[str] = set()
@@ -3717,6 +3718,69 @@ class OrderRouter:
             )
         if self.position_manager and sym:
             self.position_manager.note_trade_led_fill(sym)
+        self._emit_bus_fill_events(
+            intent_id=intent_id,
+            strategy=strategy,
+            instrument=instrument,
+            side=side,
+            qty=qty,
+            price=price,
+            position_closed=bool(position_closed),
+            realized_pnl=realized_pnl,
+            structure_id=structure_id,
+            tag=tag,
+        )
+
+    def _emit_bus_fill_events(
+        self,
+        *,
+        intent_id: Any,
+        strategy: Any,
+        instrument: Any,
+        side: Any,
+        qty: Any,
+        price: Any,
+        position_closed: bool,
+        realized_pnl: Any,
+        structure_id: Any,
+        tag: Any,
+    ) -> None:
+        bus = getattr(self, "event_bus", None)
+        if bus is None:
+            return
+        from core.events.types import EventType, make_event
+
+        sym = self._instrument_trading_symbol(instrument)
+        engine_id = str(getattr(self, "engine_id", None) or "live")
+        bus.publish(
+            make_event(
+                EventType.INTENT_FILLED,
+                {
+                    "intent_id": intent_id,
+                    "strategy": strategy,
+                    "symbol": sym,
+                    "side": side,
+                    "qty": qty,
+                    "price": price,
+                    "structure_id": structure_id,
+                    "tag": tag,
+                },
+                engine_id=engine_id,
+            )
+        )
+        if position_closed:
+            bus.publish(
+                make_event(
+                    EventType.POSITION_CLOSED,
+                    {
+                        "strategy": strategy,
+                        "symbol": sym,
+                        "realized_pnl": realized_pnl,
+                        "structure_id": structure_id,
+                    },
+                    engine_id=engine_id,
+                )
+            )
 
     def process_trade(self, trade: Dict[str, Any]) -> bool:
         """

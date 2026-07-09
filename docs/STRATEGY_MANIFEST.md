@@ -42,6 +42,7 @@ core/strategies/BTST/BankNiftyBTST/
 | Runtime spec | `core/strategies/_generated/runtime_spec.py` |
 | Meta keys | `core/strategies/_generated/meta_keys.py` |
 | Aliases | `core/strategies/_generated/aliases.py` |
+| Event subscriptions | `core/strategies/_generated/subscriptions.py` |
 | Index table | `docs/STRATEGY_INDEX.generated.md` |
 
 Thin wrappers re-export generated data:
@@ -69,8 +70,33 @@ Thin wrappers re-export generated data:
 | `dependencies` | mixins, `meta_key`, `meta_aliases` |
 | `documentation` | readme generation (`--readme`) |
 | `aliases` | `STRATEGY_ALIASES` (e.g. IPOAnchorVWAP) |
+| `subscriptions` | Event bus interest → `_generated/subscriptions.py` (optional; inferred from `schedule` / `execution`) |
 
 Template: `docs/templates/strategy.yaml`
+
+## Event subscriptions
+
+`wire_event_bus()` registers handlers from the **union** of loaded strategies' subscriptions (plus always-on OMS/feed events). Defaults when `subscriptions:` is omitted:
+
+| `schedule.eval_mode` / `execution` | Enabled events |
+|------------------------------------|----------------|
+| `live_feed` | `BarClosed` (+ infra) |
+| `scheduled` | `ScheduledSlot` (+ infra) |
+| `GTT` / `HYBRID_GTT` or `gtt_fallback` set | `QuoteUpdated` |
+
+Override in YAML:
+
+```yaml
+subscriptions:
+  BarClosed:
+    enabled: true
+    timeframes: ["15"]
+    symbols: [NIFTY]
+  ScheduledSlot: false
+  QuoteUpdated: false
+```
+
+Adding strategy #14+: implement class + `strategy.yaml` + `generate` — no `core/events/wiring.py` edits.
 
 ## What stays manual
 

@@ -49,6 +49,16 @@ def validate_manifest(manifest: StrategyManifest) -> List[str]:
     if manifest.schedule.eval_mode == "scheduled" and not manifest.schedule.times:
         issues.append(f"{manifest.id}: scheduled eval_mode requires schedule.times")
 
+    subs = manifest.subscriptions
+    if manifest.schedule.eval_mode == "live_feed" and not subs.enabled("BarClosed"):
+        issues.append(
+            f"{manifest.id}: live_feed eval_mode but subscriptions.BarClosed.enabled is false"
+        )
+    if manifest.schedule.eval_mode == "scheduled" and not subs.enabled("ScheduledSlot"):
+        issues.append(
+            f"{manifest.id}: scheduled eval_mode but subscriptions.ScheduledSlot.enabled is false"
+        )
+
     if manifest.data:
         has_default = "default" in manifest.data
         for mode in manifest.allowed_modes:

@@ -156,6 +156,14 @@ def emit_aliases(manifests: List[StrategyManifest]) -> str:
     return f"{HEADER}\nGENERATED_STRATEGY_ALIASES: dict = {_py_repr(mapping, 0)}\n"
 
 
+def emit_subscriptions(manifests: List[StrategyManifest]) -> str:
+    entries = []
+    for m in sorted(manifests, key=lambda x: x.id):
+        entries.append(f"    {m.id!r}: {_py_repr(m.subscriptions.to_dict(), 4)},")
+    body = "\n".join(entries)
+    return f"{HEADER}\nGENERATED_STRATEGY_SUBSCRIPTIONS: dict = {{\n{body}\n}}\n"
+
+
 def emit_strategy_index(manifests: List[StrategyManifest]) -> str:
     lines = [
         "# Strategy index",
@@ -259,6 +267,7 @@ def write_generated_files(
         "runtime_spec.py": emit_runtime_spec(manifests),
         "meta_keys.py": emit_meta_keys(manifests),
         "aliases.py": emit_aliases(manifests),
+        "subscriptions.py": emit_subscriptions(manifests),
     }
     for name, content in files.items():
         path = out / name

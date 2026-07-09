@@ -12,6 +12,31 @@ VALID_MODES = frozenset({"BACKTEST", "PAPER", "LIVE"})
 VALID_EVAL_MODES = frozenset({"live_feed", "scheduled"})
 VALID_VENUES = frozenset({"DHAN", "DELTA"})
 
+# Event names strategies may declare under subscriptions:
+VALID_SUBSCRIPTION_EVENTS = frozenset(
+    {
+        "BarClosed",
+        "ScheduledSlot",
+        "QuoteUpdated",
+        "IntentCreated",
+        "IntentFilled",
+        "PositionClosed",
+        "FeedDisconnected",
+        "FeedRecovered",
+    }
+)
+
+# Always-on infrastructure events (registered once per engine when any strategy loads).
+INFRA_SUBSCRIPTION_EVENTS = frozenset(
+    {
+        "IntentCreated",
+        "IntentFilled",
+        "PositionClosed",
+        "FeedDisconnected",
+        "FeedRecovered",
+    }
+)
+
 
 @dataclass
 class ImplementationSpec:
@@ -58,6 +83,37 @@ class DocumentationSpec:
 
 
 @dataclass
+class EventSubscriptionSpec:
+    """Per-event subscription declared (or inferred) for a strategy."""
+
+    enabled: bool = True
+    timeframes: List[str] = field(default_factory=list)
+    symbols: List[str] = field(default_factory=list)
+
+
+@dataclass
+class SubscriptionsSpec:
+    """Resolved event interest for bus wiring (strategy.yaml → subscriptions:)."""
+
+    events: Dict[str, EventSubscriptionSpec] = field(default_factory=dict)
+
+    def enabled(self, event_name: str) -> bool:
+        spec = self.events.get(event_name)
+        return bool(spec and spec.enabled)
+
+    def to_dict(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for name, spec in sorted(self.events.items()):
+            entry: Dict[str, Any] = {"enabled": bool(spec.enabled)}
+            if spec.timeframes:
+                entry["timeframes"] = list(spec.timeframes)
+            if spec.symbols:
+                entry["symbols"] = list(spec.symbols)
+            out[name] = entry
+        return out
+
+
+@dataclass
 class StrategyManifest:
     """Parsed strategy.yaml — source of truth for generated wiring."""
 
@@ -78,11 +134,104 @@ class StrategyManifest:
     dependencies: DependenciesSpec = field(default_factory=DependenciesSpec)
     documentation: DocumentationSpec = field(default_factory=DocumentationSpec)
     aliases: List[str] = field(default_factory=list)
+    subscriptions: SubscriptionsSpec = field(default_factory=SubscriptionsSpec)
     source_path: Optional[Path] = None
 
     @property
     def class_attr_name(self) -> str:
         return self.implementation.class_name
+
+
+def _parse_event_subscription(raw: Any, *, default_enabled: bool) -> EventSubscriptionSpec:
+    if raw is None:
+        return EventSubscriptionSpec(enabled=default_enabled)
+    if isinstance(raw, bool):
+        return EventSubscriptionSpec(enabled=raw)
+    if isinstance(raw, dict):
+        enabled = raw.get("enabled")
+        if enabled is None:
+            enabled = default_enabled
+        tfs = raw.get("timeframes") or []
+        syms = raw.get("symbols") or []
+        if not isinstance(tfs, list):
+            raise ValueError("subscriptions.*.timeframes must be a list")
+        if not isinstance(syms, list):
+            raise ValueError("subscriptions.*.symbols must be a list")
+        return EventSubscriptionSpec(
+            enabled=bool(enabled),
+            timeframes=[str(t).strip() for t in tfs if str(t).strip()],
+            symbols=[str(s).strip().upper() for s in syms if str(s).strip()],
+        )
+    raise ValueError(f"subscriptions entry must be bool or mapping, got {type(raw).__name__}")
+
+
+def default_subscriptions_for(
+    *,
+    eval_mode: str,
+    timeframe: Optional[str],
+    symbols: Optional[List[str]],
+    execution: ExecutionSpec,
+) -> SubscriptionsSpec:
+    """Infer bus subscriptions from schedule + execution when YAML omits them."""
+    live_feed = eval_mode == "live_feed"
+    scheduled = eval_mode == "scheduled"
+    has_gtt = bool(execution.gtt_fallback) or execution.mode in {"GTT", "HYBRID_GTT"}
+    tfs = [str(timeframe)] if timeframe else []
+    syms = list(symbols) if symbols else []
+
+    events: Dict[str, EventSubscriptionSpec] = {
+        "BarClosed": EventSubscriptionSpec(enabled=live_feed, timeframes=tfs, symbols=syms),
+        "ScheduledSlot": EventSubscriptionSpec(enabled=scheduled, symbols=syms),
+        "QuoteUpdated": EventSubscriptionSpec(enabled=has_gtt, symbols=syms),
+        "IntentCreated": EventSubscriptionSpec(enabled=True),
+        "IntentFilled": EventSubscriptionSpec(enabled=True),
+        "PositionClosed": EventSubscriptionSpec(enabled=True),
+        "FeedDisconnected": EventSubscriptionSpec(enabled=True),
+        "FeedRecovered": EventSubscriptionSpec(enabled=True),
+    }
+    return SubscriptionsSpec(events=events)
+
+
+def resolve_subscriptions(
+    raw: Optional[Dict[str, Any]],
+    *,
+    eval_mode: str,
+    timeframe: Optional[str],
+    symbols: Optional[List[str]],
+    execution: ExecutionSpec,
+) -> SubscriptionsSpec:
+    """Merge explicit YAML subscriptions over inferred defaults."""
+    base = default_subscriptions_for(
+        eval_mode=eval_mode,
+        timeframe=timeframe,
+        symbols=symbols,
+        execution=execution,
+    )
+    if not raw:
+        return base
+    if not isinstance(raw, dict):
+        raise ValueError("subscriptions must be a mapping")
+
+    for key, value in raw.items():
+        name = str(key).strip()
+        if name not in VALID_SUBSCRIPTION_EVENTS:
+            raise ValueError(
+                f"unknown subscription event {name!r}; "
+                f"valid={sorted(VALID_SUBSCRIPTION_EVENTS)}"
+            )
+        default_enabled = base.enabled(name)
+        base.events[name] = _parse_event_subscription(value, default_enabled=default_enabled)
+        # Fill timeframe/symbol defaults when override is a bare bool True
+        if isinstance(value, bool) and value:
+            if name == "BarClosed" and timeframe and not base.events[name].timeframes:
+                base.events[name].timeframes = [str(timeframe)]
+            if symbols and not base.events[name].symbols and name in (
+                "BarClosed",
+                "ScheduledSlot",
+                "QuoteUpdated",
+            ):
+                base.events[name].symbols = list(symbols)
+    return base
 
 
 def _require_dict(raw: Any, label: str) -> Dict[str, Any]:
@@ -180,6 +329,17 @@ def parse_manifest(raw: Dict[str, Any], source_path: Optional[Path] = None) -> S
     if backtest_tf is not None:
         backtest_tf = str(backtest_tf)
 
+    try:
+        subscriptions = resolve_subscriptions(
+            raw.get("subscriptions"),
+            eval_mode=schedule.eval_mode,
+            timeframe=timeframe,
+            symbols=symbols,
+            execution=execution,
+        )
+    except ValueError as exc:
+        raise ValueError(f"{strategy_id}: {exc}") from exc
+
     return StrategyManifest(
         id=strategy_id,
         implementation=ImplementationSpec(module=module, class_name=class_name),
@@ -198,5 +358,6 @@ def parse_manifest(raw: Dict[str, Any], source_path: Optional[Path] = None) -> S
         dependencies=dependencies,
         documentation=documentation,
         aliases=[str(a).strip() for a in (raw.get("aliases") or []) if str(a).strip()],
+        subscriptions=subscriptions,
         source_path=source_path,
     )

@@ -72,6 +72,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
         emit_profiles,
         emit_registry,
         emit_runtime_spec,
+        emit_subscriptions,
     )
 
     manifests = discover_manifests()
@@ -92,6 +93,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
         "runtime_spec.py": emit_runtime_spec(manifests),
         "meta_keys.py": emit_meta_keys(manifests),
         "aliases.py": emit_aliases(manifests),
+        "subscriptions.py": emit_subscriptions(manifests),
     }
     stale = []
     for name, content in expected.items():

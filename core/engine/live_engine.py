@@ -148,6 +148,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self.candle_queue = candle_queue
         self.candle_aggregator = candle_aggregator
         self.engine_id = engine_id or "live"
+        self.event_bus = None
+        self._feed_disconnect_event_sent = False
         self.venue = venue or ""
         self.market_exchange = str(market_exchange or "").upper()
         self.engine_logger = engine_logger
@@ -1843,10 +1845,41 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         feed.replace_instruments(self._merge_feed_instruments(existing, rows))
 
     def _run_gtt_fallback_tick(self) -> None:
+        """
+        GTT maintenance (fill sync + active_until).
+
+        Quote triggers are push-driven: feed ticks → QuoteUpdated → on_quote.
+        If no feed quote for watched symbols recently, fall back to QuoteProvider
+        (feed cache + REST) via book.tick().
+        """
         book = getattr(self.order_router, "gtt_fallback_book", None)
         if book is None or not book.has_active_watches():
             return
-        book.tick(self._current_ist_now())
+        now_ist = self._current_ist_now()
+        bus = getattr(self, "event_bus", None)
+        if bus is not None:
+            from core.events.types import EventType, make_event
+
+            bus.publish(
+                make_event(
+                    EventType.QUOTE_UPDATED,
+                    {"source": "gtt_maintenance"},
+                    engine_id=self.engine_id,
+                )
+            )
+            last_feed = float(getattr(self, "_last_gtt_feed_quote_ts", 0.0) or 0.0)
+            # REST/provider safety when feed is quiet (e.g. option not ticking).
+            if (time.time() - last_feed) >= 3.0:
+                book.tick(now_ist)
+            return
+        maintenance = getattr(book, "maintenance_tick", None)
+        if callable(maintenance):
+            maintenance(now_ist)
+            last_feed = float(getattr(self, "_last_gtt_feed_quote_ts", 0.0) or 0.0)
+            if (time.time() - last_feed) >= 3.0:
+                book.tick(now_ist)
+        else:
+            book.tick(now_ist)
 
 
     @staticmethod
@@ -1895,6 +1928,22 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             and str(getattr(s, "timeframe", "") or "").strip()
             for s in (strategies or [])
         )
+
+    @classmethod
+    def needs_tick_queue(
+        cls,
+        strategies: List[Any],
+        strategy_eval_modes: Optional[Dict[str, str]] = None,
+    ) -> bool:
+        """True when candle aggregation or GTT QuoteUpdated push needs the tick queue."""
+        if cls.needs_candle_aggregator(strategies, strategy_eval_modes):
+            return True
+        try:
+            from core.events.subscriptions import collect_enabled_events
+
+            return "QuoteUpdated" in collect_enabled_events(strategies or [])
+        except Exception:
+            return False
 
     @staticmethod
     def _collect_feed_symbols(
@@ -2094,6 +2143,25 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             candle = self._build_scheduled_candle(
                 sym, close, slot_time, exchange, now_ist
             )
+            bus = getattr(self, "event_bus", None)
+            if bus is not None:
+                from core.events.types import EventType, make_event
+
+                bus.publish(
+                    make_event(
+                        EventType.SCHEDULED_SLOT,
+                        {
+                            "strategy": strategy,
+                            "symbol": sym,
+                            "candle": candle,
+                            "slot_time": slot_time.strftime("%H:%M"),
+                            "dedupe_key": key,
+                            "exchange": exchange,
+                        },
+                        engine_id=self.engine_id,
+                    )
+                )
+                continue
             self._scheduled_evaluated_keys.add(key)
             if self.engine_logger:
                 self.engine_logger.log(
@@ -2380,6 +2448,19 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             if (now - last_seen) > self._feed_stall_seconds:
                 stale_symbols.append(sym)
         if len(stale_symbols) != len(feed_syms):
+            if self._feed_disconnect_event_sent:
+                bus = getattr(self, "event_bus", None)
+                if bus is not None:
+                    from core.events.types import EventType, make_event
+
+                    bus.publish(
+                        make_event(
+                            EventType.FEED_RECOVERED,
+                            {"symbols": list(feed_syms), "reason": "feed_stall_cleared"},
+                            engine_id=self.engine_id,
+                        )
+                    )
+                self._feed_disconnect_event_sent = False
             self._feed_stall_last_log_ts = 0.0
             return
         if (
@@ -2395,6 +2476,22 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         if self.engine_logger:
             self.engine_logger.log("feed_stalled", msg)
         self._feed_stall_last_log_ts = now
+        if not self._feed_disconnect_event_sent:
+            bus = getattr(self, "event_bus", None)
+            if bus is not None:
+                from core.events.types import EventType, make_event
+
+                bus.publish(
+                    make_event(
+                        EventType.FEED_DISCONNECTED,
+                        {
+                            "symbols": stale_symbols,
+                            "reason": msg,
+                        },
+                        engine_id=self.engine_id,
+                    )
+                )
+            self._feed_disconnect_event_sent = True
 
     def start(self, exchange, sector, rsi):
         self._live_exchange = str(exchange or "INDEX")
@@ -2470,6 +2567,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             except Exception:
                 self._dhan_order_ws_bound = False
         self._configure_gtt_fallback_book()
+        from core.events.wiring import wire_event_bus
+
+        wire_event_bus(self)
         primary_tf = getattr(self.strategy, "timeframe", None)
         engine_timeframes = list(self._engine_timeframes or [])
         if not engine_timeframes and primary_tf:
@@ -2510,17 +2610,19 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             use_feed = bool(
                 self.realtime_feed and self.realtime_feed.is_connected()
             )
-
-            if engine_timeframes:
-                use_aggregator = (
-                    use_feed
-                    and self.tick_queue is not None
-                    and self.candle_aggregator is not None
-                )
-                if use_aggregator:
-                    if live_candle_pipeline:
-                        self._drain_tick_queue()
-                    self._maybe_flush_session_end_candles()
+            use_aggregator = (
+                use_feed
+                and self.tick_queue is not None
+                and self.candle_aggregator is not None
+            )
+            use_tick_drain = use_feed and self.tick_queue is not None
+            # Drain ticks for candle pipeline and/or GTT QuoteUpdated push
+            # (scheduled-only engines may have empty engine_timeframes).
+            need_tick_drain = live_candle_pipeline or bool(self._gtt_watch_symbols())
+            if use_tick_drain and need_tick_drain:
+                self._drain_tick_queue()
+            if engine_timeframes and use_aggregator:
+                self._maybe_flush_session_end_candles()
 
             self.check_feed_health()
             self._check_feed_stall_fail_safe()
@@ -2826,41 +2928,60 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             )
 
                     self._enrich_candle_depth(symbol, candle)
-                    self._run_exits_and_rollover_for_closed_bar(
-                        symbol, candle, tf, enriched_candle=enriched_candle
-                    )
-                    for eval_result in self._evaluate_strategies_parallel(
-                        enriched_candle, timeframe=tf, already_enriched=True
-                    ):
-                        eval_strategy = eval_result.get("strategy")
-                        eval_strategy_name = str(
-                            getattr(eval_strategy, "name", "unknown_strategy")
-                        )
-                        if self.engine_logger:
-                            self.engine_logger.log(
-                                "strategy_evaluated",
-                                message=f"Strategy evaluated: {eval_strategy_name}",
-                                strategy=eval_strategy_name,
-                                symbol=symbol,
+                    bus = getattr(self, "event_bus", None)
+                    if bus is not None:
+                        from core.events.types import EventType, make_event
+
+                        bus.publish(
+                            make_event(
+                                EventType.BAR_CLOSED,
+                                {
+                                    "symbol": symbol,
+                                    "timeframe": tf,
+                                    "candle": candle,
+                                    "enriched_candle": enriched_candle,
+                                    "eval_key": eval_key,
+                                    "eval_ts_key": eval_ts_key,
+                                },
+                                engine_id=self.engine_id,
                             )
-                        intent = eval_result["intent"]
-                        if self._log_entry_skipped_if_paused(
-                            strategy=eval_strategy,
-                            symbol=symbol,
-                            intent=intent,
-                        ):
-                            continue
-                        self._run_strategy(
-                            symbol,
-                            candle,
-                            eval_result["ctx"],
-                            intent,
-                            strategy=eval_result["strategy"],
-                            strategy_time_ms=eval_result["strategy_time_ms"],
-                            timeframe=tf,
                         )
-                    if eval_key is not None:
-                        self._last_evaluated_candle_ts[eval_ts_key] = eval_key
+                    else:
+                        self._run_exits_and_rollover_for_closed_bar(
+                            symbol, candle, tf, enriched_candle=enriched_candle
+                        )
+                        for eval_result in self._evaluate_strategies_parallel(
+                            enriched_candle, timeframe=tf, already_enriched=True
+                        ):
+                            eval_strategy = eval_result.get("strategy")
+                            eval_strategy_name = str(
+                                getattr(eval_strategy, "name", "unknown_strategy")
+                            )
+                            if self.engine_logger:
+                                self.engine_logger.log(
+                                    "strategy_evaluated",
+                                    message=f"Strategy evaluated: {eval_strategy_name}",
+                                    strategy=eval_strategy_name,
+                                    symbol=symbol,
+                                )
+                            intent = eval_result["intent"]
+                            if self._log_entry_skipped_if_paused(
+                                strategy=eval_strategy,
+                                symbol=symbol,
+                                intent=intent,
+                            ):
+                                continue
+                            self._run_strategy(
+                                symbol,
+                                candle,
+                                eval_result["ctx"],
+                                intent,
+                                strategy=eval_result["strategy"],
+                                strategy_time_ms=eval_result["strategy_time_ms"],
+                                timeframe=tf,
+                            )
+                        if eval_key is not None:
+                            self._last_evaluated_candle_ts[eval_ts_key] = eval_key
             # To be checked properly else condition--> Pending
             else:
                 candles = None
@@ -3318,6 +3439,26 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         timeframe: Optional[str] = None,
     ):
         strategy = strategy or self.strategy
+        bus = getattr(self, "event_bus", None)
+        if bus is not None and intent is not None:
+            from core.events.types import EventType, make_event
+
+            bus.publish(
+                make_event(
+                    EventType.INTENT_CREATED,
+                    {
+                        "strategy": strategy,
+                        "symbol": symbol,
+                        "candle": candle,
+                        "ctx": ctx,
+                        "intent": intent,
+                        "strategy_time_ms": strategy_time_ms,
+                        "timeframe": timeframe,
+                    },
+                    engine_id=self.engine_id,
+                )
+            )
+            return
         risk_manager = getattr(self.order_router, "risk", None)
         entry_intents = (
             [intent]

@@ -429,7 +429,7 @@ class EngineFactory:
                         engine_logger=engine_logger,
                         telegram_alert=telegram_alert,
                     )
-                    if LiveEngine.needs_candle_aggregator(strategies, eval_modes):
+                    if LiveEngine.needs_tick_queue(strategies, eval_modes):
                         tick_queue = queue.Queue(maxsize=TICK_QUEUE_MAXSIZE)
                         candle_queue = queue.Queue(maxsize=5000)
                         candle_aggregator = CandleAggregator(
@@ -489,7 +489,7 @@ class EngineFactory:
                             config, "market_ws_stall_timeout_seconds", None
                         ),
                     )
-                    if LiveEngine.needs_candle_aggregator(strategies, eval_modes):
+                    if LiveEngine.needs_tick_queue(strategies, eval_modes):
                         tick_queue = queue.Queue(maxsize=TICK_QUEUE_MAXSIZE)
                         if is_nse_like:
                             candle_aggregator = CandleAggregator(

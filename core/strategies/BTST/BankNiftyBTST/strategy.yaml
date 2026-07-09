@@ -73,3 +73,13 @@ execution:
     active_until: '15:20'
   bracket_leg_tags:
   - MAIN_SL
+subscriptions:
+  BarClosed: false
+  ScheduledSlot:
+    enabled: true
+    symbols:
+    - BANKNIFTY
+  QuoteUpdated:
+    enabled: true
+    symbols:
+    - BANKNIFTY

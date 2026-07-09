@@ -982,9 +982,10 @@ class LiveEngineHelpersMixin:
             self.engine_logger.eod_export(path)
 
     def _drain_tick_queue(self) -> None:
-        """Drain tick queue into candle_aggregator (single state owner). Non-blocking; cap per cycle."""
-        if not self.tick_queue or not self.candle_aggregator:
+        """Drain tick queue into candle_aggregator; publish QuoteUpdated for GTT watches."""
+        if not self.tick_queue:
             return
+        has_aggregator = self.candle_aggregator is not None
         if not hasattr(self, "_tick_debug_count"):
             self._tick_debug_count = 0
             self._tick_debug_last_log = time.time()
@@ -1002,8 +1003,10 @@ class LiveEngineHelpersMixin:
                 v = tick.get("volume", 0)
                 ts = tick.get("timestamp")
                 if s is not None and p is not None and ts is not None:
-                    self.candle_aggregator.on_tick(s, p, v, ts)
+                    if has_aggregator:
+                        self.candle_aggregator.on_tick(s, p, v, ts)
                     self._last_tick_timestamp[s] = time.time()
+                    self._publish_quote_updated_from_tick(s, p, ts)
                     self._tick_debug_count += 1
                     now = time.time()
                     if now - self._tick_debug_last_log >= 1800:
@@ -1035,7 +1038,75 @@ class LiveEngineHelpersMixin:
                     )
                 else:
                     logger.exception("Aggregator error for symbol=%s", s)
-        self._drain_candle_queue()
+        if has_aggregator:
+            self._drain_candle_queue()
+
+    def _gtt_watch_symbols(self) -> set:
+        book = getattr(getattr(self, "order_router", None), "gtt_fallback_book", None)
+        if book is None or not book.has_active_watches():
+            return set()
+        fn = getattr(book, "active_trading_symbols", None)
+        if not callable(fn):
+            return set()
+        return {str(s).strip().upper() for s in (fn() or []) if str(s).strip()}
+
+    def _quote_fields_from_feed(self, symbol: str, ltp: Any) -> dict:
+        """Best bid/ask/ltp from realtime feed cache for QuoteUpdated payload."""
+        feed = getattr(self, "realtime_feed", None)
+        bid = ask = None
+        if feed is not None:
+            bid_fn = getattr(feed, "get_best_bid", None)
+            ask_fn = getattr(feed, "get_best_ask", None)
+            if callable(bid_fn):
+                try:
+                    bid = bid_fn(symbol)
+                except Exception:
+                    bid = None
+            if callable(ask_fn):
+                try:
+                    ask = ask_fn(symbol)
+                except Exception:
+                    ask = None
+            if ltp is None:
+                ticker_fn = getattr(feed, "get_last_ticker", None)
+                if callable(ticker_fn):
+                    try:
+                        tick = ticker_fn(symbol)
+                        if isinstance(tick, dict):
+                            ltp = tick.get("close") or tick.get("last_price") or tick.get("mark_price")
+                    except Exception:
+                        pass
+        return {
+            "symbol": str(symbol),
+            "bid": float(bid) if bid is not None else None,
+            "ask": float(ask) if ask is not None else None,
+            "ltp": float(ltp) if ltp is not None else None,
+            "source": "feed",
+        }
+
+    def _publish_quote_updated_from_tick(self, symbol: Any, price: Any, ts: Any) -> None:
+        """Push QuoteUpdated for GTT-watched symbols (replaces GTT quote poll)."""
+        bus = getattr(self, "event_bus", None)
+        if bus is None:
+            return
+        sym = str(symbol or "").strip()
+        if not sym:
+            return
+        watched = self._gtt_watch_symbols()
+        if not watched or sym.upper() not in watched:
+            return
+        from core.events.types import EventType, make_event
+
+        payload = self._quote_fields_from_feed(sym, price)
+        payload["ts"] = float(ts) if ts is not None else None
+        self._last_gtt_feed_quote_ts = time.time()
+        bus.publish(
+            make_event(
+                EventType.QUOTE_UPDATED,
+                payload,
+                engine_id=getattr(self, "engine_id", None) or "live",
+            )
+        )
 
     def _drain_candle_queue(self) -> None:
         """Apply Delta exchange candlestick OHLC over tick-built bars (per resolution)."""
