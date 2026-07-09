@@ -1,22 +1,25 @@
 # Event-Driven Strategy Guide
 
-How to add strategies and evolve this codebase toward a cleaner **event-driven** architecture.
+How to add strategies on top of the live event bus and strategy manifests.
 
-## Current architecture (as implemented)
+## Current architecture
 
 ```
 Market data events          Strategy events              Execution events
 ──────────────────          ───────────────              ────────────────
-WS tick                     closed 60m bar               OrderIntent created
-  → CandleAggregator          → should_evaluate          → intent queue
-  → closed bar                → on_candle                → account router
-scheduled IST slot            → should_exit              → OMS worker
-  → synthetic candle          → on_candle_rollover       → broker place/fill
-quote update (GttFallback)    → on_main_entry_filled     → process_trade
-                                                         → position_manager
+WS tick                     BarClosed / ScheduledSlot    IntentCreated
+  → tick queue                → exits + rollover           → OMS enqueue
+  → CandleAggregator          → should_evaluate            → account router
+  → closed bar → BarClosed    → on_candle                  → broker place/fill
+scheduled IST → ScheduledSlot → should_exit / rollover     → IntentFilled
+QuoteUpdated (feed push)      → on_main_entry_filled       → PositionClosed
+  → GttFallbackBook.on_quote
+FeedDisconnected / Recovered
 ```
 
-The system is **already multi-strategy** and **mostly event-driven** at the edges (ticks, fills, scheduled slots). The main gap is **uniform internal events** — today the live loop polls (`sleep(1)`) and calls strategy hooks directly.
+Live is **hybrid**: an in-process event bus drives strategy/OMS wiring (`docs/EVENT_BUS.md`); the main loop still polls (~1s) for feed health, GTT maintenance, and scheduled slots.
+
+Manifests + generator: `docs/STRATEGY_MANIFEST.md`.
 
 ---
 
@@ -39,15 +42,13 @@ Class attrs: `name`, `underlying_symbols`, `timeframe`, `api`, `expiryType`, `re
 
 ### Entry vs exit evaluation (live)
 
-On each **closed bar**, `LiveEngine` runs hooks in this order:
+On each **closed bar** (`BarClosed` → services):
 
-1. **`_run_exits_and_rollover_for_closed_bar`** — for every loaded strategy with open MAIN legs:
+1. **Exits + rollover** — for every loaded strategy with open MAIN legs:
    - `should_exit` → `on_position_exit`
    - `on_candle_rollover` (hedge roll)
    - Does **not** call `should_evaluate`
-2. **`_evaluate_strategies_parallel`** — entry path only:
-   - `should_evaluate(candle)` must return true
-   - then `on_candle(candle, ctx)`
+2. **Entry path** — `should_evaluate(candle)` must return true, then `on_candle(candle, ctx)`
 
 Implications:
 
@@ -60,19 +61,24 @@ Implications:
 
 Do **not** rely on `should_evaluate` for managing open positions — exits will not run if you gate the whole strategy there.
 
-### 2. Registration
+### 2. Registration (manifest)
 
-```python
-# core/strategies/registry.py
-STRATEGY_MAP["MyStrategy"] = {"strategy": MyStrategy, "allowed_modes": [...]}
+Add `core/strategies/**/strategy.yaml`, then:
 
-# run/strategy_profiles.py
-STRATEGY_PROFILES["MyStrategy"] = {"symbols": [...], "live": {...}, "backtest": {...}}
+```bash
+python -m tools.strategy_manifest generate
+```
 
-# core/strategies/runtime_spec.py
-STRATEGY_RUNTIME_SPEC["MyStrategy"] = {"live": {...}, "backtest": {...}}
+That refreshes `core/strategies/_generated/` (registry, profiles, runtime spec, aliases, subscriptions). Enable the job in `run/config.py` `ENGINE_JOBS`. See `docs/STRATEGY_MANIFEST.md` and `docs/templates/strategy.yaml`.
 
-# run/config.py — ENGINE_JOBS entry (optional engine_id)
+Optional event filters in YAML:
+
+```yaml
+subscriptions:
+  BarClosed:
+    enabled: true
+    timeframes: ["15"]
+  QuoteUpdated: false
 ```
 
 ### 3. Execution opt-in
@@ -88,7 +94,7 @@ metadata_extras = {
 }
 ```
 
-Handled by `GttFallbackBook` — no strategy-local polling.
+Handled by `GttFallbackBook` via push `QuoteUpdated` (+ quiet-feed REST fallback) — no strategy-local polling.
 
 ### 4. Shared India options — `IndiaMktMixins`
 
@@ -101,64 +107,23 @@ Chain fetch, expiry (`ExpiryResolver`), hedge intents, rollover, strike-in-premi
 
 ---
 
-## Recommended optimizations (priority order)
+## Remaining optimizations (priority order)
 
-### P0 — Quick wins (low risk)
+### P0 — Quick wins
 
 | Item | Why | Where |
 |------|-----|--------|
-| **Strategy readme template** | Every new strategy documents hooks + eval mode | `docs/templates/STRATEGY_README.md` |
-| **Registry name = `strategy.name`** | Fix IPOBreakout / IPOAnchorVWAP mismatch | `IPOBreakout.name` + `STRATEGY_ALIASES` |
-| **LEAPS eval on every closed bar for exits** | Already in `_run_exits_and_rollover`; document | done in live_engine |
 | **Scheduled engines subscribe underlying** | BTST/OI get index WS for spot + GttFallback base | `_collect_feed_symbols` |
 
-### P1 — Event bus (implemented)
-
-In-process bus: `core/events/`. Wired from `LiveEngine.start()` via `wire_event_bus()`.
-
-| Event | Publisher | Subscribers |
-|-------|-----------|-------------|
-| `BarClosed` | LiveEngine | Exits (p10) → Entries (p20) |
-| `ScheduledSlot` | LiveEngine clock | Scheduled strategies |
-| `QuoteUpdated` | GTT poll | GttFallbackBook |
-| `IntentCreated` | Strategy eval | ExecutionEngine enqueue |
-| `IntentFilled` | OrderRouter | Audit / hooks |
-| `PositionClosed` | OrderRouter | Audit / risk |
-| `FeedDisconnected` / `FeedRecovered` | Feed supervisor | Entry pause flags |
-
-See `docs/EVENT_BUS.md`. Audit: `logs/{engine_id}_events.jsonl` (`ALGO_EVENT_TAP=0` to disable).
-
-### P2 — Strategy plugin manifest (implemented)
-
-One `strategy.yaml` per strategy under `core/strategies/**/`. Generator:
-
-```bash
-python -m tools.strategy_manifest generate
-```
-
-Produces `core/strategies/_generated/` (registry, profiles, runtime spec, meta keys). See `docs/STRATEGY_MANIFEST.md`.
-
-```yaml
-id: MyStrategy
-implementation: { module: ..., class: MyStrategy }
-broker: { venue: DHAN }
-schedule: { eval_mode: live_feed }
-data: { backtest: { data: { option_chain: ... } } }
-profile: { live: {...}, backtest: {...} }
-dependencies: { meta_key: my_strategy }
-```
-
-Trading logic stays in Python; manifests replace copy-paste across registry files.
-
-### P3 — Unified quote layer
+### P1 — Unified quote layer
 
 `QuoteService` wrapping feed + REST + instrument_store:
 
 - Single API for strategies, GttFallbackBook, exit refresh
-- Push-driven: feed callback → `QuoteUpdated` event
-- Removes duplicate `get_best_bid` / `get_quote_v2` paths
+- Collapse remaining duplicate `get_best_bid` / `get_quote_v2` paths
+- (Feed → `QuoteUpdated` for GTT watches is already wired; this is the shared facade)
 
-### P4 — Execution policy registry
+### P2 — Execution policy registry
 
 Move fill-gate, HYBRID_GTT, bracket placement into pluggable policies:
 
@@ -173,18 +138,19 @@ EXECUTION_POLICIES = {
 
 OrderRouter delegates to policy by `execution_mode` — easier to add `ICEBERG`, `TWAP`, etc.
 
-### P5 — Backtest / live parity tests
+### P3 — Backtest / live parity tests
 
 Per-strategy golden tests:
 
 - Same candle fixture → same intents in backtest and live `build_context` path
 - Expiry resolution unit tests (`LEAPS_ROLL` vs `QUARTERLY`)
 
-### P6 — Observability
+### P4 — Observability
 
-- Structured event log (`logs/{engine_id}_events.jsonl`)
 - Per-strategy metrics: eval count, intent count, fill latency, GTT fallback rate
 - Canvas dashboard for open watches / positions (optional)
+
+Event JSONL tap already exists (`logs/{engine_id}_events.jsonl`; `ALGO_EVENT_TAP=0` to disable).
 
 ---
 
@@ -196,6 +162,7 @@ Per-strategy golden tests:
 | Put broker API in strategy | Use `ctx.order_router`, `ctx.position_store` |
 | Duplicate expiry logic | `ExpiryResolver` + `expiryType` on class |
 | Hardcode IST slots in engine | `scheduled_times` on strategy |
+| Hand-edit `_generated/` or skip YAML | Edit `strategy.yaml` + regenerate |
 | Document Mar/Jun/Sep quarterly for LEAPS | Document `LEAPS_ROLL` or change code |
 
 ---
@@ -204,9 +171,9 @@ Per-strategy golden tests:
 
 1. [ ] Subclass `BaseStrategy` (+ `IndiaMktMixins` if options)
 2. [ ] Implement `should_evaluate` + `on_candle` (+ exit hooks if positional)
-3. [ ] Register in `STRATEGY_MAP` + `STRATEGY_PROFILES` + `STRATEGY_RUNTIME_SPEC`
+3. [ ] Add `strategy.yaml` + run `python -m tools.strategy_manifest generate`
 4. [ ] Add `ENGINE_JOBS` entry in `run/config.py` (if new engine)
-5. [ ] Choose eval mode: candle TF vs `scheduled_times`
+5. [ ] Choose eval mode: candle TF vs `scheduled_times` (and optional `subscriptions:`)
 6. [ ] Choose execution: default LIMIT vs `HYBRID_GTT`
 7. [ ] Add `readme.md` next to strategy module (use `docs/templates/STRATEGY_README.md`)
 8. [ ] Paper trade → verify logs + intent_store + positions reconcile
@@ -218,6 +185,8 @@ Per-strategy golden tests:
 | File | Why |
 |------|-----|
 | `core/strategies/base.py` | Hook contract |
+| `docs/STRATEGY_MANIFEST.md` | Plugin YAML + generate |
+| `docs/EVENT_BUS.md` | Events, services, subscriptions |
 | `core/strategies/registry.py` | Registration + `resolve_registry_key` |
 | `core/strategies/meta.py` | Standard `metadata_extras` helpers |
 | `docs/STRATEGY_INDEX.md` | Full strategy inventory |
@@ -231,13 +200,6 @@ Per-strategy golden tests:
 
 ## Summary
 
-You can **build many more strategies today** by composing `BaseStrategy` hooks + registry + optional mixins + execution modes — without rewriting the engine.
+Add strategies via `BaseStrategy` hooks + `strategy.yaml` + `ENGINE_JOBS` — no engine or handler registration edits for normal cases.
 
-The highest-value evolution toward **fully event-driven** operation is:
-
-1. **Event bus** (decouple live loop from strategy wiring)
-2. **Push quotes** into `GttFallbackBook` (lower latency than 1s poll)
-3. **Execution policy registry** (composable broker behaviors)
-4. **Strategy manifest** (less copy-paste per new algo)
-
-Implement P1–P2 when you have 5+ active live strategies or multiple engines sharing feeds.
+Still worth doing for a cleaner platform: **unified QuoteService**, **execution policy registry**, **parity tests**, and **per-strategy metrics**.
