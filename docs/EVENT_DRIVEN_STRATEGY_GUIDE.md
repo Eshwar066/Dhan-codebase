@@ -37,16 +37,42 @@ The system is **already multi-strategy** and **mostly event-driven** at the edge
 
 Class attrs: `name`, `underlying_symbols`, `timeframe`, `api`, `expiryType`, `required_context`.
 
+### Entry vs exit evaluation (live)
+
+On each **closed bar**, `LiveEngine` runs hooks in this order:
+
+1. **`_run_exits_and_rollover_for_closed_bar`** — for every loaded strategy with open MAIN legs:
+   - `should_exit` → `on_position_exit`
+   - `on_candle_rollover` (hedge roll)
+   - Does **not** call `should_evaluate`
+2. **`_evaluate_strategies_parallel`** — entry path only:
+   - `should_evaluate(candle)` must return true
+   - then `on_candle(candle, ctx)`
+
+Implications:
+
+| Concern | Pattern |
+|---------|---------|
+| Time-based exit (RSI cross, trail, partial) | Implement in `should_exit` / structure hooks; runs every closed bar |
+| Entry window (crossover, slot, divergence age) | Gate in `should_evaluate` |
+| Scheduled BTST / OI | `eval_mode: scheduled`, `timeframe = None`, `scheduled_times` |
+| LEAPS hourly | Exits on every 60m close; entries only when `should_evaluate` allows |
+
+Do **not** rely on `should_evaluate` for managing open positions — exits will not run if you gate the whole strategy there.
+
 ### 2. Registration
 
 ```python
 # core/strategies/registry.py
 STRATEGY_MAP["MyStrategy"] = {"strategy": MyStrategy, "allowed_modes": [...]}
 
+# run/strategy_profiles.py
+STRATEGY_PROFILES["MyStrategy"] = {"symbols": [...], "live": {...}, "backtest": {...}}
+
 # core/strategies/runtime_spec.py
 STRATEGY_RUNTIME_SPEC["MyStrategy"] = {"live": {...}, "backtest": {...}}
 
-# run/config.py — STRATEGY_JOBS entry
+# run/config.py — ENGINE_JOBS entry (optional engine_id)
 ```
 
 ### 3. Execution opt-in
@@ -82,7 +108,7 @@ Chain fetch, expiry (`ExpiryResolver`), hedge intents, rollover, strike-in-premi
 | Item | Why | Where |
 |------|-----|--------|
 | **Strategy readme template** | Every new strategy documents hooks + eval mode | `docs/templates/STRATEGY_README.md` |
-| **Registry name = `strategy.name`** | Fix IPOBreakout / IPOAnchorVWAP mismatch | registry or class `name` |
+| **Registry name = `strategy.name`** | Fix IPOBreakout / IPOAnchorVWAP mismatch | `IPOBreakout.name` + `STRATEGY_ALIASES` |
 | **LEAPS eval on every closed bar for exits** | Already in `_run_exits_and_rollover`; document | done in live_engine |
 | **Scheduled engines subscribe underlying** | BTST/OI get index WS for spot + GttFallback base | `_collect_feed_symbols` |
 
@@ -112,23 +138,27 @@ class Event:
 
 **Benefit:** Add strategies without editing `live_engine.py` main loop.
 
-### P2 — Strategy plugin manifest
+### P2 — Strategy plugin manifest (implemented)
 
-Single YAML/JSON per strategy:
+One `strategy.yaml` per strategy under `core/strategies/**/`. Generator:
 
-```yaml
-name: MyStrategy
-eval_mode: live_feed | scheduled
-timeframe: "60"
-symbols: [NIFTY]
-execution:
-  mode: HYBRID_GTT
-  gtt_fallback: { trigger_field: ask, trigger_op: "<=", active_until: "15:20" }
-hooks:
-  mixins: [IndiaMktMixins]
+```bash
+python -m tools.strategy_manifest generate
 ```
 
-Loader builds registry + runtime_spec — reduces boilerplate across 10+ strategies.
+Produces `core/strategies/_generated/` (registry, profiles, runtime spec, meta keys). See `docs/STRATEGY_MANIFEST.md`.
+
+```yaml
+id: MyStrategy
+implementation: { module: ..., class: MyStrategy }
+broker: { venue: DHAN }
+schedule: { eval_mode: live_feed }
+data: { backtest: { data: { option_chain: ... } } }
+profile: { live: {...}, backtest: {...} }
+dependencies: { meta_key: my_strategy }
+```
+
+Trading logic stays in Python; manifests replace copy-paste across registry files.
 
 ### P3 — Unified quote layer
 
@@ -184,11 +214,11 @@ Per-strategy golden tests:
 
 1. [ ] Subclass `BaseStrategy` (+ `IndiaMktMixins` if options)
 2. [ ] Implement `should_evaluate` + `on_candle` (+ exit hooks if positional)
-3. [ ] Register in `STRATEGY_MAP` + `STRATEGY_RUNTIME_SPEC`
-4. [ ] Add `STRATEGY_JOBS` entry in `run/config.py`
+3. [ ] Register in `STRATEGY_MAP` + `STRATEGY_PROFILES` + `STRATEGY_RUNTIME_SPEC`
+4. [ ] Add `ENGINE_JOBS` entry in `run/config.py` (if new engine)
 5. [ ] Choose eval mode: candle TF vs `scheduled_times`
 6. [ ] Choose execution: default LIMIT vs `HYBRID_GTT`
-7. [ ] Add `readme.md` next to strategy module (use BTST or LEAPS as template)
+7. [ ] Add `readme.md` next to strategy module (use `docs/templates/STRATEGY_README.md`)
 8. [ ] Paper trade → verify logs + intent_store + positions reconcile
 
 ---
@@ -198,7 +228,9 @@ Per-strategy golden tests:
 | File | Why |
 |------|-----|
 | `core/strategies/base.py` | Hook contract |
-| `core/strategies/registry.py` | Registration |
+| `core/strategies/registry.py` | Registration + `resolve_registry_key` |
+| `core/strategies/meta.py` | Standard `metadata_extras` helpers |
+| `docs/STRATEGY_INDEX.md` | Full strategy inventory |
 | `core/engine/live_engine.py` | Main loop, scheduled + feed paths |
 | `core/orderExecution/order_router.py` | Execution + fills |
 | `core/orderExecution/gtt_fallback_book.py` | HYBRID_GTT pattern |

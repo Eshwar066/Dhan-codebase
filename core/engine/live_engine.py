@@ -317,22 +317,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         )
 
     def _underlying_from_strategy_meta(self, metadata_extras: Any) -> Optional[str]:
-        if isinstance(metadata_extras, dict):
-            od = metadata_extras.get("one_day_magical_line") or metadata_extras.get(
-                "one_day_ml1"
-            )
-            if isinstance(od, dict) and od.get("symbol"):
-                return str(od["symbol"])
-            niml = metadata_extras.get("nifty_intraday_magical_line")
-            if isinstance(niml, dict) and niml.get("symbol"):
-                return str(niml["symbol"])
-            oi = metadata_extras.get("oi_positional_buy")
-            if isinstance(oi, dict) and oi.get("symbol"):
-                return str(oi["symbol"])
-            btst = metadata_extras.get("banknifty_btst")
-            if isinstance(btst, dict) and btst.get("symbol"):
-                return str(btst["symbol"])
-        return None
+        from core.strategies.meta import underlying_from_metadata
+
+        return underlying_from_metadata(metadata_extras)
 
     @staticmethod
     def _underlying_from_structure_id(structure_id: Any) -> Optional[str]:

@@ -1,0 +1,44 @@
+id: RSIBreadAndButter
+implementation:
+  module: core.strategies.crypto.RSIBreadAndButter.RSIBreadAndButter
+  class: RSIBreadAndButter
+instrument: FUTURE
+allowed_modes:
+- BACKTEST
+- PAPER
+- LIVE
+broker:
+  venue: DELTA
+  api: DELTA
+  delta:
+    india: true
+    testnet: false
+    leverage: 5
+symbols:
+- BTCUSD
+exchange: NSE
+timeframe: '1'
+schedule:
+  eval_mode: live_feed
+data:
+  default:
+    data: {}
+profile:
+  live:
+    exchange: DELTA
+    sector: 'YES'
+  backtest:
+    start_date: '2026-07-02'
+    end_date: '2026-07-03'
+    timeframe: '1'
+    exchange: DELTA
+    sector: 'YES'
+dependencies:
+  mixins:
+  - MarketStructureMixin
+  - IndiaMktMixins
+  meta_key: rsi_bread_butter
+documentation:
+  title: RSI Bread and Butter
+  overview: Delta BTCUSD 1m RSI divergence + structure entries.
+  run_command: python -m run.main --engine-id delta_rsi_bread_butter

@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 class IPOBreakout(IndiaMktMixins, BaseStrategy):
 
-    name = "IPOAnchorVWAP"
+    name = "IPOBreakout"
     required_context = ["instrument_store"]
 
     def __init__(self):

@@ -1,0 +1,62 @@
+id: LEAPS_RSI
+implementation:
+  module: core.strategies.Leaps.LeapsQuatery_RSI_52_32
+  class: LeapsQuarterly
+instrument: OPTION
+allowed_modes:
+- BACKTEST
+- PAPER
+- LIVE
+broker:
+  venue: DHAN
+  api: DHAN
+symbols:
+- NIFTY
+exchange: NSE
+timeframe: '60'
+schedule:
+  eval_mode: live_feed
+data:
+  backtest:
+    data:
+      option_chain:
+        exchange: NSE
+        interval: '60'
+        segment: OPT
+        api: DHAN
+        expiry_flag: MONTHLY
+  paper:
+    data:
+      option_chain:
+        exchange: NSE
+        interval: '60'
+        segment: OPT
+        api: DHAN
+        expiry_flag: MONTHLY
+  live:
+    data:
+      option_chain:
+        exchange: NSE
+        interval: '1'
+        segment: OPT
+profile:
+  live:
+    exchange: INDEX
+    sector: 'YES'
+    rsi: 'YES'
+  backtest:
+    start_date: '2026-01-01'
+    end_date: '2026-05-24'
+    timeframe: '60'
+    exchange: INDEX
+    sector: 'YES'
+dependencies:
+  mixins:
+  - IndiaMktMixins
+  required_context:
+  - option_chain
+  expiry_type: MONTHLY
+documentation:
+  title: LEAPS RSI
+  overview: NIFTY monthly option selling on 1h RSI with hedge protection.
+  run_command: python -m run.main --engine-id dhan_leaps_rsi

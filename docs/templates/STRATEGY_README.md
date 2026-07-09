@@ -14,8 +14,9 @@ One paragraph: what market, what edge, long/short, instrument type.
 |------|-------|
 | Eval mode | `live_feed` (candle TF) or `scheduled` (`scheduled_times`) |
 | Timeframe | e.g. `60`, `15`, `5`, or `None` for scheduled |
-| `should_evaluate` | When entries are allowed |
-| Exits | `should_exit` / every bar / scheduled slot |
+| `should_evaluate` | When **entries** are allowed (live_feed only) |
+| Exits | `should_exit` / `on_position_exit` — run **every closed bar** before entries |
+| Rollover | `on_candle_rollover` — same pass as exits |
 
 ## Entry / exit rules
 

@@ -1,0 +1,75 @@
+id: BankNiftyBTST
+implementation:
+  module: core.strategies.BTST.BankNiftyBTST.BankNiftyBTST
+  class: BankNiftyBTST
+instrument: OPTION
+allowed_modes:
+- BACKTEST
+- PAPER
+- LIVE
+broker:
+  venue: DHAN
+  api: DHAN
+symbols:
+- BANKNIFTY
+exchange: NSE
+timeframe: null
+schedule:
+  eval_mode: scheduled
+  times:
+  - 09:20
+  - '15:20'
+  - 09:25
+data:
+  backtest:
+    data:
+      option_chain:
+        exchange: NSE
+        interval: '5'
+        segment: OPT
+        api: DHAN
+        expiry_flag: MONTHLY
+  paper:
+    data:
+      option_chain:
+        exchange: NSE
+        interval: '5'
+        segment: OPT
+        api: DHAN
+        expiry_flag: MONTHLY
+  live:
+    data:
+      option_chain:
+        exchange: NSE
+        interval: '1'
+        segment: OPT
+profile:
+  live:
+    exchange: INDEX
+    sector: 'YES'
+  backtest:
+    start_date: '2026-01-02'
+    end_date: '2026-02-19'
+    timeframe: '5'
+    exchange: INDEX
+    sector: 'YES'
+dependencies:
+  mixins:
+  - IndiaMktMixins
+  required_context:
+  - option_chain
+  expiry_type: MONTHLY
+  meta_key: banknifty_btst
+documentation:
+  title: Bank Nifty BTST
+  overview: Buy CE+PE near 100 premium; SL at 50% of limit; exit T+1 9:25 IST.
+  run_command: python -m run.main --engine-id dhan_banknifty_btst
+backtest_timeframe: '5'
+execution:
+  mode: HYBRID_GTT
+  gtt_fallback:
+    trigger_field: ask
+    trigger_op: <=
+    active_until: '15:20'
+  bracket_leg_tags:
+  - MAIN_SL

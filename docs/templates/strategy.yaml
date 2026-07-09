@@ -1,0 +1,82 @@
+# Strategy plugin manifest — add new strategies here
+
+id: MyStrategy
+
+implementation:
+  module: core.strategies.path.MyStrategy
+  class: MyStrategy
+
+instrument: OPTION  # OPTION | FUTURE | EQUITY
+allowed_modes:
+  - BACKTEST
+  - PAPER
+  - LIVE
+
+broker:
+  venue: DHAN  # DHAN | DELTA
+  api: DHAN
+  # delta: { india: true, testnet: false, leverage: 5 }
+
+symbols: [NIFTY]
+exchange: NSE
+timeframe: "60"  # null for scheduled strategies
+
+schedule:
+  eval_mode: live_feed  # live_feed | scheduled
+  # times: ["09:20", "15:20"]  # IST HH:MM when scheduled
+
+execution:
+  mode: LIMIT  # LIMIT | GTT | HYBRID_GTT
+  # gtt_fallback: { trigger_field: ask, trigger_op: "<=", active_until: "15:20" }
+
+data:
+  backtest:
+    data:
+      option_chain:
+        exchange: NSE
+        interval: "60"
+        segment: OPT
+        api: DHAN
+        expiry_flag: MONTHLY
+  paper:
+    data:
+      option_chain:
+        exchange: NSE
+        interval: "60"
+        segment: OPT
+        api: DHAN
+        expiry_flag: MONTHLY
+  live:
+    data:
+      option_chain:
+        exchange: NSE
+        interval: "1"
+        segment: OPT
+
+profile:
+  live:
+    exchange: INDEX
+    sector: YES
+  backtest:
+    start_date: "2026-01-01"
+    end_date: "2026-02-01"
+    timeframe: "60"
+    exchange: INDEX
+    sector: YES
+
+dependencies:
+  mixins: [IndiaMktMixins]
+  required_context: [option_chain]
+  expiry_type: MONTHLY
+  meta_key: my_strategy  # optional legacy metadata_extras key
+
+documentation:
+  title: My Strategy
+  overview: One paragraph describing the edge.
+  rules: |
+    - Entry rule 1
+    - Exit rule 2
+  run_command: python -m run.main --engine-id my_engine
+  generate_readme: false
+
+# aliases: [OldStrategyName]

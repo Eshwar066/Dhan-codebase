@@ -64,7 +64,7 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
     """
 
     name = "RSIBreadAndButter"
-    underlying_symbols = ["BTCUSD"] #, "ETHUSD"
+    underlying_symbols = ["BTCUSD"]
     timeframe = "1"
     required_context = ["instrument_store"]
     api = "DELTA"

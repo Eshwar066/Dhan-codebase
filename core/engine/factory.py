@@ -26,7 +26,7 @@ TICK_QUEUE_MAXSIZE = 500000
 
 from run.config import RunMode
 from run.engine_config import EngineConfig, configure_process_logging
-from core.strategies.registry import STRATEGY_MAP
+from core.strategies.registry import get_strategy_config, resolve_registry_key
 from core.engine.base_engine import BaseEngine
 from core.engine.backtest_engine import BacktestEngine
 from core.engine.live_engine import LiveEngine
@@ -113,7 +113,7 @@ class EngineFactory:
         """
         Build BacktestEngine with isolated stack for config.broker_name.
         """
-        cfg = STRATEGY_MAP.get(config.strategy_name)
+        cfg = get_strategy_config(config.strategy_name)
         if not cfg:
             raise ValueError(f"Unknown strategy: {config.strategy_name}")
         if config.run_mode.value not in [m.value for m in cfg["allowed_modes"]]:
@@ -201,7 +201,7 @@ class EngineFactory:
         LIVE + Delta: DeltaDataProvider, DeltaBroker, DeltaWebSocketFeed when credentials set.
         """
         load_dotenv()
-        cfg = STRATEGY_MAP.get(config.strategy_name)
+        cfg = get_strategy_config(config.strategy_name)
         if not cfg:
             raise ValueError(f"Unknown strategy: {config.strategy_name}")
         if config.run_mode.value not in [m.value for m in cfg["allowed_modes"]]:
@@ -217,7 +217,7 @@ class EngineFactory:
         for strategy_name in extra_names:
             if strategy_name == config.strategy_name:
                 continue
-            extra_cfg = STRATEGY_MAP.get(strategy_name)
+            extra_cfg = get_strategy_config(strategy_name)
             if not extra_cfg:
                 raise ValueError(f"Unknown strategy in strategy_names: {strategy_name}")
             if config.run_mode.value not in [m.value for m in extra_cfg["allowed_modes"]]:
@@ -635,7 +635,7 @@ class EngineFactory:
         """
         if config.broker_name != "DHAN":
             return None
-        cfg = STRATEGY_MAP.get(config.strategy_name)
+        cfg = get_strategy_config(config.strategy_name)
         if not cfg or cfg.get("instrument") != "EQUITY":
             return None
         if EquityUniverseService is None:

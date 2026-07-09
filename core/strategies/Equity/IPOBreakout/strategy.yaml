@@ -1,0 +1,66 @@
+id: IPOBreakout
+implementation:
+  module: core.strategies.Equity.IPOBreakout.IPOBreakout
+  class: IPOBreakout
+instrument: EQUITY
+allowed_modes:
+- BACKTEST
+- PAPER
+- LIVE
+broker:
+  venue: DHAN
+  api: DHAN
+symbols: null
+exchange: NSE
+timeframe: DAY
+schedule:
+  eval_mode: live_feed
+data:
+  backtest:
+    data:
+      ohlc:
+        exchange: NSE
+        interval: '5'
+  paper:
+    data:
+      ohlc:
+        exchange: NSE
+        interval: '5'
+  live:
+    data:
+      ohlc:
+        exchange: NSE
+        interval: '5'
+profile:
+  live:
+    exchange: NSE
+    sector: 'NO'
+    ipo_days: 365
+    ipo_filter:
+      price_above: 200
+      volume_above: 500000
+    ipo_max_symbols: 50
+  backtest:
+    start_date: '2022-01-01'
+    end_date: '2026-02-20'
+    timeframe: DAY
+    exchange: NSE
+    sector: 'NO'
+    ipo_days: 365
+    ipo_filter:
+      price_above: 200
+      volume_above: 500000
+    ipo_max_symbols: 50
+    ipo_fallback_symbols:
+    - RELIANCE
+dependencies:
+  mixins:
+  - IndiaMktMixins
+  required_context:
+  - instrument_store
+documentation:
+  title: IPO Breakout
+  overview: 'Dhan IPO listings: anchor VWAP + staged scale-in.'
+  run_command: python -m run.main --engine-id dhan_ipo_breakout
+aliases:
+- IPOAnchorVWAP

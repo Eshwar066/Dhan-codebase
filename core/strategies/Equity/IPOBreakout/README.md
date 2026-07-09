@@ -1,7 +1,7 @@
 # IPO Anchor VWAP (registry: IPOBreakout)
 
 **Class:** `IPOBreakout` in `IPOBreakout.py`  
-**Strategy name (runtime):** `IPOAnchorVWAP` — registry key is `IPOBreakout`.
+**Strategy name (runtime):** `IPOBreakout` — registry key is `IPOBreakout` (alias `IPOAnchorVWAP` supported).
 
 Equity strategy for **Dhan** IPO listings: anchor VWAP + staged scale-in after listing stabilization filters.
 
