@@ -1483,9 +1483,16 @@ class IndiaMktMixins:
         )
 
     def calculate_hedge_strike(self, sold_strike, option_type):
-        if option_type == "CALL":
-            return int(round((sold_strike * 1.02) / 500) * 500)
-        return int(round((sold_strike * 0.98) / 500) * 500)
+        step = 500
+        sold = int(sold_strike)
+        opt = str(option_type or "").upper()
+        if opt in ("CE", "CALL"):
+            target = sold * 1.02
+        elif opt in ("PE", "PUT"):
+            target = sold * 0.98
+        else:
+            target = sold * 1.02
+        return int(round(target / step) * step)
 
     def resolve_hedge_entry_price(
         self,
@@ -1613,10 +1620,13 @@ class IndiaMktMixins:
         )
 
         if price is None:
-            print(
-                f"⚠️ No exit price for hedge {hedge.instrument.symbol} at {candle['timestamp']}"
-            )
-            return None
+            if RUN_MODE == RunMode.BACKTEST:
+                print(
+                    f"⚠️ No exit price for hedge {hedge.instrument.symbol} at {candle['timestamp']}"
+                )
+                return None
+            # Live: engine resolves executable price from depth at enqueue time.
+            price = 0
 
         return self.create_order_intent(
             inst=hedge.instrument,

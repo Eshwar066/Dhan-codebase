@@ -144,11 +144,19 @@ class BracketLegRegistry:
         if order_router and intent_id and getattr(order_router, "intent_store", None):
             try:
                 from core.orderExecution.intent_store import IntentStatus
+                from core.orderExecution.order_router import OrderState
 
+                if hasattr(order_router, "_set_order_state"):
+                    order_router._set_order_state(
+                        intent_id,
+                        OrderState.CANCELLED,
+                        action="cancel_sibling",
+                        message=detail,
+                    )
                 order_router.intent_store.update(
                     intent_id,
                     IntentStatus.CANCELLED,
-                    order_state="CANCELLED",
+                    order_state=OrderState.CANCELLED,
                 )
             except Exception:
                 pass

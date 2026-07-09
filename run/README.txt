@@ -19,6 +19,12 @@ config.py
 
 Strategy config is wired via core/strategies/registry.STRATEGY_MAP and runtime_spec.
 
+Per-strategy execution (optional):
+  metadata_extras.execution_mode = "GTT" | "HYBRID_GTT"
+  metadata_extras.gtt_fallback = { trigger_field, trigger_op, active_until }
+
+See docs/EVENT_DRIVEN_STRATEGY_GUIDE.md for adding new strategies.
+
 Dependencies
 ------------
 - DhanSource uses core/library/dhan_tradehull.Tradehull, which expects:

@@ -392,6 +392,71 @@ class DeltaBroker(BaseBroker):
                 return o
         return self._find_order_in_history_or_fills(client_order_id)
 
+    def find_order_by_id(self, order_id: str):
+        """Find order by broker order id in live list, history, or fills."""
+        oid = str(order_id or "").strip()
+        if not oid:
+            return None
+        for o in self.api.get_order_list() or []:
+            if str(o.get("order_id") or o.get("id") or "") == oid:
+                return o
+        if hasattr(self.api, "get_orders_history"):
+            try:
+                history = self.api.get_orders_history(page_size=100)
+            except Exception as e:
+                logger.debug("Delta get_orders_history failed: %s", e)
+                history = []
+            for o in history or []:
+                if str(o.get("id") or o.get("order_id") or "") != oid:
+                    continue
+                tag = o.get("client_order_id") or o.get("tag")
+                state = (o.get("state") or o.get("status") or "").lower()
+                size = int(o.get("size", 0) or 0)
+                unfilled = int(o.get("unfilled_size", 0) or 0)
+                filled = size - unfilled
+                if filled < 0:
+                    filled = size
+                return {
+                    "order_id": oid,
+                    "tag": tag,
+                    "product_id": o.get("product_id"),
+                    "symbol": o.get("product_symbol")
+                    or (o.get("product") or {}).get("symbol"),
+                    "status": state,
+                    "side": (o.get("side") or "").lower(),
+                    "qty": size,
+                    "remaining_qty": unfilled,
+                    "filled_size": filled,
+                    "size": size,
+                    "unfilled_size": unfilled,
+                    "average_fill_price": float(
+                        o.get("average_fill_price") or o.get("limit_price") or 0
+                    ),
+                    "price": float(
+                        o.get("limit_price") or o.get("average_fill_price") or 0
+                    ),
+                    "reduce_only": o.get("reduce_only"),
+                }
+        fill_info = self.get_fill_by_order_id(oid)
+        if fill_info:
+            return {
+                "order_id": oid,
+                "tag": fill_info.get("client_order_id") or fill_info.get("tag"),
+                "product_id": fill_info.get("product_id"),
+                "symbol": fill_info.get("product_symbol"),
+                "status": "filled",
+                "side": (fill_info.get("side") or "").lower(),
+                "qty": int(fill_info.get("size", 0)),
+                "remaining_qty": 0,
+                "filled_size": fill_info.get("size", 0),
+                "size": fill_info.get("size", 0),
+                "unfilled_size": 0,
+                "average_fill_price": fill_info.get("price", 0),
+                "price": fill_info.get("price", 0),
+                "reduce_only": fill_info.get("reduce_only"),
+            }
+        return None
+
     def _find_order_in_history_or_fills(self, client_order_id: str):
         """Resolve order status from order history or fills when not in live list."""
         if not hasattr(self.api, "get_orders_history"):

@@ -29,6 +29,7 @@ from core.utils.structure import MarketStructureConfig
 from core.utils.structure.rsi_divergence import add_rsi_divergence
 from core.utils.structure.swings import add_swing_points
 from core.utils import indicator_history as ind_hist
+from core.strategies.crypto.RSIBreadAndButter import indicator_persist as bb_persist
 
 if TYPE_CHECKING:
     from core.models.strategy_context import StrategyContext
@@ -128,6 +129,13 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
             liquidity_session_exchange=ex,
             rsi_period=14,
         )
+
+    def indicator_persist_delay_bars(self) -> int:
+        """Fractal confirmation lag for shared indicator_history live_append."""
+        return bb_persist.persist_delay_bars(self)
+
+    def indicator_persist_tail_rows(self) -> int:
+        return bb_persist.persist_tail_rows(self)
 
     def get_warmup_period(self) -> int:
         sig = self.signal_timeframe_minutes_resolved()

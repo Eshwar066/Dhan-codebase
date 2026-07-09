@@ -743,3 +743,6 @@ class EngineLogger:
 
     def latency_critical_pause(self, message: str = "Latency critical for N cycles; entries paused") -> None:
         self.log("latency_critical_pause", message=message)
+
+    def latency_pause_cleared(self, message: str = "Latency recovered; entries resumed") -> None:
+        self.log("latency_pause_cleared", message=message)

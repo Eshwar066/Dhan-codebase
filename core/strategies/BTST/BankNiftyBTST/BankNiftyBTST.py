@@ -35,8 +35,8 @@ PREM_MIN = 80.0
 PREM_MAX = 120.0
 LIMIT_PREM_MULT = 1.5
 SL_OF_LIMIT = 0.5
-# Live ENTRY uses Dhan Forever (GTT): trigger/limit at LIMIT_PREM_MULT × ref premium.
-ENTRY_EXECUTION_MODE = "GTT"
+# Live ENTRY: Dhan Forever (GTT) + engine bid/ask fallback (GttFallbackBook).
+ENTRY_EXECUTION_MODE = "HYBRID_GTT"
 
 
 BTST_META_KEY = "banknifty_btst"
@@ -306,6 +306,9 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
             actions=["ENTRY"],
             trade_date=trade_dt,
         )
+        book = getattr(router, "gtt_fallback_book", None)
+        if book is not None:
+            n += book.cancel_all_for_strategy(self.name, trade_date=trade_dt)
         if n:
             print(
                 f"BankNiftyBTST: cancelled {n} unfilled ENTRY order(s) at "
@@ -440,6 +443,11 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         strategy_meta = self._strategy_meta(meta)
         if use_gtt:
             strategy_meta["execution_mode"] = ENTRY_EXECUTION_MODE
+            strategy_meta["gtt_fallback"] = {
+                "trigger_field": "ask",
+                "trigger_op": "<=",
+                "active_until": CANCEL_TIME.strftime("%H:%M"),
+            }
 
         return self.create_order_intent(
             inst=inst,

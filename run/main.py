@@ -106,6 +106,11 @@ def run_engine(config: EngineConfig) -> None:
         print(f"[WARN] {config.strategy_name} ({config.broker_name}) is disabled. Skipping.")
         return
 
+    if config.run_mode == RunMode.LIVE and config.engine_id:
+        from run.engine_lock import acquire_engine_lock
+
+        acquire_engine_lock(config.engine_id)
+
     loaded_strategies = [config.strategy_name] + list(config.strategy_names or [])
     logger.info(
         "Loaded strategies for %s (%s): %s",

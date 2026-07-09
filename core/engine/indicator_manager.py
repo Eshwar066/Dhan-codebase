@@ -129,25 +129,32 @@ class IndicatorManager:
 
     @staticmethod
     def _structure_confirm_delay_bars(strategy: Any) -> int:
-        """Bars to wait after close before persisting (fractal ``swing_right``)."""
-        fn = getattr(strategy, "market_structure_config", None)
+        """
+        Bars after close before writing ``live_append`` history.
+
+        Only strategies that opt in (RSIBreadAndButter via
+        ``indicator_persist_delay_bars`` / fractal ``swing_right``) use a lag.
+        LEAPS and other RSI/EMA strategies persist on the closed bar (delay=0).
+        """
+        fn = getattr(strategy, "indicator_persist_delay_bars", None)
         if callable(fn):
             try:
-                return max(0, int(fn().swing_right))
+                return max(0, int(fn()))
             except Exception:
                 pass
-        return 2
+        return 0
 
     @staticmethod
     def _structure_confirm_tail_rows(strategy: Any) -> int:
-        """Bars to re-persist after each close (swing_right + 1 for fractal confirmation lag)."""
-        fn = getattr(strategy, "market_structure_config", None)
+        """Lag window for confirmed structure flags on the eval candle."""
+        fn = getattr(strategy, "indicator_persist_tail_rows", None)
         if callable(fn):
             try:
-                return max(1, int(fn().swing_right) + 1)
+                return max(1, int(fn()))
             except Exception:
                 pass
-        return 3
+        delay = IndicatorManager._structure_confirm_delay_bars(strategy)
+        return max(1, delay + 1) if delay > 0 else 1
 
     @staticmethod
     def _ist_bar_key_from_row(row: Any) -> Optional[str]:
@@ -707,8 +714,9 @@ class IndicatorManager:
             if abs(delta - tf_sec) <= tol:
                 continue
             if d1 == d2:
-                if strict_nse_index_session and delta > tf_sec * 1.5 and delta < 48 * 3600:
-                    return False, f"intra_session_gap row={i} delta_sec={delta:.0f}"
+                # Missing in-session bars (feed gaps / lunch holes) are common in candle
+                # logs; allow bootstrap so live_append can keep chaining. Reject only
+                # compressed bars (sub-timeframe) that break RSI sequencing.
                 if delta < tf_sec - tol:
                     return False, f"sub_tf_delta row={i} delta_sec={delta:.0f}"
             else:
@@ -743,7 +751,8 @@ class IndicatorManager:
             return
         source = "live_append" if seeded else "historical_seed"
         if seeded:
-            # Persist each bar once, after fractal confirmation lag (not on close + backfill).
+            # Default delay=0 (persist the just-closed bar). RSIBreadAndButter opts into
+            # fractal confirmation lag via ``indicator_persist_delay_bars``.
             delay = self._structure_confirm_delay_bars(strategy)
             persist_idx = len(df) - 1 - delay
             if persist_idx < 0:
@@ -856,7 +865,24 @@ class IndicatorManager:
         if str(self._live_exchange or "").upper() == "DELTA":
             live_df = self._load_today_from_indicator_history(symbol, tf)
         else:
-            live_df = self._load_today_live_candles(symbol, tf, strategy_id=strategy_id)
+            # Prefer today's closed candles; also stitch any log bars after last hist
+            # (covers multi-day downtime when bootstrap came from indicator_history).
+            today_df = self._load_today_live_candles(symbol, tf, strategy_id=strategy_id)
+            hist_ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+            last_hist = hist_ts.max() if len(hist_ts) else pd.NaT
+            tail_df = pd.DataFrame()
+            if not pd.isna(last_hist):
+                all_log = self._load_candles_from_logs(
+                    symbol, tf, tail_rows=500, strategy_id=strategy_id
+                )
+                if all_log is not None and len(all_log) > 0:
+                    ats = pd.to_datetime(all_log["timestamp"], utc=True, errors="coerce")
+                    tail_df = all_log.loc[ats > last_hist].reset_index(drop=True)
+            parts = [p for p in (today_df, tail_df) if p is not None and len(p) > 0]
+            if not parts:
+                return df
+            live_df = pd.concat(parts, ignore_index=True)
+            live_df = live_df.drop_duplicates(subset=["timestamp"], keep="last")
         if live_df is None or len(live_df) == 0:
             return df
 
@@ -864,7 +890,7 @@ class IndicatorManager:
         hist["timestamp"] = pd.to_datetime(hist["timestamp"], utc=True, errors="coerce")
         hist = hist.dropna(subset=["timestamp"])
 
-        # Live closed-candle log is source of truth for current-day candles.
+        # Closed-candle log is source of truth for bars after bootstrap history.
         merged = hist.set_index("timestamp")
         live = live_df.set_index("timestamp")
         merged.update(live)

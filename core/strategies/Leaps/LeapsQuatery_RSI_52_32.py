@@ -92,6 +92,27 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             return ExpiryResolver.current_month_expiry(trade_date, weekday=exp_wd)
         return ExpiryResolver.next_month_expiry(trade_date, weekday=exp_wd)
 
+    def calculate_hedge_strike(self, sold_strike, option_type):
+        """
+        Hedge ~2% OTM from sold strike on the NIFTY 500-pt grid (readme).
+
+        CALL sold @ 24500 → hedge 25000; PUT sold @ 24500 → hedge 24000.
+        """
+        step = int(getattr(self, "option_chain_strike_step", 500) or 500)
+        sold = int(sold_strike)
+        opt = str(option_type or "").upper()
+        if opt in ("CE", "CALL"):
+            target = sold * 1.02
+        elif opt in ("PE", "PUT"):
+            target = sold * 0.98
+        else:
+            logger.warning(
+                "LEAPS calculate_hedge_strike: unknown option_type=%s; defaulting +2%%",
+                option_type,
+            )
+            target = sold * 1.02
+        return int(round(target / step) * step)
+
     #option chain snapshot
     def _candle_close_ts_ist(self, candle: dict) -> pd.Timestamp:
         ts = pd.Timestamp(candle["timestamp"])

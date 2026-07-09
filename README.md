@@ -62,8 +62,8 @@ Current live path is feed-first and queue-isolated:
 
 1. WebSocket feed (`DhanWebSocketFeed` / `DeltaWebSocketFeed`)
 2. Tick queue (engine-owned)
-3. `CandleAggregator` (closed bars only)
-4. Main engine loop
+3. `CandleAggregator` (closed bars only) **or** `scheduled_times` wall-clock eval (e.g. BankNiftyBTST)
+4. Main engine loop (~1s) — feed health, `GttFallbackBook.tick()` when HYBRID_GTT watches active
 5. Per-strategy worker threads (deterministic per strategy)
 6. Bounded global intent queue
 7. Account router
@@ -73,7 +73,17 @@ Current live path is feed-first and queue-isolated:
    - token-bucket throttling (per account)
    - per-account circuit breaker
    - watchdog supervision
-10. Broker API
+10. Broker API (LIMIT / SL-M / Forever GTT / **HYBRID_GTT** via `GttFallbackBook`)
+
+### Execution modes (opt-in per intent)
+
+| Mode | Use case |
+|------|----------|
+| *(default)* | Resting LIMIT / SL-M |
+| `GTT` | Dhan Forever order; fill polled by OrderRouter |
+| `HYBRID_GTT` | GTT + engine watches ask/bid → cancel GTT → resting LIMIT when trigger fires (BankNiftyBTST live) |
+
+See `core/orderExecution/README.md` and `core/strategies/BTST/BankNiftyBTST/readme.md`.
 
 ## Safety and Reliability Features
 
@@ -138,6 +148,7 @@ core/engine/
 
 core/orderExecution/
   order_router.py
+  gtt_fallback_book.py   # HYBRID_GTT watch + fallback
   intent_store.py
   account_router.py
   risk_manager.py
@@ -259,6 +270,7 @@ python -m run.main --venue DELTA
 
 ```bash
 sudo systemctl daemon-reload          # after editing unit files
+ps aux | grep 'run.main.*dhan' | grep -v grep
 sudo systemctl restart dhan-leaps-rsi.service
 
 
@@ -272,16 +284,27 @@ sudo systemctl list-units 'dhan*' 'option-buildup*' 'delta*'
 
 ## Notes
 
-- Live candle evaluation is feed/aggregator-based.
+- Live evaluation is **candle-driven** (`CandleAggregator` + `should_evaluate`) or **scheduled** (`scheduled_times` IST slots).
+- LEAPS live runs exits + hedge rollover on every closed 60m bar; entries only on RSI crossover.
 - OMS is trade-led: positions are updated from fills, not inferred order state.
 - Multi-strategy mode is supported via `strategy_name` + optional `strategy_names` list in `EngineConfig`.
 
+## Active strategy jobs (see `run/config.py`)
+
+| Engine ID | Strategy | Venue | Typical mode |
+|-----------|----------|-------|--------------|
+| `dhan_leaps_rsi` | LEAPS_RSI | DHAN | LIVE |
+| `dhan_oi_positional_buy` | OIPositionalBuy | DHAN | PAPER |
+| `dhan_banknifty_btst` | BankNiftyBTST | DHAN | LIVE (HYBRID_GTT) |
+| `delta_rsi_bread_butter` | RSIBreadAndButter | DELTA | LIVE |
+
 ## Further Reading
 
-- `docs/MULTI_VENUE.md`
-- `docs/PRODUCTION_UPGRADES.md`
-- `core/engine/factory.py`
-- `core/engine/live_engine.py`
+- **`docs/EVENT_DRIVEN_STRATEGY_GUIDE.md`** — add strategies, extension points, optimization roadmap
+- `docs/runtime_flow.md`, `docs/oms_flow.md`
+- `docs/MULTI_VENUE.md`, `docs/PRODUCTION_UPGRADES.md`
+- Strategy readmes: `core/strategies/Leaps/readme.txt`, `core/strategies/BTST/BankNiftyBTST/readme.md`, …
+- `core/engine/factory.py`, `core/engine/live_engine.py`
 
 ## most repeated
 sudo systemctl daemon-reload

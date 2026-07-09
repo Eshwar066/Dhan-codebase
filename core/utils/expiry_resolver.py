@@ -156,6 +156,27 @@ class ExpiryResolver:
         return f"{str(symbol).upper()}-{mon}{expiry.year}-{strike}-{opt}"
 
     @staticmethod
+    def parse_compact_trading_symbol_expiry(
+        trading_symbol: str, *, monthly_weekday: int = 1
+    ) -> Optional[dt.date]:
+        """
+        Parse expiry from Dhan compact option symbols, e.g. ``NIFTY-Aug2026-24500-CE``.
+        Uses last ``monthly_weekday`` in that month (NIFTY monthly = Tuesday = 1).
+        """
+        import re
+
+        ts = str(trading_symbol or "").strip()
+        m = re.match(r"^[A-Z0-9]+-([A-Za-z]{3})(\d{4})-\d+-[CP]E$", ts, re.IGNORECASE)
+        if not m:
+            return None
+        try:
+            month = dt.datetime.strptime(m.group(1).title(), "%b").month
+            year = int(m.group(2))
+        except (TypeError, ValueError):
+            return None
+        return ExpiryResolver.last_weekday_of_month(year, month, monthly_weekday)
+
+    @staticmethod
     def last_weekday_of_month(year, month, weekday: int) -> dt.date:
         """Last ``weekday`` (Mon=0 … Sun=6) in the given calendar month."""
         if month == 12:

@@ -1,46 +1,51 @@
 core/ – Algo trading core
 ========================
 
-Current layout (matches this codebase):
-
 core/
 ├── data/
-│   ├── datalayer/           IDataProvider, DhanDataProvider – data feed for engines
-│   ├── sources/             DhanSource (Dhan API via library), NSEClient
-│   ├── adapters/             NSEAdapter, DhanAdapter – option chain per API
-│   ├── data_router.py        Picks adapter by api (NSE/DHAN)
-│   ├── option_chain_service.py  get_expiries, get_chain (uses StrategyContext)
-│   └── candle_service.py    Latest closed candle for live
+│   ├── datalayer/           IDataProvider, DhanDataProvider, DeltaDataProvider
+│   ├── sources/             DhanSource, NSEClient, delta_source
+│   ├── adapters/            NSEAdapter, DhanAdapter
+│   ├── feeds/               DhanWebSocketFeed, DeltaWebSocketFeed, DhanDepthFeed
+│   ├── candle_aggregator.py Closed-bar builder from ticks
+│   ├── option_chain_service.py
+│   └── candle_service.py
 ├── engine/
-│   ├── base_engine.py        build_context() → StrategyContext, strategy.on_candle
-│   ├── backtest_engine.py    Candle loop, exits, rollover, entry
-│   └── live_engine.py       Live/paper loop
-├── library/
-│   └── dhan_tradehull.py    In-project Dhan Tradehull (OHLC, option chain, orders)
+│   ├── base_engine.py       StrategyContext, build_context
+│   ├── backtest_engine.py   Historical loop; exits+rollover every bar
+│   ├── live_engine.py       Feed loop, scheduled eval, GttFallbackBook tick
+│   ├── live_engine_common.py Depth pricing, spread checks
+│   ├── execution_engine.py  Intent queue workers, OMS fanout
+│   └── factory.py           EngineFactory per job
 ├── models/
-│   ├── order_intent.py      OrderIntent dataclass
-│   └── strategy_context.py StrategyContext dataclass (typed ctx for strategies)
-├── broker/                   Order placement only (see broker/README.md)
-│   ├── broker_api.py        IBrokerApi
-│   ├── dhan_broker_api.py, dhanbroker.py
-│   ├── delta_broker_api.py, delta_broker.py
-│   └── simulated_broker.py
-├── orderExecution/           Intent → risk → broker → PositionManager (see orderExecution/README.md)
+│   ├── order_intent.py
+│   └── strategy_context.py
+├── broker/                  See broker/README.md
+├── orderExecution/          See orderExecution/README.md
 │   ├── order_router.py
+│   ├── gtt_fallback_book.py HYBRID_GTT watch + fallback
+│   ├── bracket_orders.py
 │   ├── risk_manager.py, intent_store.py, position_manager.py
-│   ├── order_state.py, slippage.py
 ├── strategies/
-│   ├── base.py              BaseStrategy (on_candle(candle, ctx: StrategyContext))
-│   ├── IndiaMktMixins.py    Shared option/hedge/rollover logic for India strategies
+│   ├── base.py              BaseStrategy hooks
+│   ├── IndiaMktMixins.py    India options: chain, hedge, rollover
 │   ├── registry.py          STRATEGY_MAP
-│   ├── runtime_spec.py      STRATEGY_RUNTIME_SPEC
-│   ├── Leaps/               LeapsQuatery_RSI_52_32, readme
-│   └── Inside_bar_candle/   inside_bar, historical_dhan, readme
+│   ├── runtime_spec.py      Per-mode data feeds
+│   ├── Leaps/               LEAPS_RSI
+│   ├── BTST/                BankNiftyBTST
+│   ├── OpenIntrest/         OIPositionalBuy
+│   ├── Futures/             FuturesEMAHighLow, Futures_EMA_Momentum
+│   ├── Equity/              IPOBreakout (IPOAnchorVWAP)
+│   ├── MagicalLines/        NiftyIntradayMagicalLine, MagicalLines (+ readme.md)
+│   └── crypto/              RSIBreadAndButter (+ readme.md), oneDayMagicalLine
 ├── utils/
-│   ├── expiry_resolver.py   Expiry resolution (NSE/Dhan, monthly/quarterly)
-│   ├── instruments/         instrument_store.py, README
-│   └── session/            holidays, market_calendar, session_manager
-└── instruments.py           (legacy/convenience if used)
+│   ├── expiry_resolver.py   MONTHLY, QUARTERLY, LEAPS_ROLL, WEEKLY
+│   ├── indicator_history.py
+│   ├── instruments/
+│   └── session/
+└── analytics/
 
-Data flow:  IDataProvider → Engine → Strategy.on_candle(candle, StrategyContext) → OrderIntent
-Order flow: OrderRouter.process_intent(intent) → RiskManager → Broker.place_order() → PositionManager
+Data flow:  Feed/IDataProvider → Engine → Strategy.on_candle → OrderIntent
+Order flow: Intent queue → OrderRouter → Broker → fills → PositionManager
+
+See docs/EVENT_DRIVEN_STRATEGY_GUIDE.md for adding new strategies.
