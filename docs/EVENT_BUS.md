@@ -10,9 +10,24 @@ core/events/
   bus.py             EventBus (sync, priority-ordered)
   context.py         EngineEventContext
   subscriptions.py   Resolve strategy.yaml → enabled events / filters
-  wiring.py          wire_event_bus(engine) — manifest-driven registration
-  handlers/          BarClosed, ScheduledSlot, IntentCreated, QuoteUpdated, fills, feed
+  wiring.py          wire_event_bus(engine) — attach services + register handlers
+  services/          Orchestration (exits, eval, execution, scheduled, feed)
+  handlers/          Thin adapters → services
 ```
+
+## Services (logic ownership)
+
+| Service | Owns |
+|---------|------|
+| `ExitRolloverService` | Closed-bar / per-strategy exits + hedge rollover |
+| `StrategyEvalService` | Parallel eval loop → publish `IntentCreated` |
+| `ExecutionService` | `IntentCreated` → OMS enqueue |
+| `ScheduledEvalService` | IST slot: exits then eval |
+| `FeedSupervisorService` | Feed stall pause / recover flags |
+
+`wire_event_bus()` calls `attach_event_services(engine)`. Handlers and `LiveEngine` both use these services (LiveEngine methods like `_run_exits_and_rollover` delegate).
+
+Low-level helpers (`_evaluate_strategies_parallel`, `_enqueue_entry_intents_grouped`, `_process_strategy_exit_intent`) remain on the engine as collaborators.
 
 ## Events
 
@@ -73,20 +88,8 @@ Then:
 python -m tools.strategy_manifest generate
 ```
 
-Ad-hoc handler (infra / debugging only):
-
-```python
-engine.event_bus.subscribe(
-    EventType.BAR_CLOSED,
-    my_handler,
-    priority=15,
-    name="my_handler",
-    filter_fn=lambda e: e.payload.get("symbol") == "NIFTY",
-)
-```
-
 ## Tests
 
 ```bash
-python -c "from tests.test_event_bus import *; tests=[test_publish_priority_order,test_filter_skips_handler,test_handler_exception_does_not_block_others,test_default_subscriptions_live_feed,test_default_subscriptions_scheduled_gtt,test_resolve_subscriptions_override,test_collect_enabled_events_union,test_bar_closed_filter_timeframe,test_resolve_strategy_subscriptions_from_table,test_gtt_quote_handler_push_calls_on_quote,test_gtt_quote_handler_maintenance]; [t() for t in tests]; print(f'{len(tests)} ok')"
+python -c "from tests.test_event_bus import *; import tests.test_event_bus as t; names=[n for n in dir(t) if n.startswith('test_')]; [getattr(t,n)() for n in names]; print(f'{len(names)} ok')"
 ```

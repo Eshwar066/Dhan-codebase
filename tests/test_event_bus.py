@@ -277,3 +277,159 @@ def test_gtt_quote_handler_maintenance():
         )
     )
     assert calls == ["maintenance"]
+
+
+def test_gtt_maintenance_without_maintenance_tick_does_not_full_tick():
+    """Regression: handler must not book.tick() on maintenance (LiveEngine owns quiet tick)."""
+    from core.events.context import EngineEventContext
+    from core.events.handlers.gtt import GttQuoteHandler
+
+    calls = []
+
+    class _Book:
+        def has_active_watches(self):
+            return True
+
+        def tick(self, now_ist=None):
+            calls.append("tick")
+
+    class _Router:
+        gtt_fallback_book = _Book()
+
+    class _Engine:
+        order_router = _Router()
+        engine_id = "t"
+
+        def _current_ist_now(self):
+            return None
+
+    bus = EventBus(engine_id="t")
+    ctx = EngineEventContext.from_engine(_Engine(), bus)
+    GttQuoteHandler(ctx)(
+        make_event(
+            EventType.QUOTE_UPDATED,
+            {"source": "gtt_maintenance"},
+            engine_id="t",
+        )
+    )
+    assert calls == []
+
+
+def test_execution_service_enqueues():
+    from core.events.services.execution import ExecutionService
+
+    calls = []
+
+    class _Engine:
+        order_router = type("R", (), {"risk": None})()
+        engine_id = "t"
+
+        def _enqueue_entry_intents_grouped(self, *args, **kwargs):
+            calls.append(args)
+
+    svc = ExecutionService(_Engine())
+    intent = object()
+    svc.enqueue_intent(
+        strategy=object(),
+        symbol="NIFTY",
+        candle={"close": 1},
+        intent=intent,
+        strategy_time_ms=1.0,
+        timeframe="15",
+    )
+    assert len(calls) == 1
+    assert calls[0][0] == [intent]
+
+
+def test_feed_supervisor_service_flags():
+    from core.events.services.feed_supervisor import FeedSupervisorService
+
+    class _Engine:
+        _entries_paused_feed_stale = False
+        _symbol_state = {}
+        engine_logger = None
+
+    eng = _Engine()
+    svc = FeedSupervisorService(eng)
+    svc.on_disconnected(
+        make_event(
+            EventType.FEED_DISCONNECTED,
+            {"symbols": ["NIFTY"], "reason": "stall"},
+            engine_id="t",
+        )
+    )
+    assert eng._entries_paused_feed_stale is True
+    assert eng._symbol_state["NIFTY"]["feed_stale"] is True
+    svc.on_recovered(
+        make_event(
+            EventType.FEED_RECOVERED,
+            {"symbols": ["NIFTY"]},
+            engine_id="t",
+        )
+    )
+    assert eng._entries_paused_feed_stale is False
+    assert eng._symbol_state["NIFTY"]["feed_stale"] is False
+
+
+def test_exit_rollover_service_filters_scheduled():
+    from core.events.services.exit_rollover import ExitRolloverService
+
+    calls = []
+
+    class _Live:
+        name = "Live"
+        timeframe = "15"
+
+        def applies_to_symbol(self, s):
+            return True
+
+    class _Sched:
+        name = "Sched"
+        timeframe = "15"
+
+        def applies_to_symbol(self, s):
+            return True
+
+    class _Engine:
+        strategies = [_Live(), _Sched()]
+        strategy_eval_modes = {"Sched": "scheduled"}
+        engine_id = "t"
+
+        def _is_scheduled_strategy(self, strategy, modes):
+            return getattr(strategy, "name", "") == "Sched"
+
+        def _enrich_candle_for_strategy(self, *a, **k):
+            return {"symbol": "NIFTY", "close": 1}
+
+        def _recent_candles_for_strategy(self, *a, **k):
+            return []
+
+        def build_context_only(self, *a, **k):
+            return {}
+
+    eng = _Engine()
+    svc = ExitRolloverService(eng)
+    orig = ExitRolloverService.run_exits_and_rollover
+
+    def _capture(self, strategy, *a, **k):
+        calls.append(getattr(strategy, "name", ""))
+
+    ExitRolloverService.run_exits_and_rollover = _capture  # type: ignore
+    try:
+        svc.run_for_closed_bar("NIFTY", {"symbol": "NIFTY"}, "15")
+    finally:
+        ExitRolloverService.run_exits_and_rollover = orig  # type: ignore
+    assert calls == ["Live"]
+
+
+def test_attach_event_services():
+    from core.events.services import attach_event_services
+
+    class _Engine:
+        pass
+
+    eng = _Engine()
+    out = attach_event_services(eng)
+    assert "execution_service" in out
+    assert eng.execution_service is out["execution_service"]
+    assert eng.exit_rollover_service is out["exit_rollover_service"]

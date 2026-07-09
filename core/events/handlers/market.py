@@ -1,8 +1,6 @@
-"""BarClosed → exits then entries (priority ordered)."""
+"""BarClosed → exits then entries (priority ordered) via services."""
 
 from __future__ import annotations
-
-from typing import Any, Dict, List, Optional
 
 from core.events.context import EngineEventContext
 from core.events.types import Event
@@ -15,17 +13,21 @@ class BarClosedExitHandler:
         self._ctx = ctx
 
     def __call__(self, event: Event) -> None:
+        engine = self._ctx.engine
         payload = event.payload
         symbol = str(payload.get("symbol") or "")
         timeframe = str(payload.get("timeframe") or "")
         candle = payload.get("candle") or {}
         enriched = payload.get("enriched_candle")
-        self._ctx.engine._run_exits_and_rollover_for_closed_bar(
-            symbol,
-            candle,
-            timeframe,
-            enriched_candle=enriched,
-        )
+        svc = getattr(engine, "exit_rollover_service", None)
+        if svc is not None:
+            svc.run_for_closed_bar(
+                symbol, candle, timeframe, enriched_candle=enriched
+            )
+        else:
+            engine._run_exits_and_rollover_for_closed_bar(
+                symbol, candle, timeframe, enriched_candle=enriched
+            )
 
 
 class BarClosedEntryHandler:
@@ -35,9 +37,14 @@ class BarClosedEntryHandler:
         self._ctx = ctx
 
     def __call__(self, event: Event) -> None:
+        engine = self._ctx.engine
+        svc = getattr(engine, "strategy_eval_service", None)
+        if svc is not None:
+            svc.handle_bar_closed(event)
+            return
+        # Fallback if services not attached
         from core.events.types import EventType, make_event
 
-        engine = self._ctx.engine
         bus = self._ctx.bus
         payload = event.payload
         symbol = str(payload.get("symbol") or "")
@@ -50,21 +57,9 @@ class BarClosedEntryHandler:
             enriched, timeframe=timeframe, already_enriched=True
         ):
             eval_strategy = eval_result.get("strategy")
-            eval_strategy_name = str(
-                getattr(eval_strategy, "name", "unknown_strategy")
-            )
-            if engine.engine_logger:
-                engine.engine_logger.log(
-                    "strategy_evaluated",
-                    message=f"Strategy evaluated: {eval_strategy_name}",
-                    strategy=eval_strategy_name,
-                    symbol=symbol,
-                )
             intent = eval_result["intent"]
             if engine._log_entry_skipped_if_paused(
-                strategy=eval_strategy,
-                symbol=symbol,
-                intent=intent,
+                strategy=eval_strategy, symbol=symbol, intent=intent
             ):
                 continue
             bus.publish(
@@ -83,7 +78,6 @@ class BarClosedEntryHandler:
                     trace_id=event.trace_id,
                 )
             )
-
         if eval_key is not None and eval_ts_key is not None:
             engine._last_evaluated_candle_ts[eval_ts_key] = eval_key
 

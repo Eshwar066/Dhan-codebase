@@ -1,8 +1,6 @@
-"""IntentCreated → execution pipeline."""
+"""IntentCreated → ExecutionService."""
 
 from __future__ import annotations
-
-from typing import Any, List, Optional
 
 from core.events.context import EngineEventContext
 from core.events.types import Event
@@ -14,43 +12,21 @@ class IntentCreatedHandler:
 
     def __call__(self, event: Event) -> None:
         engine = self._ctx.engine
-        payload = event.payload
-        strategy = payload.get("strategy")
-        symbol = str(payload.get("symbol") or "")
-        candle = payload.get("candle") or {}
-        ctx = payload.get("ctx")
-        intent = payload.get("intent")
-        strategy_time_ms = payload.get("strategy_time_ms")
-        timeframe = payload.get("timeframe")
-        risk_manager = getattr(getattr(engine, "order_router", None), "risk", None)
-
-        if intent is None:
+        svc = getattr(engine, "execution_service", None)
+        if svc is not None:
+            svc.handle_intent_created(event)
             return
+        from core.events.services.execution import ExecutionService
 
-        intents: List[Any]
-        if isinstance(intent, list):
-            intents = list(intent)
-        else:
-            intents = [intent]
-
-        engine._enqueue_entry_intents_grouped(
-            intents,
-            strategy,
-            symbol,
-            candle,
-            strategy_time_ms,
-            timeframe,
-            risk_manager,
-        )
+        ExecutionService(engine).handle_intent_created(event)
 
 
 def register_intent_created_handler(ctx: EngineEventContext) -> None:
-    handler = IntentCreatedHandler(ctx)
     from core.events.types import EventType
 
     ctx.bus.subscribe(
         EventType.INTENT_CREATED,
-        handler,
+        IntentCreatedHandler(ctx),
         priority=50,
         name="intent_created_execution",
     )

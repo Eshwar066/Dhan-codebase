@@ -40,12 +40,12 @@ class GttQuoteHandler:
         source = str(payload.get("source") or "")
 
         # Maintenance / legacy poll: fill sync + active_until only (no quote trigger).
+        # Never fall back to book.tick() here — LiveEngine owns quiet-period
+        # QuoteProvider safety via a single book.tick() after publish.
         if source in ("gtt_maintenance", "gtt_poll") or not symbol:
             maintenance = getattr(book, "maintenance_tick", None)
             if callable(maintenance):
                 maintenance(now_ist)
-            else:
-                book.tick(now_ist)
             return
 
         quote = _quote_from_payload(payload)

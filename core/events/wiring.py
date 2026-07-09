@@ -15,6 +15,7 @@ from core.events.handlers.gtt import register_quote_handlers
 from core.events.handlers.logging import register_event_tap
 from core.events.handlers.market import register_bar_closed_handlers
 from core.events.handlers.scheduled import register_scheduled_slot_handler
+from core.events.services import attach_event_services
 from core.events.subscriptions import (
     bar_closed_filter_for_strategies,
     collect_enabled_events,
@@ -77,6 +78,7 @@ def wire_event_bus(engine: object, bus: EventBus | None = None) -> EventBus:
     if bus is None:
         bus = create_event_bus(engine)
     engine.event_bus = bus
+    attach_event_services(engine)
     ctx = EngineEventContext.from_engine(engine, bus)
 
     strategies = _loaded_strategies(engine)

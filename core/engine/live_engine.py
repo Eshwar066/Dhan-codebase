@@ -1860,6 +1860,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         if bus is not None:
             from core.events.types import EventType, make_event
 
+            # Handler runs maintenance_tick only (no quote scan).
             bus.publish(
                 make_event(
                     EventType.QUOTE_UPDATED,
@@ -1868,7 +1869,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 )
             )
             last_feed = float(getattr(self, "_last_gtt_feed_quote_ts", 0.0) or 0.0)
-            # REST/provider safety when feed is quiet (e.g. option not ticking).
+            # Single QuoteProvider pass when feed is quiet (do not also tick in handler).
             if (time.time() - last_feed) >= 3.0:
                 book.tick(now_ist)
             return
@@ -2950,38 +2951,40 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         self._run_exits_and_rollover_for_closed_bar(
                             symbol, candle, tf, enriched_candle=enriched_candle
                         )
-                        for eval_result in self._evaluate_strategies_parallel(
-                            enriched_candle, timeframe=tf, already_enriched=True
-                        ):
-                            eval_strategy = eval_result.get("strategy")
-                            eval_strategy_name = str(
-                                getattr(eval_strategy, "name", "unknown_strategy")
-                            )
-                            if self.engine_logger:
-                                self.engine_logger.log(
-                                    "strategy_evaluated",
-                                    message=f"Strategy evaluated: {eval_strategy_name}",
-                                    strategy=eval_strategy_name,
-                                    symbol=symbol,
-                                )
-                            intent = eval_result["intent"]
-                            if self._log_entry_skipped_if_paused(
-                                strategy=eval_strategy,
+                        eval_svc = getattr(self, "strategy_eval_service", None)
+                        if eval_svc is not None:
+                            eval_svc.evaluate_and_publish_intents(
+                                candle=enriched_candle,
                                 symbol=symbol,
-                                intent=intent,
-                            ):
-                                continue
-                            self._run_strategy(
-                                symbol,
-                                candle,
-                                eval_result["ctx"],
-                                intent,
-                                strategy=eval_result["strategy"],
-                                strategy_time_ms=eval_result["strategy_time_ms"],
                                 timeframe=tf,
+                                already_enriched=True,
+                                source_candle=candle,
+                                eval_key=eval_key,
+                                eval_ts_key=eval_ts_key,
                             )
-                        if eval_key is not None:
-                            self._last_evaluated_candle_ts[eval_ts_key] = eval_key
+                        else:
+                            for eval_result in self._evaluate_strategies_parallel(
+                                enriched_candle, timeframe=tf, already_enriched=True
+                            ):
+                                eval_strategy = eval_result.get("strategy")
+                                intent = eval_result["intent"]
+                                if self._log_entry_skipped_if_paused(
+                                    strategy=eval_strategy,
+                                    symbol=symbol,
+                                    intent=intent,
+                                ):
+                                    continue
+                                self._run_strategy(
+                                    symbol,
+                                    candle,
+                                    eval_result["ctx"],
+                                    intent,
+                                    strategy=eval_result["strategy"],
+                                    strategy_time_ms=eval_result["strategy_time_ms"],
+                                    timeframe=tf,
+                                )
+                            if eval_key is not None:
+                                self._last_evaluated_candle_ts[eval_ts_key] = eval_key
             # To be checked properly else condition--> Pending
             else:
                 candles = None
@@ -3086,27 +3089,17 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         enriched_candle: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Exits + monthly hedge rollover on every closed live-feed bar (backtest parity)."""
-        tf = str(timeframe or "").strip()
-        sym_u = str(symbol or "").strip().upper()
-        for strategy in self.strategies:
-            if self._is_scheduled_strategy(strategy, self.strategy_eval_modes):
-                continue
-            if str(getattr(strategy, "timeframe", "") or "").strip() != tf:
-                continue
-            if sym_u and not strategy.applies_to_symbol(sym_u):
-                continue
-            strategy_candle = enriched_candle
-            if strategy_candle is None:
-                strategy_candle = self._enrich_candle_for_strategy(
-                    strategy, candle, allow_live_persist=False
-                )
-            recent = self._recent_candles_for_strategy(strategy, strategy_candle)
-            ctx = self.build_context_only(
-                strategy_candle, recent_candles=recent
+        svc = getattr(self, "exit_rollover_service", None)
+        if svc is not None:
+            svc.run_for_closed_bar(
+                symbol, candle, timeframe, enriched_candle=enriched_candle
             )
-            self._run_exits_and_rollover(
-                strategy, sym_u, strategy_candle, ctx, timeframe=tf
-            )
+            return
+        from core.events.services.exit_rollover import ExitRolloverService
+
+        ExitRolloverService(self).run_for_closed_bar(
+            symbol, candle, timeframe, enriched_candle=enriched_candle
+        )
 
     def _run_exits_and_rollover(
         self,
@@ -3118,89 +3111,27 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         strategy_time_ms: Optional[float] = None,
     ) -> None:
         """Strategy exits and hedge rollover — always run before entry evaluation."""
-        risk_manager = getattr(self.order_router, "risk", None)
-        if risk_manager and risk_manager.is_engine_blocked():
-            return
-        self.evaluate_sim_broker_stops(candle, ctx)
-        open_positions = self.position_manager.get_open_positions(
-            underlying=symbol, strategy=strategy.name
-        )
-        exited_structures: set[str] = set()
-        for position in open_positions:
-            if not _position_allows_strategy_exit(position):
-                continue
-            if not strategy.should_exit(position, candle, ctx):
-                continue
-            sid = getattr(position, "structure_id", None)
-            if sid is not None:
-                exited_structures.add(str(sid))
-            exit_intents = strategy.on_position_exit(position, candle, ctx) or []
-            is_sell = position.net_qty > 0
-            required_exit_side = "SELL" if is_sell else "BUY"
-            if exit_intents and self.engine_logger:
-                self.engine_logger.exit_triggered(
-                    symbol,
-                    required_exit_side,
-                    abs(position.net_qty),
-                    "Strategy exit",
-                )
-            for raw_intent in exit_intents:
-                self._process_strategy_exit_intent(
-                    raw_intent,
-                    strategy,
-                    symbol,
-                    candle,
-                    position,
-                    required_exit_side,
-                    strategy_time_ms,
-                    timeframe,
-                    risk_manager,
-                )
-
-        rollover_fn = getattr(strategy, "on_candle_rollover", None)
-        if not callable(rollover_fn):
-            return
-        rollover_positions = (
-            [
-                p
-                for p in open_positions
-                if str(getattr(p, "structure_id", "") or "") not in exited_structures
-            ]
-            if exited_structures
-            else open_positions
-        )
-        rollover_intents = (
-            rollover_fn(
-                open_positions=rollover_positions, candle=candle, ctx=ctx
-            )
-            or []
-        )
-        if not rollover_intents:
-            return
-        if not self._within_trading_hours():
-            if self.engine_logger:
-                self.engine_logger.time_window_blocked(
-                    "Hedge rollover blocked: outside allowed trading hours"
-                )
-            return
-        if self.engine_logger:
-            self.engine_logger.log(
-                "hedge_rollover",
-                f"Hedge rollover {len(rollover_intents)} intent(s)",
-                strategy=strategy.name,
-                symbol=symbol,
-                intent_count=len(rollover_intents),
-            )
-        for raw_intent in rollover_intents:
-            self._process_rollover_intent(
-                raw_intent,
+        svc = getattr(self, "exit_rollover_service", None)
+        if svc is not None:
+            svc.run_exits_and_rollover(
                 strategy,
                 symbol,
                 candle,
-                strategy_time_ms,
-                timeframe,
-                risk_manager,
+                ctx,
+                timeframe=timeframe,
+                strategy_time_ms=strategy_time_ms,
             )
+            return
+        from core.events.services.exit_rollover import ExitRolloverService
+
+        ExitRolloverService(self).run_exits_and_rollover(
+            strategy,
+            symbol,
+            candle,
+            ctx,
+            timeframe=timeframe,
+            strategy_time_ms=strategy_time_ms,
+        )
 
     def _process_strategy_exit_intent(
         self,
@@ -3459,11 +3390,22 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 )
             )
             return
+        exec_svc = getattr(self, "execution_service", None)
+        if exec_svc is not None:
+            exec_svc.enqueue_intent(
+                strategy=strategy,
+                symbol=symbol,
+                candle=candle,
+                intent=intent,
+                strategy_time_ms=strategy_time_ms,
+                timeframe=timeframe,
+            )
+            return
         risk_manager = getattr(self.order_router, "risk", None)
         entry_intents = (
             [intent]
             if intent is not None and not isinstance(intent, list)
-            else (intent or [])
+            else list(intent or [])
         )
         self._enqueue_entry_intents_grouped(
             entry_intents,
