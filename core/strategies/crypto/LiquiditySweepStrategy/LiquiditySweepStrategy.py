@@ -57,7 +57,7 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
     """
 
     name = "LiquiditySweepStrategy"
-    underlying_symbols = ["BTCUSD", "ETHUSD"]
+    underlying_symbols = ["XAUTUSD", "BTCUSD", "ETHUSD"]
     timeframe = "1"
     required_context = ["instrument_store"]
     api = "DELTA"
@@ -83,7 +83,6 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
         return max(1, int(DEFAULT_ORDER_QTY))
 
     def market_structure_config(self) -> MarketStructureConfig:
-        ex = getattr(self, "_structure_session_exchange", None) or "DELTA"
         return MarketStructureConfig(
             swing_left=2,
             swing_right=2,
@@ -91,9 +90,22 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
             include_order_blocks=False,
             include_bos_choch=False,
             include_rsi_divergence=False,
-            include_liquidity_sweeps=True,
-            liquidity_session_exchange=ex,
         )
+
+    def prepare_indicators(self, df: Any) -> Any:
+        from core.utils.structure.liquidity import add_liquidity_sweeps
+
+        df = super().prepare_indicators(df)
+        return add_liquidity_sweeps(df)
+
+    def persisted_indicator_keys(self) -> List[str]:
+        from core.utils.structure.liquidity import LIQUIDITY_COLS
+
+        keys = list(super().persisted_indicator_keys() or [])
+        for col in LIQUIDITY_COLS:
+            if col not in keys:
+                keys.append(col)
+        return keys
 
     def get_warmup_period(self) -> int:
         return max(50, 1440)
