@@ -470,6 +470,117 @@ class OrderRouter:
                 applied += 1
         return applied
 
+    def _promote_seeded_intent_to_filled(self, intent_id: str) -> None:
+        """Move a CSV-seeded intent through VALIDATED → SENT → FILLED."""
+        rec = self.intent_store.get(intent_id)
+        if not rec:
+            return
+        cur = rec.get("status")
+        if isinstance(cur, str):
+            cur = IntentStatus(cur)
+        if cur == IntentStatus.FILLED:
+            return
+        if cur == IntentStatus.CREATED:
+            self.intent_store.update(intent_id, IntentStatus.VALIDATED)
+            cur = IntentStatus.VALIDATED
+        if cur == IntentStatus.VALIDATED:
+            self.intent_store.update(intent_id, IntentStatus.SENT)
+            cur = IntentStatus.SENT
+        if cur in (IntentStatus.SENT, IntentStatus.ACKED):
+            self.intent_store.update(
+                intent_id, IntentStatus.FILLED, order_state=OrderState.FILLED
+            )
+
+    def seed_filled_intents_from_open_positions_csv(
+        self, csv_path: Optional[str] = None
+    ) -> int:
+        """
+        Create FILLED ENTRY intents from open-positions CSV rows (manual / recovered legs).
+        Enables structure_id + tag linkage for LEAPS after restart.
+        """
+        path = csv_path or getattr(self.position_manager, "open_positions_csv_path", None)
+        if not path or not self.intent_store:
+            return 0
+        try:
+            from utils.logger.open_positions_logger import read_open_positions_snapshot
+        except ImportError:
+            return 0
+        snap = read_open_positions_snapshot(path)
+        if not snap:
+            return 0
+        seeded = 0
+        for sym, row in snap.items():
+            strategy = (row.get("strategy") or self.strategy_id or "").strip()
+            structure_id = (row.get("structure_id") or "").strip()
+            tag = (row.get("tag") or "MAIN").strip().upper()
+            if not strategy or not structure_id:
+                continue
+            try:
+                nq = int(float(row.get("net_qty") or 0))
+            except (TypeError, ValueError):
+                continue
+            if nq == 0:
+                continue
+            intent_id = (row.get("intent_id") or "").strip()
+            if not intent_id:
+                intent_id = f"seed_{tag.lower()}_{sym[-12:].replace('-', '')}"[:30]
+            if self.intent_store.exists(intent_id):
+                self._promote_seeded_intent_to_filled(intent_id)
+                if self._order_state.get(intent_id) != OrderState.FILLED:
+                    self._set_order_state(
+                        intent_id,
+                        OrderState.FILLED,
+                        action="seed_from_csv",
+                        message="Open position CSV seed",
+                    )
+                seeded += 1
+                continue
+            side = "SELL" if nq < 0 else "BUY"
+            qty = abs(nq)
+            try:
+                avg = float(row.get("avg_price") or 0)
+            except (TypeError, ValueError):
+                avg = 0.0
+            inst = None
+            if self.instrument_store:
+                from core.orderExecution.position_manager import PositionManager
+
+                opt, strike = PositionManager._extract_option_hint(sym, structure_id)
+                inst = self.instrument_store.intent_creation_details(
+                    sym, "NSE", None, opt, strike
+                )
+            payload = {
+                "symbol": sym,
+                "side": side,
+                "qty": qty,
+                "price": avg,
+                "action": "ENTRY",
+                "strategy": strategy,
+                "strategy_id": strategy,
+                "structure_id": structure_id,
+                "tag": tag,
+                "engine_id": self.engine_id,
+            }
+            self.intent_store.create(payload=payload, intent_id=intent_id)
+            self.intent_store.update(intent_id, IntentStatus.VALIDATED)
+            self._promote_seeded_intent_to_filled(intent_id)
+            rec = self.intent_store.get(intent_id)
+            if rec and inst is not None:
+                rec["instrument"] = inst
+                rec["side"] = side
+                rec["qty"] = qty
+                rec["tag"] = tag
+                rec["structure_id"] = structure_id
+                rec["action"] = "ENTRY"
+            self._set_order_state(
+                intent_id,
+                OrderState.FILLED,
+                action="seed_from_csv",
+                message=f"Seeded FILLED {tag} from open-positions CSV",
+            )
+            seeded += 1
+        return seeded
+
     @staticmethod
     def _broker_tag_matches_intent(intent_id: str, broker_tag: str) -> bool:
         tag = str(broker_tag or "").strip()

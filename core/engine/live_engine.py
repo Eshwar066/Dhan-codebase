@@ -671,6 +671,41 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     f"Failed to fetch broker positions: {e}"
                 )
             return False
+
+        # Restore persisted open legs before comparing local vs broker (avoids false mismatch on restart).
+        if hasattr(
+            self.position_manager, "rebuild_position_metadata_from_open_positions_csv"
+        ):
+            self.position_manager.rebuild_position_metadata_from_open_positions_csv()
+        if (
+            hasattr(self.position_manager, "rebuild_open_positions_from_open_positions_csv")
+            and self.instrument_store
+        ):
+            restored = self.position_manager.rebuild_open_positions_from_open_positions_csv(
+                self.instrument_store,
+                exchange=self._live_exchange or "NSE",
+            )
+            if restored and self.engine_logger:
+                self.engine_logger.reconciliation(
+                    f"Restored {restored} open position(s) from CSV before broker compare"
+                )
+        seed_fn = getattr(
+            self.order_router, "seed_filled_intents_from_open_positions_csv", None
+        )
+        csv_path = getattr(self.position_manager, "open_positions_csv_path", None)
+        if callable(seed_fn) and csv_path:
+            try:
+                seeded = seed_fn(csv_path)
+                if seeded and self.engine_logger:
+                    self.engine_logger.reconciliation(
+                        f"Seeded {seeded} FILLED intent(s) from open-positions CSV"
+                    )
+            except Exception as exc:
+                if self.engine_logger:
+                    self.engine_logger.reconciliation(
+                        f"Open-positions intent seed failed: {exc}"
+                    )
+
         local_snapshot = self.position_manager.snapshot()
         resolved_broker_positions = {}
         diff = []
@@ -679,8 +714,11 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             # Resolve broker symbol (id or short_name) to engine symbol
             engine_sym = b_sym
             if self.instrument_store:
+                from core.orderExecution.position_manager import PositionManager
+
+                opt, strike = PositionManager._extract_option_hint(b_sym, None)
                 inst = self.instrument_store.intent_creation_details(
-                    b_sym, self.venue, None, None, None
+                    b_sym, self.venue, None, opt, strike
                 )
                 if inst:
                     engine_sym = inst.trading_symbol
@@ -690,6 +728,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             local = local_snapshot.get(engine_sym, {})
             lq = local.get("qty", 0)
             bq = int(bp.get("qty", 0))
+            if lq == 0 and bq == 0:
+                continue
             if (
                 lq != bq
                 or abs(local.get("avg_price", 0) - float(bp.get("avg_price", 0))) > 0.01
@@ -750,13 +790,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             self.position_manager, "rebuild_position_metadata_from_open_positions_csv"
         ):
             self.position_manager.rebuild_position_metadata_from_open_positions_csv()
-        if hasattr(
-            self.position_manager, "rebuild_open_positions_from_open_positions_csv"
-        ) and self.instrument_store:
-            self.position_manager.rebuild_open_positions_from_open_positions_csv(
-                self.instrument_store,
-                exchange=self._live_exchange or "NSE",
-            )
         self.position_manager.reconcile_with_broker(
             resolved_broker_positions, strategy=None
         )
