@@ -1,13 +1,17 @@
 """
 One-shot: close open LEAPS_RSI structure and place a fresh ENTRY (hedge + main).
 
+Supports dual MAIN legs when strategy.yaml has both mini_leaps and quarterly_leaps
+enabled — places one hedge-gated bundle per structure_id (mini + :QTR).
+
 Manual emergency tool only — not imported by live engine / strategy registry.
 
 Usage (stop dhan-leaps-rsi.service first):
-  .venv/bin/python -m core.strategies.Leaps.emergency.force_leaps_cycle
+  python -m core.strategies.Leaps.emergency.force_leaps_cycle
+  python -m core.strategies.Leaps.emergency.force_leaps_cycle --entry-only
 
-  .venv/bin/python -m core.strategies.Leaps.emergency.force_leaps_cycle
-.venv/bin/python -m core.strategies.Leaps.emergency.retry_leaps_main
+  --entry-only   Skip close cycle; place entry bundles for all enabled legs.
+                 Useful after hours: LIMIT orders rest until market open.
 """
 
 from __future__ import annotations
@@ -268,6 +272,79 @@ def _force_close(engine: Any, strategy: Any) -> List[str]:
     return placed_ids
 
 
+def _order_bundle_legs(intents: List[Any]) -> List[Any]:
+    """HEDGE before MAIN within one structure bundle."""
+    hedges = [i for i in intents if str(getattr(i, "tag", "")).upper() == "HEDGE"]
+    mains = [i for i in intents if str(getattr(i, "tag", "")).upper() == "MAIN"]
+    others = [
+        i
+        for i in intents
+        if str(getattr(i, "tag", "")).upper() not in ("HEDGE", "MAIN")
+    ]
+    return hedges + mains + others
+
+
+def _group_entry_intents_by_structure(intents: List[Any]) -> Dict[str, List[Any]]:
+    bundles: Dict[str, List[Any]] = {}
+    for intent in intents:
+        stid = str(getattr(intent, "structure_id", "") or "").strip()
+        if not stid:
+            stid = "FORCE_ENTRY"
+        bundles.setdefault(stid, []).append(intent)
+    return bundles
+
+
+def _place_entry_bundle(
+    engine: Any,
+    strategy: Any,
+    structure_id: str,
+    intents: List[Any],
+) -> Tuple[List[str], Dict[str, Any]]:
+    ordered = _order_bundle_legs(intents)
+    price_map: Dict[str, float] = {}
+    for intent in ordered:
+        px = _resolve_entry_price(engine, intent)
+        if px is None or px <= 0:
+            px = engine._positive_price(getattr(intent, "price", None))
+        if px is None or px <= 0:
+            raise RuntimeError(
+                f"No entry price for {engine._intent_place_order_symbol(intent, '')} "
+                f"structure={structure_id}"
+            )
+        try:
+            intent.price = float(px)
+        except Exception:
+            pass
+        price_map.update(_price_map_for_intent(intent, float(px)))
+
+    bundle_item = {
+        "intent_bundle": ordered,
+        "price_map": price_map,
+        "structure_id": structure_id,
+        "strategy_id": strategy.name,
+        "engine_id": getattr(engine, "engine_id", None),
+        "idempotency_key": f"force_leaps|{structure_id}|{uuid.uuid4().hex[:8]}",
+    }
+    logger.info(
+        "Placing hedge-gated ENTRY bundle structure=%s legs=%s",
+        structure_id,
+        [
+            (getattr(i, "tag", None), engine._intent_place_order_symbol(i, ""))
+            for i in ordered
+        ],
+    )
+    result = engine.order_router.process_intent_bundle(bundle_item)
+    logger.info("Bundle result structure=%s: %s", structure_id, result)
+    if not isinstance(result, dict) or not result.get("ok"):
+        raise RuntimeError(f"Entry bundle failed structure={structure_id}: {result}")
+    intent_ids = [
+        str(getattr(i, "intent_id", ""))
+        for i in ordered
+        if getattr(i, "intent_id", None)
+    ]
+    return intent_ids, result
+
+
 def _force_entry(engine: Any, strategy: Any) -> List[str]:
     symbol = "NIFTY"
     candle = _synthetic_candle(engine, symbol)
@@ -295,51 +372,27 @@ def _force_entry(engine: Any, strategy: Any) -> List[str]:
     if not isinstance(intents, list):
         intents = [intents]
 
-    # Build price_map for all legs (custom + compact keys)
-    price_map: Dict[str, float] = {}
-    ordered: List[Any] = []
-    # Ensure HEDGE before MAIN in bundle
-    hedges = [i for i in intents if str(getattr(i, "tag", "")).upper() == "HEDGE"]
-    mains = [i for i in intents if str(getattr(i, "tag", "")).upper() == "MAIN"]
-    others = [
-        i
-        for i in intents
-        if str(getattr(i, "tag", "")).upper() not in ("HEDGE", "MAIN")
-    ]
-    for intent in hedges + mains + others:
-        px = _resolve_entry_price(engine, intent)
-        if px is None or px <= 0:
-            px = engine._positive_price(getattr(intent, "price", None))
-        if px is None or px <= 0:
-            raise RuntimeError(
-                f"No entry price for {engine._intent_place_order_symbol(intent, '')}"
-            )
-        try:
-            intent.price = float(px)
-        except Exception:
-            pass
-        price_map.update(_price_map_for_intent(intent, float(px)))
-        ordered.append(intent)
-
-    structure_id = str(getattr(ordered[0], "structure_id", "") or "FORCE_ENTRY")
-    bundle_item = {
-        "intent_bundle": ordered,
-        "price_map": price_map,
-        "structure_id": structure_id,
-        "strategy_id": strategy.name,
-        "engine_id": getattr(engine, "engine_id", None),
-        "idempotency_key": f"force_leaps|{structure_id}|{uuid.uuid4().hex[:8]}",
-    }
     logger.info(
-        "Placing hedge-gated ENTRY bundle legs=%s structure=%s",
-        [(getattr(i, "tag", None), engine._intent_place_order_symbol(i, "")) for i in ordered],
-        structure_id,
+        "on_candle produced %s intent(s) across %s structure(s): %s",
+        len(intents),
+        len(_group_entry_intents_by_structure(intents)),
+        [
+            (
+                getattr(i, "structure_id", None),
+                getattr(i, "tag", None),
+                engine._intent_place_order_symbol(i, ""),
+            )
+            for i in intents
+        ],
     )
-    result = engine.order_router.process_intent_bundle(bundle_item)
-    logger.info("Bundle result: %s", result)
-    if not isinstance(result, dict) or not result.get("ok"):
-        raise RuntimeError(f"Entry bundle failed: {result}")
-    return [str(getattr(i, "intent_id", "")) for i in ordered if getattr(i, "intent_id", None)]
+
+    placed_ids: List[str] = []
+    for structure_id, group in _group_entry_intents_by_structure(intents).items():
+        ids, _ = _place_entry_bundle(engine, strategy, structure_id, group)
+        placed_ids.extend(ids)
+    if not placed_ids:
+        raise RuntimeError("No entry intents placed")
+    return placed_ids
 
 
 def _write_open_positions_csv(engine: Any) -> None:
@@ -360,6 +413,16 @@ def _write_open_positions_csv(engine: Any) -> None:
 
 
 def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Force LEAPS close + dual-structure entry")
+    parser.add_argument(
+        "--entry-only",
+        action="store_true",
+        help="Skip close cycle; place fresh entry bundles for all enabled legs",
+    )
+    args = parser.parse_args()
+
     configure_process_logging()
     if RUN_MODE != RunMode.LIVE:
         logger.error("RUN_MODE must be LIVE (got %s)", RUN_MODE)
@@ -382,64 +445,72 @@ def main() -> int:
     logger.info("Building live engine stack (no main loop)…")
     engine = EngineFactory.create_live_engine(cfg)
     strategy = engine.strategy
+    logger.info(
+        "Enabled legs: mini_leaps=%s quarterly_leaps=%s",
+        getattr(strategy, "mini_leaps_enabled", None),
+        getattr(strategy, "quarterly_leaps_enabled", None),
+    )
 
     logger.info("Reconciling positions…")
     engine.reconcile_positions_on_start()
     engine._subscribe_open_option_legs()
 
-    open_pos = engine.position_manager.get_open_positions(
-        underlying="NIFTY", strategy="LEAPS_RSI"
-    ) or []
-    logger.info(
-        "Open before close: %s",
-        [
-            (
-                getattr(getattr(p, "instrument", None), "trading_symbol", None),
-                getattr(p, "tag", None),
-                getattr(p, "net_qty", None),
-            )
-            for p in open_pos
-        ],
-    )
-
-    if open_pos:
-        exit_ids = _force_close(engine, strategy)
-        if exit_ids:
-            logger.info("Waiting for exit fills…")
-            if not _wait_fills(engine, exit_ids, timeout_sec=120):
-                return 1
-        # Re-sync PM to broker
-        broker = engine.order_router.broker
-        if hasattr(broker, "get_positions_for_recon"):
-            engine.position_manager.reconcile_with_broker(
-                broker.get_positions_for_recon(), strategy="LEAPS_RSI"
-            )
+    if args.entry_only:
+        logger.info("Entry-only mode — skipping close cycle")
     else:
-        logger.info("No open LEAPS positions to close")
-
-    # Skip entry if still holding (partial close)
-    still_open = [
-        p
-        for p in (
-            engine.position_manager.get_open_positions(
-                underlying="NIFTY", strategy="LEAPS_RSI"
-            )
-            or []
-        )
-        if int(getattr(p, "net_qty", 0) or 0) != 0
-    ]
-    if still_open:
-        logger.error(
-            "Still open after exit attempt: %s — skipping entry",
+        open_pos = engine.position_manager.get_open_positions(
+            underlying="NIFTY", strategy="LEAPS_RSI"
+        ) or []
+        logger.info(
+            "Open before close: %s",
             [
                 (
                     getattr(getattr(p, "instrument", None), "trading_symbol", None),
+                    getattr(p, "tag", None),
                     getattr(p, "net_qty", None),
                 )
-                for p in still_open
+                for p in open_pos
             ],
         )
-        return 1
+
+        if open_pos:
+            exit_ids = _force_close(engine, strategy)
+            if exit_ids:
+                logger.info("Waiting for exit fills…")
+                if not _wait_fills(engine, exit_ids, timeout_sec=120):
+                    return 1
+            # Re-sync PM to broker
+            broker = engine.order_router.broker
+            if hasattr(broker, "get_positions_for_recon"):
+                engine.position_manager.reconcile_with_broker(
+                    broker.get_positions_for_recon(), strategy="LEAPS_RSI"
+                )
+        else:
+            logger.info("No open LEAPS positions to close")
+
+        # Skip entry if still holding (partial close)
+        still_open = [
+            p
+            for p in (
+                engine.position_manager.get_open_positions(
+                    underlying="NIFTY", strategy="LEAPS_RSI"
+                )
+                or []
+            )
+            if int(getattr(p, "net_qty", 0) or 0) != 0
+        ]
+        if still_open:
+            logger.error(
+                "Still open after exit attempt: %s — skipping entry",
+                [
+                    (
+                        getattr(getattr(p, "instrument", None), "trading_symbol", None),
+                        getattr(p, "net_qty", None),
+                    )
+                    for p in still_open
+                ],
+            )
+            return 1
 
     logger.info("Placing new LEAPS entry…")
     entry_ids = _force_entry(engine, strategy)
