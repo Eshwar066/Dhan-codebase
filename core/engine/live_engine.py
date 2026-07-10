@@ -730,18 +730,28 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             bq = int(bp.get("qty", 0))
             if lq == 0 and bq == 0:
                 continue
-            if (
-                lq != bq
-                or abs(local.get("avg_price", 0) - float(bp.get("avg_price", 0))) > 0.01
-            ):
+            # Qty mismatch is a real position drift. Avg-only drift is normal
+            # (fill price vs broker cost-average) — sync quietly, do not alarm.
+            if lq != bq:
                 diff.append(
                     {
                         "symbol": engine_sym,
                         "local_qty": lq,
                         "broker_qty": bq,
+                        "local_avg": local.get("avg_price"),
                         "broker_avg": bp.get("avg_price"),
                     }
                 )
+            else:
+                try:
+                    local_avg = float(local.get("avg_price") or 0)
+                    broker_avg = float(bp.get("avg_price") or 0)
+                except (TypeError, ValueError):
+                    local_avg, broker_avg = 0.0, 0.0
+                if abs(local_avg - broker_avg) > 0.01 and self.engine_logger:
+                    self.engine_logger.reconciliation(
+                        f"Avg price sync {engine_sym}: local={local_avg} broker={broker_avg}"
+                    )
 
         for sym in set(local_snapshot.keys()) - set(resolved_broker_positions.keys()):
             if local_snapshot[sym].get("qty", 0) != 0:
@@ -1855,6 +1865,35 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         existing = list(getattr(feed, "instruments", None) or [])
         feed.replace_instruments(self._merge_feed_instruments(existing, rows))
 
+    def _subscribe_open_option_legs(self) -> None:
+        """Subscribe WS quotes for open option positions (needed for LEAPS exit pricing)."""
+        pm = getattr(self, "position_manager", None)
+        if pm is None or not hasattr(pm, "get_open_positions"):
+            return
+        try:
+            open_pos = pm.get_open_positions() or []
+        except Exception:
+            return
+        syms: List[str] = []
+        for pos in open_pos:
+            if int(getattr(pos, "net_qty", 0) or 0) == 0:
+                continue
+            inst = getattr(pos, "instrument", None)
+            if inst is None:
+                continue
+            if hasattr(inst, "place_order_symbol"):
+                try:
+                    s = inst.place_order_symbol()
+                except Exception:
+                    s = None
+                if s:
+                    syms.append(str(s))
+            ts = getattr(inst, "trading_symbol", None)
+            if ts:
+                syms.append(str(ts))
+        if syms:
+            self._gtt_fallback_subscribe(syms)
+
     def _run_gtt_fallback_tick(self) -> None:
         book = getattr(self.order_router, "gtt_fallback_book", None)
         if book is None or not book.has_active_watches():
@@ -2483,6 +2522,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             except Exception:
                 self._dhan_order_ws_bound = False
         self._configure_gtt_fallback_book()
+        self._subscribe_open_option_legs()
         primary_tf = getattr(self.strategy, "timeframe", None)
         engine_timeframes = list(self._engine_timeframes or [])
         if not engine_timeframes and primary_tf:
@@ -3106,11 +3146,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         timeframe: Optional[str],
         risk_manager: Any,
     ) -> None:
-        is_main_exit = (
-            str(getattr(raw_intent, "action", "") or "").upper() == "EXIT"
-            and str(getattr(raw_intent, "tag", "") or "").upper() == "MAIN_EXIT"
-        )
-        if not is_main_exit:
+        tag_u = str(getattr(raw_intent, "tag", "") or "").upper()
+        action_u = str(getattr(raw_intent, "action", "") or "").upper()
+        is_exit = action_u == "EXIT" or tag_u.endswith("EXIT")
+        if not is_exit:
             self._process_entry_like_intent(
                 raw_intent,
                 strategy,
@@ -3121,28 +3160,51 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 risk_manager,
             )
             return
+
         exit_intent = raw_intent
-        if getattr(exit_intent, "side", None) != required_exit_side:
+        # MAIN_EXIT must close the MAIN position side; hedge/other exits keep their own side.
+        if tag_u == "MAIN_EXIT" and getattr(exit_intent, "side", None) != required_exit_side:
             exit_intent = dataclasses.replace(exit_intent, side=required_exit_side)
+
         self._log_signal(
             exit_intent,
             symbol,
             action="EXIT",
-            qty_fallback=abs(position.net_qty),
+            qty_fallback=abs(getattr(position, "net_qty", 0) or 0),
         )
         trading_sym = self._intent_place_order_symbol(exit_intent, symbol)
-        is_sell = position.net_qty > 0
+        side_u = str(getattr(exit_intent, "side", "") or "").upper()
+        is_sell = side_u == "SELL"
         exit_price = (
             self._exit_price_from_depth(trading_sym, is_sell)
             or self.get_price_map(trading_sym)
+            or self._positive_price(getattr(exit_intent, "price", None))
             or self.get_price_map(symbol)
         )
         if exit_price is None:
+            logger.warning(
+                "EXIT skipped: no executable price symbol=%s trading_sym=%s "
+                "strategy=%s tag=%s",
+                symbol,
+                trading_sym,
+                getattr(strategy, "name", ""),
+                tag_u,
+            )
             return
         self._validate_lot_size(exit_intent, trading_sym)
-        price_map = {trading_sym: exit_price}
+        # Key by both place_order_symbol and compact trading_symbol for OrderRouter lookup.
+        compact = ""
+        inst = getattr(exit_intent, "instrument", None)
+        if inst is not None:
+            compact = str(getattr(inst, "trading_symbol", "") or "").strip()
+        price_map = {trading_sym: float(exit_price)}
+        if compact and compact != trading_sym:
+            price_map[compact] = float(exit_price)
         exit_idem_key = getattr(exit_intent, "idempotency_key", None) or self._signal_hash(
-            symbol, timeframe or "", candle.get("timestamp"), "exit"
+            symbol,
+            timeframe or "",
+            candle.get("timestamp"),
+            f"exit|{trading_sym}|{tag_u}",
         )
         self._enqueue_intent(
             strategy=strategy,
@@ -3292,7 +3354,13 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             trading_sym = self._intent_place_order_symbol(single_intent, symbol)
             self._validate_lot_size(single_intent, trading_sym)
             self._last_signal_hash_per_symbol[symbol] = signal_hash
-            price_map = {trading_sym: exec_price}
+            price_map = {trading_sym: float(exec_price)}
+            compact = ""
+            inst = getattr(single_intent, "instrument", None)
+            if inst is not None:
+                compact = str(getattr(inst, "trading_symbol", "") or "").strip()
+            if compact and compact != trading_sym:
+                price_map[compact] = float(exec_price)
             self._enqueue_intent(
                 strategy=strategy,
                 intent=single_intent,

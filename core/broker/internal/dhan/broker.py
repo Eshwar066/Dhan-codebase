@@ -103,7 +103,7 @@ class DhanBroker(BaseBroker):
     supports_hedge_fill_gated_bundles = True
     hedge_fill_wait_timeout_sec = 120.0
     hedge_fill_poll_interval_sec = 0.5
-    hedge_fill_margin_settle_sec = 0.5
+    hedge_fill_margin_settle_sec = 2.0
     hedge_fill_retry_max_attempts = 3
     hedge_fill_retry_per_attempt_sec = 40.0
     hedge_fill_retry_strategy_ids = frozenset({"LEAPS_RSI"})
@@ -304,11 +304,13 @@ class DhanBroker(BaseBroker):
         """
         Multi-leg margin (hedge benefit) for same-structure ENTRY legs.
         ``legs``: list of (intent, execution_price).
+
+        Even a single follow-leg (MAIN after hedge fill) must use the multi
+        calculator with ``includePosition=True`` so Dhan applies hedge benefit
+        from open positions. Plain ``margin_calculator`` ignores portfolio hedge.
         """
         if not legs:
             return None
-        if len(legs) == 1:
-            return self.check_funds_before_order(legs[0][0], legs[0][1])
 
         payloads: List[Dict[str, Any]] = []
         for intent, execution_price in legs:
@@ -322,7 +324,16 @@ class DhanBroker(BaseBroker):
             return None
 
         tsl = getattr(getattr(self.api, "_source", None), "tsl", None)
-        if not tsl or not getattr(tsl, "margin_calculator_multi", None):
+        # Prefer multi calculator whenever positions/orders should be included,
+        # including the post-hedge single-MAIN check.
+        use_multi = bool(
+            tsl
+            and getattr(tsl, "margin_calculator_multi", None)
+            and (len(legs) > 1 or include_position or include_orders)
+        )
+        if not use_multi:
+            if len(legs) == 1:
+                return self.check_funds_before_order(legs[0][0], legs[0][1])
             total_required = 0.0
             for intent, execution_price in legs:
                 single = self.check_funds_before_order(intent, execution_price)
@@ -354,6 +365,9 @@ class DhanBroker(BaseBroker):
             )
         except Exception as exc:
             logger.warning("margin_calculator_multi failed: %s", exc)
+            # Fallback: without include_position, single-leg check is wrong after hedge.
+            if len(legs) == 1 and not include_position:
+                return self.check_funds_before_order(legs[0][0], legs[0][1])
             return None
 
         if not isinstance(oc, dict):
@@ -370,7 +384,7 @@ class DhanBroker(BaseBroker):
         ok, shortfall = self._parse_margin_shortfall(available, required_margin, 0)
         msg = (
             f"Multi-leg margin: available={available:.2f} required={required_margin:.2f} "
-            f"legs={len(legs)}"
+            f"legs={len(legs)} include_position={include_position}"
         )
         if hedge_benefit not in (None, ""):
             msg += f" hedge_benefit={hedge_benefit}"

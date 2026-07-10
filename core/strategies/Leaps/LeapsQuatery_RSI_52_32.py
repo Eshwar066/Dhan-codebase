@@ -489,11 +489,13 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             if RUN_MODE == RunMode.BACKTEST
             else None
         )
+        lot = int(getattr(position.instrument, "lot_size", 1) or 1)
+        qty_lots = self._order_qty_in_lots(position.instrument, abs(int(position.net_qty or 0)))
         intents.append(
             self.create_order_intent(
                 inst=position.instrument,
                 side="BUY" if position.net_qty < 0 else "SELL",
-                qty=abs(position.net_qty),
+                qty=qty_lots,
                 price=price,
                 order_type="LIMIT",
                 strategy=self.name,
