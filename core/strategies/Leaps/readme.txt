@@ -122,7 +122,7 @@ HEDGE ROLLOVER (LIVE + BACKTEST)
 IndiaMktMixins.on_candle_rollover — wired in LiveEngine._run_exits_and_rollover.
 
 Window: calendar days 15–18 of month.
-Roll when: current date >= adjusted 18th (Fri→Thu, Sun→Fri).
+Roll when: current date >= adjusted 18th (weekends + NSE holidays → prior session).
 Action: HEDGE_EXIT (sell old hedge) + new HEDGE ENTRY.
 Deduped: one roll per structure per calendar day (rolled_hedges set).
 
@@ -152,7 +152,6 @@ ROADMAP / NOT YET IMPLEMENTED
 - Regime lock (one open structure per regime globally)
 - Hedge PnL attribution
 - Delta-aware hedge distance
-- Holiday-aware rollover without Expiry_Calendar dependency
 
 ==========================================================================================
 INTENT REFERENCE

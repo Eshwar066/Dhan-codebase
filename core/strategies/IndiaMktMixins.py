@@ -1691,12 +1691,19 @@ class IndiaMktMixins:
         if expiry <= current:
             return False
 
-        target = date(current.year, current.month, 18)
-        if target.weekday() == 5:
-            target -= timedelta(days=1)
-        elif target.weekday() == 6:
-            target -= timedelta(days=2)
+        from core.utils.session.session_manager import SessionManager
 
+        exchange = (
+            getattr(self, "session_exchange", None)
+            or getattr(self, "market_exchange", None)
+            or "INDEX"
+        )
+        target = SessionManager.hedge_rollover_target_date(
+            current.year,
+            current.month,
+            rollover_day=18,
+            exchange=str(exchange),
+        )
         return current >= target
 
     def on_candle_rollover(self, open_positions, candle, ctx):
