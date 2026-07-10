@@ -66,6 +66,8 @@ class GttFallbackWatch:
     qty: int = 1
     candle_ts: Any = None
     symbol: str = ""
+    confirm_ticks: int = 1
+    _trigger_hits: int = 0
 
 
 class QuoteProvider(Protocol):
@@ -242,6 +244,12 @@ def _trigger_met(watch: GttFallbackWatch, quote: BidAskLtp) -> bool:
         val = quote.bid
     elif field == "ltp":
         val = quote.ltp
+        if val is None:
+            # Fall back to mid/ask when LTP not yet in feed cache.
+            if quote.ask is not None and quote.bid is not None:
+                val = (float(quote.ask) + float(quote.bid)) / 2.0
+            else:
+                val = quote.ask
     else:
         val = quote.ask
     if val is None:
@@ -256,6 +264,34 @@ def _trigger_met(watch: GttFallbackWatch, quote: BidAskLtp) -> bool:
     if op == ">":
         return float(val) > limit
     return False
+
+
+def _fallback_limit_price(watch: GttFallbackWatch, quote: Optional[BidAskLtp]) -> float:
+    """
+    Resting LIMIT price after GTT cancel. Prefer a price near live market so NSE
+    LPP (EXCH:17070) does not reject far-from-LTP limits.
+    """
+    limit = float(watch.limit_price)
+    side = str(watch.side or "BUY").upper()
+    if quote is None:
+        return limit
+    ask = _positive_float(quote.ask)
+    bid = _positive_float(quote.bid)
+    ltp = _positive_float(quote.ltp)
+    if side == "BUY":
+        # Cap at our GTT limit; prefer current ask when tighter (better fill + LPP-safe).
+        candidates = [limit]
+        if ask is not None:
+            candidates.append(ask)
+        if ltp is not None:
+            candidates.append(ltp)
+        return min(candidates)
+    candidates = [limit]
+    if bid is not None:
+        candidates.append(bid)
+    if ltp is not None:
+        candidates.append(ltp)
+    return max(candidates)
 
 
 class GttFallbackBook:
@@ -320,6 +356,10 @@ class GttFallbackBook:
         limit_price = float(getattr(intent, "price", 0) or 0)
         if limit_price <= 0:
             return
+        try:
+            confirm_ticks = max(1, int(fb.get("confirm_ticks") or 1))
+        except (TypeError, ValueError):
+            confirm_ticks = 1
         watch = GttFallbackWatch(
             gtt_intent_id=str(intent.intent_id),
             strategy_id=str(getattr(intent, "strategy", "") or ""),
@@ -337,6 +377,7 @@ class GttFallbackBook:
             qty=int(getattr(intent, "qty", 1) or 1),
             candle_ts=candle_ts,
             symbol=str(getattr(intent, "symbol", "") or ""),
+            confirm_ticks=confirm_ticks,
         )
         with self._lock:
             self._watches[watch.gtt_intent_id] = watch
@@ -431,6 +472,10 @@ class GttFallbackBook:
                 limit_price = float(rec.get("price") or payload.get("price") or 0)
                 if limit_price <= 0:
                     continue
+                try:
+                    confirm_ticks = max(1, int(fb.get("confirm_ticks") or 1))
+                except (TypeError, ValueError):
+                    confirm_ticks = 1
                 watch = GttFallbackWatch(
                     gtt_intent_id=iid,
                     strategy_id=str(
@@ -453,6 +498,7 @@ class GttFallbackBook:
                     candle_ts=rec.get("candle_ts") or payload.get("candle_ts"),
                     symbol=str(payload.get("symbol") or rec.get("symbol") or ""),
                     phase=GttFallbackPhase.GTT,
+                    confirm_ticks=confirm_ticks,
                 )
                 with self._lock:
                     self._watches[iid] = watch
@@ -513,13 +559,37 @@ class GttFallbackBook:
             return
         quote = self._quote_provider.get_quote(watch.trading_symbol)
         if quote is None or not _trigger_met(watch, quote):
+            watch._trigger_hits = 0
             return
 
+        watch._trigger_hits = int(getattr(watch, "_trigger_hits", 0) or 0) + 1
+        if watch._trigger_hits < max(1, int(watch.confirm_ticks or 1)):
+            return
+
+        # Premium reached GTT price; only fall back if Forever still unfilled.
         if not self._gtt_still_unfilled(watch, rec):
+            self.on_fill(watch.gtt_intent_id)
+            return
+
+        # Re-poll Forever book once more before cancel (broker may have just triggered).
+        if rec and hasattr(router, "_try_sync_gtt_intent_fill"):
+            if router._try_sync_gtt_intent_fill(rec):
+                self.on_fill(watch.gtt_intent_id)
+                return
+        if not self._gtt_still_unfilled(watch, store.get(watch.gtt_intent_id) if store else None):
+            self.on_fill(watch.gtt_intent_id)
             return
 
         if watch.phase == GttFallbackPhase.GTT:
-            router.cancel_gtt_fallback_watch(watch, reason="fallback_trigger")
+            cancelled = router.cancel_gtt_fallback_watch(watch, reason="fallback_trigger")
+            if not cancelled:
+                # Cancel failed — do not place LIMIT on top of live Forever order.
+                self._log(
+                    "gtt_fallback_cancel_failed",
+                    f"skip LIMIT; Forever still open {watch.trading_symbol}",
+                    intent_id=watch.gtt_intent_id,
+                )
+                return
 
         if watch.fallback_intent_id:
             return
@@ -548,13 +618,15 @@ class GttFallbackBook:
                 if pending_fb:
                     return
 
-        fallback_id = router.place_gtt_fallback_order(watch)
+        fallback_price = _fallback_limit_price(watch, quote)
+        fallback_id = router.place_gtt_fallback_order(watch, price=fallback_price)
         if fallback_id:
             watch.phase = GttFallbackPhase.FALLBACK_SENT
             watch.fallback_intent_id = fallback_id
             self._log(
                 "gtt_fallback_placed",
-                f"fallback LIMIT {watch.trading_symbol} @ {watch.limit_price}",
+                f"fallback LIMIT {watch.trading_symbol} @ {fallback_price} "
+                f"(gtt_limit={watch.limit_price})",
                 intent_id=fallback_id,
                 parent_intent_id=watch.gtt_intent_id,
             )

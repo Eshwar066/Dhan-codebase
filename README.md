@@ -81,7 +81,7 @@ Current live path is feed-first and queue-isolated:
 |------|----------|
 | *(default)* | Resting LIMIT / SL-M |
 | `GTT` | Dhan Forever order; fill polled by OrderRouter |
-| `HYBRID_GTT` | GTT + engine watches ask/bid → cancel GTT → resting LIMIT when trigger fires (BankNiftyBTST live) |
+| `HYBRID_GTT` | GTT + engine watches LTP/ask → cancel GTT → resting LIMIT when trigger fires (BankNiftyBTST live) |
 
 See `core/orderExecution/README.md` and `core/strategies/BTST/BankNiftyBTST/readme.md`.
 

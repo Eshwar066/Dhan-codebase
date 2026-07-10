@@ -2722,11 +2722,14 @@ class OrderRouter:
         )
         return True
 
-    def place_gtt_fallback_order(self, watch: GttFallbackWatch) -> Optional[str]:
+    def place_gtt_fallback_order(
+        self, watch: GttFallbackWatch, *, price: Optional[float] = None
+    ) -> Optional[str]:
         """Place resting LIMIT fallback after GTT trigger; returns new intent_id."""
         store = self.intent_store
         if store is None or watch.instrument is None:
             return None
+        limit = float(price) if price is not None and float(price) > 0 else float(watch.limit_price)
         meta = dict(watch.metadata_extras or {})
         meta["execution_mode"] = "LIMIT"
         meta["gtt_fallback_parent"] = watch.gtt_intent_id
@@ -2735,7 +2738,7 @@ class OrderRouter:
             instrument=watch.instrument,
             side=watch.side,
             qty=int(watch.qty or 1),
-            price=float(watch.limit_price),
+            price=limit,
             order_type="LIMIT",
             strategy=watch.strategy_id,
             structure_id=watch.structure_id,
@@ -2749,7 +2752,7 @@ class OrderRouter:
             trigger_price=None,
         )
         sym = watch.trading_symbol
-        result = self.process_intent(fallback, {sym: float(watch.limit_price)})
+        result = self.process_intent(fallback, {sym: limit})
         if not isinstance(result, dict) or not result.get("ok"):
             return None
         return fallback.intent_id

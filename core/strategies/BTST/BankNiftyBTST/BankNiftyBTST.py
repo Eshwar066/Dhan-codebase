@@ -2,9 +2,9 @@
 Bank Nifty BTST (Buy Today Sell Tomorrow) — Dhan index options.
 
 Rules (see readme.md)
-- 9:20 IST: pick CE and PE strikes near ~100 premium; GTT (Forever) LIMIT BUY each at premium × 1.5.
+- 9:20 IST: pick CE and PE strikes near ~100 premium; HYBRID_GTT BUY each at premium × 1.5.
 - After fill: resting SL-SELL at 50% of the limit entry price.
-- 15:20 IST: cancel any unfilled ENTRY limits placed today.
+- 15:20 IST: cancel any unfilled ENTRY (GTT / fallback LIMIT / watches) placed today.
 - If SL not hit: exit next session at 9:25 IST.
 
 
@@ -35,7 +35,9 @@ PREM_MIN = 80.0
 PREM_MAX = 120.0
 LIMIT_PREM_MULT = 1.5
 SL_OF_LIMIT = 0.5
-# Live ENTRY: Dhan Forever (GTT) + engine bid/ask fallback (GttFallbackBook).
+# Live ENTRY: Dhan Forever (GTT) + engine watch (HYBRID_GTT).
+# Watch fires when premium (LTP) reaches GTT price from below; if Forever
+# still unfilled, cancel GTT and place resting LIMIT near market.
 ENTRY_EXECUTION_MODE = "HYBRID_GTT"
 
 
@@ -443,10 +445,13 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         strategy_meta = self._strategy_meta(meta)
         if use_gtt:
             strategy_meta["execution_mode"] = ENTRY_EXECUTION_MODE
+            # Premium starts ~100; GTT limit is ~150. Fire when LTP rises to
+            # limit (not ask<=limit, which is true immediately and caused LPP rejects).
             strategy_meta["gtt_fallback"] = {
-                "trigger_field": "ask",
-                "trigger_op": "<=",
+                "trigger_field": "ltp",
+                "trigger_op": ">=",
                 "active_until": CANCEL_TIME.strftime("%H:%M"),
+                "confirm_ticks": 2,
             }
 
         return self.create_order_intent(

@@ -12,18 +12,21 @@
 `execution_mode: HYBRID_GTT` via `GttFallbackBook` (`core/orderExecution/gtt_fallback_book.py`):
 
 1. Place Dhan **Forever (GTT)** LIMIT BUY at trigger/limit = limit_price.
-2. Engine watches **ask** on subscribed option symbols (websocket + REST fallback).
-3. When **ask <= limit_price** and GTT still unfilled → cancel Forever order → place **resting LIMIT BUY @ limit_price**.
+2. Engine registers an internal watch and subscribes option quotes (WS + REST).
+3. When **premium (LTP) >= limit_price** and Forever is still unfilled → cancel Forever → place **resting LIMIT** near live ask/LTP (capped at limit_price) so NSE LPP accepts it.
 4. Fill from either path triggers `on_main_entry_filled` → SL-M as above.
 
 `gtt_fallback` spec on intent:
 ```json
 {
-  "trigger_field": "ask",
-  "trigger_op": "<=",
-  "active_until": "15:20"
+  "trigger_field": "ltp",
+  "trigger_op": ">=",
+  "active_until": "15:20",
+  "confirm_ticks": 2
 }
 ```
+
+Why `ltp >= limit` (not `ask <= limit`): at 9:20 premium is ~100 and limit is ~150, so ask is already below limit. The old trigger fired immediately, cancelled GTT, and placed LIMIT @ 150 far from LTP → `EXCH:17070` LPP reject.
 
 Backtest / paper: plain LIMIT at limit_price (no GTT, no fallback).
 
