@@ -56,6 +56,18 @@ dependencies:
   required_context:
   - option_chain
   expiry_type: MONTHLY
+
+# MAIN leg toggles — each enabled leg places MAIN sell + monthly hedge bundle.
+legs:
+  mini_leaps:
+    enabled: true
+    expiry_pref: LEAPS_ROLL
+    structure_suffix: ""
+  quarterly_leaps:
+    enabled: false
+    expiry_pref: QUARTERLY
+    structure_suffix: ":QTR"
+
 documentation:
   title: LEAPS RSI
   overview: NIFTY monthly option selling on 1h RSI with hedge protection.

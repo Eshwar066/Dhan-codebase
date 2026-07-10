@@ -707,8 +707,9 @@ class IndiaMktMixins:
         out["abs_delta"] = d_abs
         return out
 
-    def fetch_option_chain(self, candle, ctx, option_type):
+    def fetch_option_chain(self, candle, ctx, option_type, expiry_pref=None):
         ocs = ctx.option_chain_service
+        pref = str(expiry_pref or getattr(self, "expiryType", "") or "").strip().upper()
 
         if self.api == "NSE":
             ctx.expiry_list = ocs.get_expiries(
@@ -716,7 +717,7 @@ class IndiaMktMixins:
             )
 
         rollover = getattr(self, "dhan_monthly_rollover_after_calendar_day", None)
-        if str(getattr(self, "expiryType", "") or "").upper() != "MONTHLY":
+        if pref != "MONTHLY":
             rollover = None
         weekly_wd = getattr(self, "weekly_expiry_weekday", None)
         days_before_exp = getattr(self, "dhan_monthly_rollover_days_before_expiry", None)
@@ -725,7 +726,7 @@ class IndiaMktMixins:
             expiry_list=ctx.get_expiry_list(),
             trade_date=ctx.timestamp,
             api=self.api,
-            expiry_pref=self.expiryType,
+            expiry_pref=pref,
             dhan_calendar_rollover_day=rollover,
             weekly_expiry_weekday=weekly_wd,
             days_before_expiry_rollover=days_before_exp,
@@ -1019,8 +1020,11 @@ class IndiaMktMixins:
         max_prem=400,
         delta_min=None,
         delta_max=None,
+        expiry_pref=None,
     ):
-        otm_strikes = self.fetch_option_chain(candle, ctx, option_type)
+        otm_strikes = self.fetch_option_chain(
+            candle, ctx, option_type, expiry_pref=expiry_pref
+        )
 
         if not otm_strikes:
             return None
@@ -1079,7 +1083,7 @@ class IndiaMktMixins:
                 params.update(extra_snapshot_params)
 
         reuse_cached_chain = False
-        if not snapshot_mode and str(self.api or "").upper() == "DHAN":
+        if expiry_pref is None and not snapshot_mode and str(self.api or "").upper() == "DHAN":
             cached = getattr(self, "_last_option_chain", None)
             if isinstance(cached, dict):
                 inner = cached.get("chain")

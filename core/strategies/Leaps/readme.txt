@@ -49,7 +49,27 @@ Backtest path:
   BacktestEngine runs exit + rollover every candle; gates entry on should_evaluate.
 
 ==========================================================================================
-MAIN LEG EXPIRY — LEAPS_ROLL (not Mar/Jun/Sep/Dec quarterly)
+MAIN LEG EXPIRY — dual MAIN bundles (toggle in strategy.yaml → legs:)
+==========================================================================================
+
+Two optional MAIN+HEDGE bundles on the same RSI signal (separate structure_id):
+
+  mini_leaps (default on):
+    expiry_pref: LEAPS_ROLL — monthly rollover table (16th cutoff in resolver)
+    structure_id: LEAPS_RSI:NIFTY:{regime}
+
+  quarterly_leaps (default off):
+    expiry_pref: QUARTERLY — Mar/Jun/Sep/Dec last Tuesday
+    structure_id: LEAPS_RSI:NIFTY:{regime}:QTR
+    Quarterly mid-month cutoff: 15th (Feb/May/Aug/Nov)
+
+Toggle in core/strategies/Leaps/strategy.yaml → legs: → enabled: true/false
+Or class attrs: mini_leaps_enabled / quarterly_leaps_enabled
+
+Hedge is unchanged for both: monthly BUY ~2% OTM (15th calendar cutoff).
+
+==========================================================================================
+MAIN LEG EXPIRY — LEAPS_ROLL detail (mini leg)
 ==========================================================================================
 
 Code: expiryType = "LEAPS_ROLL" (ExpiryResolver._leaps_rollover_month_year)
