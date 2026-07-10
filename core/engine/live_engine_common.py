@@ -81,9 +81,14 @@ class LiveEngineHelpersMixin:
             try:
                 bid = self.realtime_feed.get_best_bid(symbol)
                 ask = self.realtime_feed.get_best_ask(symbol)
-                return (bid, ask)
+                if bid is not None or ask is not None:
+                    return (bid, ask)
             except Exception:
                 pass
+        # Option legs may not be on the candle feed — REST quote fallback.
+        quote = self._rest_option_quote(symbol)
+        if quote is not None:
+            return (quote[0], quote[1])
         return (None, None)
 
     def _get_tick_size(self, symbol: str) -> float:
@@ -99,13 +104,47 @@ class LiveEngineHelpersMixin:
         self._tick_cache[symbol] = float(tick) if tick is not None else 0.01
         return self._tick_cache[symbol]
 
+    def _rest_option_quote(
+        self, symbol: str
+    ) -> Optional[Tuple[Optional[float], Optional[float], Optional[float]]]:
+        """Return (bid, ask, ltp) via data provider quote API, or None."""
+        data = getattr(self, "data", None)
+        store = getattr(self, "instrument_store", None)
+        if data is None or store is None or not hasattr(data, "get_quote_v2"):
+            return None
+        sym = str(symbol or "").strip()
+        if not sym:
+            return None
+        cache = getattr(self, "_rest_option_quote_cache", None)
+        if cache is None:
+            self._rest_option_quote_cache = {}
+            cache = self._rest_option_quote_cache
+        now = time.time()
+        cached = cache.get(sym)
+        if cached and (now - cached[0]) < 2.0:
+            return cached[1]
+        try:
+            from core.orderExecution.gtt_fallback_book import RestQuoteProvider
+
+            q = RestQuoteProvider(data, store).get_quote(sym)
+            if q is None:
+                return None
+            out = (q.bid, q.ask, q.ltp)
+            cache[sym] = (now, out)
+            return out
+        except Exception:
+            return None
+
     def get_price_map(self, symbol):
         sym_key = str(symbol or "").strip().upper()
         if self.realtime_feed and self.realtime_feed.is_connected():
             ticker = self.realtime_feed.get_last_ticker(symbol)
             if ticker and ticker.get("close") is not None:
-                print(">>exit ticker price ", ticker["close"])
                 return ticker["close"]
+        # Option contract LTP via REST when not on index candle feed.
+        rest_q = self._rest_option_quote(symbol)
+        if rest_q is not None and rest_q[2] is not None and float(rest_q[2]) > 0:
+            return float(rest_q[2])
         if not hasattr(self, "_rest_spot_cache"):
             self._rest_spot_cache = {}
         now = time.time()
@@ -125,7 +164,7 @@ class LiveEngineHelpersMixin:
             sym_u = sym_key
             if sym_u in candles and candles[sym_u].get("close") is not None:
                 close = candles[sym_u]["close"]
-                self._rest_spot_cache[sym_key] = (now, close)
+                self._rest_spot_cache[sym_u] = (now, close)
                 return close
         return None
 
@@ -149,6 +188,18 @@ class LiveEngineHelpersMixin:
 
         print(">>entry ask, bid", symbol, ask, bid)
         if not self._is_spread_acceptable(bid, ask):
+            # Illiquid options: still allow LTP-based limit when spread is wide.
+            rest_q = self._rest_option_quote(symbol)
+            ltp = rest_q[2] if rest_q else None
+            tick = self._get_tick_size(symbol)
+            if is_buy and ask is not None:
+                return float(ask) + tick
+            if is_buy and ltp is not None:
+                return float(ltp) + tick
+            if not is_buy and bid is not None:
+                return float(bid) - tick
+            if not is_buy and ltp is not None:
+                return float(ltp) - tick
             return None
         tick = self._get_tick_size(symbol)
 
@@ -162,16 +213,29 @@ class LiveEngineHelpersMixin:
     def _exit_price_from_depth(self, symbol: str, is_sell: bool):
         bid, ask = self._get_bid_ask(symbol)
         print(">exxit bid and ask", symbol, bid, ask)
-        if not self._is_spread_acceptable(bid, ask):
-            return None
         tick = self._get_tick_size(symbol)
-
-        if is_sell and bid is not None:
-            return bid - tick
-
-        if not is_sell and ask is not None:
-            return ask + tick
-
+        if self._is_spread_acceptable(bid, ask):
+            if is_sell and bid is not None:
+                return bid - tick
+            if not is_sell and ask is not None:
+                return ask + tick
+        # Wide/missing spread (common on LEAPS): use available side or LTP.
+        rest_q = self._rest_option_quote(symbol)
+        ltp = rest_q[2] if rest_q else None
+        if is_sell:
+            if bid is not None:
+                return float(bid) - tick
+            if ltp is not None:
+                return float(ltp) - tick
+            if ask is not None:
+                return float(ask)
+        else:
+            if ask is not None:
+                return float(ask) + tick
+            if ltp is not None:
+                return float(ltp) + tick
+            if bid is not None:
+                return float(bid)
         return None
 
     def _is_spread_acceptable(

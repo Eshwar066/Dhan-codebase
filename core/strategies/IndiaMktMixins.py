@@ -1628,10 +1628,11 @@ class IndiaMktMixins:
             # Live: engine resolves executable price from depth at enqueue time.
             price = 0
 
+        qty_lots = self._order_qty_in_lots(hedge.instrument, abs(int(hedge.net_qty or 0)))
         return self.create_order_intent(
             inst=hedge.instrument,
             side="BUY" if hedge.net_qty < 0 else "SELL",
-            qty=abs(hedge.net_qty),
+            qty=qty_lots,
             price=price,
             order_type="LIMIT",
             strategy=self.name,

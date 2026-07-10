@@ -1104,6 +1104,48 @@ class OrderRouter:
             return None
         return p
 
+    @staticmethod
+    def _lookup_price_map(
+        price_map: Optional[Dict[str, Any]], intent: Any, trading_sym: str = ""
+    ) -> Optional[float]:
+        """Resolve price from map using trading_symbol and/or place_order_symbol keys."""
+        if not price_map:
+            return None
+        keys: List[str] = []
+        if trading_sym:
+            keys.append(str(trading_sym).strip())
+        inst = getattr(intent, "instrument", None)
+        if inst is not None:
+            ts = getattr(inst, "trading_symbol", None)
+            if ts:
+                keys.append(str(ts).strip())
+            if hasattr(inst, "place_order_symbol"):
+                try:
+                    pos = inst.place_order_symbol()
+                except Exception:
+                    pos = None
+                if pos:
+                    keys.append(str(pos).strip())
+            custom = getattr(inst, "custom_symbol", None)
+            if custom:
+                keys.append(str(custom).strip())
+        seen: Set[str] = set()
+        for key in keys:
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            val = price_map.get(key)
+            if val is None:
+                # Case-insensitive fallback for Dhan custom symbols.
+                for mk, mv in price_map.items():
+                    if str(mk).strip().upper() == key.upper():
+                        val = mv
+                        break
+            coerced = OrderRouter._coerce_positive_exec_price(val)
+            if coerced is not None:
+                return coerced
+        return None
+
     def process_intent(
         self,
         intent,
@@ -1211,11 +1253,12 @@ class OrderRouter:
                     )
                     return {"ok": True, "retryable": False, "reason": "duplicate_exit"}
 
-        # Resolve execution price: always prefer price_map (engine updates it with best bid/ask)
+        # Resolve execution price: always prefer price_map (engine updates it with best bid/ask).
+        # Engine may key by place_order_symbol (Dhan SEM_CUSTOM_SYMBOL) while intent.instrument
+        # uses compact trading_symbol — try both.
         exec_price = None
-
-        if price_map and sym:
-            exec_price = price_map.get(sym)
+        if price_map:
+            exec_price = self._lookup_price_map(price_map, intent, sym)
         if exec_price is None:
             exec_price = intent.price
         exec_price = self._coerce_positive_exec_price(exec_price)
@@ -1983,7 +2026,7 @@ class OrderRouter:
                 if getattr(intent, "instrument", None)
                 else ""
             )
-            exec_price = price_map.get(sym) if sym else None
+            exec_price = self._lookup_price_map(price_map, intent, sym)
             if exec_price is None:
                 exec_price = getattr(intent, "price", None)
             exec_price = self._coerce_positive_exec_price(exec_price)
@@ -2228,11 +2271,20 @@ class OrderRouter:
 
         follow_margin: Optional[Dict[str, Any]] = None
         if multi_check and follow_legs:
+            # After hedge fill: MAIN-only check MUST include open positions so Dhan
+            # applies hedge benefit (Final Margin), not standalone short margin.
             follow_margin = multi_check(
                 follow_legs,
                 include_position=True,
                 include_orders=True,
             )
+            if follow_margin is None:
+                # Fallback: theoretical combined structure margin (matches strategy builder).
+                follow_margin = multi_check(
+                    hedge_legs + follow_legs,
+                    include_position=False,
+                    include_orders=False,
+                )
             if not self._log_bundle_margin_check(
                 bundle_item=bundle_item,
                 resolved=follow_legs,
@@ -2250,6 +2302,19 @@ class OrderRouter:
                     bundle_item=bundle_item,
                 )
                 return {"ok": False, "retryable": False, "reason": "insufficient_funds"}
+            if follow_margin is None:
+                # Do not fall through to standalone MAIN margin (ignores hedge).
+                self._reject_bundle_legs(
+                    follow_legs,
+                    reason="margin_check_unavailable",
+                    message="Post-hedge margin check unavailable; MAIN not sent",
+                    bundle_item=bundle_item,
+                )
+                return {
+                    "ok": False,
+                    "retryable": True,
+                    "reason": "margin_check_unavailable",
+                }
 
         last_result: Dict[str, Any] = {
             "ok": True,
@@ -2303,7 +2368,7 @@ class OrderRouter:
                 if getattr(intent, "instrument", None)
                 else ""
             )
-            exec_price = price_map.get(sym) if sym else None
+            exec_price = self._lookup_price_map(price_map, intent, sym)
             if exec_price is None:
                 exec_price = getattr(intent, "price", None)
             exec_price = self._coerce_positive_exec_price(exec_price)
@@ -2449,7 +2514,7 @@ class OrderRouter:
                 if getattr(intent, "instrument", None)
                 else ""
             )
-            exec_price = price_map.get(sym) if sym else None
+            exec_price = self._lookup_price_map(price_map, intent, sym)
             if exec_price is None:
                 exec_price = getattr(intent, "price", None)
             exec_price = self._coerce_positive_exec_price(exec_price)
@@ -2723,11 +2788,14 @@ class OrderRouter:
         )
         return True
 
-    def place_gtt_fallback_order(self, watch: GttFallbackWatch) -> Optional[str]:
+    def place_gtt_fallback_order(
+        self, watch: GttFallbackWatch, *, price: Optional[float] = None
+    ) -> Optional[str]:
         """Place resting LIMIT fallback after GTT trigger; returns new intent_id."""
         store = self.intent_store
         if store is None or watch.instrument is None:
             return None
+        limit = float(price) if price is not None and float(price) > 0 else float(watch.limit_price)
         meta = dict(watch.metadata_extras or {})
         meta["execution_mode"] = "LIMIT"
         meta["gtt_fallback_parent"] = watch.gtt_intent_id
@@ -2736,7 +2804,7 @@ class OrderRouter:
             instrument=watch.instrument,
             side=watch.side,
             qty=int(watch.qty or 1),
-            price=float(watch.limit_price),
+            price=limit,
             order_type="LIMIT",
             strategy=watch.strategy_id,
             structure_id=watch.structure_id,
@@ -2750,7 +2818,7 @@ class OrderRouter:
             trigger_price=None,
         )
         sym = watch.trading_symbol
-        result = self.process_intent(fallback, {sym: float(watch.limit_price)})
+        result = self.process_intent(fallback, {sym: limit})
         if not isinstance(result, dict) or not result.get("ok"):
             return None
         return fallback.intent_id
