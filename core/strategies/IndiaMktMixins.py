@@ -757,6 +757,41 @@ class IndiaMktMixins:
         except (TypeError, ValueError):
             return None
 
+    def _selected_expiry_calendar_date(self, ctx) -> Optional[date]:
+        sel = getattr(ctx, "selected_expiry", None)
+        if sel is None:
+            return None
+        if ExpiryResolver.is_calendar_expiry(sel):
+            return ExpiryResolver.as_calendar_date(sel)
+        try:
+            trade_d = pd.Timestamp(getattr(ctx, "timestamp")).date()
+            return ExpiryResolver.dhan_expiry_index_to_date(trade_d, sel)
+        except (TypeError, ValueError):
+            return None
+
+    def _can_reuse_cached_option_chain(self, ctx, expiry_pref=None) -> bool:
+        """Reuse DHAN chain cache only when expiry matches (never across expiry_pref overrides)."""
+        if expiry_pref is not None:
+            return False
+        cached = getattr(self, "_last_option_chain", None)
+        if cached is None:
+            return False
+        if isinstance(cached, dict):
+            inner = cached.get("chain")
+            if isinstance(inner, pd.DataFrame):
+                if inner.empty:
+                    return False
+            elif not cached:
+                return False
+        elif isinstance(cached, pd.DataFrame):
+            if cached.empty:
+                return False
+        else:
+            return False
+        cached_exp = self._expiry_from_option_chain(cached)
+        want_exp = self._selected_expiry_calendar_date(ctx)
+        return cached_exp is not None and want_exp is not None and cached_exp == want_exp
+
     @staticmethod
     def _coerce_backtest_option_chain_df(
         chain: Any, option_type: str
@@ -1082,14 +1117,11 @@ class IndiaMktMixins:
             if isinstance(extra_snapshot_params, dict) and extra_snapshot_params:
                 params.update(extra_snapshot_params)
 
-        reuse_cached_chain = False
-        if expiry_pref is None and not snapshot_mode and str(self.api or "").upper() == "DHAN":
-            cached = getattr(self, "_last_option_chain", None)
-            if isinstance(cached, dict):
-                inner = cached.get("chain")
-                reuse_cached_chain = isinstance(inner, pd.DataFrame) and not inner.empty
-            elif isinstance(cached, pd.DataFrame):
-                reuse_cached_chain = not cached.empty
+        reuse_cached_chain = (
+            not snapshot_mode
+            and str(self.api or "").upper() == "DHAN"
+            and self._can_reuse_cached_option_chain(ctx, expiry_pref)
+        )
 
         if reuse_cached_chain:
             chain = getattr(self, "_last_option_chain", None)

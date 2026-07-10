@@ -1050,6 +1050,9 @@ class LiveEngineHelpersMixin:
         if not self.tick_queue:
             return
         has_aggregator = self.candle_aggregator is not None
+        gtt_syms = self._gtt_watch_symbols()
+        if not has_aggregator and not gtt_syms:
+            return
         if not hasattr(self, "_tick_debug_count"):
             self._tick_debug_count = 0
             self._tick_debug_last_log = time.time()
@@ -1070,7 +1073,9 @@ class LiveEngineHelpersMixin:
                     if has_aggregator:
                         self.candle_aggregator.on_tick(s, p, v, ts)
                     self._last_tick_timestamp[s] = time.time()
-                    self._publish_quote_updated_from_tick(s, p, ts)
+                    sym_u = str(s).strip().upper()
+                    if has_aggregator or (gtt_syms and sym_u in gtt_syms):
+                        self._publish_quote_updated_from_tick(s, p, ts)
                     self._tick_debug_count += 1
                     now = time.time()
                     if now - self._tick_debug_last_log >= 1800:

@@ -1885,40 +1885,24 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
 
     def _run_gtt_fallback_tick(self) -> None:
         """
-        GTT maintenance (fill sync + active_until).
+        GTT maintenance (fill sync + active_until) every cycle.
 
         Quote triggers are push-driven: feed ticks → QuoteUpdated → on_quote.
-        If no feed quote for watched symbols recently, fall back to QuoteProvider
-        (feed cache + REST) via book.tick().
+        When the feed has been quiet for watched symbols, run ``book.tick()``
+        (QuoteProvider REST/cache fallback). Same behavior with or without event_bus.
         """
         book = getattr(self.order_router, "gtt_fallback_book", None)
         if book is None or not book.has_active_watches():
             return
         now_ist = self._current_ist_now()
-        bus = getattr(self, "event_bus", None)
-        if bus is not None:
-            from core.events.types import EventType, make_event
-
-            # Handler runs maintenance_tick only (no quote scan).
-            bus.publish(
-                make_event(
-                    EventType.QUOTE_UPDATED,
-                    {"source": "gtt_maintenance"},
-                    engine_id=self.engine_id,
-                )
-            )
-            last_feed = float(getattr(self, "_last_gtt_feed_quote_ts", 0.0) or 0.0)
-            # Single QuoteProvider pass when feed is quiet (do not also tick in handler).
-            if (time.time() - last_feed) >= 3.0:
-                book.tick(now_ist)
-            return
         maintenance = getattr(book, "maintenance_tick", None)
         if callable(maintenance):
             maintenance(now_ist)
-            last_feed = float(getattr(self, "_last_gtt_feed_quote_ts", 0.0) or 0.0)
-            if (time.time() - last_feed) >= 3.0:
-                book.tick(now_ist)
         else:
+            book.tick(now_ist)
+            return
+        last_feed = float(getattr(self, "_last_gtt_feed_quote_ts", 0.0) or 0.0)
+        if (time.time() - last_feed) >= 3.0:
             book.tick(now_ist)
 
 
@@ -1983,7 +1967,11 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
 
             return "QuoteUpdated" in collect_enabled_events(strategies or [])
         except Exception:
-            return False
+            logger.exception(
+                "needs_tick_queue: subscription resolution failed; "
+                "enabling tick queue for GTT safety"
+            )
+            return True
 
     @staticmethod
     def _collect_feed_symbols(
@@ -2184,9 +2172,11 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 sym, close, slot_time, exchange, now_ist
             )
             bus = getattr(self, "event_bus", None)
-            if bus is not None:
-                from core.events.types import EventType, make_event
+            from core.events.types import EventType, make_event
 
+            if bus is not None and self._event_bus_has_subscribers(
+                bus, EventType.SCHEDULED_SLOT
+            ):
                 bus.publish(
                     make_event(
                         EventType.SCHEDULED_SLOT,
@@ -2431,6 +2421,13 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             order_id=trade.get("order_id"),
         )
 
+    @staticmethod
+    def _event_bus_has_subscribers(bus: Any, event_type: Any) -> bool:
+        if bus is None:
+            return False
+        subs = getattr(bus, "_subs", {}).get(event_type, None)
+        return bool(subs)
+
     def _check_feed_stall_fail_safe(self) -> None:
         feed_syms = self._feed_health_symbols()
         if not self.realtime_feed or not feed_syms:
@@ -2531,7 +2528,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         engine_id=self.engine_id,
                     )
                 )
-            self._feed_disconnect_event_sent = True
+                self._feed_disconnect_event_sent = True
 
     def start(self, exchange, sector, rsi):
         self._live_exchange = str(exchange or "INDEX")
@@ -2969,9 +2966,11 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
 
                     self._enrich_candle_depth(symbol, candle)
                     bus = getattr(self, "event_bus", None)
-                    if bus is not None:
-                        from core.events.types import EventType, make_event
+                    from core.events.types import EventType, make_event
 
+                    if bus is not None and self._event_bus_has_subscribers(
+                        bus, EventType.BAR_CLOSED
+                    ):
                         bus.publish(
                             make_event(
                                 EventType.BAR_CLOSED,
@@ -3438,9 +3437,13 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
     ):
         strategy = strategy or self.strategy
         bus = getattr(self, "event_bus", None)
-        if bus is not None and intent is not None:
-            from core.events.types import EventType, make_event
+        from core.events.types import EventType, make_event
 
+        if (
+            bus is not None
+            and intent is not None
+            and self._event_bus_has_subscribers(bus, EventType.INTENT_CREATED)
+        ):
             bus.publish(
                 make_event(
                     EventType.INTENT_CREATED,
