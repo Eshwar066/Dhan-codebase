@@ -47,6 +47,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# Dhan long-term historical API native intervals (see Tradehull.get_long_term_historical_data).
+_DHAN_NATIVE_INTRADAY = frozenset({"1", "5", "15", "25", "60"})
+
 
 class DhanSource:
     """
@@ -150,8 +153,154 @@ class DhanSource:
         df["time"] = df["timestamp"].dt.time
         return df
 
+    @staticmethod
+    def _dhan_fetch_plan(timeframe: str) -> tuple[str, int | None]:
+        """
+        Map requested bar size to a Dhan-native fetch interval.
+
+        Returns ``(fetch_timeframe, resample_minutes)``. When ``resample_minutes``
+        is None, fetch_timeframe is already the requested size (or DAY).
+        """
+        raw = str(timeframe or "").strip()
+        if raw.upper() == "DAY":
+            return "DAY", None
+        if raw in _DHAN_NATIVE_INTRADAY:
+            return raw, None
+        try:
+            minutes = int(raw)
+        except (TypeError, ValueError):
+            return raw, None
+        if minutes <= 0:
+            return raw, None
+        for native in (60, 25, 15, 5, 1):
+            if minutes % native == 0:
+                if minutes == native:
+                    return str(native), None
+                return str(native), minutes
+        return "1", minutes
+
+    def _resample_ohlc_minutes(
+        self, df: pd.DataFrame, target_minutes: int
+    ) -> pd.DataFrame | None:
+        """Resample OHLC to ``target_minutes`` bars with NSE session origin 09:15 IST."""
+        if df is None or df.empty or target_minutes <= 0:
+            return None
+        work = df.copy()
+        work["timestamp"] = pd.to_datetime(work["timestamp"], utc=True, errors="coerce")
+        work = work.dropna(subset=["timestamp"])
+        if work.empty:
+            return None
+        ist = work["timestamp"].dt.tz_convert("Asia/Kolkata")
+        work = work.set_index(ist)
+        work.index.name = "timestamp"
+        market_start = pd.Timestamp("09:15:00").time()
+        market_end = pd.Timestamp("15:30:00").time()
+        rule = f"{int(target_minutes)}min"
+        chunks: list[pd.DataFrame] = []
+        for day, group in work.groupby(work.index.date):
+            origin = pd.Timestamp(f"{day} 09:15:00", tz="Asia/Kolkata")
+            daily = group.between_time(market_start, market_end)
+            if daily.empty:
+                continue
+            # Drop original timestamp column if present so resample uses the index.
+            cols = [c for c in ("open", "high", "low", "close", "volume") if c in daily.columns]
+            daily = daily[cols]
+            agg = {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+            }
+            if "volume" in daily.columns:
+                agg["volume"] = "sum"
+            resampled = (
+                daily.resample(rule, origin=origin, label="left", closed="left")
+                .agg(agg)
+                .dropna(subset=["open", "high", "low", "close"], how="any")
+            )
+            if not resampled.empty:
+                chunks.append(resampled)
+        if not chunks:
+            return None
+        out = pd.concat(chunks)
+        out = out.reset_index()
+        if "timestamp" not in out.columns:
+            out = out.rename(columns={out.columns[0]: "timestamp"})
+        out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True)
+        out = (
+            out.sort_values("timestamp")
+            .drop_duplicates(subset=["timestamp"])
+            .reset_index(drop=True)
+        )
+        out["time"] = out["timestamp"].dt.time
+        return out
+
     def get_intraday(self, symbol, start_date, end_date, timeframe, exchange, sector):
         """Long-term historical intraday. Cache key = symbol+timeframe+exchange (no dates). Returns requested range; fetches only missing dates and stitches into same cache file."""
+        fetch_tf, resample_minutes = self._dhan_fetch_plan(str(timeframe))
+        if resample_minutes is not None:
+            # Dhan has no native 120 (etc.): build from a native interval and cache as requested TF.
+            cache_name = cache_key_intraday(symbol, str(timeframe), exchange or "")
+            start_d = self._to_date(start_date)
+            end_d = self._to_date(end_date)
+            if start_d is None or end_d is None:
+                return None
+
+            cached = load_df(cache_name)
+            stitched = cached.copy() if cached is not None and not cached.empty else None
+            if (
+                stitched is not None
+                and not stitched.empty
+                and "timestamp" in stitched.columns
+            ):
+                stitched["timestamp"] = pd.to_datetime(
+                    stitched["timestamp"], utc=True
+                )
+                stitched["time"] = stitched["timestamp"].dt.time
+                earliest = stitched["timestamp"].dt.date.min()
+                latest = stitched["timestamp"].dt.date.max()
+                if (
+                    pd.notna(earliest)
+                    and pd.notna(latest)
+                    and earliest <= start_d
+                    and latest >= end_d
+                ):
+                    out = stitched[
+                        (stitched["timestamp"].dt.date >= start_d)
+                        & (stitched["timestamp"].dt.date <= end_d)
+                    ].copy()
+                    return out.reset_index(drop=True)
+
+            base = self.get_intraday(
+                symbol, start_date, end_date, fetch_tf, exchange, sector
+            )
+            resampled = self._resample_ohlc_minutes(base, resample_minutes)
+            if resampled is None or resampled.empty:
+                logger.warning(
+                    "get_intraday resample failed symbol=%s tf=%s from=%s",
+                    symbol,
+                    timeframe,
+                    fetch_tf,
+                )
+                return None
+            if stitched is not None and not stitched.empty:
+                stitched = pd.concat([stitched, resampled], ignore_index=True)
+            else:
+                stitched = resampled
+            stitched["timestamp"] = pd.to_datetime(stitched["timestamp"], utc=True)
+            stitched = (
+                stitched.sort_values("timestamp")
+                .drop_duplicates(subset=["timestamp"])
+                .reset_index(drop=True)
+            )
+            stitched["time"] = stitched["timestamp"].dt.time
+            save_df(cache_name, stitched)
+            out = stitched[
+                (stitched["timestamp"].dt.date >= start_d)
+                & (stitched["timestamp"].dt.date <= end_d)
+            ].copy()
+            return out.reset_index(drop=True)
+
         cache_name = cache_key_intraday(symbol, str(timeframe), exchange or "")
         start_d = self._to_date(start_date)
         end_d = self._to_date(end_date)
@@ -203,7 +352,7 @@ class DhanSource:
             before = self.tsl.get_long_term_historical_data(
                 tradingsymbol=symbol,
                 exchange=exchange,
-                timeframe=timeframe,
+                timeframe=fetch_tf,
                 from_date=start_d,
                 to_date=fetch_end,
                 sector=sector or "NO",
@@ -238,7 +387,7 @@ class DhanSource:
             after = self.tsl.get_long_term_historical_data(
                 tradingsymbol=symbol,
                 exchange=exchange,
-                timeframe=timeframe,
+                timeframe=fetch_tf,
                 from_date=fetch_start,
                 to_date=end_d,
                 sector=sector or "NO",
@@ -673,11 +822,18 @@ class DhanSource:
         if not labels:
             labels = ["ATM"]
 
-        interval_arg = (
-            int(interval)
-            if isinstance(interval, str) and interval.isdigit()
-            else interval
-        )
+        # Dhan expired-option API only accepts native intervals (1/5/15/25/60).
+        fetch_tf, _ = self._dhan_fetch_plan(str(interval))
+        if str(fetch_tf).upper() == "DAY":
+            interval_arg: int | str = "DAY"
+        elif str(fetch_tf).isdigit():
+            interval_arg = int(fetch_tf)
+        else:
+            interval_arg = (
+                int(interval)
+                if isinstance(interval, str) and interval.isdigit()
+                else interval
+            )
         frames = []
         try:
             for strike_arg in labels:

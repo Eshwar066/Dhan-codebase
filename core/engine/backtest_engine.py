@@ -488,10 +488,14 @@ class BacktestEngine(BaseEngine):
             )
 
             ind_keys = self._persisted_indicator_keys(self.strategy)
-            store_cols = ["timestamp", "indicator_source"] + [
-                k for k in ind_keys if k in df.columns
-            ]
-            stored_ind = df[store_cols].copy() if ind_keys else None
+            store_cols = ["timestamp"] + [k for k in ind_keys if k in df.columns]
+            if "indicator_source" in df.columns:
+                store_cols.insert(1, "indicator_source")
+            stored_ind = (
+                df[store_cols].copy()
+                if ind_keys and len(store_cols) > 1
+                else None
+            )
             prep_cols = [
                 c
                 for c in df.columns
@@ -553,6 +557,7 @@ class BacktestEngine(BaseEngine):
                 ctx, entry_intent = self.build_context(
                     candle, recent_candles=list(candle_buffer)
                 )
+                self._last_ctx = ctx
                 self.evaluate_sim_broker_stops(candle, ctx)
                 # 🔥 ALWAYS run exits + rollover
                 self._run_risk_and_rollover(symbol, candle, ctx)
@@ -580,8 +585,9 @@ class BacktestEngine(BaseEngine):
             ):
                 exit_intents = self.strategy.on_position_exit(pos, candle, ctx) or []
                 for intent in exit_intents:
-                    # dot notation since intent is now an object
-                    price_map = {intent.instrument.trading_symbol: intent.price}
+                    price_map = self._backtest_price_map(intent, candle, ctx)
+                    if price_map is None:
+                        continue
                     self.order_router.process_intent(intent, price_map)
 
         # ---------- HEDGE ROLLOVER ----------
@@ -595,8 +601,47 @@ class BacktestEngine(BaseEngine):
         )
 
         for intent in rollover_intents:
-            price_map = {intent.instrument.trading_symbol: intent.price}
+            price_map = self._backtest_price_map(intent, candle, ctx)
+            if price_map is None:
+                continue
             self.order_router.process_intent(intent, price_map)
+
+    def _backtest_price_map(self, intent, candle, ctx):
+        """Resolve a positive fill price for backtest process_intent."""
+        inst = getattr(intent, "instrument", None)
+        if inst is None:
+            return None
+        sym = getattr(inst, "trading_symbol", None)
+        if not sym:
+            return None
+        px = getattr(intent, "price", None)
+        try:
+            if px is not None and float(px) > 0:
+                return {sym: float(px)}
+        except (TypeError, ValueError):
+            pass
+        try:
+            px = self.strategy.get_option_price_at_candle(
+                candle,
+                ctx,
+                getattr(inst, "strike", None),
+                getattr(inst, "option_type", None),
+                getattr(inst, "expiry", None),
+                trading_symbol=sym,
+            )
+        except Exception:
+            px = None
+        try:
+            if px is not None and float(px) > 0:
+                return {sym: float(px)}
+        except (TypeError, ValueError):
+            pass
+        logger.warning(
+            "Backtest skip intent: no price for %s action=%s",
+            sym,
+            getattr(intent, "action", None),
+        )
+        return None
 
     # ==========================================================
     # ENTRY (SIGNAL DRIVEN)
@@ -610,10 +655,26 @@ class BacktestEngine(BaseEngine):
             entry_intent = [entry_intent]
 
         for intent in entry_intent:
-            # dot notation since intent is an object
-            price_map = {intent.instrument.trading_symbol: intent.price}
+            # Rebuild ctx from last candle for price fallback when needed.
+            ctx = getattr(self, "_last_ctx", None)
+            if ctx is None:
+                price_map = {intent.instrument.trading_symbol: intent.price}
+            else:
+                price_map = self._backtest_price_map(intent, candle, ctx)
+                if price_map is None:
+                    price_map = {intent.instrument.trading_symbol: intent.price}
+            try:
+                if price_map is None or not any(
+                    v is not None and float(v) > 0 for v in price_map.values()
+                ):
+                    logger.warning(
+                        "Backtest skip entry: no price for %s",
+                        getattr(getattr(intent, "instrument", None), "trading_symbol", None),
+                    )
+                    continue
+            except (TypeError, ValueError):
+                continue
             self.order_router.process_intent(intent, price_map)
-
     # ==========================================================
     # RISK METRICS
     # ==========================================================

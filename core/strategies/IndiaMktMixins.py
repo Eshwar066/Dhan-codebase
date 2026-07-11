@@ -77,6 +77,18 @@ class IndiaMktMixins:
         """Dhan option chain / rolling-option expiry flag (``MONTH`` or ``WEEK``)."""
         return str(getattr(self, "dhan_expiry_flag", "MONTH") or "MONTH")
 
+    def _option_data_interval(self) -> str:
+        """
+        Interval for Dhan option OHLC / expired-chain APIs.
+
+        Must be a Dhan-native bar size (1/5/15/25/60). Strategies on non-native
+        underlyings TFs (e.g. 120) should set ``option_chain_interval``.
+        """
+        raw = getattr(self, "option_chain_interval", None)
+        if raw is not None and str(raw).strip():
+            return str(raw).strip()
+        return str(self.timeframe)
+
     @staticmethod
     def _order_qty_in_lots(inst, qty: Any) -> int:
         """Normalize qty to whole lots: values ≥ lot_size that divide evenly are treated as units."""
@@ -314,7 +326,7 @@ class IndiaMktMixins:
 
         params = {
             "exchange": ctx.exchange,
-            "interval": self.timeframe,
+            "interval": self._option_data_interval(),
             "expiry_code": expiry,
             "strike": [str(int(float(strike)))],
             "option_type": option_type,
@@ -342,7 +354,22 @@ class IndiaMktMixins:
             if not filt.empty:
                 df = filt
             elif len(df) > 1:
-                return None
+                # Non-native strategy TF (e.g. 120) vs option bars (e.g. 60): use
+                # the latest option bar at or before the candle wall-clock.
+                ts_c = pd.Timestamp(candle["timestamp"])
+                if ts_c.tzinfo is None:
+                    ts_c = ts_c.tz_localize(IST)
+                else:
+                    ts_c = ts_c.tz_convert(IST)
+                chain_ts = pd.to_datetime(df["datetime"])
+                if getattr(chain_ts.dt, "tz", None) is not None:
+                    chain_ts = chain_ts.dt.tz_convert(IST)
+                else:
+                    chain_ts = chain_ts.dt.tz_localize(IST)
+                before = df.loc[chain_ts <= ts_c]
+                if before.empty:
+                    return None
+                df = before.iloc[[-1]]
 
         otp = option_type.upper()
         if otp in ("PUT", "PE"):
@@ -1005,7 +1032,7 @@ class IndiaMktMixins:
             return None
         params = {
             "exchange": ctx.exchange,
-            "interval": self.timeframe,
+            "interval": self._option_data_interval(),
             "expiry_code": ctx.selected_expiry,
             "instrument": "OPTIDX",
             "expiry_flag": self._dhan_expiry_flag(),
@@ -1091,11 +1118,16 @@ class IndiaMktMixins:
         if strike_param and isinstance(strike_param[0], (int, float)):
             strike_param = [str(int(s)) for s in otm_strikes]
 
-        if snapshot_mode and str(self.api or "").upper() == "DHAN":
+        if (
+            snapshot_mode
+            and str(self.api or "").upper() == "DHAN"
+            and RUN_MODE != RunMode.BACKTEST
+        ):
             # Log ±60 strikes around ATM from Dhan (not the 4-strike OTM ladder).
+            # Backtest historical chain requires strike/securityId — use strike path below.
             params = {
                 "exchange": ctx.exchange,
-                "interval": self.timeframe,
+                "interval": self._option_data_interval(),
                 "expiry_code": ctx.selected_expiry,
                 "instrument": "OPTIDX",
                 "expiry_flag": self._dhan_expiry_flag(),
@@ -1105,7 +1137,7 @@ class IndiaMktMixins:
         else:
             params = {
                 "exchange": ctx.exchange,
-                "interval": self.timeframe,
+                "interval": self._option_data_interval(),
                 "expiry_code": ctx.selected_expiry,
                 "strike": strike_param,
                 "option_type": option_type,

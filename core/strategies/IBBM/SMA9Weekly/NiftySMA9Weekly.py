@@ -47,6 +47,8 @@ class NiftySMA9Weekly(IndiaMktMixins, BaseStrategy):
     otm_strike_step = 50
     otm_strike_count = 8
     option_chain_ideal_premium = 90
+    # Dhan option OHLC APIs have no 120m; price exits/hedges on 60m bars.
+    option_chain_interval = "60"
     sma_period = 9
     premium_min = 80
     premium_max = 100
@@ -175,7 +177,7 @@ class NiftySMA9Weekly(IndiaMktMixins, BaseStrategy):
             }
         params = {
             "exchange": ctx.exchange,
-            "interval": self.timeframe,
+            "interval": self._option_data_interval(),
             "expiry_code": hedge_expiry,
             "instrument": "OPTIDX",
             "expiry_flag": "WEEK",
@@ -485,7 +487,8 @@ class NiftySMA9Weekly(IndiaMktMixins, BaseStrategy):
         return [hedge_intent, sell_intent] if hedge_intent else [sell_intent]
 
     def should_evaluate(self, candle):
-        if not self._in_2h_close_eval_window(candle):
+        # Live: only eval shortly after 2h bar close. Backtest: every closed bar.
+        if RUN_MODE != RunMode.BACKTEST and not self._in_2h_close_eval_window(candle):
             return False
 
         trade_date = self._trade_date(candle)
