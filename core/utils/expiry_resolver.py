@@ -205,6 +205,12 @@ class ExpiryResolver:
         return td + dt.timedelta(days=days_ahead)
 
     @staticmethod
+    def next_weekly_expiry(trade_date, weekday: int = 2) -> dt.date:
+        """Next weekly expiry strictly after the current weekly expiry for ``trade_date``."""
+        current = ExpiryResolver.current_weekly_expiry(trade_date, weekday=weekday)
+        return current + dt.timedelta(days=7)
+
+    @staticmethod
     def next_month_expiry(trade_date, weekday: int = 3):
         td = pd.Timestamp(trade_date).date()
         if td.month == 12:

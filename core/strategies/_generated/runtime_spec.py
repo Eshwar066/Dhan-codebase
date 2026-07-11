@@ -195,6 +195,41 @@ STRATEGY_RUNTIME_SPEC: dict = {
             },
         },
     },
+    'NiftySMA9Weekly': {
+        RunMode.BACKTEST: {
+            'data': {
+                'option_chain': {
+                    'exchange': 'NSE',
+                    'interval': '120',
+                    'segment': 'OPT',
+                    'api': 'DHAN',
+                    'expiry_flag': 'WEEK',
+                },
+            },
+        },
+        RunMode.PAPER: {
+            'data': {
+                'option_chain': {
+                    'exchange': 'NSE',
+                    'interval': '120',
+                    'segment': 'OPT',
+                    'api': 'DHAN',
+                    'expiry_flag': 'WEEK',
+                },
+            },
+        },
+        RunMode.LIVE: {
+            'data': {
+                'option_chain': {
+                    'exchange': 'NSE',
+                    'interval': '1',
+                    'segment': 'OPT',
+                    'api': 'DHAN',
+                    'expiry_flag': 'WEEK',
+                },
+            },
+        },
+    },
     'OIPositionalBuy': {
         RunMode.BACKTEST: {
             'data': {

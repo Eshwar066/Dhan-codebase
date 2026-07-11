@@ -9,8 +9,8 @@ Emergency (manual only; NOT loaded by live engine):
   core/strategies/Leaps/emergency/force_leaps_cycle.py
   core/strategies/Leaps/emergency/retry_leaps_main.py
   Run with engine stopped:
-    .venv/bin/python -m core.strategies.Leaps.emergency.force_leaps_cycle
-    .venv/bin/python -m core.strategies.Leaps.emergency.retry_leaps_main
+    .venv/bin/python -m core.strategies.IBBM.Leaps.emergency.force_leaps_cycle
+    .venv/bin/python -m core.strategies.IBBM.Leaps.emergency.retry_leaps_main
 
 ==========================================================================================
 STRATEGY OVERVIEW

@@ -163,6 +163,23 @@ STRATEGY_PROFILES: dict = {
             'sector': 'YES',
         },
     },
+    'NiftySMA9Weekly': {
+        'symbols': [
+            'NIFTY',
+        ],
+        'exchange': 'NSE',
+        'live': {
+            'exchange': 'INDEX',
+            'sector': 'YES',
+        },
+        'backtest': {
+            'start_date': '2026-01-01',
+            'end_date': '2026-05-24',
+            'timeframe': '120',
+            'exchange': 'INDEX',
+            'sector': 'YES',
+        },
+    },
     'OIPositionalBuy': {
         'symbols': [
             'NIFTY',

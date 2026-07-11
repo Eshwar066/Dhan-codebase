@@ -7,8 +7,8 @@ enabled — places one hedge-gated bundle per structure_id (mini + :QTR).
 Manual emergency tool only — not imported by live engine / strategy registry.
 
 Usage (stop dhan-leaps-rsi.service first):
-  python -m core.strategies.Leaps.emergency.force_leaps_cycle
-  python -m core.strategies.Leaps.emergency.force_leaps_cycle --entry-only
+  python -m core.strategies.IBBM.Leaps.emergency.force_leaps_cycle
+  python -m core.strategies.IBBM.Leaps.emergency.force_leaps_cycle --entry-only
 
   --entry-only   Skip close cycle; place entry bundles for all enabled legs.
                  Useful after hours: LIMIT orders rest until market open.

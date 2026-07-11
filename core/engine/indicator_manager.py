@@ -303,6 +303,45 @@ class IndicatorManager:
         return df
 
     @staticmethod
+    def _compute_sma_columns(
+        df: Any,
+        period: Optional[int] = None,
+        *,
+        periods: Optional[List[int]] = None,
+        source_col: str = "close",
+        column: Optional[str] = None,
+    ) -> Any:
+        """Compute SMA column(s); length(s) come from the strategy (``sma_period`` / ``sma_periods``)."""
+        from core.utils.structure.sma import add_sma
+
+        return add_sma(
+            df,
+            period=period,
+            periods=periods,
+            source_col=source_col,
+            column=column,
+        )
+
+    @staticmethod
+    def _strategy_sma_lengths(strategy: Any) -> tuple:
+        """Return ``(period, periods)`` from strategy attrs; either may be None."""
+        periods = getattr(strategy, "sma_periods", None)
+        period = getattr(strategy, "sma_period", None)
+        if periods is not None:
+            try:
+                periods = [int(p) for p in list(periods) if p is not None]
+            except Exception:
+                periods = None
+            if not periods:
+                periods = None
+        if period is not None:
+            try:
+                period = int(period)
+            except Exception:
+                period = None
+        return period, periods
+
+    @staticmethod
     def _timeframe_to_seconds(tf: str) -> int:
         raw = str(tf or "").strip().lower()
         if not raw:
@@ -1327,6 +1366,16 @@ class IndicatorManager:
                     work_df = strategy.prepare_indicators(work_df)
                 except Exception:
                     pass
+                sma_period, sma_periods = self._strategy_sma_lengths(strategy)
+                if sma_period is not None or sma_periods is not None:
+                    try:
+                        work_df = self._compute_sma_columns(
+                            work_df,
+                            period=sma_period,
+                            periods=sma_periods,
+                        )
+                    except Exception:
+                        pass
                 df = work_df
                 compute_ms = (time.time() - compute_start) * 1000.0
                 if self.engine_logger:

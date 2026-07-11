@@ -1,6 +1,6 @@
 id: LEAPS_RSI
 implementation:
-  module: core.strategies.Leaps.LeapsQuatery_RSI_52_32
+  module: core.strategies.IBBM.Leaps.LeapsQuatery_RSI_52_32
   class: LeapsQuarterly
 instrument: OPTION
 allowed_modes:

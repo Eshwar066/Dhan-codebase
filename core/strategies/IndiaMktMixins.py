@@ -1587,7 +1587,7 @@ class IndiaMktMixins:
             hedge_expiry,
             parent_sell_intent.instrument.option_type,
             hedge_strike,
-            prefer_monthly=True,
+            prefer_monthly=bool(getattr(self, "hedge_prefer_monthly", True)),
         )
         if inst is None:
             return None

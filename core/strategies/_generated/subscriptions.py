@@ -294,6 +294,44 @@ GENERATED_STRATEGY_SUBSCRIPTIONS: dict = {
             ],
         },
     },
+    'NiftySMA9Weekly': {
+        'BarClosed': {
+            'enabled': True,
+            'timeframes': [
+                '120',
+            ],
+            'symbols': [
+                'NIFTY',
+            ],
+        },
+        'FeedDisconnected': {
+            'enabled': True,
+        },
+        'FeedRecovered': {
+            'enabled': True,
+        },
+        'IntentCreated': {
+            'enabled': True,
+        },
+        'IntentFilled': {
+            'enabled': True,
+        },
+        'PositionClosed': {
+            'enabled': True,
+        },
+        'QuoteUpdated': {
+            'enabled': False,
+            'symbols': [
+                'NIFTY',
+            ],
+        },
+        'ScheduledSlot': {
+            'enabled': False,
+            'symbols': [
+                'NIFTY',
+            ],
+        },
+    },
     'OIPositionalBuy': {
         'BarClosed': {
             'enabled': True,

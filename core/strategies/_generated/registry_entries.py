@@ -7,7 +7,8 @@ from core.strategies.BTST.BankNiftyBTST.BankNiftyBTST import BankNiftyBTST
 from core.strategies.Equity.IPOBreakout.IPOBreakout import IPOBreakout
 from core.strategies.Futures.Futures_EMA.Futures_EMA import FuturesEMAHighLow
 from core.strategies.Futures.Futures_EMA_Momentum.Futures_EMA_Momentum import FuturesEMAMomentum
-from core.strategies.Leaps.LeapsQuatery_RSI_52_32 import LeapsQuarterly
+from core.strategies.IBBM.Leaps.LeapsQuatery_RSI_52_32 import LeapsQuarterly
+from core.strategies.IBBM.SMA9Weekly.NiftySMA9Weekly import NiftySMA9Weekly
 from core.strategies.MagicalLines.MagicalLines import MagicalLines
 from core.strategies.MagicalLines.NiftyIntradayMagicalLine import NiftyIntradayMagicalLine
 from core.strategies.OpenIntrest.OIPostionalBuy.OIPosBuy import OIPositionalBuy
@@ -83,6 +84,15 @@ GENERATED_STRATEGY_MAP = {
     },
     'NiftyIntradayMagicalLine': {
         "strategy": NiftyIntradayMagicalLine,
+        "instrument": 'OPTION',
+        "allowed_modes": [
+            RunMode.BACKTEST,
+            RunMode.PAPER,
+            RunMode.LIVE,
+        ],
+    },
+    'NiftySMA9Weekly': {
+        "strategy": NiftySMA9Weekly,
         "instrument": 'OPTION',
         "allowed_modes": [
             RunMode.BACKTEST,

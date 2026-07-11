@@ -71,6 +71,24 @@ ENGINE_JOBS = [
 
     },
     {
+        "engine_id": "dhan_sma9_weekly",
+        "venue": "DHAN",
+        "enabled": False,
+        "run_mode": "LIVE",
+        "capital": 200_000,
+        "ORDER_QTY_LOTS": 1,
+        "market_ws_stall_timeout_seconds": 0,
+        "strategy_timeout_seconds": 60,
+        "strategies": ["NiftySMA9Weekly"],
+        "telegram": {
+            "bot_token": os.getenv(
+                "TELEGRAM_LEAPS_BOT_TOKEN",
+                "8663481671:AAHY-OnE8OiaJmkOfXbwqoe4InosJVblAtM",
+            ),
+            "chat_id": os.getenv("TELEGRAM_LEAPS_CHAT_ID", "1021479950"),
+        },
+    },
+    {
         "engine_id": "dhan_oi_positional_buy",
         "venue": "DHAN",
         "enabled": True,

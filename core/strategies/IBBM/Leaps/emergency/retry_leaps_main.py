@@ -3,7 +3,7 @@
 Manual emergency tool only — not imported by live engine / strategy registry.
 
 Usage (stop dhan-leaps-rsi.service first):
-  .venv/bin/python -m core.strategies.Leaps.emergency.retry_leaps_main
+  .venv/bin/python -m core.strategies.IBBM.Leaps.emergency.retry_leaps_main
 """
 from __future__ import annotations
 

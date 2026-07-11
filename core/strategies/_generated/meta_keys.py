@@ -5,6 +5,7 @@ GENERATED_LEGACY_META_KEYS: dict = {
     'BankNiftyBTST': 'banknifty_btst',
     'LiquiditySweepStrategy': 'liquidity_sweep',
     'NiftyIntradayMagicalLine': 'nifty_intraday_magical_line',
+    'NiftySMA9Weekly': 'nifty_sma9_weekly',
     'OIPositionalBuy': 'oi_positional_buy',
     'OneDayMagicalLine': 'one_day_magical_line',
     'RSIBreadAndButter': 'rsi_bread_butter',

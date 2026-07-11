@@ -123,27 +123,56 @@ def nse_60m_bar_close_eval_window(
     Used by LEAPS (60m RSI) so indicator history, candle logs, and strategy eval
     run once per closed bar — not on forming or stale replay bars.
     """
+    return nse_bar_close_eval_window(
+        candle,
+        bar_minutes=60,
+        grace_minutes=grace_minutes,
+        now_unix=now_unix,
+        require_nse_60m_open=True,
+    )
+
+
+def nse_bar_close_eval_window(
+    candle: Any,
+    *,
+    bar_minutes: int = 60,
+    grace_minutes: int = 8,
+    now_unix: Optional[float] = None,
+    require_nse_60m_open: bool = False,
+) -> bool:
+    """
+    True only within a short window after a bar of ``bar_minutes`` closes.
+
+    ``require_nse_60m_open=True`` additionally requires the open to be an NSE
+    cash-session :15 hourly slot (LEAPS 60m path).
+    """
     session_partial = False
     if isinstance(candle, dict):
         bucket = candle.get("bucket_ts")
         session_partial = bool(candle.get("session_close_partial"))
     else:
         bucket = candle
-    if bucket is None or not bucket_ts_is_nse_60m_bar(bucket):
+    if bucket is None:
         return False
     try:
         bar_open_unix = int(float(bucket))
     except (TypeError, ValueError):
         return False
+    if require_nse_60m_open and not bucket_ts_is_nse_60m_bar(bucket):
+        return False
+    try:
+        minutes = max(1, int(bar_minutes))
+    except (TypeError, ValueError):
+        minutes = 60
     if session_partial:
         from core.utils.session.session_manager import SessionManager
 
         partial_close = SessionManager.session_end_unix_for_bar(bar_open_unix, "INDEX")
         bar_close_unix = (
-            partial_close if partial_close is not None else bar_open_unix + 3600
+            partial_close if partial_close is not None else bar_open_unix + minutes * 60
         )
     else:
-        bar_close_unix = bar_open_unix + 3600
+        bar_close_unix = bar_open_unix + minutes * 60
     now = int(now_unix if now_unix is not None else time.time())
     grace_sec = max(60, int(grace_minutes) * 60)
     return bar_close_unix <= now <= (bar_close_unix + grace_sec)
