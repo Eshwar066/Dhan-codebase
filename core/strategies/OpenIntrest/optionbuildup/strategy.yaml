@@ -1,6 +1,6 @@
 id: OptionBuildup
 implementation:
-  module: core.strategies.OpenIntrest.optionbuildup
+  module: core.strategies.OpenIntrest.optionbuildup.optionbuildup
   class: OptionBuildup
 instrument: OPTION
 allowed_modes:

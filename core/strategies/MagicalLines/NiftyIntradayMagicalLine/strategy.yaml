@@ -1,6 +1,6 @@
 id: NiftyIntradayMagicalLine
 implementation:
-  module: core.strategies.MagicalLines.NiftyIntradayMagicalLine
+  module: core.strategies.MagicalLines.NiftyIntradayMagicalLine.NiftyIntradayMagicalLine
   class: NiftyIntradayMagicalLine
 instrument: OPTION
 allowed_modes:
