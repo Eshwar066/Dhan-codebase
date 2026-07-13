@@ -1536,6 +1536,19 @@ class OrderRouter:
                     broker_error_message=fail_fields.get("broker_error_message"),
                     broker_error_type=fail_fields.get("broker_error_type"),
                 )
+            # Always terminalize before any raise so order-state checks do not
+            # treat this intent as forever-missing on the broker open book.
+            self.intent_store.update(
+                intent.intent_id,
+                IntentStatus.REJECTED,
+                order_state=OrderState.REJECTED,
+            )
+            self._set_order_state(
+                intent.intent_id,
+                OrderState.REJECTED,
+                action="broker_error",
+                message=f"place_order failed: {e}",
+            )
             if retryable and raise_on_retryable_failure:
                 raise RuntimeError(
                     f"retryable_broker_error: {fail_fields['fail_detail']}"
@@ -1549,15 +1562,6 @@ class OrderRouter:
                     self.engine_logger.broker_circuit_breaker_triggered(
                         "broker_failure"
                     )
-            self.intent_store.update(
-                intent.intent_id, "REJECTED", order_state=OrderState.REJECTED
-            )
-            self._set_order_state(
-                intent.intent_id,
-                OrderState.REJECTED,
-                action="broker_error",
-                message=f"place_order failed: {e}",
-            )
             return {"ok": False, "retryable": retryable, "reason": "broker_error"}
 
         if order_id is None:
@@ -1609,6 +1613,19 @@ class OrderRouter:
                     qty,
                     fail_fields["fail_detail"],
                 )
+            # Terminalize first: no_order_id must not linger as SENT/VALIDATED
+            # (that caused perpetual order_state_mismatch + reconcile spam).
+            self.intent_store.update(
+                intent.intent_id,
+                IntentStatus.REJECTED,
+                order_state=OrderState.REJECTED,
+            )
+            self._set_order_state(
+                intent.intent_id,
+                OrderState.REJECTED,
+                action="broker_no_order_id",
+                message=fail_fields["fail_detail"],
+            )
             if retryable and raise_on_retryable_failure:
                 raise RuntimeError(
                     f"retryable_broker_error: {fail_fields['reason']}"
@@ -1622,15 +1639,6 @@ class OrderRouter:
                     self.engine_logger.broker_circuit_breaker_triggered(
                         "broker_failure"
                     )
-            self.intent_store.update(
-                intent.intent_id, "REJECTED", order_state=OrderState.REJECTED
-            )
-            self._set_order_state(
-                intent.intent_id,
-                OrderState.REJECTED,
-                action="broker_no_order_id",
-                message=fail_fields["fail_detail"],
-            )
             return {
                 "ok": False,
                 "retryable": retryable,
@@ -2988,6 +2996,13 @@ class OrderRouter:
         local_pending = self.intent_store.list_by_status(
             IntentStatus.SENT
         ) + self.intent_store.list_by_status(IntentStatus.VALIDATED)
+        # Drop intents already terminal in local order-state cache (e.g. place
+        # failed / REJECTED but IntentStatus briefly lagged).
+        local_pending = [
+            i
+            for i in local_pending
+            if self._order_state.get(i.get("intent_id")) not in _TERMINAL_ORDER_STATES
+        ]
 
         # GTT fills may not appear on regular open-order book; poll Forever + fills API.
         self._sync_gtt_pending_fills(local_pending)
@@ -3162,25 +3177,56 @@ class OrderRouter:
             if action == "FORCE_EXIT":
                 sym = payload.get("symbol") or i.get("symbol")
                 tag = str(payload.get("tag") or i.get("tag") or "").upper()
-                if i.get("broker_order_id"):
-                    if hasattr(self.broker, "find_order_by_client_id"):
-                        try:
-                            order = self.broker.find_order_by_client_id(str(intent_id))
-                        except Exception:
-                            order = None
-                        if order:
-                            resolved_missing.add(str(intent_id))
-                            continue
-                    has_leg = getattr(self.broker, "has_bracket_leg_on_exchange", None)
-                    if sym and callable(has_leg) and has_leg(sym, tag):
-                        resolved_missing.add(str(intent_id))
-                        continue
+                # Never got a broker order id → place never succeeded. Do not leave
+                # these as perpetual "missing local" mismatches across strategies.
+                if not i.get("broker_order_id"):
                     created_at = float(i.get("created_at") or 0.0)
-                    if created_at > 0 and (
-                        now_ts - created_at
-                    ) < self._force_exit_pending_max_wait_sec:
+                    grace = min(
+                        60.0, float(getattr(self, "_force_exit_pending_max_wait_sec", 300) or 300)
+                    )
+                    if created_at <= 0 or (now_ts - created_at) >= grace:
+                        self._set_order_state(
+                            str(intent_id),
+                            OrderState.REJECTED,
+                            action="force_exit_no_broker_id",
+                            message="FORCE_EXIT never received broker_order_id; marking REJECTED",
+                        )
+                        try:
+                            self.intent_store.update(
+                                str(intent_id),
+                                IntentStatus.REJECTED,
+                                order_state=OrderState.REJECTED,
+                            )
+                        except Exception:
+                            pass
+                        if self.engine_logger:
+                            self.engine_logger.log(
+                                "oms",
+                                f"FORCE_EXIT {intent_id}: no broker_order_id after "
+                                f"{grace:.0f}s; marked REJECTED",
+                                strategy_id=self._intent_strategy_id(str(intent_id)),
+                                intent_id=str(intent_id),
+                            )
+                    resolved_missing.add(str(intent_id))
+                    continue
+                if hasattr(self.broker, "find_order_by_client_id"):
+                    try:
+                        order = self.broker.find_order_by_client_id(str(intent_id))
+                    except Exception:
+                        order = None
+                    if order:
                         resolved_missing.add(str(intent_id))
                         continue
+                has_leg = getattr(self.broker, "has_bracket_leg_on_exchange", None)
+                if sym and callable(has_leg) and has_leg(sym, tag):
+                    resolved_missing.add(str(intent_id))
+                    continue
+                created_at = float(i.get("created_at") or 0.0)
+                if created_at > 0 and (
+                    now_ts - created_at
+                ) < self._force_exit_pending_max_wait_sec:
+                    resolved_missing.add(str(intent_id))
+                    continue
             # GTT: still poll Forever/fills when missing from regular open book (not blind trust).
             if self._intent_is_gtt(i) and i.get("broker_order_id"):
                 if self._try_sync_gtt_intent_fill(i):

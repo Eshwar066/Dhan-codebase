@@ -153,7 +153,9 @@ class DhanBroker(BaseBroker):
             "quantity": total_qty,
             "price": price,
             "trigger_price": float(intent.get("trigger_price", 0) or 0),
-            "order_type": intent.get("order_type", "MARKET"),
+            "order_type": dhan_mappings.normalize_order_type(
+                intent.get("order_type", "MARKET")
+            ),
             "transaction_type": intent["side"],
             "trade_type": intent.get("trade_type", "MARGIN"),
             "disclosed_quantity": int(intent.get("disclosed_quantity", 0)),
@@ -587,8 +589,8 @@ class DhanBroker(BaseBroker):
                     "message": fail_msg,
                     "display_message": fail_msg,
                     "error_code": parsed.get("error_code"),
-                    "error_type": parsed.get("error_type"),
-                    "error_message": parsed.get("error_message"),
+                    "error_type": parsed.get("error_type") or type(e).__name__,
+                    "error_message": parsed.get("error_message") or str(e),
                     "payload": order_payload,
                     "response": (
                         e.args[0]
@@ -596,6 +598,7 @@ class DhanBroker(BaseBroker):
                         else None
                     ),
                     "attempt": attempt + 1,
+                    "retryable": not isinstance(e, (KeyError, TypeError, ValueError)),
                 }
                 logger.warning(
                     "Dhan place_forever_order exception intent_id=%s attempt=%s payload=%s error=%s",
@@ -704,8 +707,8 @@ class DhanBroker(BaseBroker):
                     "message": fail_msg,
                     "display_message": fail_msg,
                     "error_code": parsed.get("error_code"),
-                    "error_type": parsed.get("error_type"),
-                    "error_message": parsed.get("error_message"),
+                    "error_type": parsed.get("error_type") or type(e).__name__,
+                    "error_message": parsed.get("error_message") or str(e),
                     "payload": order_payload,
                     "response": (
                         e.args[0]
@@ -713,6 +716,7 @@ class DhanBroker(BaseBroker):
                         else None
                     ),
                     "attempt": attempt + 1,
+                    "retryable": not isinstance(e, (KeyError, TypeError, ValueError)),
                 }
                 logger.warning(
                     "Dhan place_order exception intent_id=%s attempt=%s payload=%s error=%s",

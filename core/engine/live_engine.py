@@ -170,6 +170,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self.order_state_check_interval_min = order_state_check_interval_min or 1
         self._last_order_state_check_time: float = 0
         self._entries_paused_order_mismatch = False
+        # Full position reconcile on mismatch is expensive and noisy on multi-strategy
+        # engines; cooldown avoids per-minute Seeded… spam while mismatch persists.
+        self._last_mismatch_full_reconcile_ts: float = 0.0
+        self._mismatch_reconcile_cooldown_sec: float = 300.0
         # Stale exit order refresh: re-quote at near bid/ask every 1 min until fill
         self._exit_refresh_interval_seconds = 60
         self._last_exit_refresh_time: float = 0
@@ -1064,7 +1068,12 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     )
             else:
                 self._entries_paused_order_mismatch = True
-                self.reconcile_positions_on_start()
+                if (
+                    now - self._last_mismatch_full_reconcile_ts
+                    >= self._mismatch_reconcile_cooldown_sec
+                ):
+                    self._last_mismatch_full_reconcile_ts = now
+                    self.reconcile_positions_on_start()
         else:
             self._entries_paused_order_mismatch = False
 
