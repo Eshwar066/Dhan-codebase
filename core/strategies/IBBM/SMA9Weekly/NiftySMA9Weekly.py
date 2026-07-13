@@ -109,17 +109,21 @@ class NiftySMA9Weekly(IndiaMktMixins, BaseStrategy):
 
     def prepare_indicators(self, df):
         period = int(getattr(self, "sma_period", 9) or 9)
-        df = add_sma(df, period=period, column="sma")
-        if "sma" in df.columns:
-            df["prev_sma"] = df["sma"].shift(1)
+        col = f"sma{period}"
+        prev_col = f"prev_sma{period}"
+        df = add_sma(df, period=period, column=col)
+        if col in df.columns:
+            df[prev_col] = df[col].shift(1)
         if "close" in df.columns:
             df["prev_close"] = df["close"].shift(1)
         return df
 
     def persisted_indicator_keys(self):
-        return default_persisted_keys_for_sma(
-            int(getattr(self, "sma_period", 9) or 9), column="sma"
-        ) + ["prev_sma", "prev_close"]
+        period = int(getattr(self, "sma_period", 9) or 9)
+        return default_persisted_keys_for_sma(period, column=f"sma{period}") + [
+            f"prev_sma{period}",
+            "prev_close",
+        ]
 
     def shared_indicator_signature(self) -> str:
         return f"sma9_weekly_{int(getattr(self, 'sma_period', 9) or 9)}"
@@ -497,10 +501,13 @@ class NiftySMA9Weekly(IndiaMktMixins, BaseStrategy):
         if self._is_weekly_expiry_day(trade_date):
             return False
 
+        period = int(getattr(self, "sma_period", 9) or 9)
+        sma_key = f"sma{period}"
+        prev_sma_key = f"prev_sma{period}"
         close = candle.get("close")
         prev_close = candle.get("prev_close")
-        sma = candle.get("sma")
-        prev_sma = candle.get("prev_sma")
+        sma = candle.get(sma_key)
+        prev_sma = candle.get(prev_sma_key)
         if any(pd.isna(x) for x in (close, prev_close, sma, prev_sma)):
             return False
 
@@ -516,10 +523,13 @@ class NiftySMA9Weekly(IndiaMktMixins, BaseStrategy):
         return True
 
     def eval_signal_log_message(self, candle) -> Optional[str]:
+        period = int(getattr(self, "sma_period", 9) or 9)
+        sma_key = f"sma{period}"
+        prev_sma_key = f"prev_sma{period}"
         return (
             "SMA9 cross"
-            f" close={candle.get('close')} sma={candle.get('sma')}"
-            f" prev_close={candle.get('prev_close')} prev_sma={candle.get('prev_sma')}"
+            f" close={candle.get('close')} {sma_key}={candle.get(sma_key)}"
+            f" prev_close={candle.get('prev_close')} {prev_sma_key}={candle.get(prev_sma_key)}"
             f" timeframe={getattr(self, 'timeframe', '')}"
         )
 
@@ -530,10 +540,13 @@ class NiftySMA9Weekly(IndiaMktMixins, BaseStrategy):
         ):
             return None
 
+        period = int(getattr(self, "sma_period", 9) or 9)
+        sma_key = f"sma{period}"
+        prev_sma_key = f"prev_sma{period}"
         close = candle.get("close")
         prev_close = candle.get("prev_close")
-        sma = candle.get("sma")
-        prev_sma = candle.get("prev_sma")
+        sma = candle.get(sma_key)
+        prev_sma = candle.get(prev_sma_key)
         if any(pd.isna(x) for x in (close, prev_close, sma, prev_sma)):
             return None
 
@@ -556,8 +569,10 @@ class NiftySMA9Weekly(IndiaMktMixins, BaseStrategy):
     def should_exit(self, position, candle, ctx=None):
         if position.tag != "MAIN":
             return False
+        period = int(getattr(self, "sma_period", 9) or 9)
+        sma_key = f"sma{period}"
         close = candle.get("close")
-        sma = candle.get("sma")
+        sma = candle.get(sma_key)
         if pd.isna(close) or pd.isna(sma):
             return False
         opt = str(getattr(position.instrument, "option_type", "") or "").upper()

@@ -54,7 +54,7 @@ flowchart TD
 
 - **Candle delivery** is feed- or aggregator-driven (`DhanWebSocketFeed` / `DeltaWebSocketFeed`, optional `tick_queue` + `CandleAggregator`). `core/data/feeds/dummy_feed.py` is used by `run/dummy_live.py`.
 - **`IndicatorManager`** (live) bootstraps history from engine `*_candles.log` when valid; if logs are missing, short, or invalid it may call **`IDataProvider.get_intraday`** (REST / broker historical path) before the first live bar — separate from the tick loop.
-- Optional **log-only bootstrap** for LEAPS-style setups: regenerate `logs/...` via `utils/seed_leaps_bootstrap_logs.py` (frozen Yahoo tail in `utils/leaps_bootstrap_yf_reference.py`); `utils/yfinance_nifty_rsi.py` is a manual fetch helper, not imported by the engine.
+- Optional **log-only bootstrap**: regenerate `logs/...` via `utils/yfinance/seed_leaps_bootstrap_logs.py`; Yahoo helpers live in `utils/yfinance/nifty_yahoo.py` and `utils/yfinance/refresh_nifty_indicator_history.py` (manual / offline seed — not imported by the engine).
 - **`PAPER`** uses the live data path with simulated execution.
 - **Multi-strategy** live mode runs one worker thread per strategy.
 - **Scheduled strategies** (e.g. BankNiftyBTST) use `strategy.scheduled_times` — no candle aggregator for that strategy; engine builds a synthetic candle from spot at the slot.

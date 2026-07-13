@@ -24,18 +24,22 @@ python -m run.dummy_live
 
 On **Debian/Ubuntu**, the system Python is [PEP 668](https://peps.python.org/pep-0668/) *externally managed*: use a **virtualenv** (as above) and `pip install` **inside** the activated venv — not `pip install` globally. Use **`python3`** if the `python` command is missing (`sudo apt install python-is-python3` is optional).
 
-### Yahoo NIFTY hourly + RSI (optional)
+### Yahoo NIFTY indicator history (optional)
 
 ```bash
 cd ~/Dhan-codebase
 source .venv/bin/activate   # create .venv first with: python3 -m venv .venv
 pip install yfinance pandas numpy TA-Lib
-python3 utils/yfinance_nifty_rsi.py
+# Preview Yahoo OHLC helpers
+python3 utils/yfinance/nifty_yahoo.py
+# Seed logs/indicators/NIFTY/{60,15,120}/ (LEAPS RSI, Bollinger, SMA9 weekly, …)
+python3 utils/yfinance/refresh_nifty_indicator_history.py --only 60
+python3 utils/yfinance/refresh_nifty_indicator_history.py --only 120
 ```
 
-To **rebuild LEAPS bootstrap logs** (150+ ``dhan_leaps_rsi_candles.log`` rows + RSI history tail aligned to Yahoo) so live startup skips intraday API::
+To **rebuild LEAPS bootstrap logs** (150+ candle rows + RSI history tail aligned to Yahoo) so live startup skips intraday API::
 
-    python3 utils/seed_leaps_bootstrap_logs.py
+    python3 utils/yfinance/seed_leaps_bootstrap_logs.py
 
 Keep a backup of ``logs/LEAPS_RSI/`` first; the seed script preserves RSI history lines **before** ``2026-05-12 09:15`` and replaces from that timestamp onward.
 

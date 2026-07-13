@@ -1,41 +1,47 @@
 #!/usr/bin/env python3
 """
-Refresh shared NIFTY indicator history from Yahoo ^NSEI.
+Refresh shared NIFTY ``logs/indicators/{SYMBOL}/{tf}/`` history from Yahoo ^NSEI.
 
-Default outputs (schema v2 JSONL, preserves ``live_append`` rows)::
+Used by LEAPS RSI, NiftySMA9Weekly, and any strategy that bootstraps from the
+shared indicator JSONL (preserves ``live_append`` rows).
+
+Default outputs (schema v2 JSONL)::
 
     logs/indicators/NIFTY/60/indicator_history.jsonl   — RSI(14) + EMA8 high/low on 60m bars
     logs/indicators/NIFTY/15/indicator_history.jsonl   — Bollinger(20,2) on 15m bars
+    logs/indicators/NIFTY/120/indicator_history.jsonl  — SMA(9) on 120m bars
 
 Backfill EMA on an existing 60m file (uses OHLC already in the file)::
 
-    python3 utils/yfinance/refresh_leaps_rsi_from_yahoo.py --backfill-ema --only 60
+    python3 utils/yfinance/refresh_nifty_indicator_history.py --backfill-ema --only 60
 
 Legacy ``logs/LEAPS_RSI/LEAPS_RSI_rsi_history.log`` is no longer written; migrate with
 ``--also-legacy-60`` if you still need the old file.
 
 Usage (from repo root, with venv + yfinance + TA-Lib)::
 
-    python3 utils/yfinance/refresh_leaps_rsi_from_yahoo.py
-    python3 utils/yfinance/refresh_leaps_rsi_from_yahoo.py --period 60d --dry-run
-    python3 utils/yfinance/refresh_leaps_rsi_from_yahoo.py --only 60
-    python3 utils/yfinance/refresh_leaps_rsi_from_yahoo.py --only 15
+    python3 utils/yfinance/refresh_nifty_indicator_history.py
+    python3 utils/yfinance/refresh_nifty_indicator_history.py --period 60d --dry-run
+    python3 utils/yfinance/refresh_nifty_indicator_history.py --only 60
+    python3 utils/yfinance/refresh_nifty_indicator_history.py --only 15
+    python3 utils/yfinance/refresh_nifty_indicator_history.py --only 120
 
 cd /root/Dhan-codebase
 source .venv/bin/activate
 
 # Preview
-python3 utils/yfinance/refresh_leaps_rsi_from_yahoo.py --dry-run --period 60d
+python3 utils/yfinance/refresh_nifty_indicator_history.py --dry-run --period 60d
 
 # Write both 60m + 15m indicator history files
-python3 utils/yfinance/refresh_leaps_rsi_from_yahoo.py --period 60d
+python3 utils/yfinance/refresh_nifty_indicator_history.py --period 60d
 
 # Only one timeframe
-python3 utils/yfinance/refresh_leaps_rsi_from_yahoo.py --only 60 --period 60d
-python3 utils/yfinance/refresh_leaps_rsi_from_yahoo.py --only 15 --period 60d
+python3 utils/yfinance/refresh_nifty_indicator_history.py --only 60 --period 60d
+python3 utils/yfinance/refresh_nifty_indicator_history.py --only 15 --period 60d
+python3 utils/yfinance/refresh_nifty_indicator_history.py --only 120 --period 60d
 
 # Optional legacy flat RSI log (backward compat)
-python3 utils/yfinance/refresh_leaps_rsi_from_yahoo.py --period 60d --also-legacy-60
+python3 utils/yfinance/refresh_nifty_indicator_history.py --period 60d --also-legacy-60
 """
 
 from __future__ import annotations
@@ -61,7 +67,8 @@ from core.utils.indicator_history import (  # noqa: E402
     is_nse_60m_bar_ist,
     legacy_rsi_history_path,
 )
-from utils.yfinance.yfinance_nifty_rsi import (  # noqa: E402
+from utils.yfinance.nifty_yahoo import (  # noqa: E402
+    fetch_nifty_120m_with_sma,
     fetch_nifty_15m_with_bollinger,
     fetch_nifty_hourly_with_rsi,
 )
@@ -109,6 +116,11 @@ def _row_to_schema_v2(row: dict) -> dict:
         "bb_upper",
         "bb_mid",
         "bb_lower",
+        "sma",
+        "prev_sma",
+        "sma9",
+        "prev_sma9",
+        "prev_close",
     ):
         if key in row and row[key] is not None:
             indicators[key] = row[key]
@@ -281,6 +293,68 @@ def _yahoo_rows_60(
             indicators["ema_high"] = ema_h
         if ema_l is not None:
             indicators["ema_low"] = ema_l
+        out[key] = _build_schema_row(
+            symbol=symbol,
+            timeframe=timeframe,
+            ist_key=key,
+            o=_ohlc_from_row(row, "open"),
+            h=_ohlc_from_row(row, "high"),
+            l=_ohlc_from_row(row, "low"),
+            c=close,
+            indicators=indicators,
+        )
+    return out, stats
+
+
+def _yahoo_rows_120(
+    *,
+    period: str,
+    symbol: str,
+    timeframe: str = "120",
+    sma_period: int = 9,
+) -> Tuple[Dict[str, dict], Dict[str, int]]:
+    """Yahoo 60m → NSE 120m + SMA for NiftySMA9Weekly."""
+    df = fetch_nifty_120m_with_sma(
+        symbol=symbol,
+        period=period,
+        tail=None,
+        sma_period=sma_period,
+    )
+    out: Dict[str, dict] = {}
+    stats = {
+        "fetched": 0,
+        "skipped_sma": 0,
+        "skipped_close": 0,
+    }
+    if df is None or df.empty:
+        return out, stats
+
+    stats["fetched"] = len(df)
+    for _, row in df.iterrows():
+        dt = row.get("Datetime_IST")
+        if dt is None or (isinstance(dt, float) and pd.isna(dt)):
+            continue
+        dt_ist = pd.Timestamp(dt)
+        if dt_ist.tzinfo is None:
+            dt_ist = dt_ist.tz_localize("Asia/Kolkata")
+        else:
+            dt_ist = dt_ist.tz_convert("Asia/Kolkata")
+        key = dt_ist.strftime("%Y-%m-%d %H:%M")
+        sma_col = f"sma{int(sma_period)}"
+        prev_sma_col = f"prev_sma{int(sma_period)}"
+        sma = _float_or_none(row.get(sma_col))
+        if sma is None:
+            stats["skipped_sma"] += 1
+            continue
+        close = _ohlc_from_row(row, "close")
+        if close is None:
+            stats["skipped_close"] += 1
+            continue
+        indicators: Dict[str, Any] = {
+            sma_col: sma,
+            prev_sma_col: _float_or_none(row.get(prev_sma_col)),
+            "prev_close": _float_or_none(row.get("prev_close")),
+        }
         out[key] = _build_schema_row(
             symbol=symbol,
             timeframe=timeframe,
@@ -481,9 +555,11 @@ def refresh_indicator_history_file(
     ema_period: int = 8,
     bb_period: int = 20,
     bb_std: float = 2.0,
+    sma_period: int = 9,
     dry_run: bool = False,
 ) -> dict:
     live, other = _load_history(hist_path)
+    yahoo_stats: Dict[str, int] = {}
     if mode == "15":
         yahoo = _yahoo_rows_15(
             period=period,
@@ -493,6 +569,14 @@ def refresh_indicator_history_file(
             bb_std=bb_std,
         )
         label = "bollinger"
+    elif mode == "120":
+        yahoo, yahoo_stats = _yahoo_rows_120(
+            period=period,
+            symbol="^NSEI" if symbol.upper() in ("NIFTY", "^NSEI") else symbol,
+            timeframe=timeframe,
+            sma_period=sma_period,
+        )
+        label = "sma9"
     else:
         yahoo, yahoo_stats = _yahoo_rows_60(
             period=period,
@@ -518,6 +602,19 @@ def refresh_indicator_history_file(
                 f"(fetched={yahoo_stats.get('fetched', 0)} "
                 f"skipped_nse_time={yahoo_stats.get('skipped_nse_time', 0)} "
                 f"skipped_rsi={yahoo_stats.get('skipped_rsi', 0)} "
+                f"skipped_close={yahoo_stats.get('skipped_close', 0)}). "
+                f"File was not modified: {hist_path}"
+            )
+        if mode == "120" and yahoo_stats.get("fetched", 0) == 0:
+            raise SystemExit(
+                "Yahoo Finance returned no hourly OHLC to resample into 120m "
+                f"(period={period}). File was not modified: {hist_path}"
+            )
+        if mode == "120":
+            raise SystemExit(
+                "Yahoo 60m→120m resample produced 0 SMA rows "
+                f"(fetched={yahoo_stats.get('fetched', 0)} "
+                f"skipped_sma={yahoo_stats.get('skipped_sma', 0)} "
                 f"skipped_close={yahoo_stats.get('skipped_close', 0)}). "
                 f"File was not modified: {hist_path}"
             )
@@ -560,6 +657,7 @@ def _default_paths(log_root: str) -> Dict[str, str]:
     return {
         "60": indicator_history_path("NIFTY", "60", log_root=log_root),
         "15": indicator_history_path("NIFTY", "15", log_root=log_root),
+        "120": indicator_history_path("NIFTY", "120", log_root=log_root),
     }
 
 
@@ -574,8 +672,10 @@ def refresh_all_default(
     ema_period: int,
     bb_period: int,
     bb_std: float,
+    sma_period: int = 9,
 ) -> List[dict]:
     paths = _default_paths(log_root)
+    # Default still 60+15 (LEAPS / BB). Use --only 120 for SMA9 weekly.
     modes = ["60", "15"]
     if only:
         modes = [only.strip()]
@@ -583,7 +683,7 @@ def refresh_all_default(
     for mode in modes:
         path = paths.get(mode)
         if not path:
-            raise SystemExit(f"Unknown --only value: {only!r} (use 60 or 15)")
+            raise SystemExit(f"Unknown --only value: {only!r} (use 60, 15, or 120)")
         stats = refresh_indicator_history_file(
             path,
             mode=mode,
@@ -594,6 +694,7 @@ def refresh_all_default(
             ema_period=ema_period,
             bb_period=bb_period,
             bb_std=bb_std,
+            sma_period=sma_period,
             dry_run=dry_run,
         )
         all_stats.append(stats)
@@ -639,7 +740,7 @@ def _write_legacy_rsi_from_v2(v2_path: str, legacy_path: str) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Refresh logs/indicators/NIFTY/{60,15}/indicator_history.jsonl from Yahoo ^NSEI "
+            "Refresh logs/indicators/NIFTY/{60,15,120}/indicator_history.jsonl from Yahoo ^NSEI "
             "(keeps live_append rows)."
         )
     )
@@ -655,9 +756,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--only",
-        choices=("60", "15"),
+        choices=("60", "15", "120"),
         default=None,
-        help="Refresh only NIFTY/60 or NIFTY/15 (default: both)",
+        help="Refresh only NIFTY/60, NIFTY/15, or NIFTY/120 (default: 60+15)",
     )
     parser.add_argument(
         "--period",
@@ -671,6 +772,12 @@ def main() -> None:
         type=int,
         default=8,
         help="EMA span for ema_high/ema_low on 60m (FuturesEMAHighLow default)",
+    )
+    parser.add_argument(
+        "--sma-period",
+        type=int,
+        default=9,
+        help="SMA length for --only 120 (NiftySMA9Weekly default 9)",
     )
     parser.add_argument(
         "--backfill-ema",
@@ -717,6 +824,7 @@ def main() -> None:
             ema_period=args.ema_period,
             bb_period=args.bb_period,
             bb_std=args.bb_std,
+            sma_period=args.sma_period,
             dry_run=args.dry_run,
         )
         all_stats = [stats]
@@ -731,6 +839,7 @@ def main() -> None:
             ema_period=args.ema_period,
             bb_period=args.bb_period,
             bb_std=args.bb_std,
+            sma_period=args.sma_period,
         )
 
     for stats in all_stats:
