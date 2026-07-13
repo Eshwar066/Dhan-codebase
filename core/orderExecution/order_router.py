@@ -2757,7 +2757,7 @@ class OrderRouter:
     def cancel_gtt_fallback_watch(
         self, watch: GttFallbackWatch, *, reason: str = "fallback"
     ) -> bool:
-        """Cancel the broker Forever order for a hybrid GTT watch."""
+        """Cancel the broker Forever order for a hybrid GTT watch (this leg only)."""
         store = self.intent_store
         if not store or not watch.gtt_intent_id:
             return False
@@ -2767,7 +2767,29 @@ class OrderRouter:
         if rec.get("status") == IntentStatus.FILLED:
             return True
         broker_order_id = rec.get("broker_order_id") or watch.broker_order_id
-        if broker_order_id and self.broker and hasattr(self.broker, "cancel_order_by_id"):
+        # Resolve Forever order id from broker if local id missing (avoids
+        # marking CANCELLED locally while Forever stays live → duplicate LIMITs).
+        if (
+            not broker_order_id
+            and self.broker
+            and hasattr(self.broker, "find_forever_order_by_client_id")
+        ):
+            try:
+                forever = self.broker.find_forever_order_by_client_id(watch.gtt_intent_id)
+            except Exception:
+                forever = None
+            if isinstance(forever, dict):
+                broker_order_id = forever.get("order_id") or forever.get("id")
+                if broker_order_id:
+                    watch.broker_order_id = str(broker_order_id)
+        if not broker_order_id:
+            logger.warning(
+                "GTT cancel skipped — no broker_order_id intent=%s reason=%s",
+                watch.gtt_intent_id,
+                reason,
+            )
+            return False
+        if self.broker and hasattr(self.broker, "cancel_order_by_id"):
             ok = self.broker.cancel_order_by_id(
                 str(broker_order_id),
                 intent_id=str(watch.gtt_intent_id),

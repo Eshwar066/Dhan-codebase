@@ -37,7 +37,9 @@ LIMIT_PREM_MULT = 1.5
 SL_OF_LIMIT = 0.5
 # Live ENTRY: Dhan Forever (GTT) + engine watch (HYBRID_GTT).
 # Watch fires when premium (LTP) reaches GTT price from below; if Forever
-# still unfilled, cancel GTT and place resting LIMIT near market.
+# still unfilled, cancel THAT leg's GTT only and place resting LIMIT at best ask/bid.
+# The other leg (e.g. PE) stays on Forever until 15:20.
+# After MAIN fill: place SL (STOPLIMIT) on that position.
 ENTRY_EXECUTION_MODE = "HYBRID_GTT"
 
 
@@ -499,12 +501,15 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         candle_ts: Any,
         symbol: str,
     ) -> Any:
+        # Dhan/Tradehull accepts STOPLIMIT ("SL"), not raw "SL-M" (KeyError).
+        # SELL stop-limit: trigger arms when premium falls; limit near trigger.
+        trig = float(trigger_price)
         return self.create_order_intent(
             inst=entry_ref.instrument,
             side="SELL",
             qty=entry_ref.qty,
-            price=float(trigger_price),
-            order_type="SL-M",
+            price=trig,
+            order_type="SL",
             strategy=self.name,
             candle_ts=candle_ts,
             structure_id=entry_ref.structure_id,
@@ -512,7 +517,7 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
             symbol=symbol,
             action="FORCE_EXIT",
             parent_intent_id=entry_ref.intent_id,
-            trigger_price=float(trigger_price),
+            trigger_price=trig,
         )
 
     def on_main_entry_filled(

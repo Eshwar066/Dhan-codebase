@@ -268,8 +268,8 @@ def _trigger_met(watch: GttFallbackWatch, quote: BidAskLtp) -> bool:
 
 def _fallback_limit_price(watch: GttFallbackWatch, quote: Optional[BidAskLtp]) -> float:
     """
-    Resting LIMIT price after GTT cancel. Prefer a price near live market so NSE
-    LPP (EXCH:17070) does not reject far-from-LTP limits.
+    Resting LIMIT after Forever cancel: use best ask (BUY) / best bid (SELL)
+    so the order is marketable. Fall back to GTT limit only if quote missing.
     """
     limit = float(watch.limit_price)
     side = str(watch.side or "BUY").upper()
@@ -279,19 +279,16 @@ def _fallback_limit_price(watch: GttFallbackWatch, quote: Optional[BidAskLtp]) -
     bid = _positive_float(quote.bid)
     ltp = _positive_float(quote.ltp)
     if side == "BUY":
-        # Cap at our GTT limit; prefer current ask when tighter (better fill + LPP-safe).
-        candidates = [limit]
-        if ask is not None:
-            candidates.append(ask)
-        if ltp is not None:
-            candidates.append(ltp)
-        return min(candidates)
-    candidates = [limit]
-    if bid is not None:
-        candidates.append(bid)
-    if ltp is not None:
-        candidates.append(ltp)
-    return max(candidates)
+        if ask is not None and ask > 0:
+            return float(ask)
+        if ltp is not None and ltp > 0:
+            return float(ltp)
+        return limit
+    if bid is not None and bid > 0:
+        return float(bid)
+    if ltp is not None and ltp > 0:
+        return float(ltp)
+    return limit
 
 
 class GttFallbackBook:
