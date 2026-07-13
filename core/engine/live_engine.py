@@ -1898,12 +1898,13 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         maintenance = getattr(book, "maintenance_tick", None)
         if callable(maintenance):
             maintenance(now_ist)
-        else:
-            book.tick(now_ist)
+            # Quiet-period quote scan still required after maintenance.
+            last_feed = float(getattr(self, "_last_gtt_feed_quote_ts", 0.0) or 0.0)
+            if (time.time() - last_feed) >= 3.0:
+                book.tick(now_ist)
             return
-        last_feed = float(getattr(self, "_last_gtt_feed_quote_ts", 0.0) or 0.0)
-        if (time.time() - last_feed) >= 3.0:
-            book.tick(now_ist)
+        # No maintenance_tick API: full tick covers maintenance + quotes.
+        book.tick(now_ist)
 
 
     @staticmethod
@@ -1969,9 +1970,20 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         except Exception:
             logger.exception(
                 "needs_tick_queue: subscription resolution failed; "
-                "enabling tick queue for GTT safety"
+                "falling back to strategy GTT heuristic"
             )
-            return True
+            # Do not always allocate a tick queue — only if a strategy opts into GTT.
+            for s in strategies or []:
+                mode = str(
+                    getattr(s, "ENTRY_EXECUTION_MODE", None)
+                    or getattr(s, "execution_mode", None)
+                    or ""
+                ).upper()
+                if mode in ("GTT", "HYBRID_GTT"):
+                    return True
+                if getattr(s, "gtt_fallback", None):
+                    return True
+            return False
 
     @staticmethod
     def _collect_feed_symbols(
@@ -2607,6 +2619,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         from core.events.wiring import wire_event_bus
 
         wire_event_bus(self)
+        # WS quotes for open option legs (LEAPS exit pricing + GTT symbols).
+        self._subscribe_open_option_legs()
         primary_tf = getattr(self.strategy, "timeframe", None)
         engine_timeframes = list(self._engine_timeframes or [])
         if not engine_timeframes and primary_tf:
@@ -2985,6 +2999,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                                 engine_id=self.engine_id,
                             )
                         )
+                        # Dedup even if handlers filter/fail — bar already published.
+                        if eval_key is not None:
+                            self._last_evaluated_candle_ts[eval_ts_key] = eval_key
                     else:
                         self._run_exits_and_rollover_for_closed_bar(
                             symbol, candle, tf, enriched_candle=enriched_candle

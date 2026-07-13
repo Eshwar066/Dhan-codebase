@@ -17,6 +17,7 @@ timeframe: null
 schedule:
   eval_mode: scheduled
   times:
+  - 09:15
   - 09:20
   - '15:20'
   - 09:25

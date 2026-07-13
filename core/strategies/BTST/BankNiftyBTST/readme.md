@@ -2,10 +2,11 @@
 
 ## Rules (Indian market)
 
-1. **9:20 IST** — find Bank Nifty CE and PE strikes with premium **80–120** (target ~100); place **HYBRID_GTT** live entry at **premium × 1.5** (e.g. 100 → limit 150).
-2. **After MAIN fill** — arm **SL-M SELL** (`MAIN_SL`) at **50% of limit price** (limit 150 → SL trigger 75). SL uses limit_price from BTST meta, not fill price.
-3. **15:20 IST** — cancel unfilled ENTRY (GTT, fallback LIMIT, and GttFallbackBook watches).
-4. **If SL not hit** — exit next session at **9:25 IST** (BTST square-off).
+1. **9:15 IST** — if overnight MAIN is open and no resting `MAIN_SL`, arm **SL** at **50% of limit** (protects until 9:25 exit). Catch-up also runs at 9:20 if 9:15 was missed.
+2. **9:20 IST** — find Bank Nifty CE and PE strikes with premium **80–120** (target ~100); place **HYBRID_GTT** live entry at **premium × 1.5** (e.g. 100 → limit 150).
+3. **After MAIN fill** — arm **SL SELL** (`MAIN_SL` / STOPLIMIT) at **50% of limit price** (limit 150 → SL trigger 75). SL uses limit_price from BTST meta, not fill price.
+4. **15:20 IST** — cancel unfilled ENTRY (GTT, fallback LIMIT, and GttFallbackBook watches).
+5. **If SL not hit** — exit next session at **9:25 IST** (BTST square-off).
 
 ## HYBRID_GTT execution (live only)
 
@@ -14,7 +15,7 @@
 1. Place Dhan **Forever (GTT)** LIMIT BUY at trigger/limit = limit_price.
 2. Engine registers an internal watch and subscribes option quotes (WS + REST).
 3. When **premium (LTP) >= limit_price** and Forever is still unfilled → cancel Forever → place **resting LIMIT** near live ask/LTP (capped at limit_price) so NSE LPP accepts it.
-4. Fill from either path triggers `on_main_entry_filled` → SL-M as above.
+4. Fill from either path triggers `on_main_entry_filled` → SL (STOPLIMIT) as above.
 
 `gtt_fallback` spec on intent:
 ```json
@@ -34,7 +35,7 @@ Backtest / paper: plain LIMIT at limit_price (no GTT, no fallback).
 
 | Mode | Path |
 |------|------|
-| **Live** | `scheduled_times` [9:20, 15:20, 9:25] — wall-clock, no candle aggregator |
+| **Live** | `scheduled_times` [9:15, 9:20, 15:20, 9:25] — wall-clock, no candle aggregator |
 | **Backtest** | `backtest_timeframe = 5` — 5m bar close aligned to scheduled slots |
 
 ## Option series
