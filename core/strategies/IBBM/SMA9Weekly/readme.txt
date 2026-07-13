@@ -11,7 +11,7 @@ RULES
 Study:        SMA(9) on close
 Timeframe:    2 hours (120m), closed-bar evaluation only
 Main product: Weekly NIFTY option sell, premium 80–100, must be OTM
-Hedging:      Weekly option ~2–2.5% from sold strike (same weekly series)
+Hedging:      Weekly option 500 points OTM from MAIN (CALL K→K+500, PUT K→K−500)
 Rollover:     Hedge roll 1 trading day before weekly expiry → next weekly
 Event case:   No new entries on NSE holidays, yaml event_no_trade_dates, or expiry day
 
@@ -30,7 +30,7 @@ CONFIG (strategy.yaml → params:)
 
   sma_period: 9
   premium_min / premium_max: 80 / 100
-  hedge_distance_pct: 0.0225
+  hedge_distance_points: 500
   weekly_expiry_weekday: 1   # Tuesday
   event_no_trade_dates: []   # extra ISO dates
 

@@ -3,7 +3,9 @@ NIFTY SMA(9) weekly option selling on 2h bars.
 
 - Close crosses above SMA9 → SELL PUT (OTM, premium 80–100) + weekly hedge
 - Close crosses below SMA9 → SELL CALL (OTM, premium 80–100) + weekly hedge
-- Hedge ~2–2.5% OTM on the same weekly expiry
+- If current weekly has no OTM strike in 80–100, use next weekly expiry
+- Hedge 500 points OTM from MAIN on the same weekly expiry
+  (CALL short K → long K+500; PUT short K → long K−500)
 - Roll hedge 1 trading day before weekly expiry
 - No new entries on NSE holidays / configured event dates / weekly expiry day
 """
@@ -52,7 +54,7 @@ class NiftySMA9Weekly(IndiaMktMixins, BaseStrategy):
     sma_period = 9
     premium_min = 80
     premium_max = 100
-    hedge_distance_pct = 0.0225  # mid of 2–2.5%
+    hedge_distance_points = 500  # fixed OTM gap from MAIN strike
     hedge_rollover_days_before_expiry = 1
     hedge_prefer_monthly = False  # weekly hedge series
 
@@ -63,6 +65,7 @@ class NiftySMA9Weekly(IndiaMktMixins, BaseStrategy):
         self._entry_signaled_keys: set[str] = set()
         self._evaluated_signal_keys: set[str] = set()
         self._event_no_trade_dates: Set[date] = set()
+        self._snapshot_expiry_pref: Optional[str] = None
         self._load_config_from_yaml()
 
     def _load_config_from_yaml(self) -> None:
@@ -86,8 +89,15 @@ class NiftySMA9Weekly(IndiaMktMixins, BaseStrategy):
             self.premium_min = float(params["premium_min"])
         if "premium_max" in params:
             self.premium_max = float(params["premium_max"])
-        if "hedge_distance_pct" in params:
-            self.hedge_distance_pct = float(params["hedge_distance_pct"])
+        if "hedge_distance_points" in params:
+            self.hedge_distance_points = int(params["hedge_distance_points"])
+        elif "hedge_distance_pct" in params:
+            # Legacy yaml key ignored; fixed-point hedge is required.
+            logger.info(
+                "NiftySMA9Weekly: hedge_distance_pct is deprecated; "
+                "use hedge_distance_points (default %s)",
+                getattr(self, "hedge_distance_points", 500),
+            )
         if "weekly_expiry_weekday" in params:
             self.weekly_expiry_weekday = int(params["weekly_expiry_weekday"]) % 7
         if "hedge_rollover_days_before_expiry" in params:
@@ -141,16 +151,17 @@ class NiftySMA9Weekly(IndiaMktMixins, BaseStrategy):
         return ExpiryResolver.current_weekly_expiry(trade_date, weekday=wd)
 
     def calculate_hedge_strike(self, sold_strike, option_type):
+        """Hedge is fixed points OTM from MAIN (default 500)."""
         step = int(getattr(self, "option_chain_strike_step", 50) or 50)
         sold = int(sold_strike)
-        pct = float(getattr(self, "hedge_distance_pct", 0.0225) or 0.0225)
+        gap = int(getattr(self, "hedge_distance_points", 500) or 500)
         opt = str(option_type or "").upper()
         if opt in ("CE", "CALL"):
-            target = sold * (1.0 + pct)
+            target = sold + gap  # e.g. short 24500 CE → long 25000 CE
         elif opt in ("PE", "PUT"):
-            target = sold * (1.0 - pct)
+            target = sold - gap  # e.g. short 24000 PE → long 23500 PE
         else:
-            target = sold * (1.0 + pct)
+            target = sold + gap
         return int(round(target / step) * step)
 
     def fetch_hedge_option_chain(
@@ -311,10 +322,12 @@ class NiftySMA9Weekly(IndiaMktMixins, BaseStrategy):
 
     def _find_strike_snapshot_params(self, candle, ctx, option_type):
         ts_ist = self._candle_close_ts_ist(candle)
+        expiry_tag = str(getattr(self, "_snapshot_expiry_pref", "") or "")
         slot_key = "|".join(
             [
                 str(getattr(ctx, "symbol", "") or ""),
                 str(option_type or ""),
+                expiry_tag,
                 ts_ist.strftime("%Y-%m-%d"),
                 ts_ist.strftime("%H-%M"),
             ]
@@ -322,33 +335,43 @@ class NiftySMA9Weekly(IndiaMktMixins, BaseStrategy):
         if slot_key in self._snapshot_logged_slots:
             return {}
         self._snapshot_logged_slots.add(slot_key)
+        target = "nifty_sma9_weekly"
+        if expiry_tag == "NEXT_WEEKLY":
+            target = "nifty_sma9_weekly_next"
         return {
             "snapshot": True,
             "snapshot_date": ts_ist.strftime("%Y-%m-%d"),
             "snapshot_time": ts_ist.strftime("%H-%M"),
-            "snapshot_target": "nifty_sma9_weekly",
+            "snapshot_target": target,
         }
 
-    def _resolve_main_expiry(self, candle: dict, ctx) -> Optional[date]:
+    def _resolve_main_expiry(
+        self, candle: dict, ctx, expiry_pref: str = "WEEKLY"
+    ) -> Optional[date]:
         chain_exp = self._expiry_from_option_chain()
         if chain_exp is not None:
             return chain_exp
         trade_date = self._trade_date(candle)
         wd = int(getattr(self, "weekly_expiry_weekday", 1) or 1) % 7
+        pref = str(expiry_pref or "WEEKLY").strip().upper()
         try:
             resolved = ExpiryResolver.resolve(
                 expiry_list=ctx.get_expiry_list() if ctx is not None else [],
                 trade_date=trade_date,
                 api=self.api,
-                expiry_pref="WEEKLY",
+                expiry_pref=pref,
                 weekly_expiry_weekday=wd,
             )
         except (TypeError, ValueError):
-            return ExpiryResolver.current_weekly_expiry(trade_date, weekday=wd)
+            resolved = None
         if resolved is None:
+            if pref == "NEXT_WEEKLY":
+                return ExpiryResolver.next_weekly_expiry(trade_date, weekday=wd)
             return ExpiryResolver.current_weekly_expiry(trade_date, weekday=wd)
         if ExpiryResolver.is_calendar_expiry(resolved):
             return ExpiryResolver.as_calendar_date(resolved)
+        if pref == "NEXT_WEEKLY":
+            return ExpiryResolver.next_weekly_expiry(trade_date, weekday=wd)
         return ExpiryResolver.current_weekly_expiry(trade_date, weekday=wd)
 
     def _strike_is_otm(self, strike: Any, option_type: str, spot: float) -> bool:
@@ -363,6 +386,30 @@ class NiftySMA9Weekly(IndiaMktMixins, BaseStrategy):
         if opt in ("PE", "PUT"):
             return k < s
         return False
+
+    def _accept_otm_premium_strike(
+        self,
+        result: Optional[Any],
+        option_type: str,
+        spot: float,
+        min_prem: float,
+        max_prem: float,
+    ) -> Optional[Any]:
+        """Require OTM strike with premium strictly inside ``min_prem``–``max_prem``."""
+        if result is None:
+            return None
+        strike, premium, row = result
+        if not strike:
+            return None
+        try:
+            prem = float(premium)
+        except (TypeError, ValueError):
+            return None
+        if prem < float(min_prem) or prem > float(max_prem):
+            return None
+        if spot > 0 and not self._strike_is_otm(strike, option_type, spot):
+            return None
+        return result
 
     def _build_entry_intents(
         self,
@@ -397,18 +444,52 @@ class NiftySMA9Weekly(IndiaMktMixins, BaseStrategy):
 
         min_prem = float(getattr(self, "premium_min", 80) or 80)
         max_prem = float(getattr(self, "premium_max", 100) or 100)
+        spot = float(candle.get("close") or 0)
 
-        result = self.find_strike_in_premium_range(
-            candle,
-            ctx,
-            option_type,
-            min_prem=min_prem,
-            max_prem=max_prem,
-            expiry_pref="WEEKLY",
-        )
+        # Prefer current weekly; if no OTM in premium band, roll MAIN to next weekly.
+        result = None
+        expiry_pref = "WEEKLY"
+        for pref in ("WEEKLY", "NEXT_WEEKLY"):
+            self._snapshot_expiry_pref = pref
+            try:
+                candidate = self.find_strike_in_premium_range(
+                    candle,
+                    ctx,
+                    option_type,
+                    min_prem=min_prem,
+                    max_prem=max_prem,
+                    expiry_pref=pref,
+                )
+            finally:
+                self._snapshot_expiry_pref = None
+            accepted = self._accept_otm_premium_strike(
+                candidate, option_type, spot, min_prem, max_prem
+            )
+            if accepted is not None:
+                result = accepted
+                expiry_pref = pref
+                if pref == "NEXT_WEEKLY":
+                    logger.info(
+                        "NiftySMA9Weekly: no OTM prem=%s-%s on current weekly; "
+                        "using next weekly opt=%s ts=%s",
+                        min_prem,
+                        max_prem,
+                        option_type,
+                        candle.get("timestamp"),
+                    )
+                break
+            logger.info(
+                "NiftySMA9Weekly: no OTM strike in prem=%s-%s expiry_pref=%s opt=%s",
+                min_prem,
+                max_prem,
+                pref,
+                option_type,
+            )
+
         if result is None:
             logger.warning(
-                "NiftySMA9Weekly entry skipped: no strike opt=%s prem=%s-%s ts=%s",
+                "NiftySMA9Weekly entry skipped: no OTM strike opt=%s prem=%s-%s "
+                "on WEEKLY or NEXT_WEEKLY ts=%s",
                 option_type,
                 min_prem,
                 max_prem,
@@ -417,22 +498,13 @@ class NiftySMA9Weekly(IndiaMktMixins, BaseStrategy):
             return None
 
         strike, premium, row = result
-        if not strike:
-            return None
 
-        spot = float(candle.get("close") or 0)
-        if spot > 0 and not self._strike_is_otm(strike, option_type, spot):
-            logger.warning(
-                "NiftySMA9Weekly entry skipped: strike not OTM strike=%s spot=%s opt=%s",
-                strike,
-                spot,
-                option_type,
-            )
-            return None
-
-        expiry_for_symbol = self._resolve_main_expiry(candle, ctx)
+        expiry_for_symbol = self._resolve_main_expiry(candle, ctx, expiry_pref)
         if expiry_for_symbol is None:
-            logger.warning("NiftySMA9Weekly entry skipped: no weekly expiry")
+            logger.warning(
+                "NiftySMA9Weekly entry skipped: no weekly expiry pref=%s",
+                expiry_pref,
+            )
             return None
 
         # Do not open a new weekly on expiry day (handled earlier) or past expiry.
@@ -482,10 +554,13 @@ class NiftySMA9Weekly(IndiaMktMixins, BaseStrategy):
         )
         self._entry_signaled_keys.add(signal_key)
         logger.info(
-            "NiftySMA9Weekly entry structure=%s main=%s premium=%s hedge=%s",
+            "NiftySMA9Weekly entry structure=%s main=%s premium=%s expiry=%s "
+            "expiry_pref=%s hedge=%s",
             structure_id,
             trading_symbol,
             premium,
+            expiry_for_symbol,
+            expiry_pref,
             getattr(getattr(hedge_intent, "instrument", None), "trading_symbol", None),
         )
         return [hedge_intent, sell_intent] if hedge_intent else [sell_intent]

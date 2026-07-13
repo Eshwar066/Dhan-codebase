@@ -64,6 +64,11 @@ class ExpiryResolver:
                     weekly_expiry_weekday if weekly_expiry_weekday is not None else 2
                 )
                 return ExpiryResolver.current_weekly_expiry(trade_date, weekday=weekday)
+            elif expiry_pref == "NEXT_WEEKLY":
+                weekday = int(
+                    weekly_expiry_weekday if weekly_expiry_weekday is not None else 2
+                )
+                return ExpiryResolver.next_weekly_expiry(trade_date, weekday=weekday)
 
         raise ValueError(f"Unsupported api={api}, expiry_pref={expiry_pref}")
 
