@@ -37,11 +37,7 @@ python3 utils/yfinance/refresh_nifty_indicator_history.py --only 60
 python3 utils/yfinance/refresh_nifty_indicator_history.py --only 120
 ```
 
-To **rebuild LEAPS bootstrap logs** (150+ candle rows + RSI history tail aligned to Yahoo) so live startup skips intraday API::
-
-    python3 utils/yfinance/seed_leaps_bootstrap_logs.py
-
-Keep a backup of ``logs/LEAPS_RSI/`` first; the seed script preserves RSI history lines **before** ``2026-05-12 09:15`` and replaces from that timestamp onward.
+Live bootstrap uses those shared indicator files plus engine ``*_candles.log`` rows; if history is missing or short, ``IndicatorManager`` may fall back to the intraday API.
 
 ## Core Runtime Modes
 
