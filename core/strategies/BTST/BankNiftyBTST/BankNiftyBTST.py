@@ -2,6 +2,7 @@
 Bank Nifty BTST (Buy Today Sell Tomorrow) — Dhan index options.
 
 Rules (see readme.md)
+- 9:15 IST: if overnight MAIN is open and no SL is resting, arm MAIN_SL.
 - 9:20 IST: pick CE and PE strikes near ~100 premium; HYBRID_GTT BUY each at premium × 1.5.
 - After fill: resting SL-SELL at 50% of the limit entry price.
 - 15:20 IST: cancel any unfilled ENTRY (GTT / fallback LIMIT / watches) placed today.
@@ -26,6 +27,7 @@ from core.strategies.IndiaMktMixins import IST, IndiaMktMixins
 from core.utils.expiry_resolver import ExpiryResolver
 from core.utils.price_tick import resolve_tick_size, round_by_tick_size
 
+ARM_SL_TIME = time(9, 15)
 ENTRY_TIME = time(9, 20)
 EXIT_TIME = time(9, 25)
 CANCEL_TIME = time(15, 20)
@@ -37,7 +39,9 @@ LIMIT_PREM_MULT = 1.5
 SL_OF_LIMIT = 0.5
 # Live ENTRY: Dhan Forever (GTT) + engine watch (HYBRID_GTT).
 # Watch fires when premium (LTP) reaches GTT price from below; if Forever
-# still unfilled, cancel GTT and place resting LIMIT near market.
+# still unfilled, cancel THAT leg's GTT only and place resting LIMIT at best ask/bid.
+# The other leg (e.g. PE) stays on Forever until 15:20.
+# After MAIN fill: place SL (STOPLIMIT) on that position.
 ENTRY_EXECUTION_MODE = "HYBRID_GTT"
 
 
@@ -65,7 +69,7 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
     bracket_leg_tags = ["MAIN_SL"]
     timeframe = None
     backtest_timeframe = "5"
-    scheduled_times = [ENTRY_TIME, CANCEL_TIME, EXIT_TIME]
+    scheduled_times = [ARM_SL_TIME, ENTRY_TIME, CANCEL_TIME, EXIT_TIME]
     required_context = ["option_chain"]
     api = "DHAN"
     expiryType = "MONTHLY"
@@ -85,6 +89,7 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         self._entry_signaled_keys: set[str] = set()
         self._evaluated_signal_keys: set[str] = set()
         self._cancel_evaluated_signal_keys: set[str] = set()
+        self._arm_sl_signaled_keys: set[str] = set()
 
     def get_warmup_period(self):
         return 0
@@ -319,6 +324,12 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
 
     def should_evaluate(self, candle) -> bool:
         slot = self._active_slot(candle)
+        if slot == ARM_SL_TIME:
+            eval_key = f"arm_sl|{self._evaluate_signal_key(candle)}"
+            if eval_key in self._evaluated_signal_keys:
+                return False
+            self._evaluated_signal_keys.add(eval_key)
+            return True
         if slot == CANCEL_TIME:
             eval_key = self._cancel_evaluate_signal_key(candle)
             if eval_key in self._cancel_evaluated_signal_keys:
@@ -470,8 +481,105 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
             metadata_extras=strategy_meta,
         )
 
+    def _has_resting_main_sl(self, ctx: Any, structure_id: str) -> bool:
+        intent_store = getattr(ctx, "intent_store", None)
+        if intent_store is None:
+            return False
+        return bool(
+            intent_store.has_pending_intent(
+                strategy=self.name,
+                structure_id=structure_id,
+                tags=["MAIN_SL"],
+                actions=["FORCE_EXIT"],
+            )
+        )
+
+    def _arm_missing_sl_intents(self, candle: dict, ctx: Any) -> List[Any]:
+        """
+        For each open MAIN leg with no resting MAIN_SL, place SL until T+1 9:25 exit.
+        Used at 9:15 (market open) and as catch-up at 9:20 before new entries.
+        """
+        ps = getattr(ctx, "position_store", None)
+        if ps is None or not hasattr(ps, "get_open_positions"):
+            return []
+        trade_dt = pd.Timestamp(candle["timestamp"]).date()
+        intents: List[Any] = []
+        for pos in ps.get_open_positions(strategy=self.name) or []:
+            if str(getattr(pos, "tag", "") or "").upper() != "MAIN":
+                continue
+            net_qty = int(getattr(pos, "net_qty", 0) or 0)
+            if net_qty <= 0:
+                continue
+            inst = getattr(pos, "instrument", None)
+            if inst is None:
+                continue
+            sid = str(getattr(pos, "structure_id", "") or "")
+            if not sid:
+                continue
+            self._ensure_btst_meta_for_main_fill(
+                sid,
+                inst,
+                ctx,
+                getattr(pos, "intent_id", None),
+                None,
+            )
+            meta = self._meta_by_structure_id.get(sid)
+            entry_date = meta.entry_date if meta is not None else None
+            # Only protect overnight / prior-day carries (not same-day new entries).
+            if entry_date is not None and entry_date >= trade_dt:
+                continue
+            arm_key = f"{sid}|{trade_dt.isoformat()}"
+            if arm_key in self._arm_sl_signaled_keys:
+                continue
+            if self._has_resting_main_sl(ctx, sid):
+                self._arm_sl_signaled_keys.add(arm_key)
+                continue
+
+            limit_price = None
+            if meta is not None and float(meta.limit_price or 0) > 0:
+                limit_price = float(meta.limit_price)
+            else:
+                try:
+                    avg = float(getattr(pos, "avg_price", 0) or 0)
+                except (TypeError, ValueError):
+                    avg = 0.0
+                if avg > 0:
+                    limit_price = avg
+            if limit_price is None or limit_price <= 0:
+                continue
+
+            sym = getattr(inst, "trading_symbol", None) or (
+                meta.symbol if meta is not None else candle.get("symbol")
+            )
+            sl_trigger = self._round_order_price(
+                float(limit_price * SL_OF_LIMIT),
+                str(sym or ""),
+                ctx,
+                instrument=inst,
+                side="SELL",
+            )
+            ref = SimpleNamespace(
+                instrument=inst,
+                structure_id=sid,
+                intent_id=getattr(pos, "intent_id", None),
+                qty=self._order_qty_in_lots(inst, abs(net_qty)),
+            )
+            intents.append(
+                self._build_main_sl_intent(
+                    ref, sl_trigger, candle["timestamp"], str(sym or "BANKNIFTY")
+                )
+            )
+            self._arm_sl_signaled_keys.add(arm_key)
+            print(
+                f"BankNiftyBTST: arming missing MAIN_SL for {sid} "
+                f"@ {sl_trigger} (limit/avg base={limit_price})"
+            )
+        return intents
+
     def on_candle(self, candle, ctx):
         slot = self._active_slot(candle)
+        if slot == ARM_SL_TIME:
+            return self._arm_missing_sl_intents(candle, ctx) or None
         if slot == CANCEL_TIME:
             self._cancel_unfilled_entry_orders(candle, ctx)
             return None
@@ -480,9 +588,10 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         if slot != ENTRY_TIME:
             return None
 
-        trade_dt = pd.Timestamp(candle["timestamp"]).date()
-        intents: List[Any] = []
+        # Catch-up if engine missed 9:15: arm missing overnight SLs before new entries.
+        intents: List[Any] = list(self._arm_missing_sl_intents(candle, ctx))
 
+        trade_dt = pd.Timestamp(candle["timestamp"]).date()
         for opt in ("CE", "PE"):
             leg_intent = self._build_entry_intent(
                 candle, ctx, option_type=opt, trade_dt=trade_dt
@@ -499,12 +608,15 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         candle_ts: Any,
         symbol: str,
     ) -> Any:
+        # Dhan/Tradehull accepts STOPLIMIT ("SL"), not raw "SL-M" (KeyError).
+        # SELL stop-limit: trigger arms when premium falls; limit near trigger.
+        trig = float(trigger_price)
         return self.create_order_intent(
             inst=entry_ref.instrument,
             side="SELL",
             qty=entry_ref.qty,
-            price=float(trigger_price),
-            order_type="SL-M",
+            price=trig,
+            order_type="SL",
             strategy=self.name,
             candle_ts=candle_ts,
             structure_id=entry_ref.structure_id,
@@ -512,7 +624,7 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
             symbol=symbol,
             action="FORCE_EXIT",
             parent_intent_id=entry_ref.intent_id,
-            trigger_price=float(trigger_price),
+            trigger_price=trig,
         )
 
     def on_main_entry_filled(

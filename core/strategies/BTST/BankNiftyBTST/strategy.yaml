@@ -17,6 +17,7 @@ timeframe: null
 schedule:
   eval_mode: scheduled
   times:
+  - 09:15
   - 09:20
   - '15:20'
   - 09:25
@@ -68,9 +69,10 @@ backtest_timeframe: '5'
 execution:
   mode: HYBRID_GTT
   gtt_fallback:
-    trigger_field: ask
-    trigger_op: <=
+    trigger_field: ltp
+    trigger_op: '>='
     active_until: '15:20'
+    confirm_ticks: 2
   bracket_leg_tags:
   - MAIN_SL
 subscriptions:

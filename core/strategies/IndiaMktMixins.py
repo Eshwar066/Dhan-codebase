@@ -797,7 +797,13 @@ class IndiaMktMixins:
             return None
 
     def _can_reuse_cached_option_chain(self, ctx, expiry_pref=None) -> bool:
-        """Reuse DHAN chain cache only when expiry matches (never across expiry_pref overrides)."""
+        """
+        Reuse DHAN chain cache when safe.
+
+        - Explicit ``expiry_pref`` (e.g. QUARTERLY override): never reuse — force fresh fetch.
+        - Default callers (``expiry_pref is None``): reuse non-empty cache when expiry
+          matches, or when expiry cannot be compared (preserves prior optimization).
+        """
         if expiry_pref is not None:
             return False
         cached = getattr(self, "_last_option_chain", None)
@@ -817,7 +823,9 @@ class IndiaMktMixins:
             return False
         cached_exp = self._expiry_from_option_chain(cached)
         want_exp = self._selected_expiry_calendar_date(ctx)
-        return cached_exp is not None and want_exp is not None and cached_exp == want_exp
+        if cached_exp is None or want_exp is None:
+            return True
+        return cached_exp == want_exp
 
     @staticmethod
     def _coerce_backtest_option_chain_df(

@@ -619,8 +619,32 @@ class EngineLogger:
     def risk_block(self, reason: str, symbol: Optional[str] = None) -> None:
         self.log("risk_block", message=reason, symbol=symbol)
 
-    def reconciliation(self, message: str, details: Optional[Dict] = None) -> None:
-        self.log("reconciliation", message=message, **(details or {}))
+    def reconciliation(
+        self,
+        message: str,
+        details: Optional[Dict] = None,
+        strategy_id: Optional[str] = None,
+    ) -> None:
+        payload = dict(details or {})
+        if strategy_id:
+            self.log(
+                "reconciliation",
+                message=message,
+                strategy_id=strategy_id,
+                **payload,
+            )
+            return
+        # Multi-strategy engines: do not dump engine-wide reconcile/seed noise into
+        # the primary strategy file (e.g. LEAPS_RSI absorbing BankNiftyBTST OMS).
+        if len(self._known_strategies) > 1:
+            self.log(
+                "reconciliation",
+                message=message,
+                strategy_id=self.engine_id,
+                **payload,
+            )
+            return
+        self.log("reconciliation", message=message, **payload)
 
     def websocket_disconnect(self, message: str = "WebSocket disconnected") -> None:
         self.log("websocket_disconnect", message=message)

@@ -57,22 +57,37 @@ def _order_intent_to_payload(intent, execution_price=None, instrument_store=None
     exchange = dhan_mappings.internal_segment_to_exchange_arg(
         str(segment) if segment is not None else "NFO"
     )
-    price = execution_price if execution_price is not None else (intent.price or 0)
+    extras = getattr(intent, "metadata_extras", None) or {}
+    execution_mode = str(extras.get("execution_mode") or "").strip().upper()
+    intent_price = float(getattr(intent, "price", 0) or 0)
+    trigger = float(getattr(intent, "trigger_price", 0) or 0)
+    # Forever / HYBRID_GTT must keep strategy limit+trigger. Do NOT overwrite with
+    # live ask from price_map (that placed Forever @ ~100 instead of GTT @ ~150).
+    if execution_mode in ("GTT", "HYBRID_GTT"):
+        price = intent_price if intent_price > 0 else float(execution_price or 0)
+        if trigger <= 0:
+            trigger = price
+        # Dhan Forever BUY: trigger activates the order; price is the resting limit.
+        if price <= 0:
+            price = trigger
+    else:
+        price = (
+            float(execution_price)
+            if execution_price is not None
+            else intent_price
+        )
     qty = getattr(intent, "qty", inst.lot_size)
     lot_size = int(getattr(inst, "lot_size", 1))
     total_qty = int(qty) * lot_size
-    extras = getattr(intent, "metadata_extras", None) or {}
-    execution_mode = str(extras.get("execution_mode") or "").strip().upper()
-    trigger = float(getattr(intent, "trigger_price", 0) or 0)
-    if execution_mode in ("GTT", "HYBRID_GTT") and trigger <= 0:
-        trigger = float(price or 0)
+    raw_ot = getattr(intent, "order_type", "MARKET")
+    order_type = dhan_mappings.normalize_order_type(raw_ot)
     payload = {
         "tradingsymbol": inst.place_order_symbol(),
         "exchange": exchange,
         "quantity": total_qty,
         "price": float(price),
         "trigger_price": trigger,
-        "order_type": getattr(intent, "order_type", "MARKET"),
+        "order_type": order_type,
         "transaction_type": intent.side,
         "trade_type": getattr(intent, "trade_type", "MARGIN"),
         "disclosed_quantity": 0,
@@ -138,7 +153,9 @@ class DhanBroker(BaseBroker):
             "quantity": total_qty,
             "price": price,
             "trigger_price": float(intent.get("trigger_price", 0) or 0),
-            "order_type": intent.get("order_type", "MARKET"),
+            "order_type": dhan_mappings.normalize_order_type(
+                intent.get("order_type", "MARKET")
+            ),
             "transaction_type": intent["side"],
             "trade_type": intent.get("trade_type", "MARGIN"),
             "disclosed_quantity": int(intent.get("disclosed_quantity", 0)),
@@ -572,8 +589,8 @@ class DhanBroker(BaseBroker):
                     "message": fail_msg,
                     "display_message": fail_msg,
                     "error_code": parsed.get("error_code"),
-                    "error_type": parsed.get("error_type"),
-                    "error_message": parsed.get("error_message"),
+                    "error_type": parsed.get("error_type") or type(e).__name__,
+                    "error_message": parsed.get("error_message") or str(e),
                     "payload": order_payload,
                     "response": (
                         e.args[0]
@@ -581,6 +598,7 @@ class DhanBroker(BaseBroker):
                         else None
                     ),
                     "attempt": attempt + 1,
+                    "retryable": not isinstance(e, (KeyError, TypeError, ValueError)),
                 }
                 logger.warning(
                     "Dhan place_forever_order exception intent_id=%s attempt=%s payload=%s error=%s",
@@ -689,8 +707,8 @@ class DhanBroker(BaseBroker):
                     "message": fail_msg,
                     "display_message": fail_msg,
                     "error_code": parsed.get("error_code"),
-                    "error_type": parsed.get("error_type"),
-                    "error_message": parsed.get("error_message"),
+                    "error_type": parsed.get("error_type") or type(e).__name__,
+                    "error_message": parsed.get("error_message") or str(e),
                     "payload": order_payload,
                     "response": (
                         e.args[0]
@@ -698,6 +716,7 @@ class DhanBroker(BaseBroker):
                         else None
                     ),
                     "attempt": attempt + 1,
+                    "retryable": not isinstance(e, (KeyError, TypeError, ValueError)),
                 }
                 logger.warning(
                     "Dhan place_order exception intent_id=%s attempt=%s payload=%s error=%s",

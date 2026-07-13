@@ -267,6 +267,16 @@ def format_broker_failure_for_log(
 
     code_u = str(error_code or "").upper()
     retryable = code_u not in ("DH-906", "DH-907")
+    if "retryable" in broker_fail:
+        retryable = bool(broker_fail.get("retryable"))
+    else:
+        # Tradehull KeyError('SL-M') / invalid order-type — do not retry or leave SENT.
+        em = str(error_message or display or broker_fail.get("message") or "")
+        et = str(error_type or "").upper()
+        if et in {"KEYERROR", "TYPEERROR", "VALUEERROR"} or (
+            em.strip().startswith("'") and em.strip().endswith("'") and len(em.strip()) <= 24
+        ):
+            retryable = False
     reason = code_u.lower() if code_u else "no_order_id"
 
     return {

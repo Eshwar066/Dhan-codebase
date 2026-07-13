@@ -1,6 +1,6 @@
 id: OneDayMagicalLine
 implementation:
-  module: core.strategies.crypto.oneDayMagicalLine
+  module: core.strategies.crypto.oneDayMagicalLine.oneDayMagicalLine
   class: OneDayMagicalLine
 instrument: OPTION
 allowed_modes:
