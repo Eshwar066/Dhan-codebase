@@ -793,9 +793,28 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             self.position_manager, "rebuild_position_metadata_from_open_positions_csv"
         ):
             self.position_manager.rebuild_position_metadata_from_open_positions_csv()
+        merge_own = getattr(
+            self.position_manager,
+            "merge_ownership_from_all_strategy_open_positions_csvs",
+            None,
+        )
+        if callable(merge_own):
+            try:
+                merge_own(engine_id=self.engine_id)
+            except Exception as exc:
+                if self.engine_logger:
+                    self.engine_logger.reconciliation(
+                        f"strategy CSV ownership merge failed: {exc}"
+                    )
         self.position_manager.reconcile_with_broker(
             resolved_broker_positions, strategy=None
         )
+        # Re-apply ownership after broker-adopted bare legs.
+        if callable(merge_own):
+            try:
+                merge_own(engine_id=self.engine_id)
+            except Exception:
+                pass
         restore_fn = getattr(self.strategy, "restore_state_on_startup", None)
         if callable(restore_fn):
             try:

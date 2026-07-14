@@ -576,6 +576,58 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
             )
         return intents
 
+    def _build_overnight_exit_intents(self, candle: dict, ctx: Any) -> List[Any]:
+        """T+1 9:25 square-off for open MAIN legs entered on a prior session."""
+        ps = getattr(ctx, "position_store", None)
+        if ps is None or not hasattr(ps, "get_open_positions"):
+            return []
+        trade_dt = pd.Timestamp(candle["timestamp"]).date()
+        intents: List[Any] = []
+        # Prefer strategy-scoped; fall back to all opens and filter by structure_id.
+        positions = list(ps.get_open_positions(strategy=self.name) or [])
+        if not positions:
+            positions = list(ps.get_open_positions() or [])
+        for position in positions:
+            if int(getattr(position, "net_qty", 0) or 0) <= 0:
+                continue
+            tag_u = str(getattr(position, "tag", "") or "").upper()
+            sid = str(getattr(position, "structure_id", "") or "")
+            strat = str(getattr(position, "strategy", "") or "")
+            if strat and strat != self.name and not sid.startswith(f"{self.name}:"):
+                continue
+            if tag_u and tag_u != "MAIN" and not tag_u.startswith("MAIN_"):
+                continue
+            if sid:
+                self._ensure_btst_meta_for_main_fill(
+                    sid,
+                    getattr(position, "instrument", None),
+                    ctx,
+                    getattr(position, "intent_id", None),
+                    None,
+                )
+            meta = self._meta_by_structure_id.get(sid) if sid else None
+            entry_date = meta.entry_date if meta is not None else None
+            if entry_date is None and sid:
+                # structure_id: BankNiftyBTST:BANKNIFTY:YYYY-MM-DD:CE
+                parts = sid.split(":")
+                if len(parts) >= 3:
+                    try:
+                        entry_date = date.fromisoformat(parts[2])
+                    except ValueError:
+                        entry_date = None
+            if entry_date is None or trade_dt <= entry_date:
+                continue
+            if self._active_slot(candle) != EXIT_TIME:
+                continue
+            # Ensure tag is MAIN for exit intent builders / OMS bookkeeping.
+            if not getattr(position, "tag", None):
+                position.tag = "MAIN"
+            if not getattr(position, "strategy", None):
+                position.strategy = self.name
+            exit_intents = self.on_position_exit(position, candle, ctx) or []
+            intents.extend(exit_intents)
+        return intents
+
     def on_candle(self, candle, ctx):
         slot = self._active_slot(candle)
         if slot == ARM_SL_TIME:
@@ -584,7 +636,9 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
             self._cancel_unfilled_entry_orders(candle, ctx)
             return None
         if slot == EXIT_TIME:
-            return None
+            # Belt-and-suspenders: exit service may miss legs that lost strategy/tag
+            # after broker reconcile; emit MAIN_EXIT here too.
+            return self._build_overnight_exit_intents(candle, ctx) or None
         if slot != ENTRY_TIME:
             return None
 
@@ -666,9 +720,17 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         return [self._build_main_sl_intent(ref, sl_trigger, candle_ts, meta.symbol)]
 
     def should_exit(self, position, candle, ctx=None):
-        if position.tag != "MAIN" or position.net_qty <= 0:
+        net_qty = int(getattr(position, "net_qty", 0) or 0)
+        if net_qty <= 0:
             return False
-        sid = str(position.structure_id or "")
+        tag_u = str(getattr(position, "tag", "") or "").upper()
+        # After broker reconcile, tag/strategy may be blank; allow exit if structure
+        # still identifies this as a BTST MAIN (or tag is empty).
+        sid = str(getattr(position, "structure_id", "") or "")
+        if tag_u and tag_u != "MAIN" and not tag_u.startswith("MAIN_"):
+            return False
+        if not tag_u and sid and not sid.startswith(f"{self.name}:"):
+            return False
         if sid:
             self._ensure_btst_meta_for_main_fill(
                 sid,
@@ -677,11 +739,19 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
                 getattr(position, "intent_id", None),
                 None,
             )
-        meta = self._meta_by_structure_id.get(sid)
-        if meta is None:
+        meta = self._meta_by_structure_id.get(sid) if sid else None
+        entry_date = meta.entry_date if meta is not None else None
+        if entry_date is None and sid:
+            parts = sid.split(":")
+            if len(parts) >= 3:
+                try:
+                    entry_date = date.fromisoformat(parts[2])
+                except ValueError:
+                    entry_date = None
+        if entry_date is None:
             return False
         trade_dt = pd.Timestamp(candle["timestamp"]).date()
-        if trade_dt <= meta.entry_date:
+        if trade_dt <= entry_date:
             return False
         return self._active_slot(candle) == EXIT_TIME
 

@@ -720,6 +720,87 @@ class PositionManager:
                     cur[k] = v
             self.position_metadata[sym] = cur
 
+    def merge_ownership_from_all_strategy_open_positions_csvs(
+        self, *, engine_id: Optional[str] = None, logs_root: str = "logs"
+    ) -> int:
+        """
+        Multi-strategy engines store ownership in logs/{strategy}/{engine_id}_open_positions.csv
+        while PM's primary path is usually the primary strategy dir. Merge ownership from
+        every strategy CSV that shares this engine_id so overnight legs keep strategy/tag.
+        """
+        try:
+            from utils.logger.open_positions_logger import (
+                load_position_metadata_from_csv,
+            )
+        except ImportError as exc:
+            logger.warning("open_positions_logger import failed: %s", exc)
+            return 0
+
+        eid = str(
+            engine_id
+            or (os.path.basename(self.open_positions_csv_path or "").replace(
+                "_open_positions.csv", ""
+            ))
+            or ""
+        ).strip()
+        if not eid:
+            return 0
+        root = logs_root
+        if not os.path.isdir(root):
+            return 0
+        merged = 0
+        for name in os.listdir(root):
+            strat_dir = os.path.join(root, name)
+            if not os.path.isdir(strat_dir):
+                continue
+            path = os.path.join(strat_dir, f"{eid}_open_positions.csv")
+            if not os.path.isfile(path):
+                continue
+            if self.open_positions_csv_path and os.path.abspath(
+                path
+            ) == os.path.abspath(self.open_positions_csv_path):
+                continue
+            file_meta = load_position_metadata_from_csv(path)
+            if not file_meta:
+                continue
+            before = len(self.position_metadata)
+            self._merge_open_positions_csv_dict(file_meta)
+            merged += max(0, len(file_meta))
+            _ = before
+        # Also re-apply ownership onto any already-open positions that lost meta.
+        applied = 0
+        with self._lock:
+            for sym, pos in list(self.positions.items()):
+                if int(getattr(pos, "net_qty", 0) or 0) == 0:
+                    continue
+                meta = self.position_metadata.get(sym) or {}
+                if not meta:
+                    continue
+                changed = False
+                if not getattr(pos, "strategy", None) and meta.get("strategy"):
+                    pos.strategy = meta.get("strategy")
+                    changed = True
+                if not getattr(pos, "structure_id", None) and meta.get("structure_id"):
+                    pos.structure_id = meta.get("structure_id")
+                    changed = True
+                if not getattr(pos, "tag", None) and meta.get("tag"):
+                    pos.tag = meta.get("tag")
+                    changed = True
+                if not getattr(pos, "intent_id", None) and meta.get("intent_id"):
+                    pos.intent_id = meta.get("intent_id")
+                    changed = True
+                if changed:
+                    applied += 1
+                    if pos.strategy:
+                        self.strategy_pos[pos.strategy][sym] = int(pos.net_qty)
+        if applied:
+            logger.info(
+                "Restored ownership on %s open position(s) from strategy CSVs (engine=%s)",
+                applied,
+                eid,
+            )
+        return applied
+
     def rebuild_position_metadata_from_open_positions_csv(self) -> None:
         """Merge metadata from logs/{engine_id}_open_positions.csv (strategy_meta, etc.)."""
         path = self.open_positions_csv_path
@@ -938,6 +1019,16 @@ class PositionManager:
         with self._lock:
             if file_meta:
                 self._merge_open_positions_csv_dict(file_meta)
+            # Multi-strategy: ownership often lives under logs/{strategy}/…, not
+            # the primary LEAPS csv path. Merge before adopting bare broker legs.
+            pass
+        # Outside lock: scans filesystem then takes its own lock to apply.
+        try:
+            self.merge_ownership_from_all_strategy_open_positions_csvs()
+        except Exception as exc:
+            logger.warning("strategy open-positions CSV ownership merge failed: %s", exc)
+
+        with self._lock:
             self.last_recon_time = time.time()
             broker_symbols = set(broker_positions.keys())
             local_symbols = set(self.positions.keys())
@@ -971,10 +1062,12 @@ class PositionManager:
                     pos.net_qty = bqty
                     pos.avg_price = float(bp.get("avg_price", 0))
                     pos.strategy = meta_strategy or strategy
-                    pos.tag = tag_m
+                    pos.tag = tag_m or ("MAIN" if meta_strategy or strategy else None)
                     pos.structure_id = structure_id_m
                     pos.intent_id = intent_id_m
                     self.positions[sym] = pos
+                    if pos.strategy:
+                        self.strategy_pos[pos.strategy][sym] = int(bqty)
                     continue
 
                 local = self.positions[sym]
@@ -1016,13 +1109,17 @@ class PositionManager:
                     )
 
                 if not getattr(local, "tag", None):
-                    local.tag = tag_m
+                    local.tag = tag_m or (
+                        "MAIN" if (meta_strategy or strategy or local.strategy) else None
+                    )
                 if not getattr(local, "structure_id", None):
                     local.structure_id = structure_id_m
                 if not getattr(local, "intent_id", None):
                     local.intent_id = intent_id_m
                 if not getattr(local, "strategy", None):
                     local.strategy = meta_strategy or strategy
+                if getattr(local, "strategy", None):
+                    self.strategy_pos[local.strategy][sym] = int(local.net_qty)
 
             for sym in local_symbols - broker_symbols:
                 self.positions.pop(sym, None)
@@ -1116,19 +1213,29 @@ class PositionManager:
 
                 # Prefix match for India-style symbols:
                 # e.g. "NIFTY 30 JAN 24000 CALL" should match underlying "NIFTY".
-                by_prefix = trading_upper.startswith(f"{underlying_norm} ") or custom_upper.startswith(
-                    f"{underlying_norm} "
+                # Dhan compact: "BANKNIFTY-Jul2026-59700-CE" (hyphen, not space).
+                by_prefix = (
+                    trading_upper.startswith(f"{underlying_norm} ")
+                    or trading_upper.startswith(f"{underlying_norm}-")
+                    or custom_upper.startswith(f"{underlying_norm} ")
+                    or custom_upper.startswith(f"{underlying_norm}-")
                 )
 
                 # Handle option format: C-BTC-78000-270326 / P-BTC-...
+                # Also Dhan: BANKNIFTY-Jul2026-59700-CE → underlying is parts[0].
                 if "-" in custom_symbol:
                     parts = custom_symbol.split("-")
                     if len(parts) >= 2:
-                        underlying_from_symbol = parts[1].strip().upper()  # BTC
-
-                        # Compare with passed underlying (BTCUSD → BTC)
+                        # Delta crypto: C-BTC-... / P-BTC-...
+                        if parts[0].strip().upper() in {"C", "P"} and len(parts) >= 2:
+                            underlying_from_symbol = parts[1].strip().upper()
+                        else:
+                            underlying_from_symbol = parts[0].strip().upper()
                         base_underlying = underlying_norm.replace("USD", "").strip()
-                        by_custom = underlying_from_symbol == base_underlying
+                        by_custom = underlying_from_symbol in {
+                            underlying_norm,
+                            base_underlying,
+                        }
 
                 if not (by_trading or by_custom):
                     if not by_prefix:
