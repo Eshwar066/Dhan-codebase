@@ -864,6 +864,69 @@ class OrderRouter:
             self._order_state_log = log
         self._persist_order_state()
 
+    def prune_terminal_order_states(
+        self, *, keep_recent_seconds: float = 6 * 3600, max_terminal: int = 2_000
+    ) -> int:
+        """Drop old terminal order-state entries to bound RAM/JSON growth."""
+        now = time.time()
+        # Prefer timestamps from the rolling state log when available.
+        last_ts: Dict[str, float] = {}
+        for entry in getattr(self, "_order_state_log", []) or []:
+            iid = entry.get("intent_id")
+            if not iid:
+                continue
+            ts_raw = entry.get("timestamp")
+            try:
+                if isinstance(ts_raw, str) and ts_raw.endswith("Z"):
+                    dt = datetime.datetime.strptime(ts_raw[:19], "%Y-%m-%dT%H:%M:%S")
+                    last_ts[str(iid)] = dt.replace(tzinfo=datetime.timezone.utc).timestamp()
+            except (TypeError, ValueError):
+                continue
+
+        to_drop: List[str] = []
+        terminal_ids = [
+            iid
+            for iid, st in list(self._order_state.items())
+            if st in _TERMINAL_ORDER_STATES
+        ]
+        for iid in terminal_ids:
+            ts = last_ts.get(iid, 0.0)
+            if keep_recent_seconds > 0 and ts and (now - ts) < keep_recent_seconds:
+                continue
+            if not ts:
+                # No timestamp — still candidates once over soft cap.
+                continue
+            to_drop.append(iid)
+
+        if len(terminal_ids) > max_terminal:
+            # Force-drop oldest unknown-ts terminals beyond soft cap.
+            surplus = [
+                iid for iid in terminal_ids if iid not in to_drop and iid not in last_ts
+            ]
+            surplus.extend(
+                sorted(
+                    [iid for iid in terminal_ids if iid in last_ts],
+                    key=lambda i: last_ts.get(i, 0.0),
+                )
+            )
+            need = len(terminal_ids) - max_terminal
+            for iid in surplus:
+                if need <= 0:
+                    break
+                if iid not in to_drop:
+                    to_drop.append(iid)
+                    need -= 1
+
+        for iid in to_drop:
+            self._order_state.pop(iid, None)
+            filled_map = getattr(self, "_last_applied_filled_by_intent", None)
+            if isinstance(filled_map, dict):
+                filled_map.pop(iid, None)
+        if to_drop:
+            self._persist_order_state()
+            logger.info("OrderRouter pruned %s terminal order-state entr(y/ies)", len(to_drop))
+        return len(to_drop)
+
     def _rebuild_order_state_cache(self) -> None:
         """Merge IntentStore order states into _order_state (e.g. after restart). Then persist."""
         if not hasattr(self.intent_store, "get_all_order_states"):

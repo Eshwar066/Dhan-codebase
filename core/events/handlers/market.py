@@ -69,7 +69,6 @@ class BarClosedEntryHandler:
                         "strategy": eval_strategy,
                         "symbol": symbol,
                         "candle": payload.get("candle") or enriched,
-                        "ctx": eval_result["ctx"],
                         "intent": intent,
                         "strategy_time_ms": eval_result.get("strategy_time_ms"),
                         "timeframe": timeframe,

@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 logger = logging.getLogger(__name__)
 
 # Temporary headroom while main-loop drain/stall ordering is improved (see utils/cursor.md).
-TICK_QUEUE_MAXSIZE = 500000
+TICK_QUEUE_MAXSIZE = 5000
 
 from run.config import RunMode
 from run.engine_config import EngineConfig, configure_process_logging

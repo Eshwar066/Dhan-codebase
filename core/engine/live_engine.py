@@ -1072,6 +1072,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         ):
             return
         self._last_order_state_check_time = now
+        self._prune_runtime_memory()
         ok, details = self.order_router.verify_open_orders_with_broker()
         if not ok:
             transient = self._is_transient_broker_reconcile_error(details)
@@ -1095,6 +1096,23 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     self.reconcile_positions_on_start()
         else:
             self._entries_paused_order_mismatch = False
+
+    def _prune_runtime_memory(self) -> None:
+        """Bound IntentStore / order-state maps that otherwise grow until OOM."""
+        intent_store = getattr(self, "intent_store", None)
+        if intent_store is not None and hasattr(intent_store, "cleanup_finalized"):
+            try:
+                dropped = intent_store.cleanup_finalized(keep_recent_seconds=6 * 3600)
+                if dropped:
+                    logger.info("IntentStore pruned %s finalized intent(s)", dropped)
+            except Exception:
+                logger.debug("IntentStore cleanup_finalized failed", exc_info=True)
+        router = getattr(self, "order_router", None)
+        if router is not None and hasattr(router, "prune_terminal_order_states"):
+            try:
+                router.prune_terminal_order_states(keep_recent_seconds=6 * 3600)
+            except Exception:
+                logger.debug("OrderRouter prune_terminal_order_states failed", exc_info=True)
 
     @staticmethod
     def _is_transient_broker_reconcile_error(details: Optional[Dict[str, Any]]) -> bool:
@@ -3496,7 +3514,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         "strategy": strategy,
                         "symbol": symbol,
                         "candle": candle,
-                        "ctx": ctx,
                         "intent": intent,
                         "strategy_time_ms": strategy_time_ms,
                         "timeframe": timeframe,

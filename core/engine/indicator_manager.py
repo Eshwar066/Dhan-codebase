@@ -42,8 +42,9 @@ class IndicatorManager:
         self._live_sector = "NO"
         self._base_candle_state: Dict[str, Dict[str, Any]] = {}
         self._strategy_indicator_state: Dict[str, Dict[str, Any]] = {}
-        # Optional shared indicator cache for explicitly compatible strategies.
-        # key: (symbol, timeframe, shared_signature, base_sig)
+        # Shared indicator cache for compatible strategies.
+        # key: (symbol, timeframe, shared_signature) → (base_sig, df)
+        # Overwrites in place so update_seq changes do not accumulate DF copies.
         self._indicator_cache: Dict[Any, Any] = {}
         self._startup_logged: bool = False
         self._rsi_logged_keys = set()
@@ -55,6 +56,9 @@ class IndicatorManager:
         self._log_bootstrap_buffer = 50
         # (symbol, timeframe, ist_bar) → fingerprint of last persisted live_append row.
         self._live_persist_fingerprints: Dict[Tuple[str, str, str], tuple] = {}
+        # Bound in-memory dedupe maps (disk JSONL remains source of truth).
+        self._rsi_logged_keys_max = 8_000
+        self._live_persist_fingerprints_max = 4_000
 
     def set_runtime_context(self, exchange: str, sector: str) -> None:
         self._live_exchange = str(exchange or "INDEX")
@@ -474,6 +478,28 @@ class IndicatorManager:
         out.sort(key=lambda r: r["timestamp"])
         return out
 
+    def _prune_rsi_logged_keys(self) -> None:
+        max_n = int(getattr(self, "_rsi_logged_keys_max", 8000) or 8000)
+        keys = self._rsi_logged_keys
+        if keys is None or len(keys) <= max_n:
+            return
+        # Sets are unordered; drop an arbitrary excess chunk (disk remains source of truth).
+        overflow = len(keys) - max_n
+        for i, key in enumerate(list(keys)):
+            if i >= overflow:
+                break
+            keys.discard(key)
+
+    def _prune_live_persist_fingerprints(self) -> None:
+        max_n = int(getattr(self, "_live_persist_fingerprints_max", 4000) or 4000)
+        fps = self._live_persist_fingerprints
+        if len(fps) <= max_n:
+            return
+        # Drop oldest by IST bar key lexicographic order (YYYY-MM-DD HH:MM sorts well).
+        ordered = sorted(fps.keys(), key=lambda k: k[2] if len(k) > 2 else "")
+        for key in ordered[: len(fps) - max_n]:
+            fps.pop(key, None)
+
     def _hydrate_rsi_session_state_from_disk(
         self, strategy_id: str, symbol: str, tf: str
     ) -> None:
@@ -489,7 +515,9 @@ class IndicatorManager:
             self._rsi_logged_keys,
             self._rsi_seeded_streams,
             log_root=self._rsi_log_root,
+            max_keys=int(getattr(self, "_rsi_logged_keys_max", 8000) or 8000),
         )
+        self._prune_rsi_logged_keys()
         if found <= 0:
             self._rsi_session_hydrated.discard(stream_key)
 
@@ -838,6 +866,8 @@ class IndicatorManager:
             )
             if seeded and ist_key and wrote:
                 self._live_persist_fingerprints[(sym_u, tf_s, ist_key)] = fp
+                self._prune_live_persist_fingerprints()
+                self._prune_rsi_logged_keys()
         self._rsi_seeded_streams.add(stream_key)
 
     def _load_today_live_candles(
@@ -1339,12 +1369,19 @@ class IndicatorManager:
                 return dict(candle)
             df = df.copy()
             shared_sig = self._shared_indicator_signature(strategy)
-            cache_key = (symbol, tf, shared_sig, base_sig) if shared_sig else None
+            # Stable key (no update_seq) — one DF slot per shared stream.
+            cache_key = (symbol, tf, shared_sig) if shared_sig else None
             cache_hit = False
             if cache_key is not None:
-                cached_df = self._indicator_cache.get(cache_key)
-                if cached_df is not None:
-                    df = cached_df.copy()
+                cached_entry = self._indicator_cache.get(cache_key)
+                if (
+                    cached_entry is not None
+                    and isinstance(cached_entry, tuple)
+                    and len(cached_entry) == 2
+                    and cached_entry[0] == base_sig
+                    and cached_entry[1] is not None
+                ):
+                    df = cached_entry[1].copy()
                     cache_hit = True
 
             if not cache_hit:
@@ -1391,7 +1428,7 @@ class IndicatorManager:
                     except Exception:
                         pass
                 if cache_key is not None:
-                    self._indicator_cache[cache_key] = df.copy()
+                    self._indicator_cache[cache_key] = (base_sig, df.copy())
             elif self.engine_logger:
                 try:
                     self.engine_logger.latency(

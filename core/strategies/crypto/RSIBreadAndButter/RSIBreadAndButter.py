@@ -82,7 +82,19 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
         # symbol|bucket_ts — one on_candle eval per closed bar (no re-eval on missing bucket_ts).
         self._evaluated_bar_keys: set[str] = set()
         self._divergence_logged_keys: set[str] = set()
+        self._evaluated_bar_keys_max = 5_000
+        self._divergence_logged_keys_max = 2_000
         self._sync_entry_timeframe()
+
+    @staticmethod
+    def _prune_str_set(store: set, max_n: int) -> None:
+        if max_n <= 0 or len(store) <= max_n:
+            return
+        overflow = len(store) - max_n
+        for i, key in enumerate(sorted(store)):
+            if i >= overflow:
+                break
+            store.discard(key)
 
     @staticmethod
     def _timeframe_minutes(tf: Any) -> int:
@@ -389,6 +401,7 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
         if key in self._evaluated_bar_keys:
             return False
         self._evaluated_bar_keys.add(key)
+        self._prune_str_set(self._evaluated_bar_keys, self._evaluated_bar_keys_max)
         return True
 
     def on_candle(
@@ -427,6 +440,9 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
             div_key = f"{symbol}|{sig_side}|{bucket}"
             if div_key not in self._divergence_logged_keys:
                 self._divergence_logged_keys.add(div_key)
+                self._prune_str_set(
+                    self._divergence_logged_keys, self._divergence_logged_keys_max
+                )
                 last = recent[-1] if recent else candle
                 logger.info(
                     "RSIBreadAndButter divergence %s %s rsi=%s rsi_div_bull=%s "

@@ -40,6 +40,7 @@ from core.strategies.crypto.RSIBreadAndButter.RSIBreadAndButter import (  # noqa
 from core.utils.indicator_history import (  # noqa: E402
     SCHEMA_VERSION,
     indicator_history_path,
+    maybe_trim_indicator_history_file,
     normalize_ist_bar_key,
 )
 from core.data.candle_aggregator import _resolution_to_seconds  # noqa: E402
@@ -294,6 +295,7 @@ def refresh_file(
         with open(hist_path, "w", encoding="utf-8") as f:
             for row in merged:
                 f.write(json.dumps(round_json_floats(row), default=str) + "\n")
+        maybe_trim_indicator_history_file(hist_path)
     return stats
 
 

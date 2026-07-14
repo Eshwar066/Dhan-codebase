@@ -3,6 +3,9 @@ Shared per-(symbol, timeframe) indicator history on disk (JSONL).
 
 Path: logs/indicators/{SYMBOL}/{timeframe}/indicator_history.jsonl
 
+When a history file reaches ``INDICATOR_HISTORY_TRIM_TRIGGER`` lines (10_000), the oldest
+``INDICATOR_HISTORY_TRIM_DROP`` lines (6_000) are dropped on the next append.
+
 Legacy LEAPS RSI files (logs/{strategy}/{strategy}_rsi_history.log) are read for bootstrap
 when the shared file is missing or short.
 """
@@ -33,6 +36,10 @@ DEFAULT_LOG_ROOT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
     "logs",
 )
+
+# Keep indicator JSONL files bounded: at N lines, drop the oldest M lines.
+INDICATOR_HISTORY_TRIM_TRIGGER = 10_000
+INDICATOR_HISTORY_TRIM_DROP = 6_000
 
 
 def indicator_history_path(
@@ -491,8 +498,13 @@ def hydrate_session_keys_from_disk(
     seeded_streams: set,
     *,
     log_root: str = DEFAULT_LOG_ROOT,
+    max_keys: int = 8_000,
 ) -> int:
-    """Populate dedupe keys and mark stream seeded if history exists."""
+    """Populate dedupe keys and mark stream seeded if history exists.
+
+    Only the most recent ``max_keys`` matching lines are hydrated so restarts
+    do not load an unbounded set into process memory.
+    """
     stream_key = (symbol, timeframe)
     if stream_key in seeded_streams:
         return 0
@@ -502,6 +514,8 @@ def hydrate_session_keys_from_disk(
     paths = [indicator_history_path(sym_u, tf_s, log_root=log_root)]
     if strategy_id:
         paths.append(legacy_rsi_history_path(strategy_id, log_root=log_root))
+    # Collect then keep the tail so we do not store every historical bar key.
+    collected: List[Tuple[str, str, str, str]] = []
     for path in paths:
         if not os.path.isfile(path):
             continue
@@ -523,11 +537,14 @@ def hydrate_session_keys_from_disk(
                     if not ist_ts:
                         continue
                     source = str(payload.get("source") or "historical_seed")
-                    key = (sym_u, tf_s, ist_ts, source)
-                    logged_keys.add(key)
-                    count += 1
+                    collected.append((sym_u, tf_s, ist_ts, source))
         except OSError:
             logger.exception("Failed hydrating indicator session: %s", path)
+    if max_keys > 0 and len(collected) > max_keys:
+        collected = collected[-max_keys:]
+    for key in collected:
+        logged_keys.add(key)
+        count += 1
     if count > 0:
         seeded_streams.add(stream_key)
     return count
@@ -554,6 +571,58 @@ def normalize_indicator_scalar(val: Any) -> Optional[Any]:
     if math.isnan(f) or math.isinf(f):
         return None
     return round(f, 6)
+
+
+def maybe_trim_indicator_history_file(
+    path: str,
+    *,
+    trigger_lines: int = INDICATOR_HISTORY_TRIM_TRIGGER,
+    drop_lines: int = INDICATOR_HISTORY_TRIM_DROP,
+) -> bool:
+    """
+    If ``path`` has at least ``trigger_lines`` lines, drop the first ``drop_lines``
+    and rewrite the file (atomic via temp + replace).
+
+    Returns True when a trim was performed.
+    """
+    if trigger_lines <= 0 or drop_lines <= 0 or drop_lines >= trigger_lines:
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        logger.exception("Failed reading indicator history for trim: %s", path)
+        return False
+
+    n = len(lines)
+    if n < trigger_lines:
+        return False
+
+    kept = lines[drop_lines:]
+    tmp = f"{path}.trim.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(kept)
+        os.replace(tmp, path)
+    except OSError:
+        logger.exception("Failed trimming indicator history: %s", path)
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+    logger.info(
+        "Trimmed indicator history %s: %s -> %s lines (dropped first %s)",
+        path,
+        n,
+        len(kept),
+        drop_lines,
+    )
+    return True
 
 
 def append_indicator_history_row(
@@ -644,6 +713,7 @@ def append_indicator_history_row(
         pl = round_fn(payload) if round_fn is not None else payload
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(pl, default=str) + "\n")
+        maybe_trim_indicator_history_file(path)
         return True
     except OSError:
         logger.exception("Failed writing indicator history: %s", path)

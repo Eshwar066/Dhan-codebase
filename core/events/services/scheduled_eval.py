@@ -81,7 +81,6 @@ class ScheduledEvalService:
                                 "strategy": eval_strategy,
                                 "symbol": sym,
                                 "candle": candle,
-                                "ctx": eval_result["ctx"],
                                 "intent": intent,
                                 "strategy_time_ms": eval_result.get("strategy_time_ms"),
                                 "timeframe": None,

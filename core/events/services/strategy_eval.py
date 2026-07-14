@@ -71,7 +71,6 @@ class StrategyEvalService:
                             "strategy": eval_strategy,
                             "symbol": symbol,
                             "candle": publish_candle,
-                            "ctx": eval_result["ctx"],
                             "intent": intent,
                             "strategy_time_ms": eval_result.get("strategy_time_ms"),
                             "timeframe": timeframe,

@@ -101,10 +101,11 @@ def wire_event_bus(engine: object, bus: EventBus | None = None) -> EventBus:
     if "IntentFilled" in enabled or "PositionClosed" in enabled:
         register_fill_handlers(ctx)
 
-    tap_enabled = str(os.getenv("ALGO_EVENT_TAP", "1")).strip().lower() not in (
+    tap_enabled = str(os.getenv("ALGO_EVENT_TAP", "0")).strip().lower() not in (
         "0",
         "false",
         "no",
+        "",
     )
     register_event_tap(ctx, enabled=tap_enabled)
 

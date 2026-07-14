@@ -358,19 +358,40 @@ class IntentStore:
     # -------------------------
     # CLEANUP FINISHED
     # -------------------------
-    def cleanup_finalized(self):
+    def cleanup_finalized(self, *, keep_recent_seconds: float = 0.0):
+        """Drop terminal intents from RAM (and matching idempotency keys).
+
+        ``keep_recent_seconds`` keeps freshly finalized rows briefly for
+        restart/reconcile lookups (0 = drop all terminal).
+        """
+        now = time.time()
         with self._lock:
-            to_delete = [
-                iid
-                for iid, i in self.intents.items()
-                if i["status"]
-                in (
+            to_delete = []
+            for iid, i in self.intents.items():
+                status = i.get("status")
+                if isinstance(status, str):
+                    try:
+                        status = IntentStatus(status)
+                    except ValueError:
+                        continue
+                if status not in (
                     IntentStatus.FILLED,
                     IntentStatus.CANCELLED,
                     IntentStatus.REJECTED,
                     IntentStatus.EXPIRED,
-                )
-            ]
+                ):
+                    continue
+                if keep_recent_seconds > 0:
+                    updated = float(i.get("updated_at") or i.get("created_at") or 0)
+                    if now - updated < keep_recent_seconds:
+                        continue
+                to_delete.append(iid)
 
             for iid in to_delete:
-                self.intents.pop(iid, None)
+                intent = self.intents.pop(iid, None)
+                if not intent:
+                    continue
+                ikey = intent.get("idempotency_key")
+                if ikey and self.idempotency_index.get(ikey) == iid:
+                    self.idempotency_index.pop(ikey, None)
+            return len(to_delete)

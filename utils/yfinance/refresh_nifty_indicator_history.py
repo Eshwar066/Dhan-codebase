@@ -66,6 +66,7 @@ from core.utils.indicator_history import (  # noqa: E402
     indicator_history_path,
     is_nse_60m_bar_ist,
     legacy_rsi_history_path,
+    maybe_trim_indicator_history_file,
 )
 from utils.yfinance.nifty_yahoo import (  # noqa: E402
     fetch_nifty_120m_with_sma,
@@ -452,6 +453,7 @@ def backfill_ema_on_indicator_history(
                 parsed, key=lambda r: _normalize_ist_key(r.get("candle_timestamp_ist"))
             ):
                 f.write(json.dumps(row, default=str) + "\n")
+        maybe_trim_indicator_history_file(hist_path)
 
     return stats
 
@@ -649,6 +651,7 @@ def refresh_indicator_history_file(
         with open(hist_path, "w", encoding="utf-8") as f:
             for row in merged:
                 f.write(json.dumps(row, default=str) + "\n")
+        maybe_trim_indicator_history_file(hist_path)
 
     return stats
 
