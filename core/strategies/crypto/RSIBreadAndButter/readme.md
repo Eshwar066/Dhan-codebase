@@ -2,7 +2,7 @@
 
 Registry: `STRATEGY_MAP["RSIBreadAndButter"]`  
 Implementation: `RSIBreadAndButter.py`  
-Engine job: `run/config.py` → `delta_rsi_bread_butter`
+Engine job: `run/config.py` → `delta_engine_one` (with BTCZeroDTE)
 
 ## Overview
 
@@ -36,7 +36,7 @@ Persists under `logs/indicators/` for live `IndicatorManager`.
 ## Run
 
 ```bash
-python -m run.main --engine-id delta_rsi_bread_butter
+python -m run.main --engine-id delta_engine_one
 ```
 
 ## Logs

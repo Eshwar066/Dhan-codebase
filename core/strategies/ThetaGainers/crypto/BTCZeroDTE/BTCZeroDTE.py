@@ -11,7 +11,7 @@ Rules
 Eval style: scheduled slots (like BankNiftyBTST). ``backtest_timeframe="5"`` so
 backtest bar closes at :00/:05 can hit 09:00 and 17:15 IST.
 
-Run: ``python -m run.main --engine-id delta_btc_zerodte``
+Run: ``python -m run.main --engine-id delta_engine_one``
 """
 
 from __future__ import annotations
