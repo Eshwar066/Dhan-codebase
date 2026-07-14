@@ -10,16 +10,26 @@ from core.strategies.Futures.Futures_EMA_Momentum.Futures_EMA_Momentum import Fu
 from core.strategies.IBBM.Leaps.LeapsQuatery_RSI_52_32 import LeapsQuarterly
 from core.strategies.IBBM.SMA9Weekly.NiftySMA9Weekly import NiftySMA9Weekly
 from core.strategies.MagicalLines.MagicalLines import MagicalLines
-from core.strategies.MagicalLines.NiftyIntradayMagicalLine import NiftyIntradayMagicalLine
+from core.strategies.MagicalLines.NiftyIntradayMagicalLine.NiftyIntradayMagicalLine import NiftyIntradayMagicalLine
 from core.strategies.OpenIntrest.OIPostionalBuy.OIPosBuy import OIPositionalBuy
-from core.strategies.OpenIntrest.optionbuildup import OptionBuildup
+from core.strategies.OpenIntrest.optionbuildup.optionbuildup import OptionBuildup
 from core.strategies.PipelineTest.signal_flood_test import SignalFloodTestStrategy
+from core.strategies.ThetaGainers.crypto.BTCZeroDTE.BTCZeroDTE import BTCZeroDTE
 from core.strategies.crypto.LiquiditySweepStrategy.LiquiditySweepStrategy import LiquiditySweepStrategy
 from core.strategies.crypto.RSIBreadAndButter.RSIBreadAndButter import RSIBreadAndButter
-from core.strategies.crypto.oneDayMagicalLine import OneDayMagicalLine
+from core.strategies.crypto.oneDayMagicalLine.oneDayMagicalLine import OneDayMagicalLine
 
 GENERATED_STRATEGY_MAP = {
-        'BankNiftyBTST': {
+        'BTCZeroDTE': {
+        "strategy": BTCZeroDTE,
+        "instrument": 'OPTION',
+        "allowed_modes": [
+            RunMode.BACKTEST,
+            RunMode.PAPER,
+            RunMode.LIVE,
+        ],
+    },
+    'BankNiftyBTST': {
         "strategy": BankNiftyBTST,
         "instrument": 'OPTION',
         "allowed_modes": [

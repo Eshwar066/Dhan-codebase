@@ -249,6 +249,17 @@ ENGINE_JOBS = [
     },
 
     {
+        "engine_id": "delta_btc_zerodte",
+        "venue": "DELTA",
+        "enabled": False,
+        "run_mode": "LIVE",
+        "capital": 200_000,
+        "strategies": ["BTCZeroDTE"],
+        "max_open_positions": 4,
+        "check_short_option_margin_enabled": True,
+    },
+
+    {
         "engine_id": "delta_rsi_bread_butter",
         "venue": "DELTA",
         "enabled": True,

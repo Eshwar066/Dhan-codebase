@@ -2,6 +2,7 @@
 # Regenerate: python -m tools.strategy_manifest generate
 
 GENERATED_LEGACY_META_KEYS: dict = {
+    'BTCZeroDTE': 'btc_zero_dte',
     'BankNiftyBTST': 'banknifty_btst',
     'LiquiditySweepStrategy': 'liquidity_sweep',
     'NiftyIntradayMagicalLine': 'nifty_intraday_magical_line',

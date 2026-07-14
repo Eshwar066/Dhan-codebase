@@ -329,6 +329,30 @@ class DeltaMktMixins:
 
         return ctx.selected_expiry
 
+    def dailyExpiry(self, candle: dict, ctx: Any):
+        """Same-day (0DTE) expiry label ``DDMMYY`` for the candle trade date."""
+        ts = pd.to_datetime(candle["timestamp"]).tz_localize(None)
+        trade_date = ts.date()
+        s = trade_date.strftime("%d%m%y")
+        ctx.selected_expiry = s
+        return s
+
+    def _resolve_expiry_pref(
+        self, candle: dict, ctx: Any, expiry: Optional[str] = None
+    ) -> Optional[str]:
+        """Map Weekly / Monthly / Daily (0DTE) prefs to ``DDMMYY`` on ``ctx.selected_expiry``."""
+        pref = str(expiry or "").strip().upper()
+        if pref in ("WEEKLY",):
+            return self.weeklyExpiry(candle, ctx)
+        if pref in ("MONTHLY",):
+            return self.monthlyExpiry(candle, ctx)
+        if pref in ("DAILY", "0DTE", "ZERO_DTE", "ZERO-DTE"):
+            return self.dailyExpiry(candle, ctx)
+        sel = getattr(ctx, "selected_expiry", None)
+        if sel:
+            return sel
+        return self.weeklyExpiry(candle, ctx)
+
     def monthlyExpiry(self, candle: dict, ctx: Any):
         """Monthly expiry label ``DDMMYY`` using last Friday month expiry."""
         ts = pd.to_datetime(candle["timestamp"]).tz_localize(None)
@@ -393,12 +417,7 @@ class DeltaMktMixins:
         df["strike"] = parts[2].astype(float)
         df["expiry"] = parts[3]  # e.g. 010226
         # ---- 🔥 resolve expiry ----
-        if expiry == "Weekly":
-            selected_expiry = self.weeklyExpiry(candle, ctx)
-        elif expiry == "Monthly":
-            selected_expiry = self.monthlyExpiry(candle, ctx)
-        else:
-            selected_expiry = ctx.selected_expiry  # fallback
+        selected_expiry = self._resolve_expiry_pref(candle, ctx, expiry)
 
         if selected_expiry is None:
             print(">>select expiry")
@@ -493,9 +512,7 @@ class DeltaMktMixins:
         elif expiry == "Monthly":
             selected_expiry = self.monthlyExpiry(candle, ctx)
         else:
-            selected_expiry = getattr(
-                ctx, "selected_expiry", None
-            ) or self.weeklyExpiry(candle, ctx)
+            selected_expiry = self._resolve_expiry_pref(candle, ctx, expiry)
 
         opt_letter = option_type.strip().upper()[0]
         und = _delta_underlying_prefix(candle.get("symbol", "BTCUSD"))
@@ -1162,12 +1179,7 @@ class DeltaMktMixins:
         df["strike"] = parts[2].astype(float)
         df["expiry"] = parts[3]  # e.g. 010226
         # ---- 🔥 resolve expiry ----
-        if expiry == "Weekly":
-            selected_expiry = self.weeklyExpiry(candle, ctx)
-        elif expiry == "Monthly":
-            selected_expiry = self.monthlyExpiry(candle, ctx)
-        else:
-            selected_expiry = ctx.selected_expiry  # fallback
+        selected_expiry = self._resolve_expiry_pref(candle, ctx, expiry)
 
         df = df[df["strike"] == strike]
         df = df[df["expiry"] == selected_expiry]

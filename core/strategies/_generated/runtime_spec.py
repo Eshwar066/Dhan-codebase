@@ -4,6 +4,17 @@
 from run.config import RunMode
 
 STRATEGY_RUNTIME_SPEC: dict = {
+    'BTCZeroDTE': {
+        RunMode.BACKTEST: {
+            'data': {},
+        },
+        RunMode.PAPER: {
+            'data': {},
+        },
+        RunMode.LIVE: {
+            'data': {},
+        },
+    },
     'BankNiftyBTST': {
         RunMode.BACKTEST: {
             'data': {

@@ -1,0 +1,70 @@
+id: BTCZeroDTE
+implementation:
+  module: core.strategies.ThetaGainers.crypto.BTCZeroDTE.BTCZeroDTE
+  class: BTCZeroDTE
+instrument: OPTION
+allowed_modes:
+- BACKTEST
+- PAPER
+- LIVE
+broker:
+  venue: DELTA
+  api: DELTA
+  delta:
+    india: true
+    testnet: false
+    leverage: 10
+symbols:
+- BTCUSD
+exchange: NSE
+timeframe: null
+schedule:
+  eval_mode: scheduled
+  times:
+  - '09:00'
+  - '17:15'
+backtest_timeframe: '5'
+data:
+  default:
+    data: {}
+profile:
+  live:
+    exchange: DELTA
+    sector: 'YES'
+  backtest:
+    start_date: '2026-02-01'
+    end_date: '2026-02-28'
+    timeframe: '5'
+    exchange: DELTA
+    sector: 'YES'
+dependencies:
+  mixins:
+  - IndiaMktMixins
+  - DeltaMktMixins
+  required_context:
+  - option_chain
+  expiry_type: Daily
+  meta_key: btc_zero_dte
+documentation:
+  title: BTC Zero DTE
+  overview: >
+    Delta BTC same-day OTM short strangle (~$100 premium), 100% stop-loss per leg,
+    one re-entry per leg, flat at 17:15 IST.
+  rules: |
+    - 09:00 IST: sell 1 OTM Call + 1 OTM Put (premium <= ~100)
+    - After MAIN fill: broker SL at 2x entry premium (100% stop)
+    - One re-entry per leg at same premium band after SL
+    - Manage remaining leg independently
+    - 17:15 IST: exit all remaining MAIN positions
+    - Scheduled slots; backtest uses 5m bars for clock alignment
+  run_command: python -m run.main --engine-id delta_btc_zerodte
+  generate_readme: false
+subscriptions:
+  BarClosed: false
+  ScheduledSlot:
+    enabled: true
+    symbols:
+    - BTCUSD
+execution:
+  bracket_leg_tags:
+  - MAIN_SL
