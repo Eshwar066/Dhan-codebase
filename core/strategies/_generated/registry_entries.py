@@ -14,7 +14,7 @@ from core.strategies.MagicalLines.NiftyIntradayMagicalLine.NiftyIntradayMagicalL
 from core.strategies.OpenIntrest.OIPostionalBuy.OIPosBuy import OIPositionalBuy
 from core.strategies.OpenIntrest.optionbuildup.optionbuildup import OptionBuildup
 from core.strategies.PipelineTest.signal_flood_test import SignalFloodTestStrategy
-from core.strategies.ThetaGainers.crypto.BTCZeroDTE.BTCZeroDTE import BTCZeroDTE
+from core.strategies.crypto.BTCZeroDteThreeFifteen.BTCZeroDTE import BTCZeroDTE
 from core.strategies.crypto.LiquiditySweepStrategy.LiquiditySweepStrategy import LiquiditySweepStrategy
 from core.strategies.crypto.RSIBreadAndButter.RSIBreadAndButter import RSIBreadAndButter
 from core.strategies.crypto.oneDayMagicalLine.oneDayMagicalLine import OneDayMagicalLine

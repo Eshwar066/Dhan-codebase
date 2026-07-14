@@ -2,14 +2,14 @@
 BTC Zero-DTE short strangle (Delta).
 
 Rules
-- 09:00 IST: sell 1 OTM Call + 1 OTM Put near ~$100 premium (same-day expiry).
+- 15:15 IST: sell 1 OTM Call + 1 OTM Put near ~$100 premium (same-day expiry).
 - Hold through the day; after each MAIN fill place 100% premium stop (SL-M BUY cover).
 - One re-entry per leg at the same premium band after SL.
 - Manage remaining leg independently.
 - 17:15 IST: exit all remaining MAIN positions.
 
 Eval style: scheduled slots (like BankNiftyBTST). ``backtest_timeframe="5"`` so
-backtest bar closes at :00/:05 can hit 10:00 and 17:15 IST.
+backtest bar closes at :00/:05 can hit 15:15 and 17:15 IST.
 
 Run: ``python -m run.main --engine-id delta_engine_one``
 """
@@ -32,7 +32,7 @@ from core.strategies.meta import pack_strategy_meta
 
 logger = logging.getLogger(__name__)
 
-ENTRY_TIME = time(10, 10)
+ENTRY_TIME = time(15, 15)
 EXIT_TIME = time(17, 15)
 
 # Discrete BTC 0DTE strikes (~$200 spacing) often skip an exact $60–$100 print.

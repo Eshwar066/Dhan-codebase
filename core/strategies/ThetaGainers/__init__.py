@@ -1,1 +1,0 @@
-"""ThetaGainers strategy family."""
