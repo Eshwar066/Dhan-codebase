@@ -249,24 +249,15 @@ ENGINE_JOBS = [
     },
 
     {
-        "engine_id": "delta_btc_zerodte",
-        "venue": "DELTA",
-        "enabled": False,
-        "run_mode": "LIVE",
-        "capital": 200_000,
-        "strategies": ["BTCZeroDTE"],
-        "max_open_positions": 4,
-        "check_short_option_margin_enabled": True,
-    },
-
-    {
-        "engine_id": "delta_rsi_bread_butter",
+        "engine_id": "delta_engine_one",
         "venue": "DELTA",
         "enabled": True,
         "run_mode": "LIVE",
         "capital": 200000,
+        "strategies": ["BTCZeroDTE", "RSIBreadAndButter"],
+        "max_open_positions": 4,
+        "check_short_option_margin_enabled": True,
         "ORDER_QTY_LOTS": 1,
-        "strategies": ["RSIBreadAndButter"],
         "delta_leverage": 10,
         "latency_critical_ms": 6000,
         "latency_critical_cycles": 6,

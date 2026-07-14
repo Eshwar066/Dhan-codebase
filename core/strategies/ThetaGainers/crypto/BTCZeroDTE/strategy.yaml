@@ -57,7 +57,7 @@ documentation:
     - Manage remaining leg independently
     - 17:15 IST: exit all remaining MAIN positions
     - Scheduled slots; backtest uses 5m bars for clock alignment
-  run_command: python -m run.main --engine-id delta_btc_zerodte
+  run_command: python -m run.main --engine-id delta_engine_one
   generate_readme: false
 subscriptions:
   BarClosed: false
