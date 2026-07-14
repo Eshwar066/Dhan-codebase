@@ -70,10 +70,28 @@ class ExitRolloverService:
         open_positions = engine.position_manager.get_open_positions(
             underlying=symbol, strategy=strategy.name
         )
+        # Dhan compact option symbols + strippered ownership after broker sync can
+        # make the combined filter miss legs. Fall back to strategy-only, then
+        # structure_id prefix match for this strategy.
+        if not open_positions:
+            open_positions = engine.position_manager.get_open_positions(
+                strategy=strategy.name
+            )
+        if not open_positions:
+            prefix = f"{strategy.name}:"
+            open_positions = [
+                p
+                for p in (engine.position_manager.get_open_positions() or [])
+                if str(getattr(p, "structure_id", "") or "").startswith(prefix)
+            ]
         exited_structures: set[str] = set()
         for position in open_positions:
+            # Allow blank tag when structure clearly belongs to this strategy
+            # (broker reconcile can wipe tag/strategy but leave qty).
             if not _position_allows_strategy_exit(position):
-                continue
+                sid = str(getattr(position, "structure_id", "") or "")
+                if not sid.startswith(f"{strategy.name}:"):
+                    continue
             if not strategy.should_exit(position, candle, ctx):
                 continue
             sid = getattr(position, "structure_id", None)
