@@ -51,7 +51,7 @@ documentation:
     Delta BTC same-day OTM short strangle (~$100 premium), 100% stop-loss per leg,
     one re-entry per leg, flat at 17:15 IST.
   rules: |
-    - 09:00 IST: sell 1 OTM Call + 1 OTM Put (premium <= ~100)
+    - 09:00 IST: sell 1 OTM Call + 1 OTM Put (premium band ~50–110 around $100)
     - After MAIN fill: broker SL at 2x entry premium (100% stop)
     - One re-entry per leg at same premium band after SL
     - Manage remaining leg independently

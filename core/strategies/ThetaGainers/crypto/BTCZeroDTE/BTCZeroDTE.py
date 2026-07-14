@@ -2,14 +2,14 @@
 BTC Zero-DTE short strangle (Delta).
 
 Rules
-- 09:00 IST: sell 1 OTM Call + 1 OTM Put with premium <= ~$100 (same-day expiry).
+- 09:00 IST: sell 1 OTM Call + 1 OTM Put near ~$100 premium (same-day expiry).
 - Hold through the day; after each MAIN fill place 100% premium stop (SL-M BUY cover).
 - One re-entry per leg at the same premium band after SL.
 - Manage remaining leg independently.
 - 17:15 IST: exit all remaining MAIN positions.
 
 Eval style: scheduled slots (like BankNiftyBTST). ``backtest_timeframe="5"`` so
-backtest bar closes at :00/:05 can hit 09:00 and 17:15 IST.
+backtest bar closes at :00/:05 can hit 10:00 and 17:15 IST.
 
 Run: ``python -m run.main --engine-id delta_engine_one``
 """
@@ -32,12 +32,17 @@ from core.strategies.meta import pack_strategy_meta
 
 logger = logging.getLogger(__name__)
 
-ENTRY_TIME = time(9, 0)
+ENTRY_TIME = time(10, 10)
 EXIT_TIME = time(17, 15)
 
-PREM_MIN = 60.0
-PREM_MAX = 100.0
+# Discrete BTC 0DTE strikes (~$200 spacing) often skip an exact $60–$100 print.
+# Keep a band around ~$100 so CE+PE both resolve; live scorer targets band midpoint.
+PREM_MIN = 50.0
+PREM_MAX = 110.0
 IDEAL_PREM = 100.0
+# Premium-band strategy: do not inherit MagicalLine-style delta gates (0.15–0.35).
+DELTA_MIN = 0.0
+DELTA_MAX = 1.0
 SL_PREM_MULT = 2.0  # 100% stop on short premium
 MAX_REENTRIES_PER_LEG = 1
 
@@ -263,6 +268,8 @@ class BTCZeroDTE(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             lookback_sec=lookback_sec,
             expiry="Daily",
             side="SELL",
+            delta_min=DELTA_MIN,
+            delta_max=DELTA_MAX,
         )
 
     def _normalize_order_qty(self, instrument: Any, fill_qty: Any) -> int:
