@@ -239,6 +239,9 @@ class ExecutionEngine:
             jl = round_json_floats(line) if round_json_floats else line
             with open(self._intent_journal_path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(jl, default=str) + "\n")
+            from core.utils.jsonl_rotate import maybe_trim_jsonl_file
+
+            maybe_trim_jsonl_file(self._intent_journal_path)
         except Exception:
             pass
 

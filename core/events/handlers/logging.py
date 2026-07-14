@@ -9,12 +9,23 @@ from typing import Any, Dict, Optional
 
 from core.events.context import EngineEventContext
 from core.events.types import Event, EventType
+from core.utils.jsonl_rotate import maybe_trim_jsonl_file
 
 logger = logging.getLogger(__name__)
 
 # Keep tap payloads small — dumping StrategyContext / live objects grew events.jsonl
 # by tens of KB per bar and caused GC/I/O pressure on small droplets.
-_OHLC_KEYS = ("symbol", "exchange", "timestamp", "open", "high", "low", "close", "volume", "bucket_ts")
+_OHLC_KEYS = (
+    "symbol",
+    "exchange",
+    "timestamp",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "bucket_ts",
+)
 
 
 def _summarize_intent(intent: Any) -> Any:
@@ -55,6 +66,9 @@ def sanitize_event_payload_for_log(payload: Any) -> Any:
     for key, val in payload.items():
         if key == "ctx":
             continue
+        if key == "enriched_candle":
+            out[key] = _summarize_candle(val)
+            continue
         if key == "strategy":
             out[key] = str(getattr(val, "name", None) or val)[:120]
             continue
@@ -79,6 +93,7 @@ class EventTapHandler:
     def __init__(self, ctx: EngineEventContext, log_path: Optional[Path] = None) -> None:
         self._ctx = ctx
         self._log_path = log_path
+        self._writes_since_trim = 0
 
     def __call__(self, event: Event) -> None:
         if self._log_path is None:
@@ -94,6 +109,10 @@ class EventTapHandler:
             }
             with self._log_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(record, default=str) + "\n")
+            self._writes_since_trim += 1
+            if self._writes_since_trim >= 50:
+                self._writes_since_trim = 0
+                maybe_trim_jsonl_file(self._log_path)
         except Exception:
             logger.debug("Event tap write failed", exc_info=True)
 
