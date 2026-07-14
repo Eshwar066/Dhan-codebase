@@ -71,6 +71,28 @@ ENGINE_JOBS = [
 
     },
     {
+        "engine_id": "delta_engine_one",
+        "venue": "DELTA",
+        "enabled": True,
+        "run_mode": "LIVE",
+        "capital": 200000,
+        "strategies": [
+            "BTCZeroDTE",
+            "BTCZeroDTEElevenPM",
+            "RSIBreadAndButter",
+        ],
+        "max_open_positions": 8,
+        "check_short_option_margin_enabled": True,
+        "ORDER_QTY_LOTS": 1,
+        "delta_leverage": 10,
+        "latency_critical_ms": 6000,
+        "latency_critical_cycles": 6,
+        "telegram": {
+            "bot_token": "8389724629:AAHY_CGcBF8HZCexedsEJFw80Mf6SxH5Bkk",
+            "chat_id": "1021479950",
+        },
+    },
+    {
         "engine_id": "dhan_sma9_weekly",
         "venue": "DHAN",
         "enabled": False,
@@ -248,24 +270,7 @@ ENGINE_JOBS = [
 
     },
 
-    {
-        "engine_id": "delta_engine_one",
-        "venue": "DELTA",
-        "enabled": True,
-        "run_mode": "LIVE",
-        "capital": 200000,
-        "strategies": ["BTCZeroDTE", "RSIBreadAndButter"],
-        "max_open_positions": 4,
-        "check_short_option_margin_enabled": True,
-        "ORDER_QTY_LOTS": 1,
-        "delta_leverage": 10,
-        "latency_critical_ms": 6000,
-        "latency_critical_cycles": 6,
-        "telegram": {
-            "bot_token": "8389724629:AAHY_CGcBF8HZCexedsEJFw80Mf6SxH5Bkk",
-            "chat_id": "1021479950",
-        },
-    },
+   
 
     {
 

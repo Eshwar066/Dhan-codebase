@@ -296,7 +296,7 @@ sudo systemctl list-units 'dhan*' 'option-buildup*' 'delta*'
 | `dhan_leaps_rsi` | LEAPS_RSI | DHAN | LIVE |
 | `dhan_oi_positional_buy` | OIPositionalBuy | DHAN | PAPER |
 | `dhan_banknifty_btst` | BankNiftyBTST | DHAN | LIVE (HYBRID_GTT) |
-| `delta_engine_one` | BTCZeroDTE, RSIBreadAndButter | DELTA | LIVE |
+| `delta_engine_one` | BTCZeroDTE, BTCZeroDTEElevenPM, RSIBreadAndButter | DELTA | LIVE |
 
 ## Further Reading
 
