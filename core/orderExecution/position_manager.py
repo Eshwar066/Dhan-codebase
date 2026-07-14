@@ -113,10 +113,17 @@ class Position:
             self.entry_price = price
             if fill_ts is not None:
                 self.entry_clock = _fill_clock_for_trade_log(fill_ts)
-                self.entry_time = float(pd.Timestamp(fill_ts).timestamp())
+                try:
+                    self.entry_time = float(pd.Timestamp(fill_ts).timestamp())
+                except (TypeError, ValueError):
+                    self.entry_time = time.time()
             else:
-                self.entry_clock = None
+                # REST / broker fills often omit candle_ts — still stamp wall clock so
+                # trade_log rows always have entry_time.
                 self.entry_time = time.time()
+                self.entry_clock = _fill_clock_for_trade_log(
+                    datetime.now(tz=timezone.utc)
+                )
             self.mae = 0.0
             self.mfe = 0.0
 
@@ -348,15 +355,20 @@ class PositionManager:
                 _exit_like = trade_type in ("EXIT", "FORCE_EXIT")
                 pnl_val = pos.realized_pnl if _exit_like else ""
                 cumulative_val = pos.cumulative_pnl if _exit_like else ""
-                # CSV timestamps are rendered in IST (naive UTC inputs are converted)
-                candle_ts_ist = _fill_clock_for_trade_log(candle_ts)
+                # CSV timestamps are rendered in IST (naive UTC inputs are converted).
+                # Fallback to wall clock so REST fills without candle_ts still stamp a time.
+                candle_ts_eff = candle_ts
+                if candle_ts_eff is None:
+                    candle_ts_eff = datetime.now(tz=timezone.utc)
+                candle_ts_ist = _fill_clock_for_trade_log(candle_ts_eff)
+                ts_str = (
+                    candle_ts_ist.strftime("%Y-%m-%d %H:%M")
+                    if candle_ts_ist is not None
+                    else ""
+                )
                 row = {
-                    "candle_timestamp": (
-                        candle_ts_ist.strftime("%Y-%m-%d %H:%M")
-                        if candle_ts_ist is not None
-                        else (candle_ts if candle_ts is not None else "")
-                    ),
-                    "tag": tag,
+                    "candle_timestamp": ts_str,
+                    "tag": tag or "",
                     "symbol": sym,
                     "trade_type": trade_type,
                     "side": side,
@@ -366,22 +378,18 @@ class PositionManager:
                     "cumulative_pnl": cumulative_val,
                     "net_qty_after": new_qty,
                     "execution_source": execution_source or "",
-                    # "order_id": order_id,
-                    # "intent_id": intent_id,
-                    # "trade_id": pos.trade_id,
-                    # "execution_timestamp": datetime.now().isoformat(),
-                    # "strategy": strategy,
+                    # Always present so ENTRY/EXIT share one fixed TRADES_COLUMNS schema.
+                    "mae": pos.mae if _exit_like else "",
+                    "mfe": pos.mfe if _exit_like else "",
+                    "exit_reason": (
+                        (getattr(pos, "exit_reason", None) or "") if _exit_like else ""
+                    ),
                 }
 
                 if _exit_like:
-                    row["mae"] = pos.mae
-                    row["mfe"] = pos.mfe
-                    if getattr(pos, "exit_reason", None):
-                        row["exit_reason"] = pos.exit_reason
-                    if execution_source:
-                        row["execution_source"] = execution_source
-
-                    # Log complete trade for performance analytics (trade log) — all timestamps in IST
+                    # Ensure identity fields exist even for positions adopted via reconcile.
+                    if not getattr(pos, "trade_id", None):
+                        pos.trade_id = f"T-{uuid.uuid4().hex[:10]}"
                     if getattr(pos, "entry_clock", None) is not None:
                         # entry_clock is already IST-naive (see _fill_clock_for_trade_log)
                         entry_time_str = pos.entry_clock.strftime("%Y-%m-%d %H:%M:%S")
@@ -423,7 +431,9 @@ class PositionManager:
                         "entry_time": entry_time_str,
                         "exit_time": exit_time_str,
                         "side": entry_side,
-                        "entry_price": entry_price_for_log if entry_price_for_log is not None else "",
+                        "entry_price": entry_price_for_log
+                        if entry_price_for_log is not None
+                        else "",
                         "exit_price": price,
                         "qty": qty,
                         "pnl": pos.realized_pnl,
@@ -1065,6 +1075,14 @@ class PositionManager:
                     pos.tag = tag_m or ("MAIN" if meta_strategy or strategy else None)
                     pos.structure_id = structure_id_m
                     pos.intent_id = intent_id_m
+                    # Adopted broker legs must still produce complete trade_log rows on exit.
+                    if bqty != 0:
+                        pos.trade_id = f"T-{uuid.uuid4().hex[:10]}"
+                        pos.entry_price = float(bp.get("avg_price", 0) or 0) or None
+                        pos.entry_time = time.time()
+                        pos.entry_clock = _fill_clock_for_trade_log(
+                            datetime.now(tz=timezone.utc)
+                        )
                     self.positions[sym] = pos
                     if pos.strategy:
                         self.strategy_pos[pos.strategy][sym] = int(bqty)
@@ -1118,6 +1136,17 @@ class PositionManager:
                     local.intent_id = intent_id_m
                 if not getattr(local, "strategy", None):
                     local.strategy = meta_strategy or strategy
+                if int(local.net_qty or 0) != 0:
+                    if not getattr(local, "trade_id", None):
+                        local.trade_id = f"T-{uuid.uuid4().hex[:10]}"
+                    if getattr(local, "entry_price", None) is None:
+                        local.entry_price = float(bp.get("avg_price", 0) or 0) or None
+                    if getattr(local, "entry_time", None) is None:
+                        local.entry_time = time.time()
+                    if getattr(local, "entry_clock", None) is None:
+                        local.entry_clock = _fill_clock_for_trade_log(
+                            datetime.now(tz=timezone.utc)
+                        )
                 if getattr(local, "strategy", None):
                     self.strategy_pos[local.strategy][sym] = int(local.net_qty)
 

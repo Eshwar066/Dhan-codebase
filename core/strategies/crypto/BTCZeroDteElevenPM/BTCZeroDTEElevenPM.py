@@ -1,10 +1,11 @@
 """
-BTC overnight OTM15 short strangle (Delta).
+BTC overnight OTM10 short strangle (Delta).
 
 Rules
-- 23:00 IST: sell 1 OTM15 Call + 1 OTM15 Put (same-day / Daily expiry).
+- 23:00 IST: sell 1 OTM10 Call + 1 OTM10 Put (same-day / Daily expiry).
+- If OTM10 is missing for a leg, use the farthest listed ATM+OTM strike available.
 - Hold overnight; after each MAIN fill place 100% premium stop (SL-M BUY cover).
-- Up to 2 re-entries per leg at the same OTM15 after SL (re-entry at cost).
+- Up to 2 re-entries per leg at the same OTM target after SL (re-entry at cost).
 - Manage remaining leg independently.
 - 17:15 IST (next session): exit all remaining MAIN positions.
 
@@ -34,8 +35,9 @@ logger = logging.getLogger(__name__)
 ENTRY_TIME = time(23, 0)
 EXIT_TIME = time(17, 15)
 
-# OTM15 = 15 listed ATM+OTM steps from spot (calls above, puts below).
-OTM_STEPS = 15
+# OTM10 = 10 listed ATM+OTM steps from spot (calls above, puts below).
+# If fewer strikes are listed, fall back to the last available OTM.
+OTM_STEPS = 10
 # Premium SL at 2x entry = 100% stop on short premium.
 SL_PREM_MULT = 2.0
 MAX_REENTRIES_PER_LEG = 2
@@ -55,7 +57,7 @@ class _LegMeta:
 
 
 class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
-    """Delta BTC OTM15 short strangle: 23:00→17:15, 100% SL, 2 re-entries."""
+    """Delta BTC OTM10 short strangle: 23:00→17:15, 100% SL, 2 re-entries."""
 
     name = "BTCZeroDTEElevenPM"
     underlying_symbols = ["BTCUSD"]
@@ -214,7 +216,23 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                     if isinstance(body, dict):
                         self._try_merge_meta_from_raw(sid, body)
 
-    # ---------- strike (OTM15) ----------
+    # ---------- strike (OTM10, fallback to last available) ----------
+
+    def _pick_otm_index(self, available: int, otm_steps: int, option_type: str) -> Optional[int]:
+        """Prefer ``otm_steps``; if missing, use last available index (farthest OTM)."""
+        if available <= 0:
+            return None
+        if available > otm_steps:
+            return int(otm_steps)
+        idx = available - 1
+        logger.warning(
+            "BTCZeroDTEElevenPM: OTM%s unavailable opt=%s (have %s); using last available OTM%s",
+            otm_steps,
+            option_type,
+            available,
+            idx,
+        )
+        return idx
 
     def _find_strike_snapshot_params(self, candle, ctx, option_type):
         trade_dt = self._trade_date(candle)
@@ -272,7 +290,7 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         expiry: str = EXPIRY_PREF,
         lookback_sec: int = 60,
     ):
-        """Pick the Nth ATM+OTM listed strike (OTM15 → index 15)."""
+        """Pick OTM-N; if missing, use the farthest listed ATM+OTM strike."""
         if RUN_MODE == RunMode.BACKTEST:
             return self._find_otm_n_strike_backtest(
                 candle,
@@ -363,15 +381,10 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         latest = latest.copy()
         latest["dist"] = (latest["strike"] - spot).abs()
         latest = latest.sort_values(["dist", "strike"]).reset_index(drop=True)
-        if len(latest) <= otm_steps:
-            logger.warning(
-                "BTCZeroDTEElevenPM: need >=%s OTM strikes, got %s opt=%s",
-                otm_steps + 1,
-                len(latest),
-                option_type,
-            )
+        idx = self._pick_otm_index(len(latest), otm_steps, option_type)
+        if idx is None:
             return None
-        selected = latest.iloc[otm_steps]
+        selected = latest.iloc[idx]
         return (
             float(selected["strike"]),
             float(selected["price"]),
@@ -398,36 +411,47 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         if prepared is None:
             return None
         source, _und, selected_expiry, _opt, _spot, scored, tickers_map = prepared
-        if len(scored) <= otm_steps:
-            logger.warning(
-                "BTCZeroDTEElevenPM: need >=%s live OTM strikes, got %s expiry=%s",
-                otm_steps + 1,
-                len(scored),
-                selected_expiry,
-            )
+        idx = self._pick_otm_index(len(scored), otm_steps, option_type)
+        if idx is None:
             return None
-        _dist, strike, sym, _prod = scored[otm_steps]
-        ltp, bid, ask = self._ltp_from_ticker_map(source, tickers_map, sym, side="SELL")
-        if ltp <= 0:
-            logger.warning(
-                "BTCZeroDTEElevenPM: no LTP for OTM%s %s",
-                otm_steps,
-                sym,
+
+        # Prefer target / fallback index; walk toward ATM only when a quote has no LTP.
+        # Instrument availability is validated later for the exact selected strike.
+        for try_idx in range(idx, -1, -1):
+            _dist, strike, sym, _prod = scored[try_idx]
+            ltp, bid, ask = self._ltp_from_ticker_map(
+                source, tickers_map, sym, side="SELL"
             )
-            return None
-        row = pd.Series(
-            {
-                "symbol": sym,
-                "price": ltp,
-                "strike": strike,
-                "close": ltp,
-                "qty": 1,
-                "best_bid": bid,
-                "best_ask": ask,
-                "expiry": selected_expiry,
-            }
+            if ltp <= 0:
+                continue
+            if try_idx != idx:
+                logger.warning(
+                    "BTCZeroDTEElevenPM: no LTP at OTM%s; using OTM%s %s",
+                    idx,
+                    try_idx,
+                    sym,
+                )
+            row = pd.Series(
+                {
+                    "symbol": sym,
+                    "price": ltp,
+                    "strike": strike,
+                    "close": ltp,
+                    "qty": 1,
+                    "best_bid": bid,
+                    "best_ask": ask,
+                    "expiry": selected_expiry,
+                }
+            )
+            return float(strike), float(ltp), row
+
+        logger.warning(
+            "BTCZeroDTEElevenPM: no LTP among OTM0..OTM%s opt=%s expiry=%s",
+            idx,
+            option_type,
+            selected_expiry,
         )
-        return float(strike), float(ltp), row
+        return None
 
     def _normalize_order_qty(self, instrument: Any, fill_qty: Any) -> int:
         lot = int(getattr(instrument, "lot_size", None) or 1) or 1
@@ -480,6 +504,11 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             for pos in ctx.position_store.get_open_positions(strategy=self.name) or []:
                 sid = str(getattr(pos, "structure_id", "") or "")
                 if sid.startswith(day_prefix) and getattr(pos, "tag", None) == "MAIN":
+                    logger.info(
+                        "BTCZeroDTEElevenPM: skip ENTRY %s — MAIN already open (%s)",
+                        leg,
+                        sid,
+                    )
                     return None
 
         result = self.find_otm_n_strike(candle, ctx, option_type, otm_steps=OTM_STEPS)

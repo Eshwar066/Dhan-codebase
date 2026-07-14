@@ -3859,10 +3859,14 @@ class OrderRouter:
                 if self.engine_logger:
                     self.engine_logger.log(
                         "oms",
-                        f"Skipping duplicate MAIN ENTRY fill callback structure_id={stid_pf}",
+                        f"Skipping duplicate MAIN ENTRY fill structure_id={stid_pf}",
                     )
                 return
-        
+
+        # REST fill paths often omit candle_ts; stamp wall clock so trades.csv / trade_log get times.
+        if candle_ts is None:
+            candle_ts = datetime.datetime.now(tz=datetime.timezone.utc)
+
         position_closed, realized_pnl = self.position_manager.on_fill(
             instrument=instrument,
             side=side,
