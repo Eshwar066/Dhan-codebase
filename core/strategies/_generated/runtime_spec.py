@@ -15,6 +15,17 @@ STRATEGY_RUNTIME_SPEC: dict = {
             'data': {},
         },
     },
+    'BTCZeroDTEElevenPM': {
+        RunMode.BACKTEST: {
+            'data': {},
+        },
+        RunMode.PAPER: {
+            'data': {},
+        },
+        RunMode.LIVE: {
+            'data': {},
+        },
+    },
     'BankNiftyBTST': {
         RunMode.BACKTEST: {
             'data': {

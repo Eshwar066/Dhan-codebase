@@ -34,6 +34,38 @@ GENERATED_STRATEGY_SUBSCRIPTIONS: dict = {
             ],
         },
     },
+    'BTCZeroDTEElevenPM': {
+        'BarClosed': {
+            'enabled': False,
+        },
+        'FeedDisconnected': {
+            'enabled': True,
+        },
+        'FeedRecovered': {
+            'enabled': True,
+        },
+        'IntentCreated': {
+            'enabled': True,
+        },
+        'IntentFilled': {
+            'enabled': True,
+        },
+        'PositionClosed': {
+            'enabled': True,
+        },
+        'QuoteUpdated': {
+            'enabled': False,
+            'symbols': [
+                'BTCUSD',
+            ],
+        },
+        'ScheduledSlot': {
+            'enabled': True,
+            'symbols': [
+                'BTCUSD',
+            ],
+        },
+    },
     'BankNiftyBTST': {
         'BarClosed': {
             'enabled': False,

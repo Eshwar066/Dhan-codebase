@@ -14,6 +14,7 @@ from core.strategies.MagicalLines.NiftyIntradayMagicalLine.NiftyIntradayMagicalL
 from core.strategies.OpenIntrest.OIPostionalBuy.OIPosBuy import OIPositionalBuy
 from core.strategies.OpenIntrest.optionbuildup.optionbuildup import OptionBuildup
 from core.strategies.PipelineTest.signal_flood_test import SignalFloodTestStrategy
+from core.strategies.crypto.BTCZeroDteElevenPM.BTCZeroDTEElevenPM import BTCZeroDTEElevenPM
 from core.strategies.crypto.BTCZeroDteThreeFifteen.BTCZeroDTE import BTCZeroDTE
 from core.strategies.crypto.LiquiditySweepStrategy.LiquiditySweepStrategy import LiquiditySweepStrategy
 from core.strategies.crypto.RSIBreadAndButter.RSIBreadAndButter import RSIBreadAndButter
@@ -22,6 +23,15 @@ from core.strategies.crypto.oneDayMagicalLine.oneDayMagicalLine import OneDayMag
 GENERATED_STRATEGY_MAP = {
         'BTCZeroDTE': {
         "strategy": BTCZeroDTE,
+        "instrument": 'OPTION',
+        "allowed_modes": [
+            RunMode.BACKTEST,
+            RunMode.PAPER,
+            RunMode.LIVE,
+        ],
+    },
+    'BTCZeroDTEElevenPM': {
+        "strategy": BTCZeroDTEElevenPM,
         "instrument": 'OPTION',
         "allowed_modes": [
             RunMode.BACKTEST,

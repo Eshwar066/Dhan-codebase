@@ -25,6 +25,29 @@ STRATEGY_PROFILES: dict = {
             'sector': 'YES',
         },
     },
+    'BTCZeroDTEElevenPM': {
+        'symbols': [
+            'BTCUSD',
+        ],
+        'exchange': 'NSE',
+        'eval_mode': 'scheduled',
+        'delta': {
+            'india': True,
+            'testnet': False,
+            'leverage': 10,
+        },
+        'live': {
+            'exchange': 'DELTA',
+            'sector': 'YES',
+        },
+        'backtest': {
+            'start_date': '2026-02-01',
+            'end_date': '2026-02-28',
+            'timeframe': '5',
+            'exchange': 'DELTA',
+            'sector': 'YES',
+        },
+    },
     'BankNiftyBTST': {
         'symbols': [
             'BANKNIFTY',

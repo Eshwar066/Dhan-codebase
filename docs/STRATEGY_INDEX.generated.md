@@ -5,6 +5,7 @@ _AUTO-GENERATED table — run `python -m tools.strategy_manifest generate` to re
 | Registry key | Class | Instrument | Venue | Manifest |
 |--------------|-------|------------|-------|----------|
 | `BTCZeroDTE` | `BTCZeroDTE` | OPTION | DELTA | `core/strategies/crypto/BTCZeroDteThreeFifteen/strategy.yaml` |
+| `BTCZeroDTEElevenPM` | `BTCZeroDTEElevenPM` | OPTION | DELTA | `core/strategies/crypto/BTCZeroDteElevenPM/strategy.yaml` |
 | `BankNiftyBTST` | `BankNiftyBTST` | OPTION | DHAN | `core/strategies/BTST/BankNiftyBTST/strategy.yaml` |
 | `FuturesEMAHighLow` | `FuturesEMAHighLow` | FUTURE | DHAN | `core/strategies/Futures/Futures_EMA/strategy.yaml` |
 | `Futures_EMA_Momentum` | `FuturesEMAMomentum` | FUTURE | DELTA | `core/strategies/Futures/Futures_EMA_Momentum/strategy.yaml` |

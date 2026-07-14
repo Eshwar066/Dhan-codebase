@@ -1,0 +1,70 @@
+id: BTCZeroDTEElevenPM
+implementation:
+  module: core.strategies.crypto.BTCZeroDteElevenPM.BTCZeroDTEElevenPM
+  class: BTCZeroDTEElevenPM
+instrument: OPTION
+allowed_modes:
+- BACKTEST
+- PAPER
+- LIVE
+broker:
+  venue: DELTA
+  api: DELTA
+  delta:
+    india: true
+    testnet: false
+    leverage: 10
+symbols:
+- BTCUSD
+exchange: NSE
+timeframe: null
+schedule:
+  eval_mode: scheduled
+  times:
+  - '23:00'
+  - '17:15'
+backtest_timeframe: '5'
+data:
+  default:
+    data: {}
+profile:
+  live:
+    exchange: DELTA
+    sector: 'YES'
+  backtest:
+    start_date: '2026-02-01'
+    end_date: '2026-02-28'
+    timeframe: '5'
+    exchange: DELTA
+    sector: 'YES'
+dependencies:
+  mixins:
+  - IndiaMktMixins
+  - DeltaMktMixins
+  required_context:
+  - option_chain
+  expiry_type: Daily
+  meta_key: btc_zero_dte_eleven_pm
+documentation:
+  title: BTC OTM15 Overnight (11PM)
+  overview: >
+    Delta BTC OTM15 short strangle on Daily (0DTE) expiry. Enter 23:00 IST,
+    100% stop-loss per leg, up to two re-entries at cost after SL, flat at 17:15 IST.
+  rules: |
+    - 23:00 IST: sell 1 OTM15 Call + 1 OTM15 Put (same-day Daily expiry)
+    - After MAIN fill: broker SL at 2x entry premium (100% stop)
+    - Up to 2 re-entries per leg at OTM15 after SL
+    - Manage remaining leg independently
+    - 17:15 IST: exit all remaining MAIN positions (overnight hold)
+    - Scheduled slots; backtest uses 5m bars for clock alignment
+  run_command: python -m run.main --engine-id delta_engine_one
+  generate_readme: false
+subscriptions:
+  BarClosed: false
+  ScheduledSlot:
+    enabled: true
+    symbols:
+    - BTCUSD
+execution:
+  bracket_leg_tags:
+  - MAIN_SL
