@@ -248,6 +248,14 @@ class PositionManager:
         assert instrument.custom_symbol, "Instrument must have custom_symbol"
         if not isinstance(instrument, Instrument):
             raise TypeError(f"on_fill expects Instrument, got {type(instrument)}")
+        try:
+            missing_candle_ts = candle_ts is None or bool(pd.isna(candle_ts))
+        except (TypeError, ValueError):
+            missing_candle_ts = candle_ts is None
+        if missing_candle_ts:
+            # REST fills can carry pandas.NaT. Hooks require a real timestamp for
+            # slot keys, expiry selection, and deferred/re-entry intent creation.
+            candle_ts = datetime.now(timezone.utc)
 
         hook_main_entry = None
         hook_main_exit = None

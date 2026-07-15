@@ -2,7 +2,7 @@
 BTC overnight OTM10 short strangle (Delta).
 
 Rules
-- 23:00 IST: sell 1 OTM10 Call + 1 OTM10 Put (same-day / Daily expiry).
+- 23:00 IST: sell 10 OTM10 Call lots + 10 OTM10 Put lots (Daily expiry).
 - If OTM10 is missing for a leg, use the farthest listed ATM+OTM strike available.
 - Hold overnight; after each MAIN fill place 100% premium stop (SL-M BUY cover).
 - Up to 2 re-entries per leg at the same OTM target after SL (re-entry at cost).
@@ -68,6 +68,7 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     required_context = ["option_chain"]
     api = "DELTA"
     expiryType = EXPIRY_PREF
+    order_qty_lots = 10
     otm_strike_step = 200
     otm_strike_count = OTM_STEPS + 1
 
@@ -799,10 +800,19 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             return []
         ctx = kwargs.get("ctx")
         ts = kwargs.get("candle_ts")
+        try:
+            missing_ts = ts is None or bool(pd.isna(ts))
+        except (TypeError, ValueError):
+            missing_ts = ts is None
+        if missing_ts:
+            ts = pd.Timestamp.now(tz="UTC")
+        spot = kwargs.get("spot")
+        if not spot and ctx is not None:
+            spot = getattr(ctx, "spot_price", None)
         candle_stub = {
             "symbol": meta.symbol,
             "timestamp": ts,
-            "close": float(kwargs.get("spot") or 0.0),
+            "close": float(spot or 0.0),
             "exchange": None,
         }
         pairs = self._try_reentry_after_sl(ctx, meta, candle_stub)

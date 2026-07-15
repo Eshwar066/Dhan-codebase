@@ -2,7 +2,7 @@
 BTC Zero-DTE short strangle (Delta).
 
 Rules
-- 15:15 IST: sell 1 OTM Call + 1 OTM Put near ~$100 premium (same-day expiry).
+- 15:15 IST: sell 10 OTM Call lots + 10 OTM Put lots near ~$100 premium.
 - Hold through the day; after each MAIN fill place 100% premium stop (SL-M BUY cover).
 - One re-entry per leg at the same premium band after SL.
 - Manage remaining leg independently.
@@ -71,6 +71,7 @@ class BTCZeroDTE(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     required_context = ["option_chain"]
     api = "DELTA"
     expiryType = "Daily"
+    order_qty_lots = 10
     otm_strike_step = 200
     otm_strike_count = 12
     option_chain_ideal_premium = IDEAL_PREM

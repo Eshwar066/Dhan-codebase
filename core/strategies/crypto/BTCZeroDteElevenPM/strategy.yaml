@@ -52,7 +52,7 @@ documentation:
     100% stop-loss per leg, up to two re-entries at cost after SL, flat at 17:15 IST.
     If OTM10 is not listed for a leg, uses the farthest available ATM+OTM strike.
   rules: |
-    - 23:00 IST: sell 1 OTM10 Call + 1 OTM10 Put (same-day Daily expiry)
+    - 23:00 IST: sell 10 OTM10 Call lots + 10 OTM10 Put lots (Daily expiry)
     - If OTM10 missing for CE/PE: use last available OTM strike for that leg
     - After MAIN fill: broker SL at 2x entry premium (100% stop)
     - Up to 2 re-entries per leg after SL
