@@ -37,6 +37,11 @@ logger = logging.getLogger(__name__)
 ENTRY_TIME = time(23, 00)
 EXIT_TIME = time(17, 15)
 
+# Entry switches. Disabling a family blocks its initial entries and SL re-entries;
+# existing positions still retain their SL/target and 17:15 exit handling.
+ENABLE_FIRST_ENTRY = True
+ENABLE_SECOND_ENTRY = True
+
 # First entry: OTM10 with fallback to the farthest available OTM.
 FIRST_ENTRY_OTM_STEPS = 10
 FIRST_ENTRY_LOTS = 10
@@ -93,6 +98,12 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
 
     def get_warmup_period(self):
         return 0
+
+    @staticmethod
+    def _entry_group_enabled(entry_group: str) -> bool:
+        if str(entry_group).upper() == "E2":
+            return ENABLE_SECOND_ENTRY
+        return ENABLE_FIRST_ENTRY
 
     # ---------- time / slots ----------
 
@@ -552,6 +563,8 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         allow_fallback: bool = True,
         reentry_count: int = 0,
     ) -> Optional[Any]:
+        if not self._entry_group_enabled(entry_group):
+            return None
         symbol = str(candle.get("symbol") or "BTCUSD")
         structure_id = self._structure_id(
             symbol,
@@ -835,10 +848,24 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         trade_dt = self._trade_date(candle)
         intents: List[Any] = []
         entry_specs = (
-            ("E1", FIRST_ENTRY_OTM_STEPS, FIRST_ENTRY_LOTS, True),
-            ("E2", SECOND_ENTRY_OTM_STEPS, SECOND_ENTRY_LOTS, False),
+            (
+                ENABLE_FIRST_ENTRY,
+                "E1",
+                FIRST_ENTRY_OTM_STEPS,
+                FIRST_ENTRY_LOTS,
+                True,
+            ),
+            (
+                ENABLE_SECOND_ENTRY,
+                "E2",
+                SECOND_ENTRY_OTM_STEPS,
+                SECOND_ENTRY_LOTS,
+                False,
+            ),
         )
-        for entry_group, otm_steps, qty_lots, allow_fallback in entry_specs:
+        for enabled, entry_group, otm_steps, qty_lots, allow_fallback in entry_specs:
+            if not enabled:
+                continue
             for opt in ("CE", "PE"):
                 leg = self._build_leg_entry(
                     candle,
