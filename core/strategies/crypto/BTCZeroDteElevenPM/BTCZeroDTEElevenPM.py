@@ -1,9 +1,11 @@
 """
-BTC overnight OTM10 short strangle (Delta).
+BTC overnight OTM10 + OTM15 short strangles (Delta).
 
 Rules
 - 23:00 IST: sell 10 OTM10 Call lots + 10 OTM10 Put lots (Daily expiry).
 - If OTM10 is missing for a leg, use the farthest listed ATM+OTM strike available.
+- Also sell OTM15 Call and Put using a separately configurable lot size.
+- OTM15 is strict per leg: place CE or PE independently and skip a missing leg.
 - Hold overnight; after each MAIN fill place 100% premium stop (SL-M BUY cover).
 - Up to 2 re-entries per leg at the same OTM target after SL (re-entry at cost).
 - Manage remaining leg independently.
@@ -35,9 +37,14 @@ logger = logging.getLogger(__name__)
 ENTRY_TIME = time(23, 00)
 EXIT_TIME = time(17, 15)
 
-# OTM10 = 10 listed ATM+OTM steps from spot (calls above, puts below).
-# If fewer strikes are listed, fall back to the last available OTM.
-OTM_STEPS = 10
+# First entry: OTM10 with fallback to the farthest available OTM.
+FIRST_ENTRY_OTM_STEPS = 10
+FIRST_ENTRY_LOTS = 10
+# Second entry: strict OTM15; CE and PE are resolved independently.
+SECOND_ENTRY_OTM_STEPS = 15
+SECOND_ENTRY_LOTS = 10
+# Backward-compatible alias for the original entry.
+OTM_STEPS = FIRST_ENTRY_OTM_STEPS
 # Premium SL at 2x entry = 100% stop on short premium.
 SL_PREM_MULT = 2.0
 TP_TRIGGER_PRICE = 0.1
@@ -55,10 +62,13 @@ class _LegMeta:
     option_type: str
     entry_premium: float
     reentry_count: int
+    entry_group: str
+    otm_steps: int
+    qty_lots: int
 
 
 class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
-    """Delta BTC OTM10 short strangle: 23:00→17:15, 100% SL, 2 re-entries."""
+    """Delta BTC OTM10 + OTM15 entries with independent leg management."""
 
     name = "BTCZeroDTEElevenPM"
     underlying_symbols = ["BTCUSD"]
@@ -69,9 +79,9 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     required_context = ["option_chain"]
     api = "DELTA"
     expiryType = EXPIRY_PREF
-    order_qty_lots = 10
+    order_qty_lots = FIRST_ENTRY_LOTS
     otm_strike_step = 200
-    otm_strike_count = OTM_STEPS + 1
+    otm_strike_count = SECOND_ENTRY_OTM_STEPS + 1
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -141,16 +151,23 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     # ---------- meta ----------
 
     def _structure_id(
-        self, symbol: str, trade_dt: date, option_type: str, *, reentry: int = 0
+        self,
+        symbol: str,
+        trade_dt: date,
+        option_type: str,
+        *,
+        entry_group: str = "E1",
+        reentry: int = 0,
     ) -> str:
         leg = str(option_type).upper()
         if leg in ("CALL", "CE"):
             leg = "CE"
         elif leg in ("PUT", "PE"):
             leg = "PE"
+        group_suffix = "" if str(entry_group).upper() == "E1" else f":{entry_group}"
         if reentry > 0:
-            return f"{self.name}:{symbol}:{trade_dt}:{leg}:R{reentry}"
-        return f"{self.name}:{symbol}:{trade_dt}:{leg}"
+            return f"{self.name}:{symbol}:{trade_dt}:{leg}{group_suffix}:R{reentry}"
+        return f"{self.name}:{symbol}:{trade_dt}:{leg}{group_suffix}"
 
     @staticmethod
     def _entry_expiry(trade_dt: date) -> str:
@@ -164,6 +181,9 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             "option_type": meta.option_type,
             "entry_premium": meta.entry_premium,
             "reentry_count": meta.reentry_count,
+            "entry_group": meta.entry_group,
+            "otm_steps": meta.otm_steps,
+            "qty_lots": meta.qty_lots,
         }
         out = pack_strategy_meta(REGISTRY_KEY, payload)
         out[META_KEY] = payload
@@ -179,6 +199,14 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 option_type=str(raw["option_type"]),
                 entry_premium=float(raw["entry_premium"]),
                 reentry_count=int(raw.get("reentry_count", 0) or 0),
+                entry_group=str(raw.get("entry_group", "E1") or "E1").upper(),
+                otm_steps=int(
+                    raw.get("otm_steps", FIRST_ENTRY_OTM_STEPS)
+                    or FIRST_ENTRY_OTM_STEPS
+                ),
+                qty_lots=int(
+                    raw.get("qty_lots", FIRST_ENTRY_LOTS) or FIRST_ENTRY_LOTS
+                ),
             )
         except (KeyError, TypeError, ValueError):
             return False
@@ -225,12 +253,27 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
 
     # ---------- strike (OTM10, fallback to last available) ----------
 
-    def _pick_otm_index(self, available: int, otm_steps: int, option_type: str) -> Optional[int]:
-        """Prefer ``otm_steps``; if missing, use last available index (farthest OTM)."""
+    def _pick_otm_index(
+        self,
+        available: int,
+        otm_steps: int,
+        option_type: str,
+        *,
+        allow_fallback: bool,
+    ) -> Optional[int]:
+        """Resolve OTM-N, optionally falling back to the farthest listed strike."""
         if available <= 0:
             return None
         if available > otm_steps:
             return int(otm_steps)
+        if not allow_fallback:
+            logger.warning(
+                "BTCZeroDTEElevenPM: strict OTM%s unavailable opt=%s (have %s); skipping leg",
+                otm_steps,
+                option_type,
+                available,
+            )
+            return None
         idx = available - 1
         logger.warning(
             "BTCZeroDTEElevenPM: OTM%s unavailable opt=%s (have %s); using last available OTM%s",
@@ -296,8 +339,9 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         otm_steps: int = OTM_STEPS,
         expiry: str = EXPIRY_PREF,
         lookback_sec: int = 60,
+        allow_fallback: bool = True,
     ):
-        """Pick OTM-N; if missing, use the farthest listed ATM+OTM strike."""
+        """Pick OTM-N, with optional fallback to the farthest listed strike."""
         if RUN_MODE == RunMode.BACKTEST:
             return self._find_otm_n_strike_backtest(
                 candle,
@@ -306,6 +350,7 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 otm_steps=otm_steps,
                 expiry=expiry,
                 lookback_sec=lookback_sec,
+                allow_fallback=allow_fallback,
             )
         return self._find_otm_n_strike_live(
             candle,
@@ -313,6 +358,7 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             option_type,
             otm_steps=otm_steps,
             expiry=expiry,
+            allow_fallback=allow_fallback,
         )
 
     def _find_otm_n_strike_backtest(
@@ -324,6 +370,7 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         otm_steps: int,
         expiry: str,
         lookback_sec: int,
+        allow_fallback: bool,
     ):
         df = self.load_delta_data_for_candle(candle, ctx)
         if df is None or df.empty:
@@ -388,7 +435,12 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         latest = latest.copy()
         latest["dist"] = (latest["strike"] - spot).abs()
         latest = latest.sort_values(["dist", "strike"]).reset_index(drop=True)
-        idx = self._pick_otm_index(len(latest), otm_steps, option_type)
+        idx = self._pick_otm_index(
+            len(latest),
+            otm_steps,
+            option_type,
+            allow_fallback=allow_fallback,
+        )
         if idx is None:
             return None
         selected = latest.iloc[idx]
@@ -406,6 +458,7 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         *,
         otm_steps: int,
         expiry: str,
+        allow_fallback: bool,
     ):
         prepared = self._prepare_live_atm_otm_chain(
             candle,
@@ -426,13 +479,19 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 selected_expiry,
             )
             return None
-        idx = self._pick_otm_index(len(scored), otm_steps, option_type)
+        idx = self._pick_otm_index(
+            len(scored),
+            otm_steps,
+            option_type,
+            allow_fallback=allow_fallback,
+        )
         if idx is None:
             return None
 
-        # Prefer target / fallback index; walk toward ATM only when a quote has no LTP.
-        # Instrument availability is validated later for the exact selected strike.
-        for try_idx in range(idx, -1, -1):
+        # OTM10 may walk inward if the selected quote has no LTP. Strict OTM15
+        # checks only index 15, allowing CE and PE to succeed independently.
+        indices = range(idx, -1, -1) if allow_fallback else (idx,)
+        for try_idx in indices:
             _dist, strike, sym, _prod = scored[try_idx]
             ltp, bid, ask = self._ltp_from_ticker_map(
                 source, tickers_map, sym, side="SELL"
@@ -487,11 +546,19 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         option_type: str,
         trade_dt: date,
         *,
+        entry_group: str = "E1",
+        otm_steps: int = FIRST_ENTRY_OTM_STEPS,
+        qty_lots: int = FIRST_ENTRY_LOTS,
+        allow_fallback: bool = True,
         reentry_count: int = 0,
     ) -> Optional[Any]:
         symbol = str(candle.get("symbol") or "BTCUSD")
         structure_id = self._structure_id(
-            symbol, trade_dt, option_type, reentry=reentry_count
+            symbol,
+            trade_dt,
+            option_type,
+            entry_group=entry_group,
+            reentry=reentry_count,
         )
         guard = f"{structure_id}|{self._slot_key(candle)}"
         if guard in self._entry_signaled_keys:
@@ -508,19 +575,28 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         ):
             return None
 
-        # Day-level: skip if any MAIN for this CE/PE already open for this entry night.
+        # Entry-family level: E1 and E2 can coexist for the same CE/PE.
         if reentry_count == 0:
             leg = str(option_type).upper()
             if leg in ("CALL", "CE"):
                 leg = "CE"
             elif leg in ("PUT", "PE"):
                 leg = "PE"
-            day_prefix = f"{self.name}:{symbol}:{trade_dt}:{leg}"
+            day_prefix = self._structure_id(
+                symbol,
+                trade_dt,
+                leg,
+                entry_group=entry_group,
+            )
             for pos in ctx.position_store.get_open_positions(strategy=self.name) or []:
                 sid = str(getattr(pos, "structure_id", "") or "")
-                if sid.startswith(day_prefix) and getattr(pos, "tag", None) == "MAIN":
+                if (
+                    (sid == day_prefix or sid.startswith(f"{day_prefix}:R"))
+                    and getattr(pos, "tag", None) == "MAIN"
+                ):
                     logger.info(
-                        "BTCZeroDTEElevenPM: skip ENTRY %s — MAIN already open (%s)",
+                        "BTCZeroDTEElevenPM: skip %s ENTRY %s — MAIN already open (%s)",
+                        entry_group,
                         leg,
                         sid,
                     )
@@ -534,13 +610,15 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             candle,
             ctx,
             option_type,
-            otm_steps=OTM_STEPS,
+            otm_steps=otm_steps,
             expiry=expiry,
+            allow_fallback=allow_fallback,
         )
         if result is None:
             logger.warning(
-                "BTCZeroDTEElevenPM: no OTM%s strike opt=%s date=%s reentry=%s",
-                OTM_STEPS,
+                "BTCZeroDTEElevenPM: no %s OTM%s strike opt=%s date=%s reentry=%s",
+                entry_group,
+                otm_steps,
                 option_type,
                 trade_dt,
                 reentry_count,
@@ -579,6 +657,9 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             option_type=str(option_type).upper(),
             entry_premium=prem,
             reentry_count=int(reentry_count),
+            entry_group=str(entry_group).upper(),
+            otm_steps=int(otm_steps),
+            qty_lots=max(1, int(qty_lots)),
         )
         intent = self.map_instrument_to_intent(
             inst=inst,
@@ -592,14 +673,17 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             action="ENTRY",
             metadata_extras=self._strategy_meta_dict(meta),
         )
+        # Keep E1/E2 sizing independent of the engine-wide ORDER_QTY_LOTS value.
+        intent.qty = meta.qty_lots
         self._meta_by_structure_id[structure_id] = meta
         self._entry_signaled_keys.add(guard)
         logger.info(
-            "BTCZeroDTEElevenPM entry %s strike=%s prem=%s expiry=%s reentry=%s",
+            "BTCZeroDTEElevenPM entry %s strike=%s prem=%s expiry=%s lots=%s reentry=%s",
             structure_id,
             strike,
             prem,
             expiry,
+            meta.qty_lots,
             reentry_count,
         )
         return intent
@@ -717,6 +801,10 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             ctx,
             opt,
             meta.entry_date,
+            entry_group=meta.entry_group,
+            otm_steps=meta.otm_steps,
+            qty_lots=meta.qty_lots,
+            allow_fallback=meta.entry_group == "E1",
             reentry_count=meta.reentry_count + 1,
         )
         if intent is None:
@@ -746,10 +834,27 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
 
         trade_dt = self._trade_date(candle)
         intents: List[Any] = []
-        for opt in ("CE", "PE"):
-            leg = self._build_leg_entry(candle, ctx, opt, trade_dt, reentry_count=0)
-            if leg is not None:
-                intents.append(leg)
+        entry_specs = (
+            ("E1", FIRST_ENTRY_OTM_STEPS, FIRST_ENTRY_LOTS, True),
+            ("E2", SECOND_ENTRY_OTM_STEPS, SECOND_ENTRY_LOTS, False),
+        )
+        for entry_group, otm_steps, qty_lots, allow_fallback in entry_specs:
+            for opt in ("CE", "PE"):
+                leg = self._build_leg_entry(
+                    candle,
+                    ctx,
+                    opt,
+                    trade_dt,
+                    entry_group=entry_group,
+                    otm_steps=otm_steps,
+                    qty_lots=qty_lots,
+                    allow_fallback=allow_fallback,
+                    reentry_count=0,
+                )
+                # Each OTM15 leg is independent: an unavailable PE does not
+                # suppress a valid CE (and vice versa).
+                if leg is not None:
+                    intents.append(leg)
         return intents or None
 
     def should_exit(self, position, candle, ctx=None):

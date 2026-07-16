@@ -46,14 +46,16 @@ dependencies:
   expiry_type: Daily
   meta_key: btc_zero_dte_eleven_pm
 documentation:
-  title: BTC OTM10 Overnight (11PM)
+  title: BTC OTM10 + OTM15 Overnight (11PM)
   overview: >
-    Delta BTC OTM10 short strangle on Daily (0DTE) expiry. Enter 23:00 IST,
-    100% stop-loss per leg, up to two re-entries at cost after SL, flat at 17:15 IST.
-    If OTM10 is not listed for a leg, uses the farthest available ATM+OTM strike.
+    Delta BTC OTM10 and OTM15 short strangles on Daily expiry. Both enter at
+    23:00 IST with separate lot sizes, independent leg management, 100% stop-loss,
+    up to two re-entries after SL, and a 17:15 IST exit.
   rules: |
     - 23:00 IST: sell 10 OTM10 Call lots + 10 OTM10 Put lots (Daily expiry)
     - If OTM10 missing for CE/PE: use last available OTM strike for that leg
+    - Also enter strict OTM15 CE and PE with separately configurable lots
+    - If either OTM15 leg is unavailable, skip only that leg
     - After MAIN fill: broker SL at 2x entry premium (100% stop)
     - Up to 2 re-entries per leg after SL
     - Manage remaining leg independently
