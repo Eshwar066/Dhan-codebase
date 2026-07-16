@@ -845,6 +845,20 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             self._open_positions_logger.record_broker_reconcile_snapshot(
                 self.position_manager
             )
+        if self.engine_logger:
+            open_legs = [
+                {"symbol": sym, "qty": int(pos.net_qty)}
+                for sym, pos in self.position_manager.positions.items()
+                if int(getattr(pos, "net_qty", 0) or 0) != 0
+            ]
+            self.engine_logger.reconciliation(
+                "Reconciliation OK",
+                details={
+                    "open_positions": len(open_legs),
+                    "mismatches_synced": len(diff),
+                    "positions": open_legs,
+                },
+            )
         return True
 
     def _resolve_position_ownership_from_intent_store(
