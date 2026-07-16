@@ -32,7 +32,7 @@ from core.strategies.meta import pack_strategy_meta
 
 logger = logging.getLogger(__name__)
 
-ENTRY_TIME = time(23, 30)
+ENTRY_TIME = time(23, 00)
 EXIT_TIME = time(17, 15)
 
 # OTM10 = 10 listed ATM+OTM steps from spot (calls above, puts below).
