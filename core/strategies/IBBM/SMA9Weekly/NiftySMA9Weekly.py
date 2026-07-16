@@ -27,7 +27,7 @@ from core.strategies.indicator_helpers import (
     default_persisted_keys_for_sma,
 )
 from core.utils.expiry_resolver import ExpiryResolver
-from core.utils.indicator_history import nse_bar_close_eval_window
+from core.utils.indicator_history import nse_120m_bar_close_eval_window
 from core.utils.option_chain_snapshot_log import log_option_chain_snapshot
 from core.utils.session.session_manager import SessionManager
 
@@ -311,11 +311,9 @@ class NiftySMA9Weekly(IndiaMktMixins, BaseStrategy):
         return day - timedelta(days=1)
 
     def _in_2h_close_eval_window(self, candle: dict, grace_minutes: int = 10) -> bool:
-        return nse_bar_close_eval_window(
+        return nse_120m_bar_close_eval_window(
             candle,
-            bar_minutes=int(self.timeframe) if str(self.timeframe).isdigit() else 120,
             grace_minutes=grace_minutes,
-            require_nse_60m_open=False,
         )
 
     # ---------- Entry ----------

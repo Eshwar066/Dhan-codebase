@@ -15,7 +15,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import psutil
 
 from core.data.candle_aggregator import _resolution_to_seconds
-from core.utils.indicator_history import bucket_ts_is_nse_60m_bar, is_nse_index_context, nse_60m_bar_close_eval_window
+from core.utils.indicator_history import (
+    bucket_ts_is_nse_60m_bar,
+    bucket_ts_is_nse_120m_bar,
+    is_nse_index_context,
+    nse_60m_bar_close_eval_window,
+)
 
 DEFAULT_FEED_STALE_SECONDS = 60
 logger = logging.getLogger(__name__)
@@ -491,9 +496,10 @@ class LiveEngineHelpersMixin:
           if present and divisible by the strategy TF (same seconds as ``CandleAggregator``),
           treat as aligned (canonical closed bar).
         - **NSE index 60m**: require session-anchored hourly opens (09:15, 10:15, …, 15:15 IST).
+        - **NSE index 120m**: require 120m opens (09:15, 11:15, 13:15, 15:15 IST).
         - **Alignment**: unix second offset modulo ``tf_sec`` where ``tf_sec`` comes from
           ``_resolution_to_seconds`` (same map as ``TIMEFRAME_SECONDS`` / aggregator). This
-          matches ``"15"``, ``"15m"``, ``"60"``, ``"1h"``, etc., unlike naive ``int(tf)``.
+          matches ``"15"``, ``"15m"``, ``"60"``, ``"1h"``, ``"120"``, etc., unlike naive ``int(tf)``.
         """
         ts_raw = candle.get("timestamp")
         ts_utc = self._candle_timestamp_to_utc_naive(ts_raw)
@@ -506,6 +512,7 @@ class LiveEngineHelpersMixin:
         tf_sec = int(_resolution_to_seconds(timeframe))
         if tf_sec <= 0:
             tf_sec = 60
+        tf_s = str(timeframe or "").strip().lower()
 
         epoch = dt.datetime(1970, 1, 1)
         bt = candle.get("bucket_ts")
@@ -515,9 +522,13 @@ class LiveEngineHelpersMixin:
             except (TypeError, ValueError):
                 bt_int = None
             if bt_int is not None:
-                if tf_sec == 3600 and self._is_nse_index_candle(candle):
-                    if not bucket_ts_is_nse_60m_bar(bt_int):
-                        return False
+                if self._is_nse_index_candle(candle):
+                    if tf_sec == 3600 or tf_s in ("60", "1h", "60m"):
+                        if not bucket_ts_is_nse_60m_bar(bt_int):
+                            return False
+                    elif tf_sec == 7200 or tf_s in ("120", "2h", "120m"):
+                        if not bucket_ts_is_nse_120m_bar(bt_int):
+                            return False
                 now_unix = int((now_utc - epoch).total_seconds())
                 if candle.get("session_close_partial"):
                     exchange = str(

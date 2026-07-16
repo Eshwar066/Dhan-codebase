@@ -2061,13 +2061,145 @@ class OrderRouter:
     def _hedge_fill_retry_enabled(self, bundle_item: Dict[str, Any]) -> bool:
         if not self._broker_hedge_fill_gate_enabled():
             return False
+        if not bool(getattr(self.broker, "hedge_fill_retry_enabled", True)):
+            return False
         sid = str(bundle_item.get("strategy_id") or "").strip()
         allowed = getattr(self.broker, "hedge_fill_retry_strategy_ids", None)
         if allowed is None:
-            return sid == "LEAPS_RSI"
+            return True
         if isinstance(allowed, (set, frozenset, list, tuple)):
+            if not allowed:
+                return True
             return sid in allowed
         return False
+
+    def _mark_hedge_intent_cancelled(
+        self,
+        hedge_intent: Any,
+        *,
+        reason: str,
+        message: str,
+        bundle_item: Dict[str, Any],
+    ) -> None:
+        intent_id = str(getattr(hedge_intent, "intent_id", "") or "")
+        if not intent_id:
+            return
+        self.intent_store.update(
+            intent_id,
+            IntentStatus.CANCELLED,
+            order_state=OrderState.CANCELLED,
+        )
+        self._set_order_state(
+            intent_id,
+            OrderState.CANCELLED,
+            action=reason,
+            message=message,
+        )
+        if self.engine_logger:
+            self.engine_logger.log(
+                "order_failed",
+                (
+                    f"ORDER_CANCELLED intent_id={intent_id} "
+                    f"reason={reason} bundle=true | {message}"
+                ),
+                intent_id=intent_id,
+                strategy_id=bundle_item.get("strategy_id"),
+                structure_id=bundle_item.get("structure_id"),
+            )
+
+    def _cancel_hedge_intent_and_verify(
+        self,
+        hedge_intent: Any,
+        *,
+        bundle_item: Dict[str, Any],
+        timeout_sec: float,
+        poll_interval: float,
+    ) -> Dict[str, Any]:
+        """
+        Cancel a resting hedge limit after fill timeout; poll broker until terminal.
+
+        Returns ``filled=True`` if the hedge filled during cancel (caller may continue MAIN).
+        """
+        intent_id = str(getattr(hedge_intent, "intent_id", "") or "")
+        if not intent_id:
+            return {"ok": True, "filled": False, "cancelled": False}
+
+        ost = self._order_state.get(intent_id)
+        if ost == OrderState.FILLED:
+            return {"ok": True, "filled": True, "cancelled": False}
+
+        rec = self.intent_store.get(intent_id) if self.intent_store else None
+        broker_oid = (rec or {}).get("broker_order_id")
+        cancel_fn = getattr(self.broker, "cancel_order_by_id", None)
+        is_open_fn = getattr(self.broker, "order_is_open", None)
+
+        if broker_oid and callable(is_open_fn) and is_open_fn(str(broker_oid)):
+            if callable(cancel_fn):
+                cancel_fn(
+                    str(broker_oid),
+                    intent_id=intent_id,
+                    reason="hedge_fill_timeout",
+                )
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "oms",
+                        (
+                            f"Hedge cancel on bundle fail intent_id={intent_id} "
+                            f"order_id={broker_oid}"
+                        ),
+                        intent_id=intent_id,
+                        strategy_id=bundle_item.get("strategy_id"),
+                        structure_id=bundle_item.get("structure_id"),
+                    )
+            deadline = time.time() + max(1.0, float(timeout_sec))
+            while time.time() < deadline:
+                rec = self.intent_store.get(intent_id) if self.intent_store else rec
+                if rec:
+                    synced = self._poll_and_sync_intent_terminal(rec)
+                    if synced == OrderState.FILLED:
+                        return {"ok": True, "filled": True, "cancelled": False}
+                    if synced in (
+                        OrderState.CANCELLED,
+                        OrderState.REJECTED,
+                        OrderState.EXPIRED,
+                    ):
+                        return {"ok": True, "filled": False, "cancelled": True}
+                ost = self._order_state.get(intent_id)
+                if ost == OrderState.FILLED:
+                    return {"ok": True, "filled": True, "cancelled": False}
+                if ost in (
+                    OrderState.CANCELLED,
+                    OrderState.REJECTED,
+                    OrderState.EXPIRED,
+                ):
+                    return {"ok": True, "filled": False, "cancelled": True}
+                if (
+                    broker_oid
+                    and callable(is_open_fn)
+                    and not is_open_fn(str(broker_oid))
+                ):
+                    remaining = max(0.05, deadline - time.time())
+                    wait = self._await_intent_terminal(
+                        intent_id,
+                        timeout_sec=remaining,
+                        poll_interval=poll_interval,
+                    )
+                    if wait.get("ok"):
+                        return {"ok": True, "filled": True, "cancelled": False}
+                    return {"ok": True, "filled": False, "cancelled": True}
+                time.sleep(max(0.05, float(poll_interval)))
+            return {
+                "ok": False,
+                "filled": False,
+                "cancelled": False,
+                "reason": "cancel_verify_timeout",
+            }
+
+        if rec:
+            synced = self._poll_and_sync_intent_terminal(rec)
+            if synced == OrderState.FILLED:
+                return {"ok": True, "filled": True, "cancelled": False}
+        return {"ok": True, "filled": False, "cancelled": False}
 
     def _refresh_bundle_entry_prices(
         self,
@@ -2311,6 +2443,69 @@ class OrderRouter:
                     break
                 if attempt < max_attempts and retry_enabled:
                     continue
+
+            if not hedge_filled:
+                cancel_on_fail = bool(
+                    getattr(self.broker, "hedge_fill_cancel_on_failure", True)
+                )
+                verify_sec = float(
+                    getattr(self.broker, "hedge_fill_cancel_verify_sec", 15.0) or 15.0
+                )
+                if cancel_on_fail:
+                    for hedge_intent, _ in hedge_legs:
+                        cr = self._cancel_hedge_intent_and_verify(
+                            hedge_intent,
+                            bundle_item=bundle_item,
+                            timeout_sec=verify_sec,
+                            poll_interval=poll_interval,
+                        )
+                        if cr.get("filled"):
+                            hedge_filled = True
+                            if self.engine_logger:
+                                self.engine_logger.log(
+                                    "oms",
+                                    (
+                                        f"Hedge filled during cancel verify "
+                                        f"intent_id={hedge_intent.intent_id}; "
+                                        "continuing with MAIN"
+                                    ),
+                                    intent_id=hedge_intent.intent_id,
+                                    strategy_id=bundle_item.get("strategy_id"),
+                                    structure_id=bundle_item.get("structure_id"),
+                                )
+                            break
+                        fail_reason = str(
+                            last_wait.get("reason") or "hedge_fill_failed"
+                        )
+                        if cr.get("cancelled"):
+                            self._mark_hedge_intent_cancelled(
+                                hedge_intent,
+                                reason=fail_reason,
+                                message=(
+                                    "Hedge order cancelled after fill timeout; "
+                                    "follow legs not sent"
+                                ),
+                                bundle_item=bundle_item,
+                            )
+                        elif not cr.get("ok"):
+                            logger.warning(
+                                "Hedge cancel verify failed intent_id=%s reason=%s; "
+                                "order may still be live at broker",
+                                hedge_intent.intent_id,
+                                cr.get("reason"),
+                            )
+                            if self.engine_logger:
+                                self.engine_logger.log(
+                                    "oms",
+                                    (
+                                        f"Hedge cancel verify failed "
+                                        f"intent_id={hedge_intent.intent_id} "
+                                        f"reason={cr.get('reason')}"
+                                    ),
+                                    intent_id=hedge_intent.intent_id,
+                                    strategy_id=bundle_item.get("strategy_id"),
+                                    structure_id=bundle_item.get("structure_id"),
+                                )
 
             if not hedge_filled:
                 msg = (

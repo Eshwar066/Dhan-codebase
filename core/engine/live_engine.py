@@ -44,8 +44,10 @@ from core.engine.execution_engine import ExecutionEngine
 from core.engine.indicator_manager import IndicatorManager
 from core.utils.indicator_history import (
     bucket_ts_is_nse_60m_bar,
+    bucket_ts_is_nse_120m_bar,
     is_nse_index_context,
     nse_60m_bar_close_eval_window,
+    nse_120m_bar_close_eval_window,
 )
 from core.orderExecution.account_router import AccountRouter
 
@@ -378,6 +380,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             last_hist_ts
         ):
             return first_live_ts
+        if bucket_ts_is_nse_120m_bar(first_live_ts) and not bucket_ts_is_nse_120m_bar(
+            last_hist_ts
+        ):
+            return first_live_ts
         if first_live_ts < last_hist_ts:
             gap = int(last_hist_ts) - int(first_live_ts)
             if continuous_market:
@@ -436,9 +442,17 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             if df is None or len(df) == 0 or "timestamp" not in df.columns:
                 return None
             tf_s = str(tf or "").strip()
-            nse_60m = tf_s in ("60", "1h") and is_nse_index_context(symbol, exchange)
-            if nse_60m:
-                # Ignore wall-clock / misaligned rows (e.g. 12:16) that break alignment.
+            nse_session_tf = is_nse_index_context(symbol, exchange) and tf_s in (
+                "60",
+                "1h",
+                "60m",
+                "120",
+                "2h",
+                "120m",
+            )
+            if nse_session_tf:
+                # Ignore wall-clock / misaligned rows that break alignment.
+                want_120 = tf_s in ("120", "2h", "120m")
                 for i in range(len(df) - 1, -1, -1):
                     last_ts = df.iloc[i].get("timestamp")
                     if last_ts is None:
@@ -453,7 +467,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         bt = int(float(last_ts))
                     else:
                         continue
-                    if bucket_ts_is_nse_60m_bar(bt):
+                    if want_120:
+                        if bucket_ts_is_nse_120m_bar(bt):
+                            return bt
+                    elif bucket_ts_is_nse_60m_bar(bt):
                         return bt
                 return None
             last_ts = df.iloc[-1].get("timestamp")
@@ -476,9 +493,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     bt = int(float(last_ts))
                 else:
                     continue
-                if bt > cutoff:
-                    continue
-                return bt
+                if bt <= cutoff:
+                    return bt
             return None
         except Exception:
             return None
@@ -2349,8 +2365,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
     def _should_process_nse_60m_closed_bar(
         self, candle: Dict[str, Any], timeframe: str
     ) -> bool:
-        tf = str(timeframe or "").strip()
-        if tf not in ("60", "1h"):
+        tf = str(timeframe or "").strip().lower()
+        if tf not in ("60", "1h", "60m", "120", "2h", "120m"):
             return True
         symbol = str(candle.get("symbol") or "")
         exchange = str(
@@ -2360,6 +2376,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         )
         if not is_nse_index_context(symbol, exchange):
             return True
+        if tf in ("120", "2h", "120m"):
+            return nse_120m_bar_close_eval_window(candle)
         return nse_60m_bar_close_eval_window(candle)
 
     def _evaluate_strategies_parallel(
@@ -2909,13 +2927,18 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             getattr(self.realtime_feed, "is_dummy_feed", False)
                         )
                         tf_sec = max(60, int(_resolution_to_seconds(tf)))
-                        nse_60m_bar = (
-                            str(tf) in ("60", "1h")
+                        nse_session_bar = (
+                            str(tf).strip().lower()
+                            in ("60", "1h", "60m", "120", "2h", "120m")
                             and is_nse_index_context(symbol, exchange)
                             and eval_bucket is not None
-                            and bucket_ts_is_nse_60m_bar(eval_bucket)
+                            and (
+                                bucket_ts_is_nse_120m_bar(eval_bucket)
+                                if str(tf).strip().lower() in ("120", "2h", "120m")
+                                else bucket_ts_is_nse_60m_bar(eval_bucket)
+                            )
                         )
-                        if nse_60m_bar:
+                        if nse_session_bar:
                             self._first_live_alignment_done[symbol] = True
                         elif not is_dummy_feed and (
                             not self._first_live_alignment_done.get(symbol, False)

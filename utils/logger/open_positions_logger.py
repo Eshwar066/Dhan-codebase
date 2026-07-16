@@ -103,7 +103,12 @@ def load_position_metadata_from_csv(csv_path: str) -> Dict[str, Dict[str, Any]]:
                     state[sym] = m
         elif src == "broker_reconcile":
             m = _row_to_meta(row)
-            if not m.get("structure_id") and not m.get("strategy_meta"):
+            # Empty SYNC must not wipe ownership learned from fill / earlier SYNC.
+            if (
+                not m.get("structure_id")
+                and not m.get("strategy_meta")
+                and not m.get("strategy")
+            ):
                 continue
             cur = dict(state.get(sym) or {}) if state.get(sym) else {}
             for k, v in m.items():
@@ -382,17 +387,53 @@ class OpenPositionsLogger:
             self._write_snapshot(strat_snap, strategy_path)
 
     def record_broker_reconcile_snapshot(self, position_manager: Any) -> None:
-        """Live: replace file with one row per non-flat position after PM synced to broker."""
-        snap: Dict[str, Dict[str, Any]] = {}
-        for sym, pos in position_manager.positions.items():
-            if pos.net_qty == 0:
-                continue
-            pm_bucket = getattr(position_manager, "position_metadata", {}).get(
-                sym, {}
-            ) or {}
-            sm = pm_bucket.get("strategy_meta")
-            snap[sym] = self._finalize_row_for_csv(
-                {
+        """
+        Live: rewrite open-positions CSV from PM after broker sync.
+
+        Ownership fields (strategy / structure_id / tag / intent_id) are merged from
+        the prior snapshot and ``position_manager.position_metadata``. Rows with
+        ownership are retained even if the broker briefly reports flat — metadata
+        is only dropped when a fill CLOSE clears ``position_metadata``.
+        """
+        ownership_keys = (
+            "strategy",
+            "structure_id",
+            "tag",
+            "intent_id",
+            "strategy_meta",
+            "magicalLine",
+            "level",
+        )
+
+        def _merge_ownership(dst: Dict[str, Any], *sources: Dict[str, Any]) -> None:
+            for src in sources:
+                if not src:
+                    continue
+                for k in ownership_keys:
+                    cur = dst.get(k)
+                    if cur not in (None, ""):
+                        continue
+                    val = src.get(k)
+                    if val not in (None, ""):
+                        dst[k] = val
+
+        def _has_ownership(row_or_meta: Dict[str, Any]) -> bool:
+            if not row_or_meta:
+                return False
+            sid = str(row_or_meta.get("structure_id") or "").strip()
+            strat = str(row_or_meta.get("strategy") or "").strip()
+            return bool(sid or strat)
+
+        with self._lock:
+            prior = self._read_open_snapshot()
+            pm_meta_all = getattr(position_manager, "position_metadata", {}) or {}
+            snap: Dict[str, Dict[str, Any]] = {}
+
+            for sym, pos in position_manager.positions.items():
+                if pos.net_qty == 0:
+                    continue
+                pm_bucket = dict(pm_meta_all.get(sym, {}) or {})
+                row: Dict[str, Any] = {
                     "timestamp": self._now(),
                     "engine_id": self.engine_id,
                     "venue": self.venue,
@@ -403,20 +444,52 @@ class OpenPositionsLogger:
                     "prev_qty": "",
                     "net_qty": pos.net_qty,
                     "avg_price": pos.avg_price,
-                    "strategy": (getattr(pos, "strategy", "") or pm_bucket.get("strategy") or ""),
-                    "structure_id": getattr(pos, "structure_id", "")
-                    or pm_bucket.get("structure_id")
-                    or "",
-                    "tag": getattr(pos, "tag", "") or pm_bucket.get("tag") or "",
-                    "intent_id": getattr(pos, "intent_id", "")
-                    or pm_bucket.get("intent_id")
-                    or "",
-                    "strategy_meta": sm if sm is not None else "",
+                    "strategy": getattr(pos, "strategy", "") or "",
+                    "structure_id": getattr(pos, "structure_id", "") or "",
+                    "tag": getattr(pos, "tag", "") or "",
+                    "intent_id": getattr(pos, "intent_id", "") or "",
+                    "strategy_meta": pm_bucket.get("strategy_meta")
+                    if pm_bucket.get("strategy_meta") is not None
+                    else "",
                 }
-            )
-        with self._lock:
+                _merge_ownership(row, pm_bucket, prior.get(sym) or {})
+                snap[sym] = self._finalize_row_for_csv(row)
+
+            # Keep ownership rows for legs still tracked in position_metadata but
+            # temporarily missing/flat on the broker (false flat / API hole).
+            for sym, meta in list(pm_meta_all.items()):
+                if sym in snap:
+                    continue
+                if not _has_ownership(meta) and not _has_ownership(prior.get(sym) or {}):
+                    continue
+                prev = dict(prior.get(sym) or {})
+                row = {
+                    "timestamp": self._now(),
+                    "engine_id": self.engine_id,
+                    "venue": self.venue,
+                    "run_mode": self._run_mode_str,
+                    "source": "broker_reconcile",
+                    "event": "SYNC",
+                    "symbol": sym,
+                    "prev_qty": "",
+                    "net_qty": prev.get("net_qty") or "",
+                    "avg_price": prev.get("avg_price") or "",
+                    "strategy": "",
+                    "structure_id": "",
+                    "tag": "",
+                    "intent_id": "",
+                    "strategy_meta": "",
+                }
+                _merge_ownership(row, meta, prev)
+                if not _has_ownership(row):
+                    continue
+                # Sticky qty from prior so restart rebuild still sees the leg
+                # until a real fill CLOSE clears position_metadata.
+                if not str(row.get("net_qty") or "").strip() and prev.get("net_qty"):
+                    row["net_qty"] = prev.get("net_qty")
+                snap[sym] = self._finalize_row_for_csv(row)
+
             self._write_snapshot(snap)
-            # Strategy-wise snapshots (for multi-strategy engines).
             by_strategy: Dict[str, Dict[str, Dict[str, Any]]] = {}
             for sym, row in snap.items():
                 strategy_name = str(row.get("strategy") or "").strip() or self.strategy

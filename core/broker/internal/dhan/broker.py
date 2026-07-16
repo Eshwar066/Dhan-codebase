@@ -119,9 +119,14 @@ class DhanBroker(BaseBroker):
     hedge_fill_wait_timeout_sec = 120.0
     hedge_fill_poll_interval_sec = 0.5
     hedge_fill_margin_settle_sec = 2.0
-    hedge_fill_retry_max_attempts = 3
+    # Hedge chase: place → wait → refresh price → modify → repeat; then cancel before abort.
+    hedge_fill_retry_enabled = True
+    hedge_fill_retry_max_attempts = 5
     hedge_fill_retry_per_attempt_sec = 40.0
-    hedge_fill_retry_strategy_ids = frozenset({"LEAPS_RSI"})
+    # None = all strategies using hedge-gated bundles (LEAPS, NiftySMA9Weekly, …).
+    hedge_fill_retry_strategy_ids = None
+    hedge_fill_cancel_on_failure = True
+    hedge_fill_cancel_verify_sec = 15.0
 
     def __init__(self, api, position_manager=None, intent_store=None):
         super().__init__(position_manager=position_manager, intent_store=intent_store)

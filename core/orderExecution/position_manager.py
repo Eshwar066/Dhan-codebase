@@ -976,6 +976,77 @@ class PositionManager:
                 return True
         return False
 
+    def has_open_main_leg(
+        self,
+        strategy: str,
+        *,
+        underlying: Optional[str] = None,
+        structure_id: Optional[str] = None,
+    ) -> bool:
+        """
+        True if an open MAIN already blocks a new entry for this LEAPS leg family.
+
+        Exact ``structure_id`` match always blocks. Otherwise:
+        - mini (no ``:QTR`` suffix): any non-QTR MAIN on the underlying, or a
+          short MAIN with missing ``structure_id`` after broker reconcile
+        - quarterly (``:QTR``): any MAIN whose structure ends with ``:QTR``, or
+          a short MAIN with missing ``structure_id`` (safe after restart)
+
+        Also matches broker-adopted shorts with empty strategy/tag/structure_id
+        (common when reconcile runs with ``strategy=None`` and no open-positions CSV).
+
+        Long legs without structure_id are treated as hedges and ignored.
+        """
+        sid_want = str(structure_id or "").strip()
+        want_qtr = sid_want.endswith(":QTR")
+        strat = str(strategy or "").strip()
+        if sid_want and self.has_open_structure(
+            strategy=strat, structure_id=sid_want, tag="MAIN"
+        ):
+            return True
+
+        und = str(underlying or "").strip().upper()
+        # Include strategy-owned legs and unowned broker-adopted legs for this underlying.
+        candidates = list(self.get_open_positions(underlying=und or None, strategy=strat or None))
+        if und:
+            seen = {id(p) for p in candidates}
+            for pos in self.get_open_positions(underlying=und, strategy=None):
+                if id(pos) in seen:
+                    continue
+                pos_strat = str(getattr(pos, "strategy", None) or "").strip()
+                if pos_strat and pos_strat != strat:
+                    continue
+                candidates.append(pos)
+
+        for pos in candidates:
+            if int(getattr(pos, "net_qty", 0) or 0) == 0:
+                continue
+            tag_u = str(getattr(pos, "tag", None) or "").upper()
+            if tag_u.startswith("HEDGE"):
+                continue
+            if tag_u and tag_u != "MAIN" and not tag_u.startswith("MAIN_"):
+                continue
+
+            sid = str(getattr(pos, "structure_id", None) or "").strip()
+            if sid:
+                pos_strat = str(getattr(pos, "strategy", None) or "").strip()
+                if pos_strat and strat and pos_strat != strat:
+                    continue
+                if sid_want and sid == sid_want:
+                    return True
+                is_qtr = sid.endswith(":QTR")
+                if want_qtr and is_qtr:
+                    return True
+                if not want_qtr and not is_qtr:
+                    return True
+                continue
+
+            # Broker-reconciled MAIN often loses strategy/structure_id after restart.
+            # Short option = MAIN sell; long without sid = likely mis-tagged hedge.
+            if int(pos.net_qty) < 0:
+                return True
+        return False
+
     # Used while exiting positions
     def get_hedge_for(self, main_position):
         """
@@ -1118,6 +1189,21 @@ class PositionManager:
                     local.net_qty != bqty
                     or abs(local.avg_price - float(bp.get("avg_price", 0))) > 0.5
                 ):
+                    # Broker flat: keep ownership metadata (cleared only on fill CLOSE).
+                    if int(bqty) == 0 and int(local.net_qty or 0) != 0:
+                        self._merge_position_metadata(
+                            sym,
+                            strategy=getattr(local, "strategy", None),
+                            structure_id=getattr(local, "structure_id", None),
+                            tag=getattr(local, "tag", None),
+                            intent_id=getattr(local, "intent_id", None),
+                        )
+                        logger.warning(
+                            "Reconcile: broker flat for %s (was qty=%s); "
+                            "zeroing local qty but retaining ownership metadata",
+                            sym,
+                            local.net_qty,
+                        )
                     local.net_qty = bqty
                     local.avg_price = float(bp.get("avg_price", 0))
                     local.last_updated = time.time()
@@ -1158,9 +1244,28 @@ class PositionManager:
                 if getattr(local, "strategy", None):
                     self.strategy_pos[local.strategy][sym] = int(local.net_qty)
 
+            # Broker book omitted this symbol (or transient API hole). Drop local qty
+            # tracking but NEVER clear ownership metadata — that is only removed on
+            # fill CLOSE (on_fill → position_metadata.pop). Otherwise a false flat
+            # + SYNC rewrite permanently loses structure_id and allows duplicate entries.
             for sym in local_symbols - broker_symbols:
+                pos = self.positions.get(sym)
+                if pos is not None:
+                    self._merge_position_metadata(
+                        sym,
+                        strategy=getattr(pos, "strategy", None),
+                        structure_id=getattr(pos, "structure_id", None),
+                        tag=getattr(pos, "tag", None),
+                        intent_id=getattr(pos, "intent_id", None),
+                    )
+                    logger.warning(
+                        "Reconcile: symbol %s absent from broker book "
+                        "(local_qty=%s); removing local position but retaining "
+                        "ownership metadata until fill close",
+                        sym,
+                        getattr(pos, "net_qty", None),
+                    )
                 self.positions.pop(sym, None)
-                self.position_metadata.pop(sym, None)
 
     # ---------------------
     # POSITION CHECKS

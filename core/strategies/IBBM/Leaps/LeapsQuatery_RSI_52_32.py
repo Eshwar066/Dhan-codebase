@@ -333,9 +333,27 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         if signal_key in self._entry_signaled_keys:
             return None
 
-        if ctx.position_store.has_open_structure(
-            strategy=self.name, structure_id=structure_id, tag="MAIN"
-        ):
+        # Exact structure_id OR same leg family (mini vs :QTR). Also blocks when
+        # broker reconcile restored a short MAIN without structure_id after restart.
+        has_open_main = getattr(ctx.position_store, "has_open_main_leg", None)
+        if callable(has_open_main):
+            blocked = has_open_main(
+                self.name,
+                underlying=str(candle.get("symbol") or ""),
+                structure_id=structure_id,
+            )
+        else:
+            blocked = ctx.position_store.has_open_structure(
+                strategy=self.name, structure_id=structure_id, tag="MAIN"
+            )
+        if blocked:
+            logger.info(
+                "LEAPS %s entry skipped: open MAIN already present "
+                "structure=%s sym=%s",
+                leg_label,
+                structure_id,
+                candle.get("symbol"),
+            )
             return None
 
         intent_store = getattr(ctx, "intent_store", None)

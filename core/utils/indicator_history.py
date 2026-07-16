@@ -29,6 +29,10 @@ SCHEMA_VERSION = 2
 NSE_60_BAR_MINUTES = frozenset(
     {(9, 15), (10, 15), (11, 15), (12, 15), (13, 15), (14, 15), (15, 15)}
 )
+# NSE 120m bar opens (Yahoo resample / NiftySMA9Weekly): 09:15, 11:15, 13:15, 15:15.
+NSE_120_BAR_MINUTES = frozenset(
+    {(9, 15), (11, 15), (13, 15), (15, 15)}
+)
 NSE_INDEX_SYMBOLS = frozenset(
     {"NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX", "MIDCPNIFTY", "^NSEI", "NSEI"}
 )
@@ -105,6 +109,13 @@ def is_nse_60m_bar_ist(dt_ist: datetime) -> bool:
     return (int(dt_ist.hour), int(dt_ist.minute)) in NSE_60_BAR_MINUTES
 
 
+def is_nse_120m_bar_ist(dt_ist: datetime) -> bool:
+    """True when ``dt_ist`` is an NSE cash-session 120m bar open (weekday)."""
+    if dt_ist.weekday() >= 5:
+        return False
+    return (int(dt_ist.hour), int(dt_ist.minute)) in NSE_120_BAR_MINUTES
+
+
 def bucket_ts_is_nse_60m_bar(bucket_ts: Any) -> bool:
     """True when unix bucket start maps to an NSE hourly bar open in IST."""
     try:
@@ -116,6 +127,19 @@ def bucket_ts_is_nse_60m_bar(bucket_ts: Any) -> bool:
     except (OSError, OverflowError, ValueError):
         return False
     return is_nse_60m_bar_ist(dt_ist)
+
+
+def bucket_ts_is_nse_120m_bar(bucket_ts: Any) -> bool:
+    """True when unix bucket start maps to an NSE 120m bar open in IST."""
+    try:
+        bt = int(float(bucket_ts))
+    except (TypeError, ValueError):
+        return False
+    try:
+        dt_ist = datetime.fromtimestamp(bt, IST)
+    except (OSError, OverflowError, ValueError):
+        return False
+    return is_nse_120m_bar_ist(dt_ist)
 
 
 def nse_60m_bar_close_eval_window(
@@ -139,6 +163,26 @@ def nse_60m_bar_close_eval_window(
     )
 
 
+def nse_120m_bar_close_eval_window(
+    candle: Any,
+    *,
+    grace_minutes: int = 10,
+    now_unix: Optional[float] = None,
+) -> bool:
+    """
+    True only within a short window after an NSE 120m bar closes.
+
+    Opens: 09:15, 11:15, 13:15, 15:15 IST (Yahoo / NiftySMA9Weekly).
+    """
+    return nse_bar_close_eval_window(
+        candle,
+        bar_minutes=120,
+        grace_minutes=grace_minutes,
+        now_unix=now_unix,
+        require_nse_120m_open=True,
+    )
+
+
 def nse_bar_close_eval_window(
     candle: Any,
     *,
@@ -146,12 +190,14 @@ def nse_bar_close_eval_window(
     grace_minutes: int = 8,
     now_unix: Optional[float] = None,
     require_nse_60m_open: bool = False,
+    require_nse_120m_open: bool = False,
 ) -> bool:
     """
     True only within a short window after a bar of ``bar_minutes`` closes.
 
     ``require_nse_60m_open=True`` additionally requires the open to be an NSE
     cash-session :15 hourly slot (LEAPS 60m path).
+    ``require_nse_120m_open=True`` requires 120m session opens (09:15/11:15/…).
     """
     session_partial = False
     if isinstance(candle, dict):
@@ -166,6 +212,8 @@ def nse_bar_close_eval_window(
     except (TypeError, ValueError):
         return False
     if require_nse_60m_open and not bucket_ts_is_nse_60m_bar(bucket):
+        return False
+    if require_nse_120m_open and not bucket_ts_is_nse_120m_bar(bucket):
         return False
     try:
         minutes = max(1, int(bar_minutes))
@@ -258,18 +306,23 @@ def should_append_live_indicator_row(
     exchange: Optional[str] = None,
 ) -> bool:
     """
-    Gate ``live_append`` rows: for NSE index 60m history only accept session hourly opens.
+    Gate ``live_append`` rows for NSE index session bars.
+
+    - 60m / 1h: only hourly opens (09:15 … 15:15)
+    - 120m / 2h: only 120m opens (09:15, 11:15, 13:15, 15:15)
     Other symbols/timeframes pass through unchanged.
     """
     tf = str(timeframe or "").strip().lower()
-    if tf not in ("60", "1h"):
-        return True
     if not is_nse_index_context(symbol, exchange):
         return True
     dt_ist = row_timestamp_to_ist(row_timestamp)
     if dt_ist is None:
         return False
-    return is_nse_60m_bar_ist(dt_ist)
+    if tf in ("60", "1h", "60m"):
+        return is_nse_60m_bar_ist(dt_ist)
+    if tf in ("120", "2h", "120m"):
+        return is_nse_120m_bar_ist(dt_ist)
+    return True
 
 
 def _ohlc_close_from_payload(payload: Dict[str, Any]) -> float:
