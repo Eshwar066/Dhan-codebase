@@ -70,3 +70,4 @@ subscriptions:
 execution:
   bracket_leg_tags:
   - MAIN_SL
+  - MAIN_TARGET

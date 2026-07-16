@@ -44,6 +44,7 @@ IDEAL_PREM = 100.0
 DELTA_MIN = 0.0
 DELTA_MAX = 1.0
 SL_PREM_MULT = 2.0  # 100% stop on short premium
+TP_TRIGGER_PRICE = 0.1
 MAX_REENTRIES_PER_LEG = 1
 
 META_KEY = "btc_zero_dte"
@@ -64,7 +65,7 @@ class BTCZeroDTE(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
 
     name = "BTCZeroDTE"
     underlying_symbols = ["BTCUSD"]
-    bracket_leg_tags = ["MAIN_SL"]
+    bracket_leg_tags = ["MAIN_SL", "MAIN_TARGET"]
     timeframe = None
     backtest_timeframe = "5"
     scheduled_times = [ENTRY_TIME, EXIT_TIME]
@@ -423,6 +424,29 @@ class BTCZeroDTE(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             trigger_price=trig,
         )
 
+    def _build_main_target_intent(
+        self,
+        entry_ref: Any,
+        candle_ts: Any,
+        symbol: str,
+    ) -> Any:
+        target = float(TP_TRIGGER_PRICE)
+        return self.create_order_intent(
+            inst=entry_ref.instrument,
+            side="BUY",
+            qty=entry_ref.qty,
+            price=target,
+            order_type="SL-M",
+            strategy=self.name,
+            candle_ts=candle_ts,
+            structure_id=entry_ref.structure_id,
+            tag="MAIN_TARGET",
+            symbol=symbol,
+            action="FORCE_EXIT",
+            parent_intent_id=entry_ref.intent_id,
+            trigger_price=target,
+        )
+
     def _exit_intent_for_position(self, position: Any, candle: dict, ctx: Any) -> Any:
         price = None
         if RUN_MODE == RunMode.BACKTEST:
@@ -589,7 +613,7 @@ class BTCZeroDTE(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         self._ensure_meta_for_fill(sid, instrument, ctx, intent_id, metadata_extras)
         meta = self._meta_by_structure_id.get(sid)
         if meta is None:
-            logger.warning("BTCZeroDTE: MAIN fill without meta; SL skipped sid=%s", sid)
+            logger.warning("BTCZeroDTE: MAIN fill without meta; SL/TP skipped sid=%s", sid)
             return []
         sl_trigger = float(meta.entry_premium) * SL_PREM_MULT
         ref = SimpleNamespace(
@@ -598,7 +622,10 @@ class BTCZeroDTE(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             intent_id=intent_id,
             qty=self._normalize_order_qty(instrument, kwargs.get("qty")),
         )
-        return [self._build_main_sl_intent(ref, sl_trigger, candle_ts, meta.symbol)]
+        return [
+            self._build_main_sl_intent(ref, sl_trigger, candle_ts, meta.symbol),
+            self._build_main_target_intent(ref, candle_ts, meta.symbol),
+        ]
 
     def on_main_exit_filled(self, **kwargs: Any) -> List[Tuple[Any, dict]]:
         structure_id = kwargs.get("structure_id")
@@ -607,14 +634,8 @@ class BTCZeroDTE(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         sid = str(structure_id)
         self._pending_exit_structure_ids.discard(sid)
         meta = self._meta_by_structure_id.get(sid)
-        reason_u = str(kwargs.get("exit_reason") or "").upper()
         tag_u = str(kwargs.get("tag") or "").upper()
-        action_u = str(kwargs.get("action") or "").upper()
-        is_sl = (
-            tag_u == "MAIN_SL"
-            or action_u == "FORCE_EXIT"
-            or reason_u in {"SL", "MAIN_SL", "FORCE_EXIT"}
-        )
+        is_sl = tag_u == "MAIN_SL"
         if meta is None or not is_sl:
             return []
         ctx = kwargs.get("ctx")

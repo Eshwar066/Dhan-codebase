@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, time
+from datetime import date, time, timedelta
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -32,7 +32,7 @@ from core.strategies.meta import pack_strategy_meta
 
 logger = logging.getLogger(__name__)
 
-ENTRY_TIME = time(23, 0)
+ENTRY_TIME = time(23, 30)
 EXIT_TIME = time(17, 15)
 
 # OTM10 = 10 listed ATM+OTM steps from spot (calls above, puts below).
@@ -40,6 +40,7 @@ EXIT_TIME = time(17, 15)
 OTM_STEPS = 10
 # Premium SL at 2x entry = 100% stop on short premium.
 SL_PREM_MULT = 2.0
+TP_TRIGGER_PRICE = 0.1
 MAX_REENTRIES_PER_LEG = 2
 EXPIRY_PREF = "Daily"
 
@@ -61,7 +62,7 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
 
     name = "BTCZeroDTEElevenPM"
     underlying_symbols = ["BTCUSD"]
-    bracket_leg_tags = ["MAIN_SL"]
+    bracket_leg_tags = ["MAIN_SL", "MAIN_TARGET"]
     timeframe = None
     backtest_timeframe = "5"
     scheduled_times = [ENTRY_TIME, EXIT_TIME]
@@ -150,6 +151,11 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         if reentry > 0:
             return f"{self.name}:{symbol}:{trade_dt}:{leg}:R{reentry}"
         return f"{self.name}:{symbol}:{trade_dt}:{leg}"
+
+    @staticmethod
+    def _entry_expiry(trade_dt: date) -> str:
+        """The 23:00 entry trades the Daily contract expiring next calendar day."""
+        return (trade_dt + timedelta(days=1)).strftime("%d%m%y")
 
     def _strategy_meta_dict(self, meta: _LegMeta) -> dict:
         payload = {
@@ -412,6 +418,14 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         if prepared is None:
             return None
         source, _und, selected_expiry, _opt, _spot, scored, tickers_map = prepared
+        if str(selected_expiry) != str(expiry):
+            logger.warning(
+                "BTCZeroDTEElevenPM: strict next-day expiry %s unavailable; "
+                "rejecting fallback expiry %s",
+                expiry,
+                selected_expiry,
+            )
+            return None
         idx = self._pick_otm_index(len(scored), otm_steps, option_type)
         if idx is None:
             return None
@@ -512,7 +526,17 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                     )
                     return None
 
-        result = self.find_otm_n_strike(candle, ctx, option_type, otm_steps=OTM_STEPS)
+        expiry = self._entry_expiry(trade_dt)
+        # ``_resolve_expiry_pref`` preserves an existing context expiry for explicit
+        # DDMMYY values, so pin the context before scanning the option chain.
+        ctx.selected_expiry = expiry
+        result = self.find_otm_n_strike(
+            candle,
+            ctx,
+            option_type,
+            otm_steps=OTM_STEPS,
+            expiry=expiry,
+        )
         if result is None:
             logger.warning(
                 "BTCZeroDTEElevenPM: no OTM%s strike opt=%s date=%s reentry=%s",
@@ -537,7 +561,6 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             )
             return None
 
-        expiry = getattr(ctx, "selected_expiry", None) or self.dailyExpiry(candle, ctx)
         trading_symbol = self.delta_option_trading_symbol(
             row, float(strike), option_type, str(expiry)
         )
@@ -603,6 +626,29 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             action="FORCE_EXIT",
             parent_intent_id=entry_ref.intent_id,
             trigger_price=trig,
+        )
+
+    def _build_main_target_intent(
+        self,
+        entry_ref: Any,
+        candle_ts: Any,
+        symbol: str,
+    ) -> Any:
+        target = float(TP_TRIGGER_PRICE)
+        return self.create_order_intent(
+            inst=entry_ref.instrument,
+            side="BUY",
+            qty=entry_ref.qty,
+            price=target,
+            order_type="SL-M",
+            strategy=self.name,
+            candle_ts=candle_ts,
+            structure_id=entry_ref.structure_id,
+            tag="MAIN_TARGET",
+            symbol=symbol,
+            action="FORCE_EXIT",
+            parent_intent_id=entry_ref.intent_id,
+            trigger_price=target,
         )
 
     def _exit_intent_for_position(self, position: Any, candle: dict, ctx: Any) -> Any:
@@ -769,7 +815,7 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         meta = self._meta_by_structure_id.get(sid)
         if meta is None:
             logger.warning(
-                "BTCZeroDTEElevenPM: MAIN fill without meta; SL skipped sid=%s", sid
+                "BTCZeroDTEElevenPM: MAIN fill without meta; SL/TP skipped sid=%s", sid
             )
             return []
         sl_trigger = float(meta.entry_premium) * SL_PREM_MULT
@@ -779,7 +825,10 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             intent_id=intent_id,
             qty=self._normalize_order_qty(instrument, kwargs.get("qty")),
         )
-        return [self._build_main_sl_intent(ref, sl_trigger, candle_ts, meta.symbol)]
+        return [
+            self._build_main_sl_intent(ref, sl_trigger, candle_ts, meta.symbol),
+            self._build_main_target_intent(ref, candle_ts, meta.symbol),
+        ]
 
     def on_main_exit_filled(self, **kwargs: Any) -> List[Tuple[Any, dict]]:
         structure_id = kwargs.get("structure_id")
@@ -788,14 +837,8 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         sid = str(structure_id)
         self._pending_exit_structure_ids.discard(sid)
         meta = self._meta_by_structure_id.get(sid)
-        reason_u = str(kwargs.get("exit_reason") or "").upper()
         tag_u = str(kwargs.get("tag") or "").upper()
-        action_u = str(kwargs.get("action") or "").upper()
-        is_sl = (
-            tag_u == "MAIN_SL"
-            or action_u == "FORCE_EXIT"
-            or reason_u in {"SL", "MAIN_SL", "FORCE_EXIT"}
-        )
+        is_sl = tag_u == "MAIN_SL"
         if meta is None or not is_sl:
             return []
         ctx = kwargs.get("ctx")
