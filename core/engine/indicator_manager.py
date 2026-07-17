@@ -346,6 +346,39 @@ class IndicatorManager:
         return period, periods
 
     @staticmethod
+    def _compute_supertrend_columns(
+        df: Any,
+        *,
+        length: int,
+        factor: float,
+    ) -> Any:
+        """Compute Supertrend using parameters declared by the strategy."""
+        from core.utils.structure.supertrend import add_supertrend
+
+        return add_supertrend(df, length=length, factor=factor)
+
+    @staticmethod
+    def _strategy_supertrend_params(strategy: Any) -> tuple:
+        """
+        Return strategy ``(supertrend_length, supertrend_factor)``.
+
+        Both attributes are required; a strategy that declares neither does not
+        pay the Supertrend computation cost.
+        """
+        length = getattr(strategy, "supertrend_length", None)
+        factor = getattr(strategy, "supertrend_factor", None)
+        if length is None or factor is None:
+            return None, None
+        try:
+            length = int(length)
+            factor = float(factor)
+        except (TypeError, ValueError):
+            return None, None
+        if length < 1 or factor <= 0:
+            return None, None
+        return length, factor
+
+    @staticmethod
     def _timeframe_to_seconds(tf: str) -> int:
         raw = str(tf or "").strip().lower()
         if not raw:
@@ -1410,6 +1443,18 @@ class IndicatorManager:
                             work_df,
                             period=sma_period,
                             periods=sma_periods,
+                        )
+                    except Exception:
+                        pass
+                supertrend_length, supertrend_factor = (
+                    self._strategy_supertrend_params(strategy)
+                )
+                if supertrend_length is not None and supertrend_factor is not None:
+                    try:
+                        work_df = self._compute_supertrend_columns(
+                            work_df,
+                            length=supertrend_length,
+                            factor=supertrend_factor,
                         )
                     except Exception:
                         pass
