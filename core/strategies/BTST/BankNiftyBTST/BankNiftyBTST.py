@@ -193,7 +193,10 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         return ts.strftime("%Y-%m-%d %H:%M")
 
     def _entry_signal_guard_key(self, candle: dict, structure_id: str) -> str:
-        return f"{structure_id}|{self._slot_key(candle)}"
+        # Structure already contains strategy, underlying, trade date and CE/PE.
+        # Do not include slot/time: a delayed scheduler retry must not create another
+        # order for the same leg later in the day.
+        return structure_id
 
     def _evaluate_signal_key(self, candle: dict) -> str:
         symbol = str(candle.get("symbol") or "").strip().upper()
@@ -387,11 +390,25 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
             return None
 
         intent_store = getattr(ctx, "intent_store", None)
+        if (
+            intent_store is not None
+            and callable(getattr(intent_store, "has_entry_for_structure", None))
+            and intent_store.has_entry_for_structure(
+                self.name,
+                structure_id,
+                ist_date=trade_dt,
+                tags=["MAIN"],
+            )
+        ):
+            self._entry_signaled_keys.add(signal_key)
+            return None
         if intent_store is not None and intent_store.has_pending_intent(
             strategy=self.name,
             structure_id=structure_id,
+            tags=["MAIN"],
             actions=["ENTRY"],
         ):
+            self._entry_signaled_keys.add(signal_key)
             return None
 
         result = self.find_strike_in_premium_range(

@@ -61,6 +61,18 @@ def _order_intent_to_payload(intent, execution_price=None, instrument_store=None
     execution_mode = str(extras.get("execution_mode") or "").strip().upper()
     intent_price = float(getattr(intent, "price", 0) or 0)
     trigger = float(getattr(intent, "trigger_price", 0) or 0)
+    raw_ot = getattr(intent, "order_type", "MARKET")
+    raw_ot_u = str(raw_ot or "").strip().upper().replace("_", "-")
+    is_stop_order = raw_ot_u in {
+        "SL",
+        "SL-M",
+        "SLM",
+        "STOP",
+        "STOPLIMIT",
+        "STOP-LIMIT",
+        "STOPMARKET",
+        "STOP-MARKET",
+    }
     # Forever / HYBRID_GTT must keep strategy limit+trigger. Do NOT overwrite with
     # live ask from price_map (that placed Forever @ ~100 instead of GTT @ ~150).
     if execution_mode in ("GTT", "HYBRID_GTT"):
@@ -70,6 +82,10 @@ def _order_intent_to_payload(intent, execution_price=None, instrument_store=None
         # Dhan Forever BUY: trigger activates the order; price is the resting limit.
         if price <= 0:
             price = trigger
+    elif is_stop_order and intent_price > 0:
+        # Protective stop-limit prices are strategy-defined. A live bid/ask supplied
+        # by the engine is only market context and must not overwrite the SL limit.
+        price = intent_price
     else:
         price = (
             float(execution_price)
@@ -79,7 +95,6 @@ def _order_intent_to_payload(intent, execution_price=None, instrument_store=None
     qty = getattr(intent, "qty", inst.lot_size)
     lot_size = int(getattr(inst, "lot_size", 1))
     total_qty = int(qty) * lot_size
-    raw_ot = getattr(intent, "order_type", "MARKET")
     order_type = dhan_mappings.normalize_order_type(raw_ot)
     payload = {
         "tradingsymbol": inst.place_order_symbol(),

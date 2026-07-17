@@ -635,6 +635,17 @@ class GttFallbackBook:
             return
 
         # Premium reached GTT price; only fall back if Forever still unfilled.
+        # Broker position truth is checked here (rather than on every quote) because
+        # a Forever fill can reach Dhan positions before its order/fill update reaches
+        # the local PositionManager.
+        if self._broker_position_open(watch):
+            self.on_fill(watch.gtt_intent_id)
+            self._log(
+                "gtt_fallback_position_detected",
+                f"skip LIMIT; broker position already open {watch.trading_symbol}",
+                intent_id=watch.gtt_intent_id,
+            )
+            return
         if not self._gtt_still_unfilled(watch, rec):
             self.on_fill(watch.gtt_intent_id)
             return
@@ -646,6 +657,14 @@ class GttFallbackBook:
                 return
         if not self._gtt_still_unfilled(watch, store.get(watch.gtt_intent_id) if store else None):
             self.on_fill(watch.gtt_intent_id)
+            return
+        if self._broker_position_open(watch):
+            self.on_fill(watch.gtt_intent_id)
+            self._log(
+                "gtt_fallback_position_detected",
+                f"skip LIMIT; broker position already open {watch.trading_symbol}",
+                intent_id=watch.gtt_intent_id,
+            )
             return
 
         if watch.phase == GttFallbackPhase.GTT:
@@ -716,6 +735,53 @@ class GttFallbackBook:
             if str(getattr(pos, "tag", "") or "").upper() != "MAIN":
                 continue
             if int(getattr(pos, "net_qty", 0) or 0) != 0:
+                return True
+        return False
+
+    def _broker_position_open(self, watch: GttFallbackWatch) -> bool:
+        """Check broker truth for this exact contract before placing fallback LIMIT."""
+        broker = getattr(self._router, "broker", None)
+        getter = getattr(broker, "get_positions_for_recon", None)
+        if not callable(getter):
+            return False
+        try:
+            positions = getter() or {}
+        except Exception as exc:
+            logger.warning(
+                "GTT fallback broker position check failed sym=%s: %s",
+                watch.trading_symbol,
+                exc,
+            )
+            return False
+        if not isinstance(positions, dict):
+            return False
+
+        def _symbol_key(value: Any) -> str:
+            return "".join(ch for ch in str(value or "").upper() if ch.isalnum())
+
+        aliases = {
+            _symbol_key(watch.trading_symbol),
+        }
+        inst = watch.instrument
+        if inst is not None:
+            aliases.add(_symbol_key(getattr(inst, "trading_symbol", "")))
+            aliases.add(_symbol_key(getattr(inst, "custom_symbol", "")))
+            place_symbol = getattr(inst, "place_order_symbol", None)
+            if callable(place_symbol):
+                try:
+                    aliases.add(_symbol_key(place_symbol()))
+                except Exception:
+                    pass
+        aliases.discard("")
+
+        for symbol, row in positions.items():
+            if _symbol_key(symbol) not in aliases:
+                continue
+            try:
+                qty = int(float((row or {}).get("qty", 0)))
+            except (AttributeError, TypeError, ValueError):
+                qty = 0
+            if qty != 0:
                 return True
         return False
 
