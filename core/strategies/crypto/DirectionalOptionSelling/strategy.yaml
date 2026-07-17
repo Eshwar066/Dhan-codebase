@@ -1,0 +1,69 @@
+id: DirectionalOptionSelling
+implementation:
+  module: core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling
+  class: DirectionalOptionSelling
+instrument: OPTION
+allowed_modes:
+- BACKTEST
+- PAPER
+- LIVE
+broker:
+  venue: DELTA
+  api: DELTA
+  delta:
+    india: true
+    testnet: false
+    leverage: 5
+symbols:
+- BTCUSD
+exchange: NSE
+timeframe: '60'
+schedule:
+  eval_mode: live_feed
+data:
+  default:
+    data: {}
+profile:
+  live:
+    exchange: DELTA
+    sector: 'YES'
+  backtest:
+    start_date: '2026-06-02'
+    end_date: '2026-07-03'
+    timeframe: '60'
+    exchange: DELTA
+    sector: 'YES'
+dependencies:
+  mixins:
+  - IndiaMktMixins
+  - DeltaMktMixins
+  meta_key: directional_option_selling
+subscriptions:
+  BarClosed:
+    enabled: true
+    timeframes:
+    - '60'
+    symbols:
+    - BTCUSD
+  ScheduledSlot:
+    enabled: false
+    symbols:
+    - BTCUSD
+  QuoteUpdated:
+    enabled: true
+    symbols:
+    - BTCUSD
+documentation:
+  title: BTC SuperTrend Option Selling
+  overview: >
+    One-hour BTC SuperTrend reversals sell one Put in bullish regimes or one Call
+    in bearish regimes. Strike selection uses the nearest strike to SuperTrend
+    with at least $300 premium, preferring 0DTE and then the next daily expiry.
+  rules: |
+    - SuperTrend length 16, multiplier 1.5 on BTCUSD 60-minute closed candles
+    - Red to Green: sell one PE; Green to Red: sell one CE
+    - Exit the old option before placing the opposite option
+    - Tick-driven force exit 300 BTC points beyond the active SuperTrend
+    - Re-enter after force exit only when a later 60-minute close regains trend
+    - At 17:25 IST, exit today's expiry and use the next listed daily expiry
+    - Rollover strike must be at least 200 BTC points from SuperTrend with premium >= $300

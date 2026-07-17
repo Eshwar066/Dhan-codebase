@@ -5,6 +5,7 @@ GENERATED_LEGACY_META_KEYS: dict = {
     'BTCZeroDTE': 'btc_zero_dte',
     'BTCZeroDTEElevenPM': 'btc_zero_dte_eleven_pm',
     'BankNiftyBTST': 'banknifty_btst',
+    'DirectionalOptionSelling': 'directional_option_selling',
     'LiquiditySweepStrategy': 'liquidity_sweep',
     'NiftyIntradayMagicalLine': 'nifty_intraday_magical_line',
     'NiftySMA9Weekly': 'nifty_sma9_weekly',

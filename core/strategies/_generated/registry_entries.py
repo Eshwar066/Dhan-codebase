@@ -16,6 +16,7 @@ from core.strategies.OpenIntrest.optionbuildup.optionbuildup import OptionBuildu
 from core.strategies.PipelineTest.signal_flood_test import SignalFloodTestStrategy
 from core.strategies.crypto.BTCZeroDteElevenPM.BTCZeroDTEElevenPM import BTCZeroDTEElevenPM
 from core.strategies.crypto.BTCZeroDteThreeFifteen.BTCZeroDTE import BTCZeroDTE
+from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import DirectionalOptionSelling
 from core.strategies.crypto.LiquiditySweepStrategy.LiquiditySweepStrategy import LiquiditySweepStrategy
 from core.strategies.crypto.RSIBreadAndButter.RSIBreadAndButter import RSIBreadAndButter
 from core.strategies.crypto.oneDayMagicalLine.oneDayMagicalLine import OneDayMagicalLine
@@ -41,6 +42,15 @@ GENERATED_STRATEGY_MAP = {
     },
     'BankNiftyBTST': {
         "strategy": BankNiftyBTST,
+        "instrument": 'OPTION',
+        "allowed_modes": [
+            RunMode.BACKTEST,
+            RunMode.PAPER,
+            RunMode.LIVE,
+        ],
+    },
+    'DirectionalOptionSelling': {
+        "strategy": DirectionalOptionSelling,
         "instrument": 'OPTION',
         "allowed_modes": [
             RunMode.BACKTEST,

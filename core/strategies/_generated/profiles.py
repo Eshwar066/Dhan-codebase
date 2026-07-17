@@ -67,6 +67,28 @@ STRATEGY_PROFILES: dict = {
             'sector': 'YES',
         },
     },
+    'DirectionalOptionSelling': {
+        'symbols': [
+            'BTCUSD',
+        ],
+        'exchange': 'NSE',
+        'delta': {
+            'india': True,
+            'testnet': False,
+            'leverage': 5,
+        },
+        'live': {
+            'exchange': 'DELTA',
+            'sector': 'YES',
+        },
+        'backtest': {
+            'start_date': '2026-06-02',
+            'end_date': '2026-07-03',
+            'timeframe': '60',
+            'exchange': 'DELTA',
+            'sector': 'YES',
+        },
+    },
     'FuturesEMAHighLow': {
         'symbols': [
             'NIFTY',

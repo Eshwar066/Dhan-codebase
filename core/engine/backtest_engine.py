@@ -124,10 +124,17 @@ class BacktestEngine(BaseEngine):
                 inst, "symbol", None
             )
         ts = kwargs.get("candle_ts")
-        candle_stub = {"symbol": sym or "", "timestamp": ts, "close": 0.0}
+        candle_stub = getattr(self, "_last_candle", None) or {
+            "symbol": sym or "",
+            "timestamp": ts,
+            "close": 0.0,
+        }
         kwargs.pop("ctx", None)
         ctx = (
-            self.build_context(candle_stub)
+            self.build_context_only(
+                candle_stub,
+                recent_candles=getattr(self, "_last_candle_buffer", None) or [],
+            )
             if sym and callable(getattr(self, "build_context", None))
             else None
         )

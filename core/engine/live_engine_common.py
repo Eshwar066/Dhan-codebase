@@ -1057,12 +1057,12 @@ class LiveEngineHelpersMixin:
             self.engine_logger.eod_export(path)
 
     def _drain_tick_queue(self) -> None:
-        """Drain tick queue into candle_aggregator; publish QuoteUpdated for GTT watches."""
+        """Drain ticks into candles and publish subscribed ``QuoteUpdated`` events."""
         if not self.tick_queue:
             return
         has_aggregator = self.candle_aggregator is not None
-        gtt_syms = self._gtt_watch_symbols()
-        if not has_aggregator and not gtt_syms:
+        quote_syms = self._quote_update_symbols()
+        if not has_aggregator and not quote_syms:
             return
         if not hasattr(self, "_tick_debug_count"):
             self._tick_debug_count = 0
@@ -1085,7 +1085,7 @@ class LiveEngineHelpersMixin:
                         self.candle_aggregator.on_tick(s, p, v, ts)
                     self._last_tick_timestamp[s] = time.time()
                     sym_u = str(s).strip().upper()
-                    if has_aggregator or (gtt_syms and sym_u in gtt_syms):
+                    if quote_syms and sym_u in quote_syms:
                         self._publish_quote_updated_from_tick(s, p, ts)
                     self._tick_debug_count += 1
                     now = time.time()
@@ -1130,6 +1130,33 @@ class LiveEngineHelpersMixin:
             return set()
         return {str(s).strip().upper() for s in (fn() or []) if str(s).strip()}
 
+    def _strategy_quote_symbols(self) -> set:
+        """Underlying symbols explicitly subscribed to strategy quote hooks."""
+        cached = getattr(self, "_strategy_quote_symbols_cache", None)
+        if cached is not None:
+            return set(cached)
+        from core.events.subscriptions import resolve_strategy_subscriptions
+
+        strategies = list(getattr(self, "strategies", None) or [])
+        if not strategies:
+            strategy = getattr(self, "strategy", None)
+            strategies = [strategy] if strategy is not None else []
+        symbols = set()
+        for strategy in strategies:
+            entry = resolve_strategy_subscriptions(strategy).get("QuoteUpdated")
+            if not isinstance(entry, dict) or not entry.get("enabled"):
+                continue
+            symbols.update(
+                str(symbol).strip().upper()
+                for symbol in (entry.get("symbols") or [])
+                if str(symbol).strip()
+            )
+        self._strategy_quote_symbols_cache = frozenset(symbols)
+        return symbols
+
+    def _quote_update_symbols(self) -> set:
+        return self._gtt_watch_symbols() | self._strategy_quote_symbols()
+
     def _quote_fields_from_feed(self, symbol: str, ltp: Any) -> dict:
         """Best bid/ask/ltp from realtime feed cache for QuoteUpdated payload."""
         feed = getattr(self, "realtime_feed", None)
@@ -1165,14 +1192,14 @@ class LiveEngineHelpersMixin:
         }
 
     def _publish_quote_updated_from_tick(self, symbol: Any, price: Any, ts: Any) -> None:
-        """Push QuoteUpdated for GTT-watched symbols (replaces GTT quote poll)."""
+        """Push ``QuoteUpdated`` for GTT or strategy-subscribed symbols."""
         bus = getattr(self, "event_bus", None)
         if bus is None:
             return
         sym = str(symbol or "").strip()
         if not sym:
             return
-        watched = self._gtt_watch_symbols()
+        watched = self._quote_update_symbols()
         if not watched or sym.upper() not in watched:
             return
         from core.events.types import EventType, make_event

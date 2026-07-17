@@ -100,6 +100,44 @@ GENERATED_STRATEGY_SUBSCRIPTIONS: dict = {
             ],
         },
     },
+    'DirectionalOptionSelling': {
+        'BarClosed': {
+            'enabled': True,
+            'timeframes': [
+                '60',
+            ],
+            'symbols': [
+                'BTCUSD',
+            ],
+        },
+        'FeedDisconnected': {
+            'enabled': True,
+        },
+        'FeedRecovered': {
+            'enabled': True,
+        },
+        'IntentCreated': {
+            'enabled': True,
+        },
+        'IntentFilled': {
+            'enabled': True,
+        },
+        'PositionClosed': {
+            'enabled': True,
+        },
+        'QuoteUpdated': {
+            'enabled': True,
+            'symbols': [
+                'BTCUSD',
+            ],
+        },
+        'ScheduledSlot': {
+            'enabled': False,
+            'symbols': [
+                'BTCUSD',
+            ],
+        },
+    },
     'FuturesEMAHighLow': {
         'BarClosed': {
             'enabled': True,

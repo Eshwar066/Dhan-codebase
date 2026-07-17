@@ -11,9 +11,10 @@ from core.events.context import EngineEventContext
 from core.events.handlers.execution import register_intent_created_handler
 from core.events.handlers.feed import register_feed_handlers
 from core.events.handlers.fills import register_fill_handlers
-from core.events.handlers.gtt import register_quote_handlers
+from core.events.handlers.gtt import register_gtt_quote_handler
 from core.events.handlers.logging import register_event_tap
 from core.events.handlers.market import register_bar_closed_handlers
+from core.events.handlers.quotes import register_strategy_quote_handler
 from core.events.handlers.scheduled import register_scheduled_slot_handler
 from core.events.services import attach_event_services
 from core.events.subscriptions import (
@@ -95,7 +96,8 @@ def wire_event_bus(engine: object, bus: EventBus | None = None) -> EventBus:
     if "IntentCreated" in enabled:
         register_intent_created_handler(ctx)
     if "QuoteUpdated" in enabled:
-        register_quote_handlers(ctx)
+        register_strategy_quote_handler(ctx)
+        register_gtt_quote_handler(ctx)
     if "FeedDisconnected" in enabled or "FeedRecovered" in enabled:
         register_feed_handlers(ctx)
     if "IntentFilled" in enabled or "PositionClosed" in enabled:

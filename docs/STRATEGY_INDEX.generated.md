@@ -7,6 +7,7 @@ _AUTO-GENERATED table — run `python -m tools.strategy_manifest generate` to re
 | `BTCZeroDTE` | `BTCZeroDTE` | OPTION | DELTA | `core/strategies/crypto/BTCZeroDteThreeFifteen/strategy.yaml` |
 | `BTCZeroDTEElevenPM` | `BTCZeroDTEElevenPM` | OPTION | DELTA | `core/strategies/crypto/BTCZeroDteElevenPM/strategy.yaml` |
 | `BankNiftyBTST` | `BankNiftyBTST` | OPTION | DHAN | `core/strategies/BTST/BankNiftyBTST/strategy.yaml` |
+| `DirectionalOptionSelling` | `DirectionalOptionSelling` | OPTION | DELTA | `core/strategies/crypto/DirectionalOptionSelling/strategy.yaml` |
 | `FuturesEMAHighLow` | `FuturesEMAHighLow` | FUTURE | DHAN | `core/strategies/Futures/Futures_EMA/strategy.yaml` |
 | `Futures_EMA_Momentum` | `FuturesEMAMomentum` | FUTURE | DELTA | `core/strategies/Futures/Futures_EMA_Momentum/strategy.yaml` |
 | `IPOBreakout` | `IPOBreakout` | EQUITY | DHAN | `core/strategies/Equity/IPOBreakout/strategy.yaml` |

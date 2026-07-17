@@ -56,7 +56,7 @@ class GttQuoteHandler:
             book.tick(now_ist)
 
 
-def register_quote_handlers(ctx: EngineEventContext) -> None:
+def register_gtt_quote_handler(ctx: EngineEventContext) -> None:
     from core.events.types import EventType
 
     ctx.bus.subscribe(
