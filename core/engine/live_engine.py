@@ -179,6 +179,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         # Stale exit order refresh: re-quote at near bid/ask every 1 min until fill
         self._exit_refresh_interval_seconds = 60
         self._last_exit_refresh_time: float = 0
+        # Unfilled entry limits: chase the executable best quote every 30 seconds.
+        self._entry_refresh_interval_seconds = 30
+        self._last_entry_refresh_time: float = 0
         self.run_mode = run_mode
         self._open_positions_logger = open_positions_logger
         # Memory guard
@@ -2460,21 +2463,23 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             ):
                 expected += 1
         out: List[Dict[str, Any]] = []
+        completed = 0
         timeout = max(1.0, float(self.strategy_timeout_seconds or 5.0))
         deadline = time.time() + timeout
-        while len(out) < expected and time.time() < deadline:
+        while completed < expected and time.time() < deadline:
             try:
                 item = response_q.get(timeout=0.1)
             except queue.Empty:
                 continue
+            completed += 1
             if item.get("error") is not None:
-                logger.exception("Strategy evaluation failed: %s", item["error"])
+                logger.error("Strategy evaluation failed: %s", item["error"])
                 continue
             out.append(item)
-        if len(out) < expected and expected > 0:
+        if completed < expected and expected > 0:
             logger.warning(
                 "Strategy evaluation timed out: got %s/%s responses within %.1fs",
-                len(out),
+                completed,
                 expected,
                 timeout,
             )
@@ -2482,7 +2487,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 self.engine_logger.log(
                     "strategy_timeout",
                     (
-                        f"Strategy worker timeout responses={len(out)}/{expected} "
+                        f"Strategy worker timeout responses={completed}/{expected} "
                         f"threshold_sec={timeout:.1f}"
                     ),
                 )
@@ -2724,6 +2729,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             self._do_order_state_check()
             self._sync_delta_ws_trades()
             self._retry_dhan_pending_fills()
+            self._do_entry_order_refresh()
             self._do_exit_order_refresh()
             self._run_gtt_fallback_tick()
             self._maybe_run_scheduled_evaluations(exchange)

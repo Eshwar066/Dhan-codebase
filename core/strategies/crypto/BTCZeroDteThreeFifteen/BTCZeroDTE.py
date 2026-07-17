@@ -19,7 +19,7 @@ Run: ``python -m run.main --engine-id delta_engine_one``
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, time
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
@@ -606,7 +606,7 @@ class BTCZeroDTE(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             action="ENTRY",
             metadata_extras=self._strategy_meta_dict(meta),
         )
-        intent.qty = meta.qty_lots
+        intent = replace(intent, qty=meta.qty_lots)
         self._meta_by_structure_id[structure_id] = meta
         self._entry_signaled_keys.add(guard)
         logger.info(
@@ -817,7 +817,7 @@ class BTCZeroDTE(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             action="ENTRY",
             metadata_extras=self._strategy_meta_dict(new_meta),
         )
-        intent.qty = meta.qty_lots
+        intent = replace(intent, qty=meta.qty_lots)
         self._meta_by_structure_id[structure_id] = new_meta
         logger.info(
             "BTCZeroDTE same-contract SL re-entry %s contract=%s "

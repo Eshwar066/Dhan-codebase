@@ -6,6 +6,7 @@ Default outputs (schema v2 JSONL, preserves ``live_append`` rows)::
 
     logs/indicators/BTCUSD/1/indicator_history.jsonl  — 1m market structure (RSIBreadAndButter entry TF)
     logs/indicators/BTCUSD/5/indicator_history.jsonl  — 5m market structure (signal TF)
+    logs/indicators/BTCUSD/60/indicator_history.jsonl — 1h SuperTrend (DirectionalOptionSelling)
 
 Usage (from repo root)::
 
@@ -13,6 +14,7 @@ Usage (from repo root)::
     python utils/delta/refresh_crypto_indicator_history.py --dry-run
     python utils/delta/refresh_crypto_indicator_history.py --only 1 --days 14
     python utils/delta/refresh_crypto_indicator_history.py --symbol BTCUSD --only 5
+    python utils/delta/refresh_crypto_indicator_history.py --symbol BTCUSD --only 60
 """
 
 from __future__ import annotations
@@ -36,6 +38,9 @@ if _REPO_ROOT not in sys.path:
 from core.data.sources.delta_source import DeltaSource  # noqa: E402
 from core.strategies.crypto.RSIBreadAndButter.RSIBreadAndButter import (  # noqa: E402
     RSIBreadAndButter,
+)
+from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (  # noqa: E402
+    DirectionalOptionSelling,
 )
 from core.utils.indicator_history import (  # noqa: E402
     SCHEMA_VERSION,
@@ -136,11 +141,13 @@ def _merge_history(
             key=lambda r: normalize_ist_bar_key(r.get("candle_timestamp_ist", "")),
         )
     refresh_min = min(refreshed.keys())
-    refresh_max = max(refreshed.keys())
     preserved: List[dict] = []
     for row in other:
         key = normalize_ist_bar_key(row.get("candle_timestamp_ist"))
-        if key < refresh_min or key > refresh_max:
+        # Refreshed REST bars are authoritative through the latest closed candle.
+        # Drop non-live rows after that point: they can be startup snapshots of the
+        # currently forming bar (for example, a one-tick OHLC row).
+        if key < refresh_min:
             preserved.append(row)
     merged: Dict[str, dict] = {}
     for row in preserved:
@@ -207,7 +214,7 @@ def _rows_from_df(
     *,
     symbol: str,
     timeframe: str,
-    strategy: RSIBreadAndButter,
+    strategy: Any,
     min_rows: int,
 ) -> Dict[str, dict]:
     if df is None or df.empty:
@@ -250,7 +257,7 @@ def refresh_file(
     symbol: str,
     timeframe: str,
     source: DeltaSource,
-    strategy: RSIBreadAndButter,
+    strategy: Any,
     days: int,
     min_rows: int,
     dry_run: bool,
@@ -311,9 +318,9 @@ def main() -> None:
     parser.add_argument("--symbol", default="BTCUSD", help="Delta symbol (default: BTCUSD)")
     parser.add_argument(
         "--only",
-        choices=("1", "5"),
+        choices=("1", "5", "60"),
         default=None,
-        help="Refresh only 1m or 5m file (default: both)",
+        help="Refresh only 1m, 5m, or 60m file (default: 1m and 5m)",
     )
     parser.add_argument("--days", type=int, default=30, help="Calendar days of history to fetch")
     parser.add_argument(
@@ -338,7 +345,11 @@ def main() -> None:
     modes = ["1", "5"] if not args.only else [args.only.strip()]
     india = not args.global_api
     delta = DeltaSource(testnet=bool(args.testnet), india=india, symbols=[symbol])
-    strategy = RSIBreadAndButter()
+    strategies = {
+        "1": RSIBreadAndButter(),
+        "5": RSIBreadAndButter(),
+        "60": DirectionalOptionSelling(),
+    }
 
     all_stats: List[dict] = []
     for tf in modes:
@@ -348,7 +359,7 @@ def main() -> None:
             symbol=symbol,
             timeframe=tf,
             source=delta,
-            strategy=strategy,
+            strategy=strategies[tf],
             days=args.days,
             min_rows=args.min_rows,
             dry_run=bool(args.dry_run),

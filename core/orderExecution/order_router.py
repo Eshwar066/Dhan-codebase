@@ -1465,6 +1465,7 @@ class OrderRouter:
                 "side": side,
                 "qty": qty,
                 "action": getattr(intent, "action", "ENTRY"),
+                "order_type": getattr(intent, "order_type", None),
                 "engine_id": intent_engine_id,
                 "strategy_id": intent_strategy_id,
                 "structure_id": getattr(intent, "structure_id", None),
@@ -1498,9 +1499,11 @@ class OrderRouter:
             rec["structure_id"] = getattr(intent, "structure_id", None)
             rec["tag"] = getattr(intent, "tag", None)
             rec["action"] = getattr(intent, "action", "ENTRY")
+            rec["order_type"] = getattr(intent, "order_type", None)
             if hasattr(intent, "instrument"):
                 rec["instrument"] = intent.instrument
             pay = rec.get("payload") or {}
+            pay["order_type"] = getattr(intent, "order_type", None)
             if getattr(intent, "structure_id", None) is not None:
                 pay["structure_id"] = intent.structure_id
             if getattr(intent, "tag", None) is not None:
@@ -3117,23 +3120,50 @@ class OrderRouter:
         get_bid_ask: Callable[[str], Tuple[float, float]],
         stale_seconds: float = 60,
     ) -> None:
-        """
-        If an open EXIT order has been sitting unfilled for >= stale_seconds,
-        update its limit price to near bid (SELL) or near ask (BUY) and repeat until fill.
-        Only runs when broker supports update_order_price (e.g. Delta).
-        """
+        """Re-quote open EXIT limits at the executable best price."""
+        self._refresh_stale_limit_orders(
+            get_bid_ask=get_bid_ask,
+            stale_seconds=stale_seconds,
+            action="EXIT",
+            label="exit",
+        )
+
+    def refresh_stale_entry_orders(
+        self,
+        get_bid_ask: Callable[[str], Tuple[float, float]],
+        stale_seconds: float = 30,
+    ) -> None:
+        """Re-quote open ENTRY limits at best bid for SELL / best ask for BUY."""
+        self._refresh_stale_limit_orders(
+            get_bid_ask=get_bid_ask,
+            stale_seconds=stale_seconds,
+            action="ENTRY",
+            label="entry",
+        )
+
+    def _refresh_stale_limit_orders(
+        self,
+        *,
+        get_bid_ask: Callable[[str], Tuple[float, float]],
+        stale_seconds: float,
+        action: str,
+        label: str,
+    ) -> None:
+        """Modify matching open limit orders in place; never cancel or duplicate them."""
         if not hasattr(self.broker, "update_order_price"):
             return
         now = time.time()
-        sent_exits = [
+        action_u = str(action or "").upper()
+        sent_orders = [
             i
             for i in self.intent_store.list_by_status(IntentStatus.SENT)
-            if (i.get("payload") or {}).get("action") == "EXIT"
+            if str((i.get("payload") or {}).get("action") or "").upper() == action_u
         ]
-        for rec in sent_exits:
+        for rec in sent_orders:
             intent_id = rec.get("intent_id")
             if not intent_id:
                 continue
+            payload = rec.get("payload") or {}
 
             # Use last_price_update_ts so only re-quote interval matters. Fallback to updated_at only when missing (not when 0).
             # Explicit 0 = "always stale" (adopted EXIT orphan from yesterday) so we must not fall back to updated_at.
@@ -3158,14 +3188,15 @@ class OrderRouter:
             if not symbol:
                 if self.engine_logger:
                     self.engine_logger.log(
-                        "oms", f"Refresh exit skip {intent_id}: no symbol"
+                        "oms", f"Refresh {label} skip {intent_id}: no symbol"
                     )
                 continue
             order_id = rec.get("broker_order_id")
             if not order_id:
                 if self.engine_logger:
                     self.engine_logger.log(
-                        "oms", f"Refresh exit skip {intent_id}: no broker_order_id"
+                        "oms",
+                        f"Refresh {label} skip {intent_id}: no broker_order_id",
                     )
                 continue
             broker_order = None
@@ -3175,23 +3206,62 @@ class OrderRouter:
                 if self.engine_logger:
                     self.engine_logger.log(
                         "oms",
-                        f"Refresh exit skip {intent_id}: order not found at broker",
+                        f"Refresh {label} skip {intent_id}: order not found at broker",
                     )
                 continue
             status = (broker_order.get("status") or "").lower()
-            open_states = {"open", "pending", "placed", "trigger pending"}
+            open_states = {
+                "open",
+                "pending",
+                "placed",
+                "trigger pending",
+                "live",
+                "untriggered",
+            }
             if status not in open_states:
                 if self.engine_logger:
                     self.engine_logger.log(
                         "oms",
-                        f"Refresh exit skip {intent_id}: broker status={status} (not open)",
+                        f"Refresh {label} skip {intent_id}: "
+                        f"broker status={status} (not open)",
                     )
                 continue
+            broker_order_id = broker_order.get("order_id")
+            if not broker_order_id or str(broker_order_id) != str(order_id):
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "oms",
+                        f"Refresh {label} skip {intent_id}: broker order id mismatch",
+                    )
+                continue
+            remaining_qty = broker_order.get("remaining_qty")
+            if remaining_qty is not None:
+                try:
+                    if float(remaining_qty) <= 0:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            if action_u == "ENTRY":
+                order_type = str(
+                    payload.get("order_type") or rec.get("order_type") or ""
+                ).upper()
+                if order_type:
+                    if order_type != "LIMIT":
+                        continue
+                else:
+                    # Backward compatibility for intents created before order_type
+                    # was persisted: require broker evidence of a plain limit.
+                    try:
+                        broker_limit = float(broker_order.get("price") or 0)
+                    except (TypeError, ValueError):
+                        broker_limit = 0
+                    if broker_limit <= 0 or broker_order.get("stop_order_type"):
+                        continue
             product_id = broker_order.get("product_id")
             if product_id is None:
                 if self.engine_logger:
                     self.engine_logger.log(
-                        "oms", f"Refresh exit skip {intent_id}: no product_id"
+                        "oms", f"Refresh {label} skip {intent_id}: no product_id"
                     )
                 continue
             bid, ask = get_bid_ask(symbol)
@@ -3203,19 +3273,21 @@ class OrderRouter:
             if new_price is None or new_price <= 0:
                 if self.engine_logger:
                     self.engine_logger.log(
-                        "oms", f"Refresh exit skip {intent_id}: no bid/ask for {symbol}"
+                        "oms",
+                        f"Refresh {label} skip {intent_id}: no bid/ask for {symbol}",
                     )
                 continue
             try:
                 ok = self.broker.update_order_price(
                     product_id=int(product_id),
-                    order_id=str(order_id),
+                    order_id=str(broker_order_id),
                     new_limit_price=float(new_price),
                 )
                 if ok and self.engine_logger:
                     self.engine_logger.log(
                         "oms",
-                        f"Refreshed exit order {intent_id} at {new_price} (near {'bid' if side == 'SELL' else 'ask'})",
+                        f"Refreshed {label} order {intent_id} at {new_price} "
+                        f"(best {'bid' if side == 'SELL' else 'ask'})",
                     )
                 if ok:
                     self.intent_store.update(intent_id, IntentStatus.SENT)
@@ -3224,7 +3296,9 @@ class OrderRouter:
                         rec["last_price_update_ts"] = now
             except Exception as e:
                 if self.engine_logger:
-                    self.engine_logger.log("oms", f"Refresh exit order failed: {e}")
+                    self.engine_logger.log(
+                        "oms", f"Refresh {label} order failed: {e}"
+                    )
 
     def verify_open_orders_with_broker(self) -> Tuple[bool, Dict]:
         """

@@ -1,0 +1,10 @@
+[Unit]
+Description=Download Delta India instrument master
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/Dhan-codebase
+ExecStart=/root/Dhan-codebase/venv/bin/python /root/Dhan-codebase/utils/delta/refresh_delta_instruments.py

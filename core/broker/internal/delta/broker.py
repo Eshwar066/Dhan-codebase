@@ -862,6 +862,12 @@ class DeltaBroker(BaseBroker):
                     "product_id": product_id,
                     "side": (o.get("side") or "").lower(),
                     "qty": int(o.get("qty") or 0),
+                    "remaining_qty": int(
+                        o.get("remaining_qty")
+                        if o.get("remaining_qty") is not None
+                        else o.get("qty") or 0
+                    ),
+                    "price": float(o.get("price") or 0),
                     "reduce_only": o.get("reduce_only"),
                     "stop_order_type": o.get("stop_order_type"),
                 }

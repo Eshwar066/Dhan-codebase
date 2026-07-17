@@ -19,7 +19,7 @@ Run: ``python -m run.main --engine-id delta_engine_one``
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, time, timedelta
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
@@ -34,7 +34,7 @@ from core.strategies.meta import pack_strategy_meta
 
 logger = logging.getLogger(__name__)
 
-ENTRY_TIME = time(23, 00)
+ENTRY_TIME = time(23, 15)
 EXIT_TIME = time(17, 15)
 
 # Entry switches. Disabling a family blocks its initial entries and SL re-entries;
@@ -695,7 +695,7 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             metadata_extras=self._strategy_meta_dict(meta),
         )
         # Keep E1/E2 sizing independent of the engine-wide ORDER_QTY_LOTS value.
-        intent.qty = meta.qty_lots
+        intent = replace(intent, qty=meta.qty_lots)
         self._meta_by_structure_id[structure_id] = meta
         self._entry_signaled_keys.add(guard)
         logger.info(
@@ -885,7 +885,7 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             action="ENTRY",
             metadata_extras=self._strategy_meta_dict(new_meta),
         )
-        intent.qty = meta.qty_lots
+        intent = replace(intent, qty=meta.qty_lots)
         self._meta_by_structure_id[structure_id] = new_meta
         logger.info(
             "BTCZeroDTEElevenPM same-contract SL re-entry %s contract=%s "

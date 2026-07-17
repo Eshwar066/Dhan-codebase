@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timezone
 from typing import Any, Dict, List, Optional
 
@@ -549,7 +549,7 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             action="ENTRY",
             metadata_extras=self._strategy_meta(meta),
         )
-        intent.qty = ORDER_QTY_LOTS
+        intent = replace(intent, qty=ORDER_QTY_LOTS)
         self._meta_by_structure_id[structure_id] = meta
         logger.info(
             "%s ENTRY reason=%s opt=%s strike=%.2f expiry=%s premium=%.2f ST=%.2f",

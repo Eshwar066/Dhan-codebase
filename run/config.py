@@ -79,12 +79,14 @@ ENGINE_JOBS = [
         "strategies": [
             "BTCZeroDTE",
             "BTCZeroDTEElevenPM",
+            "DirectionalOptionSelling",
             # "RSIBreadAndButter",
         ],
-        "max_open_positions": 8,
+        "max_open_positions": 15,
         "check_short_option_margin_enabled": True,
-        "ORDER_QTY_LOTS": 10,
+        # "ORDER_QTY_LOTS": 10,
         "delta_leverage": 10,
+        "strategy_timeout_seconds": 60,
         "latency_critical_ms": 6000,
         "latency_critical_cycles": 6,
         "telegram": {

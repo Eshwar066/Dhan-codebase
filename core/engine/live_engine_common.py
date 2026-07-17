@@ -994,6 +994,17 @@ class LiveEngineHelpersMixin:
             stale_seconds=float(self._exit_refresh_interval_seconds),
         )
 
+    def _do_entry_order_refresh(self) -> None:
+        """Every 30 seconds, re-quote unfilled entry limits at best bid/ask."""
+        now = time.time()
+        if now - self._last_entry_refresh_time < self._entry_refresh_interval_seconds:
+            return
+        self._last_entry_refresh_time = now
+        self.order_router.refresh_stale_entry_orders(
+            get_bid_ask=self._get_bid_ask,
+            stale_seconds=float(self._entry_refresh_interval_seconds),
+        )
+
     def _log_startup_balance_snapshot(self) -> None:
         """One-time startup balance check/log for observability before live loop."""
         broker = getattr(self.order_router, "broker", None)

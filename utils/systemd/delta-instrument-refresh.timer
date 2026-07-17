@@ -1,0 +1,10 @@
+[Unit]
+Description=Download Delta instruments daily at 17:31 IST
+
+[Timer]
+OnCalendar=*-*-* 17:31:00 Asia/Kolkata
+Persistent=true
+Unit=delta-instrument-refresh.service
+
+[Install]
+WantedBy=timers.target
