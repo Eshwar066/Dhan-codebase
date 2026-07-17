@@ -25,12 +25,14 @@ GENERATED_STRATEGY_SUBSCRIPTIONS: dict = {
             'enabled': False,
             'symbols': [
                 'BTCUSD',
+                'ETHUSD',
             ],
         },
         'ScheduledSlot': {
             'enabled': True,
             'symbols': [
                 'BTCUSD',
+                'ETHUSD',
             ],
         },
     },

@@ -5,6 +5,7 @@ STRATEGY_PROFILES: dict = {
     'BTCZeroDTE': {
         'symbols': [
             'BTCUSD',
+            'ETHUSD',
         ],
         'exchange': 'NSE',
         'eval_mode': 'scheduled',

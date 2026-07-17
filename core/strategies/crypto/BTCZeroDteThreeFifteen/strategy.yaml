@@ -16,12 +16,14 @@ broker:
     leverage: 10
 symbols:
 - BTCUSD
+- ETHUSD
 exchange: NSE
 timeframe: null
 schedule:
   eval_mode: scheduled
   times:
   - '15:15'
+  - '15:30'
   - '17:15'
 backtest_timeframe: '5'
 data:
@@ -46,14 +48,19 @@ dependencies:
   expiry_type: Daily
   meta_key: btc_zero_dte
 documentation:
-  title: BTC Zero DTE
+  title: BTC/ETH Zero DTE
   overview: >
-    Delta BTC same-day OTM short strangle (~$100 premium), 100% stop-loss per leg,
-    one re-entry per leg, flat at 17:15 IST.
+    Three independently configurable Delta entries: BTC premium-band and BTC OTM2
+    at 15:15, then ETH OTM2 at 15:30. Each leg has a 100% stop, one same-contract
+    re-entry at cost, and a 17:15 exit.
   rules: |
-    - 15:15 IST: sell 10 OTM Call lots + 10 OTM Put lots (premium band ~50–110)
+    - 15:15 IST: BTC premium-band CE + PE (target ~$100)
+    - 15:15 IST: BTC OTM2 CE + PE
+    - 15:30 IST: ETH OTM2 CE + PE
+    - Each family has an enable switch and independent quantity
     - After MAIN fill: broker SL at 2x entry premium (100% stop)
-    - One re-entry per leg at same premium band after SL
+    - After SL, wait for that same contract and strike to return to entry cost
+    - One same-contract re-entry per leg
     - Manage remaining leg independently
     - 17:15 IST: exit all remaining MAIN positions
     - Scheduled slots; backtest uses 5m bars for clock alignment
@@ -65,6 +72,7 @@ subscriptions:
     enabled: true
     symbols:
     - BTCUSD
+    - ETHUSD
 execution:
   bracket_leg_tags:
   - MAIN_SL
