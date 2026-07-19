@@ -171,6 +171,10 @@ class DeltaBrokerApi:
         """Edit a single order (limit_price and/or stop_price)."""
         return self._source.edit_order(payload)
 
+    def cancel_order(self, product_id: int, order_id: Any) -> Any:
+        """Cancel an open Delta order by product_id + order id."""
+        return self._source.cancel_order(int(product_id), order_id)
+
     def edit_bracket_order(self, payload: Dict[str, Any]) -> Any:
         """Edit bracket stop-loss / take-profit trigger prices."""
         return self._source.edit_bracket_order(payload)

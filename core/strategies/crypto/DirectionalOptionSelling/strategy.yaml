@@ -60,8 +60,8 @@ documentation:
   title: BTC SuperTrend Option Selling
   overview: >
     One-hour BTC SuperTrend reversals sell one Put in bullish regimes or one Call
-    in bearish regimes. Strike selection uses the nearest strike to SuperTrend
-    with at least $150 premium, preferring 0DTE and then the next daily expiry.
+    in bearish regimes. Strike selection uses strictly OTM strikes outside SuperTrend
+    with at least $120 premium, preferring 0DTE and then the next daily expiry.
   rules: |
     - SuperTrend length 16, multiplier 1.5 on BTCUSD 60-minute closed candles
     - Red to Green: sell one PE; Green to Red: sell one CE
@@ -69,6 +69,7 @@ documentation:
     - Broker MAIN_SL is a spot-triggered stop-LIMIT on the option (never market); open limits re-quote to best ask every 30s
     - Broker SL stop_price is modified whenever the 60m SuperTrend value changes
     - Strategy emergency: if spot breaches ST±300 and position still open, place immediate LIMIT exit (also re-quoted every 30s)
+    - Strike proximity: if spot trades within ±50 of the open option strike, exit immediately
     - After any SL fill, re-enter on that same 1hr candle's close (e.g. SL at 11:01 in 10:30-11:30 → decide at 11:30): unchanged SuperTrend → same direction; flipped → opposite
-    - At 17:25 IST, exit today's expiry and use the next listed daily expiry
-    - Rollover strike must be at least 200 BTC points from SuperTrend with premium >= $150
+    - At 17:25 IST, cancel resting MAIN_SL, exit today's expiry, then sell next-day
+      OTM strike outside SuperTrend (min 200 pts) with premium >= $120

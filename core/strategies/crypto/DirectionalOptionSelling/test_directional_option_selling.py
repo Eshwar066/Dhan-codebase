@@ -82,9 +82,108 @@ class DirectionalOptionSellingTests(unittest.TestCase):
                 min_strike_distance=0,
             )
         self.assertIsNotNone(selected)
-        # Nearest eligible with premium >= MIN_PREMIUM_USD (150): 118500 @ 250.
-        self.assertEqual(selected[0], 118500)
+        # Outside SuperTrend PE (strike < ST 118450) nearest ST with premium >= 120: 118000.
+        self.assertEqual(selected[0], 118000)
         self.assertEqual(selected[3], "170726")
+
+    def test_live_selection_rejects_itm_and_atm(self):
+        products = [
+            {"symbol": "C-BTC-64400-190726", "strike_price": 64400},  # ITM CE
+            {"symbol": "C-BTC-64500-190726", "strike_price": 64500},  # not OTM (strike < spot)
+            {"symbol": "C-BTC-64600-190726", "strike_price": 64600},  # OTM but inside ST
+            {"symbol": "C-BTC-64800-190726", "strike_price": 64800},  # OTM but inside ST
+            {"symbol": "C-BTC-65000-190726", "strike_price": 65000},  # outside ST
+        ]
+        source = _LiveSource(
+            products,
+            {
+                "C-BTC-64400-190726": _ticker(211),
+                "C-BTC-64500-190726": _ticker(180),
+                "C-BTC-64600-190726": _ticker(160),
+                "C-BTC-64800-190726": _ticker(170),
+                "C-BTC-65000-190726": _ticker(125),
+            },
+        )
+        candle = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 19, 9, 0, tzinfo=timezone.utc),
+            "close": 64501.5,
+        }
+        with patch(
+            "core.strategies.crypto.DirectionalOptionSelling."
+            "DirectionalOptionSelling._delta_source_from_ctx",
+            return_value=source,
+        ):
+            selected = self.strategy._select_live_contract(
+                candle,
+                SimpleNamespace(),
+                "CE",
+                64837.05,
+                min_dte=0,
+                min_strike_distance=0,
+            )
+        self.assertIsNotNone(selected)
+        # Outside SuperTrend CE (strike > ST): 65000 (64800 rejected as inside ST).
+        self.assertEqual(selected[0], 65000)
+
+    def test_quote_exits_when_spot_near_strike(self):
+        instrument = SimpleNamespace(
+            option_type="CE",
+            expiry="200726",
+            strike=64800,
+            trading_symbol="C-BTC-64800-200726",
+        )
+        position = SimpleNamespace(
+            tag="MAIN",
+            net_qty=-10,
+            structure_id="DirectionalOptionSelling:BTCUSD:prox",
+            instrument=instrument,
+            intent_id=None,
+            avg_price=130,
+        )
+        ctx = SimpleNamespace(
+            position_store=_PositionStore([position]),
+            intent_store=None,
+            order_router=None,
+        )
+        self.strategy._confirmed_direction = -1
+        self.strategy._current_supertrend = 64775.63
+        marker = object()
+        quote = {
+            "symbol": "BTCUSD",
+            "ltp": 64760,  # within ±50 of strike 64800
+            "ts": datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc).timestamp(),
+        }
+        with patch.object(self.strategy, "_exit_intent", return_value=marker) as exit_fn:
+            result = self.strategy.on_quote(quote, ctx)
+        self.assertEqual(result, [marker])
+        self.assertEqual(
+            exit_fn.call_args.args[3], "strategy_strike_proximity_exit"
+        )
+
+    def test_should_evaluate_waits_for_candle_close(self):
+        candle = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 19, 9, 0, tzinfo=timezone.utc),  # 14:30 IST
+            "close": 64501.5,
+        }
+        mid_bar = datetime(2026, 7, 19, 9, 19, tzinfo=timezone.utc)  # 14:49 IST
+        at_close = datetime(2026, 7, 19, 10, 0, tzinfo=timezone.utc)  # 15:30 IST
+        self.assertFalse(self.strategy._bar_is_fully_closed(candle, now=mid_bar))
+        self.assertTrue(self.strategy._bar_is_fully_closed(candle, now=at_close))
+        with patch.object(
+            self.strategy,
+            "_bar_is_fully_closed",
+            return_value=False,
+        ):
+            self.assertFalse(self.strategy.should_evaluate(candle))
+        with patch.object(
+            self.strategy,
+            "_bar_is_fully_closed",
+            return_value=True,
+        ):
+            self.assertTrue(self.strategy.should_evaluate(candle))
+            self.assertFalse(self.strategy.should_evaluate(candle))
 
     def test_rollover_selection_enforces_200_point_strike_distance(self):
         products = [
@@ -398,6 +497,112 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertEqual(out, [])
         self.assertEqual(self.strategy._sl_reentry_direction, 1)
         self.assertIsNotNone(self.strategy._sl_reentry_after)
+
+    def test_rollover_cancels_pending_main_sl_and_exits(self):
+        """17:25 rollover must cancel resting FORCE_EXIT (MAIN_SL) then place MAIN_EXIT."""
+        from core.orderExecution.intent_store import IntentStatus
+
+        instrument = SimpleNamespace(
+            option_type="CE",
+            expiry="190726",
+            strike=64400,
+            trading_symbol="C-BTC-64400-190726",
+            product_id=123,
+        )
+        position = SimpleNamespace(
+            tag="MAIN",
+            net_qty=-10,
+            structure_id="DirectionalOptionSelling:BTCUSD:rollover",
+            instrument=instrument,
+            intent_id="entry1",
+            avg_price=211,
+        )
+        sl_rec = {
+            "intent_id": "sl1",
+            "broker_order_id": "1424684009",
+            "payload": {
+                "structure_id": position.structure_id,
+                "tag": "MAIN_SL",
+                "strategy": "DirectionalOptionSelling",
+                "action": "FORCE_EXIT",
+                "trading_symbol": instrument.trading_symbol,
+                "product_id": 123,
+            },
+        }
+
+        class _IntentStore:
+            def __init__(self):
+                self.updated = []
+                self._pending_force = True
+
+            def list_by_status(self, status):
+                if self._pending_force and status in (
+                    IntentStatus.SENT,
+                    IntentStatus.ACKED,
+                    IntentStatus.VALIDATED,
+                ):
+                    return [sl_rec]
+                return []
+
+            def has_pending_intent(self, **kwargs):
+                actions = {str(a).upper() for a in (kwargs.get("actions") or [])}
+                if self._pending_force and ("FORCE_EXIT" in actions or "EXIT" in actions):
+                    # After cancel, FORCE_EXIT is cleared; EXIT not yet pending.
+                    if "FORCE_EXIT" in actions and "EXIT" in actions:
+                        return self._pending_force
+                    if actions == {"FORCE_EXIT"}:
+                        return self._pending_force
+                    if actions == {"EXIT"}:
+                        return False
+                return self._pending_force and "FORCE_EXIT" in actions
+
+            def update(self, intent_id, status, **kwargs):
+                self.updated.append((intent_id, status))
+                if status == IntentStatus.CANCELLED:
+                    self._pending_force = False
+
+            def get(self, intent_id):
+                return sl_rec if intent_id == "sl1" else None
+
+        class _Broker:
+            def __init__(self):
+                self.cancelled = []
+
+            def cancel_order_by_id(self, order_id, **kwargs):
+                self.cancelled.append((order_id, kwargs))
+                return True
+
+            def find_bracket_leg_order_id(self, *_a, **_k):
+                return "1424684009"
+
+        broker = _Broker()
+        intent_store = _IntentStore()
+        ctx = SimpleNamespace(
+            position_store=_PositionStore([position]),
+            intent_store=intent_store,
+            order_router=SimpleNamespace(broker=broker),
+        )
+        self.strategy._confirmed_direction = -1
+        self.strategy._current_supertrend = 64827.25
+        quote = {
+            "symbol": "BTCUSD",
+            "ltp": 64500,
+            "ts": datetime(2026, 7, 19, 11, 55, tzinfo=timezone.utc).timestamp(),  # 17:25 IST
+        }
+        marker = object()
+        with patch.object(self.strategy, "_exit_intent", return_value=marker) as exit_fn:
+            result = self.strategy.on_quote(quote, ctx)
+        self.assertEqual(result, [marker])
+        self.assertTrue(broker.cancelled)
+        self.assertEqual(intent_store.updated[0][0], "sl1")
+        self.assertEqual(
+            self.strategy._pending_transition.reason, "expiry_rollover"
+        )
+        self.assertEqual(self.strategy._pending_transition.min_dte, 1)
+        self.assertEqual(self.strategy._pending_transition.direction, -1)
+        self.assertAlmostEqual(self.strategy._current_supertrend, 64827.25)
+        exit_fn.assert_called_once()
+        self.assertIn(datetime(2026, 7, 19).date(), self.strategy._rollover_dates)
 
 
 if __name__ == "__main__":

@@ -550,7 +550,13 @@ class LiveEngineHelpersMixin:
                 return True
 
         unix_s = int((ts_utc - epoch).total_seconds())
-        return (unix_s % tf_sec) == 0
+        # Bar open must land on a TF boundary, and wall-clock must be past bar close.
+        # Without the close check, an aligned open (e.g. 14:30) is treated as closed
+        # mid-bar (e.g. 14:49) and strategies trade on forming candles.
+        if (unix_s % tf_sec) != 0:
+            return False
+        now_unix = int((now_utc - epoch).total_seconds())
+        return now_unix >= unix_s + tf_sec
 
     def _closed_candle_diagnostics(
         self,
@@ -590,7 +596,9 @@ class LiveEngineHelpersMixin:
         now_utc = self._now_utc_naive(now)
         out["ts_utc_naive"] = ts_utc.isoformat()
         out["now_utc_naive"] = now_utc.isoformat()
-        out["forming"] = bool(ts_utc > now_utc)
+        epoch = dt.datetime(1970, 1, 1)
+        unix_s = int((ts_utc - epoch).total_seconds())
+        now_unix = int((now_utc - epoch).total_seconds())
         try:
             out["delta_ts_minus_now_sec"] = (ts_utc - now_utc).total_seconds()
         except Exception:
@@ -602,10 +610,17 @@ class LiveEngineHelpersMixin:
                 out["bucket_mod_tf"] = b % tf_sec
             except (TypeError, ValueError):
                 out["bucket_mod_tf"] = None
-        epoch = dt.datetime(1970, 1, 1)
-        unix_s = int((ts_utc - epoch).total_seconds())
         out["unix_s_mod_tf"] = unix_s % tf_sec
-        if ts_utc > now_utc:
+        bar_still_open = False
+        if bt is not None:
+            try:
+                bar_still_open = now_unix < int(float(bt)) + tf_sec
+            except (TypeError, ValueError):
+                bar_still_open = False
+        elif (unix_s % tf_sec) == 0:
+            bar_still_open = now_unix < unix_s + tf_sec
+        out["forming"] = bool(ts_utc > now_utc or bar_still_open)
+        if ts_utc > now_utc or bar_still_open:
             out["skip_reason"] = "forming"
         elif bt is not None:
             try:

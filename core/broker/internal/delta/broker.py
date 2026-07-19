@@ -880,6 +880,84 @@ class DeltaBroker(BaseBroker):
             )
         return normalized_orders
 
+    def cancel_order_by_id(
+        self,
+        order_id: str,
+        *,
+        intent_id: Optional[str] = None,
+        reason: str = "",
+        product_id: Optional[int] = None,
+        trading_symbol: Optional[str] = None,
+    ) -> bool:
+        """Cancel a resting Delta order. Resolves product_id from args, intent, or live book."""
+        oid = str(order_id or "").strip()
+        if not oid:
+            return False
+        pid: Optional[int] = int(product_id) if product_id is not None else None
+        symbol = str(trading_symbol or "").strip()
+        if pid is None and intent_id and self.intent_store:
+            rec = self.intent_store.get(str(intent_id)) or {}
+            payload = rec.get("payload") or {}
+            for key in ("product_id",):
+                try:
+                    raw = payload.get(key)
+                    if raw is not None:
+                        pid = int(raw)
+                        break
+                except (TypeError, ValueError):
+                    pass
+            if not symbol:
+                inst = payload.get("instrument") or {}
+                if isinstance(inst, dict):
+                    symbol = str(
+                        inst.get("trading_symbol")
+                        or inst.get("symbol")
+                        or ""
+                    ).strip()
+                else:
+                    symbol = str(
+                        getattr(inst, "trading_symbol", None)
+                        or getattr(inst, "symbol", None)
+                        or ""
+                    ).strip()
+                if not symbol:
+                    symbol = str(payload.get("trading_symbol") or "").strip()
+        if pid is None and symbol and hasattr(self.api, "product_id_for_symbol"):
+            try:
+                resolved = self.api.product_id_for_symbol(symbol)
+                if resolved is not None:
+                    pid = int(resolved)
+            except (TypeError, ValueError):
+                pid = None
+        if pid is None and symbol:
+            for row in self._live_orders_for_symbol(symbol):
+                if str(row.get("order_id") or "") == oid:
+                    try:
+                        pid = int(row.get("product_id"))
+                    except (TypeError, ValueError):
+                        pid = None
+                    break
+        if pid is None or not hasattr(self.api, "cancel_order"):
+            logger.warning(
+                "Delta cancel_order_by_id missing product_id order_id=%s intent=%s reason=%s",
+                oid,
+                intent_id,
+                reason,
+            )
+            return False
+        try:
+            self.api.cancel_order(int(pid), oid)
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Delta cancel_order failed order_id=%s product_id=%s reason=%s: %s",
+                oid,
+                pid,
+                reason,
+                exc,
+            )
+            return False
+
     def update_order_price(
         self, product_id: int, order_id: str, new_limit_price: float
     ) -> bool:

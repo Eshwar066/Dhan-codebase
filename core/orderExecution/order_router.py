@@ -2960,7 +2960,7 @@ class OrderRouter:
 
         pending = list(self.intent_store.list_by_status(IntentStatus.SENT)) + list(
             self.intent_store.list_by_status(IntentStatus.VALIDATED)
-        )
+        ) + list(self.intent_store.list_by_status(IntentStatus.ACKED))
         cancelled = 0
         for rec in pending:
             payload = rec.get("payload") or {}
