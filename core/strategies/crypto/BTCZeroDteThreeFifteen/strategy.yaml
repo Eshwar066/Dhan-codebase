@@ -60,15 +60,21 @@ documentation:
     - Each family has an enable switch and independent quantity
     - After MAIN fill: broker SL at 2x entry premium (100% stop)
     - After SL, wait for that same contract and strike to return to entry cost
+      (checked continuously on underlying quotes; not only at scheduled slots)
     - One same-contract re-entry per leg
     - Manage remaining leg independently
-    - 17:15 IST: exit all remaining MAIN positions
-    - Scheduled slots; backtest uses 5m bars for clock alignment
+    - 17:15 IST: exit all remaining MAIN positions (pending re-entries cancelled)
+    - Scheduled slots for entry/EOD; quote ticks drive SL re-entry-at-cost
   run_command: python -m run.main --engine-id delta_engine_one
   generate_readme: false
 subscriptions:
   BarClosed: false
   ScheduledSlot:
+    enabled: true
+    symbols:
+    - BTCUSD
+    - ETHUSD
+  QuoteUpdated:
     enabled: true
     symbols:
     - BTCUSD

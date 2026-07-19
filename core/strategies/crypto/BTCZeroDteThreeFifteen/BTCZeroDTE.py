@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
-from datetime import date, time
+from datetime import date, datetime, time, timezone
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -758,10 +758,30 @@ class BTCZeroDTE(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             getattr(inst, "expiry", None),
             trading_symbol=trading_symbol,
         )
+        # Prefer best bid for short re-entry (sell premium), fall back to mark/last.
+        if RUN_MODE != RunMode.BACKTEST:
+            try:
+                from core.strategies.deltaMktMixins import _delta_source_from_ctx
+
+                source = _delta_source_from_ctx(ctx)
+                ticker = source.get_ticker(trading_symbol) if source else None
+                if isinstance(ticker, dict):
+                    quotes = ticker.get("quotes") or {}
+                    bid = quotes.get("best_bid")
+                    if bid is not None and float(bid) > 0:
+                        current_premium = float(bid)
+            except Exception:
+                pass
         if current_premium is None or float(current_premium) <= 0:
             return None
         current_premium = float(current_premium)
         if current_premium > float(meta.entry_premium):
+            logger.debug(
+                "BTCZeroDTE SL re-entry waiting premium>cost %s prem=%.4f cost=%.4f",
+                trading_symbol,
+                current_premium,
+                meta.entry_premium,
+            )
             return None
 
         reentry_count = meta.reentry_count + 1
@@ -855,9 +875,67 @@ class BTCZeroDTE(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         self._evaluated_signal_keys.add(key)
         return True
 
+    def on_quote(self, quote: dict, ctx: Any) -> Optional[List[Any]]:
+        """
+        Scheduled slots alone never see mid-session SL fills (e.g. 15:35 / 16:14).
+        While a same-contract re-entry is waiting for premium-to-cost, poll on ticks.
+        """
+        if not self._pending_sl_reentry_by_structure_id:
+            return None
+        symbol = str(quote.get("symbol") or "").strip().upper()
+        if symbol not in ("BTCUSD", "ETHUSD"):
+            return None
+        # After EOD exit time, do not re-enter.
+        try:
+            raw_ts = quote.get("ts")
+            if raw_ts is not None:
+                tick_dt = datetime.fromtimestamp(float(raw_ts), tz=timezone.utc)
+            else:
+                tick_dt = datetime.now().astimezone()
+        except (TypeError, ValueError, OSError):
+            tick_dt = datetime.now().astimezone()
+        try:
+            now_ist = pd.Timestamp(tick_dt)
+            if now_ist.tzinfo is None:
+                now_ist = now_ist.tz_localize(IST)
+            else:
+                now_ist = now_ist.tz_convert(IST)
+            if now_ist.time() >= EXIT_TIME:
+                if self._pending_sl_reentry_by_structure_id:
+                    logger.info(
+                        "BTCZeroDTE drop pending SL re-entries at/after EOD "
+                        "count=%s",
+                        len(self._pending_sl_reentry_by_structure_id),
+                    )
+                    self._pending_sl_reentry_by_structure_id.clear()
+                return None
+        except Exception:
+            pass
+        try:
+            spot = float(quote.get("ltp") or 0)
+        except (TypeError, ValueError):
+            spot = 0.0
+        candle = {
+            "symbol": symbol,
+            "timestamp": tick_dt,
+            "open": spot,
+            "high": spot,
+            "low": spot,
+            "close": spot,
+            "exchange": "DELTA",
+            "quote_tick": True,
+        }
+        intents = self._pending_sl_reentry_intents(candle, ctx)
+        return intents or None
+
     def on_candle(self, candle, ctx):
         slot = self._active_slot(candle)
         if slot == EXIT_TIME:
+            if self._pending_sl_reentry_by_structure_id:
+                logger.info(
+                    "BTCZeroDTE EOD: clearing %s pending SL re-entries",
+                    len(self._pending_sl_reentry_by_structure_id),
+                )
             self._pending_sl_reentry_by_structure_id.clear()
             intents = self._eod_exit_intents(candle, ctx)
             return intents or None
@@ -1005,15 +1083,34 @@ class BTCZeroDTE(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             return []
         sid = str(structure_id)
         self._pending_exit_structure_ids.discard(sid)
-        meta = self._meta_by_structure_id.get(sid)
         tag_u = str(kwargs.get("tag") or "").upper()
         if tag_u != "MAIN_SL":
             self._pending_sl_reentry_by_structure_id.pop(sid, None)
             return []
         instrument = kwargs.get("instrument")
+        ctx = kwargs.get("ctx")
+        self._ensure_meta_for_fill(
+            sid,
+            instrument,
+            ctx,
+            kwargs.get("intent_id"),
+            kwargs.get("metadata_extras"),
+        )
+        meta = self._meta_by_structure_id.get(sid)
         if meta is None or instrument is None:
+            logger.warning(
+                "BTCZeroDTE SL re-entry NOT armed sid=%s meta=%s instrument=%s",
+                sid,
+                meta is not None,
+                instrument is not None,
+            )
             return []
         if meta.reentry_count >= MAX_REENTRIES_PER_LEG:
+            logger.info(
+                "BTCZeroDTE SL re-entry skipped (max reached) sid=%s count=%s",
+                sid,
+                meta.reentry_count,
+            )
             return []
         self._pending_sl_reentry_by_structure_id[sid] = _PendingSLReentry(
             meta=meta,

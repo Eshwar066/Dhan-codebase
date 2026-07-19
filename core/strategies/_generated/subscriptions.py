@@ -22,7 +22,7 @@ GENERATED_STRATEGY_SUBSCRIPTIONS: dict = {
             'enabled': True,
         },
         'QuoteUpdated': {
-            'enabled': False,
+            'enabled': True,
             'symbols': [
                 'BTCUSD',
                 'ETHUSD',
