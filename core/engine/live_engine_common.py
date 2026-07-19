@@ -984,7 +984,7 @@ class LiveEngineHelpersMixin:
         self._entries_paused_feed_stale = any_stale
 
     def _do_exit_order_refresh(self) -> None:
-        """Every 1 min, re-quote open exit orders at near bid/ask until they fill."""
+        """Every 30s, re-quote open exit / force-exit limits at best bid/ask until fill."""
         now = time.time()
         if now - self._last_exit_refresh_time < self._exit_refresh_interval_seconds:
             return

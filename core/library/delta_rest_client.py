@@ -153,6 +153,16 @@ class DeltaRestClient:
         response = self.request("POST", "/v2/orders/bracket", payload, auth=True)
         return parseResponse(response)
 
+    def edit_order(self, payload):
+        """Edit an open/pending order via PUT /v2/orders (supports stop_price)."""
+        response = self.request("PUT", "/v2/orders", payload, auth=True)
+        return parseResponse(response)
+
+    def edit_bracket_order(self, payload):
+        """Edit bracket TP/SL params via PUT /v2/orders/bracket."""
+        response = self.request("PUT", "/v2/orders/bracket", payload, auth=True)
+        return parseResponse(response)
+
     def batch_cancel(self, product_id, orders):
         response = self.request(
             "DELETE",

@@ -176,8 +176,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         # engines; cooldown avoids per-minute Seeded… spam while mismatch persists.
         self._last_mismatch_full_reconcile_ts: float = 0.0
         self._mismatch_reconcile_cooldown_sec: float = 300.0
-        # Stale exit order refresh: re-quote at near bid/ask every 1 min until fill
-        self._exit_refresh_interval_seconds = 60
+        # Stale exit / force-exit limits: re-quote at best bid/ask every 30s until fill
+        self._exit_refresh_interval_seconds = 30
         self._last_exit_refresh_time: float = 0
         # Unfilled entry limits: chase the executable best quote every 30 seconds.
         self._entry_refresh_interval_seconds = 30

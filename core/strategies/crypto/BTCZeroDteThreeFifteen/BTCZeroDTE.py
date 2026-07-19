@@ -42,7 +42,7 @@ EXIT_TIME = time(17, 15)
 # already-open positions retain their SL/target and scheduled exit handling.
 ENABLE_PREMIUM_ENTRY = True
 ENABLE_BTC_OTM2_ENTRY = True
-ENABLE_ETH_OTM2_ENTRY = True
+ENABLE_ETH_OTM2_ENTRY = False
 
 # Independent quantities (lots) for the three entry families.
 PREMIUM_ENTRY_LOTS = 10

@@ -3118,14 +3118,20 @@ class OrderRouter:
     def refresh_stale_exit_orders(
         self,
         get_bid_ask: Callable[[str], Tuple[float, float]],
-        stale_seconds: float = 60,
+        stale_seconds: float = 30,
     ) -> None:
-        """Re-quote open EXIT limits at the executable best price."""
+        """Re-quote open EXIT / FORCE_EXIT limits at best bid (SELL) or ask (BUY)."""
         self._refresh_stale_limit_orders(
             get_bid_ask=get_bid_ask,
             stale_seconds=stale_seconds,
             action="EXIT",
             label="exit",
+        )
+        self._refresh_stale_limit_orders(
+            get_bid_ask=get_bid_ask,
+            stale_seconds=stale_seconds,
+            action="FORCE_EXIT",
+            label="force_exit",
         )
 
     def refresh_stale_entry_orders(
@@ -3185,6 +3191,12 @@ class OrderRouter:
             symbol = self._instrument_trading_symbol(rec.get("instrument")) or (
                 (rec.get("payload") or {}).get("symbol") or ""
             )
+            # FORCE_EXIT MAIN_SL payload.symbol is often the underlying; always prefer
+            # the option trading symbol from the attached instrument.
+            if action_u == "FORCE_EXIT":
+                inst_sym = self._instrument_trading_symbol(rec.get("instrument"))
+                if inst_sym:
+                    symbol = inst_sym
             if not symbol:
                 if self.engine_logger:
                     self.engine_logger.log(

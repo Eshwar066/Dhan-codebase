@@ -21,11 +21,14 @@ logger = logging.getLogger(__name__)
 
 SUPER_TREND_LENGTH = 16
 SUPER_TREND_FACTOR = 1.5
-MIN_PREMIUM_USD = 300.0
+MIN_PREMIUM_USD = 150
+# Broker MAIN_SL trails SuperTrend on the spot index: bullish ST-100 / bearish ST+100.
+TRAIL_SL_POINTS = 100.0
+# Strategy emergency: if spot breaches ST±300 and the position is still open, fire LIMIT exit.
 FORCE_EXIT_POINTS = 300.0
 ROLLOVER_TIME = time(17, 25)
 ROLLOVER_MIN_STRIKE_DISTANCE = 200.0
-ORDER_QTY_LOTS = 1
+ORDER_QTY_LOTS = 10
 META_KEY = "directional_option_selling"
 
 
@@ -65,6 +68,7 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     order_qty_lots = ORDER_QTY_LOTS
     supertrend_length = SUPER_TREND_LENGTH
     supertrend_factor = SUPER_TREND_FACTOR
+    bracket_leg_tags = ["MAIN_SL"]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -74,8 +78,10 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         self._meta_by_structure_id: Dict[str, _PositionMeta] = {}
         self._pending_exit_structure_ids: set[str] = set()
         self._pending_transition: Optional[_PendingTransition] = None
-        self._force_reentry_direction: Optional[int] = None
-        self._force_exit_after: Optional[pd.Timestamp] = None
+        # After any SL: wait for the next 1hr close, then enter current SuperTrend direction.
+        # Stores the direction at SL time so same vs flip can be logged.
+        self._sl_reentry_direction: Optional[int] = None
+        self._sl_reentry_after: Optional[pd.Timestamp] = None
         self._evaluated_bars: set[str] = set()
         self._rollover_dates: set[date] = set()
 
@@ -111,6 +117,37 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     @staticmethod
     def _option_type(direction: int) -> str:
         return "PE" if direction > 0 else "CE"
+
+    @staticmethod
+    def _trail_sl_level(direction: int, supertrend: float) -> float:
+        """Broker SL level. Bullish: ST - 100. Bearish: ST + 100."""
+        st = float(supertrend)
+        if direction > 0:
+            return st - TRAIL_SL_POINTS
+        return st + TRAIL_SL_POINTS
+
+    @staticmethod
+    def _force_exit_level(direction: int, supertrend: float) -> float:
+        """Strategy emergency exit level. Bullish: ST - 300. Bearish: ST + 300."""
+        st = float(supertrend)
+        if direction > 0:
+            return st - FORCE_EXIT_POINTS
+        return st + FORCE_EXIT_POINTS
+
+    @staticmethod
+    def _spot_hits_level(
+        *,
+        direction: int,
+        level: float,
+        spot: float,
+        low: Optional[float] = None,
+        high: Optional[float] = None,
+    ) -> bool:
+        if direction > 0:
+            check = float(low if low is not None else spot)
+            return check <= float(level)
+        check = float(high if high is not None else spot)
+        return check >= float(level)
 
     @staticmethod
     def _timestamp_ist(value: Any) -> pd.Timestamp:
@@ -563,6 +600,38 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         )
         return intent
 
+    def _arm_sl_reentry(self, direction: Optional[int], exit_ts: Any) -> None:
+        """
+        After SL, re-enter on the close of the 1hr candle that contained the SL.
+
+        Example: SL at 11:01 inside the 10:30→11:30 bar → decide at 11:30 close
+        (same SuperTrend → same direction; flipped → opposite).
+        """
+        if direction is None:
+            return
+        self._sl_reentry_direction = int(direction)
+        self._sl_reentry_after = self._timestamp_ist(exit_ts)
+        logger.info(
+            "%s SL reentry armed direction=%s after=%s (reenter on that bar's close)",
+            self.name,
+            self._sl_reentry_direction,
+            self._sl_reentry_after,
+        )
+
+    def _clear_sl_reentry(self) -> None:
+        self._sl_reentry_direction = None
+        self._sl_reentry_after = None
+
+    def _sl_reentry_ready(self, candle: dict) -> bool:
+        """True once this candle's close time is after the SL fill time."""
+        if self._sl_reentry_direction is None or self._sl_reentry_after is None:
+            return False
+        # SL at 11:01 on the 10:30 bar → closed_bar_time 11:30 > 11:01 → ready.
+        return self._closed_bar_time_ist(candle) > self._sl_reentry_after
+
+    def _min_dte_for_candle(self, candle: dict) -> int:
+        return 1 if self._closed_bar_time_ist(candle).time() >= ROLLOVER_TIME else 0
+
     def _exit_intent(self, position: Any, candle: dict, ctx: Any, reason: str) -> Any:
         price = None
         if RUN_MODE == RunMode.BACKTEST:
@@ -574,6 +643,9 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 position.instrument.expiry,
                 trading_symbol=position.instrument.trading_symbol,
             )
+        elif RUN_MODE != RunMode.BACKTEST:
+            # Aggressive buy-to-cover limit for emergency exits.
+            price = self._live_exit_limit_price(position, ctx)
         return self.create_order_intent(
             inst=position.instrument,
             side="BUY" if int(position.net_qty) < 0 else "SELL",
@@ -588,6 +660,233 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             action="EXIT",
             metadata_extras={"exit_reason": reason},
         )
+
+    def _live_exit_limit_price(self, position: Any, ctx: Any) -> Optional[float]:
+        """Best ask (BUY cover) or best bid (SELL) when available."""
+        inst = getattr(position, "instrument", None)
+        side = "BUY" if int(getattr(position, "net_qty", 0) or 0) < 0 else "SELL"
+        return self._live_option_limit_price(inst, ctx, side=side)
+
+    def _live_option_limit_price(
+        self, instrument: Any, ctx: Any, *, side: str = "BUY"
+    ) -> Optional[float]:
+        """Best ask for BUY / best bid for SELL on an option symbol."""
+        symbol = str(getattr(instrument, "trading_symbol", "") or "")
+        if not symbol:
+            return None
+        source = _delta_source_from_ctx(ctx)
+        ticker = None
+        if source is not None:
+            try:
+                ticker = source.get_ticker(symbol)
+            except Exception:
+                ticker = None
+        if not isinstance(ticker, dict):
+            return None
+        quotes = ticker.get("quotes") or {}
+        key = "best_ask" if str(side).upper() == "BUY" else "best_bid"
+        try:
+            px = float(quotes.get(key) or 0)
+        except (TypeError, ValueError):
+            px = 0.0
+        if px <= 0:
+            for fallback in ("mark_price", "close", "price"):
+                try:
+                    px = float(ticker.get(fallback) or 0)
+                except (TypeError, ValueError):
+                    px = 0.0
+                if px > 0:
+                    break
+        return px if px > 0 else None
+
+    def _build_main_sl_intent(
+        self,
+        *,
+        instrument: Any,
+        qty: int,
+        structure_id: str,
+        parent_intent_id: Optional[str],
+        candle_ts: Any,
+        direction: int,
+        supertrend: float,
+        option_limit: float,
+    ) -> Any:
+        """
+        Broker stop-limit on the option: trigger off BTC spot (ST ± 100),
+        buy-to-cover LIMIT on the option (never market). Open limits are
+        re-quoted to best ask every 30s by the engine exit refresher.
+        """
+        level = self._trail_sl_level(direction, supertrend)
+        limit_px = float(option_limit)
+        if limit_px <= 0:
+            limit_px = 1.0
+        return self.create_order_intent(
+            inst=instrument,
+            side="BUY",
+            qty=max(1, int(qty)),
+            price=limit_px,
+            order_type="SL",
+            strategy=self.name,
+            candle_ts=candle_ts,
+            structure_id=structure_id,
+            tag="MAIN_SL",
+            symbol="BTCUSD",
+            action="FORCE_EXIT",
+            parent_intent_id=parent_intent_id,
+            trigger_price=level,
+            metadata_extras={
+                "stop_trigger_method": "spot_price",
+                "direction": int(direction),
+                "trigger_symbol": "BTCUSD",
+                "trail_sl_level": float(level),
+                "supertrend": float(supertrend),
+                "option_limit": float(limit_px),
+            },
+        )
+
+    def _find_main_sl_record(self, ctx: Any, structure_id: str) -> Optional[dict]:
+        intent_store = getattr(ctx, "intent_store", None)
+        if intent_store is None or not callable(getattr(intent_store, "list_by_status", None)):
+            return None
+        from core.orderExecution.intent_store import IntentStatus
+
+        pending = []
+        for status in (
+            IntentStatus.SENT,
+            IntentStatus.ACKED,
+            IntentStatus.VALIDATED,
+        ):
+            pending.extend(intent_store.list_by_status(status) or [])
+        for rec in pending:
+            payload = rec.get("payload") or {}
+            if str(payload.get("structure_id") or rec.get("structure_id") or "") != str(
+                structure_id
+            ):
+                continue
+            if str(payload.get("tag") or rec.get("tag") or "").upper() != "MAIN_SL":
+                continue
+            if str(payload.get("strategy") or rec.get("strategy") or "") not in {
+                "",
+                self.name,
+            }:
+                if str(payload.get("strategy_id") or "") != self.name:
+                    continue
+            return rec
+        return None
+
+    def _modify_broker_trail_sl(
+        self, ctx: Any, position: Any, *, direction: int, supertrend: float
+    ) -> bool:
+        """Update resting broker MAIN_SL stop_price to the latest SuperTrend trail level."""
+        level = self._trail_sl_level(direction, supertrend)
+        router = getattr(ctx, "order_router", None)
+        broker = getattr(router, "broker", None) if router is not None else None
+        if broker is None:
+            return False
+        sid = str(getattr(position, "structure_id", "") or "")
+        qty = abs(int(getattr(position, "net_qty", 0) or 0)) or 1
+        inst = getattr(position, "instrument", None)
+        trading_symbol = str(getattr(inst, "trading_symbol", "") or "")
+
+        # Simulated / paper: update pending SL book directly when available.
+        update_pending = getattr(broker, "update_pending_sl_trigger", None)
+        if callable(update_pending) and sid:
+            if update_pending(sid, level):
+                logger.info(
+                    "%s broker trail SL updated sid=%s level=%.2f (sim)",
+                    self.name,
+                    sid,
+                    level,
+                )
+                return True
+
+        order_id = None
+        product_id = getattr(inst, "product_id", None) if inst is not None else None
+        find_oid = getattr(broker, "find_bracket_leg_order_id", None)
+        if callable(find_oid) and trading_symbol:
+            order_id = find_oid(trading_symbol, "MAIN_SL")
+        rec = self._find_main_sl_record(ctx, sid)
+        if not order_id and rec is not None:
+            order_id = rec.get("broker_order_id")
+        if product_id is None and trading_symbol:
+            api = getattr(broker, "api", None)
+            pid_fn = getattr(api, "product_id_for_symbol", None) if api is not None else None
+            if callable(pid_fn):
+                product_id = pid_fn(trading_symbol)
+        update_fn = getattr(broker, "update_order_stop_price", None)
+        if not callable(update_fn) or not order_id or product_id is None:
+            return False
+        ok = bool(
+            update_fn(
+                product_id=int(product_id),
+                order_id=str(order_id),
+                new_stop_price=float(level),
+                size=int(qty),
+            )
+        )
+        if ok:
+            logger.info(
+                "%s broker trail SL updated sid=%s order=%s level=%.2f ST=%.2f",
+                self.name,
+                sid,
+                order_id,
+                level,
+                float(supertrend),
+            )
+            if rec is not None:
+                payload = rec.get("payload") or {}
+                payload["trigger_price"] = float(level)
+                payload["price"] = float(level)
+                meta = dict(payload.get("strategy_meta") or {})
+                meta["trail_sl_level"] = float(level)
+                meta["supertrend"] = float(supertrend)
+                payload["strategy_meta"] = meta
+                rec["payload"] = payload
+        return ok
+
+    def _broker_still_has_position(self, ctx: Any, position: Any) -> bool:
+        """True when local MAIN is open; prefer live broker position check when available."""
+        if int(getattr(position, "net_qty", 0) or 0) == 0:
+            return False
+        router = getattr(ctx, "order_router", None)
+        broker = getattr(router, "broker", None) if router is not None else None
+        if broker is None:
+            return True
+        trading_symbol = str(
+            getattr(getattr(position, "instrument", None), "trading_symbol", "") or ""
+        )
+        get_pos = getattr(broker, "get_positions", None) or getattr(
+            broker, "get_open_positions", None
+        )
+        if not callable(get_pos) or not trading_symbol:
+            return True
+        try:
+            rows = get_pos() or []
+        except Exception:
+            return True
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            sym = str(
+                row.get("symbol")
+                or row.get("product_symbol")
+                or row.get("trading_symbol")
+                or ""
+            ).upper()
+            if sym != trading_symbol.upper():
+                continue
+            try:
+                size = float(
+                    row.get("size")
+                    or row.get("net_qty")
+                    or row.get("quantity")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                size = 0.0
+            return abs(size) > 0
+        # Broker list has no matching row — still treat local open as present.
+        return True
 
     def _begin_transition(
         self,
@@ -667,31 +966,62 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         direction = self._normal_direction(candle.get("supertrend_direction"))
         try:
             supertrend = float(candle.get("supertrend"))
-            close = float(candle.get("close"))
+            _close = float(candle.get("close"))
         except (TypeError, ValueError):
             return None
-        if direction is None or pd.isna(supertrend) or supertrend <= 0:
+        if direction is None or pd.isna(supertrend) or supertrend <= 0 or _close <= 0:
             return None
 
         previous = self._confirmed_direction
+        previous_st = self._current_supertrend
         self._confirmed_direction = direction
         self._current_supertrend = supertrend
         self._latest_candle = dict(candle)
         positions = self._open_main_positions(ctx)
 
+        # Same-direction SuperTrend move: modify broker MAIN_SL to ST ± 100.
+        if (
+            positions
+            and previous is not None
+            and direction == previous
+            and previous_st is not None
+            and abs(float(supertrend) - float(previous_st)) > 1e-9
+        ):
+            self._modify_broker_trail_sl(
+                ctx,
+                positions[0],
+                direction=direction,
+                supertrend=supertrend,
+            )
+
         if previous is None:
             rollover = self._rollover_intent_if_due(candle, ctx, closed_bar=True)
             return [rollover] if rollover is not None else None
 
-        if direction != previous:
-            self._force_reentry_direction = None
-            self._force_exit_after = None
-            min_dte = (
-                1
-                if self._closed_bar_time_ist(candle).time() >= ROLLOVER_TIME
-                else 0
+        # After any SL: on the close of the candle that contained the SL fill,
+        # enter current SuperTrend direction (same if unchanged, opposite if flipped).
+        # e.g. SL at 11:01 in 10:30→11:30 bar → re-enter when that bar closes at 11:30.
+        if not positions and self._sl_reentry_ready(candle):
+            direction_at_sl = int(self._sl_reentry_direction or 0)
+            self._clear_sl_reentry()
+            reason = (
+                "sl_reentry_same"
+                if direction == direction_at_sl
+                else "sl_reentry_flip"
             )
+            intent = self._build_entry(
+                candle,
+                ctx,
+                direction,
+                reason=reason,
+                min_dte=self._min_dte_for_candle(candle),
+            )
+            return [intent] if intent is not None else None
+
+        if direction != previous:
+            min_dte = self._min_dte_for_candle(candle)
             if positions:
+                self._clear_sl_reentry()
                 sid = str(getattr(positions[0], "structure_id", "") or "")
                 if sid in self._pending_exit_structure_ids:
                     # The same closed bar can satisfy the intrabar stop and confirm a
@@ -712,39 +1042,18 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                         reason="supertrend_reversal",
                         min_dte=min_dte,
                     )
-            else:
-                intent = self._build_entry(
-                    candle,
-                    ctx,
-                    direction,
-                    reason="supertrend_reversal",
-                    min_dte=min_dte,
-                )
-            return [intent] if intent is not None else None
-
-        if (
-            not positions
-            and self._force_reentry_direction == direction
-            and (
-                self._force_exit_after is None
-                or self._closed_bar_time_ist(candle) > self._force_exit_after
-            )
-        ):
-            trend_valid = close > supertrend if direction > 0 else close < supertrend
-            if trend_valid:
-                self._force_reentry_direction = None
-                intent = self._build_entry(
-                    candle,
-                    ctx,
-                    direction,
-                    reason="force_exit_reentry",
-                    min_dte=(
-                        1
-                        if self._closed_bar_time_ist(candle).time() >= ROLLOVER_TIME
-                        else 0
-                    ),
-                )
                 return [intent] if intent is not None else None
+            # Flat + waiting for post-SL 1hr close: do not enter early.
+            if self._sl_reentry_direction is not None:
+                return None
+            intent = self._build_entry(
+                candle,
+                ctx,
+                direction,
+                reason="supertrend_reversal",
+                min_dte=min_dte,
+            )
+            return [intent] if intent is not None else None
 
         rollover = self._rollover_intent_if_due(candle, ctx, closed_bar=True)
         return [rollover] if rollover is not None else None
@@ -786,26 +1095,28 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             return None
         meta = self._ensure_meta(position, ctx)
         position_direction = meta.direction if meta is not None else self._confirmed_direction
-        threshold_hit = (
-            position_direction > 0
-            and spot <= float(self._current_supertrend) - FORCE_EXIT_POINTS
-        ) or (
-            position_direction < 0
-            and spot >= float(self._current_supertrend) + FORCE_EXIT_POINTS
+        force_level = self._force_exit_level(
+            int(position_direction), float(self._current_supertrend)
         )
-        if not threshold_hit:
+        if not self._spot_hits_level(
+            direction=int(position_direction),
+            level=force_level,
+            spot=spot,
+        ):
             return None
-        self._force_reentry_direction = self._confirmed_direction
-        self._force_exit_after = self._timestamp_ist(tick_dt)
+        if not self._broker_still_has_position(ctx, position):
+            return None
+        self._arm_sl_reentry(self._confirmed_direction, tick_dt)
         self._pending_exit_structure_ids.add(sid)
         logger.warning(
-            "%s FORCE EXIT spot=%.2f ST=%.2f direction=%s",
+            "%s FORCE EXIT (strategy 300) spot=%.2f ST=%.2f level=%.2f direction=%s",
             self.name,
             spot,
             self._current_supertrend,
+            force_level,
             position_direction,
         )
-        return [self._exit_intent(position, candle, ctx, "intrabar_supertrend_300")]
+        return [self._exit_intent(position, candle, ctx, "strategy_force_exit_300")]
 
     def should_exit(self, position: Any, candle: dict, ctx: Any = None) -> bool:
         if ctx is None or getattr(position, "tag", None) != "MAIN":
@@ -818,10 +1129,13 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         high = float(candle.get("high") or candle.get("close") or 0)
         meta = self._ensure_meta(position, ctx)
         position_direction = meta.direction if meta is not None else direction
-        return (
-            position_direction > 0 and low <= supertrend - FORCE_EXIT_POINTS
-        ) or (
-            position_direction < 0 and high >= supertrend + FORCE_EXIT_POINTS
+        force_level = self._force_exit_level(int(position_direction), float(supertrend))
+        return self._spot_hits_level(
+            direction=int(position_direction),
+            level=force_level,
+            spot=float(candle.get("close") or 0),
+            low=low,
+            high=high,
         )
 
     def on_position_exit(self, position: Any, candle: dict, ctx: Any) -> List[Any]:
@@ -829,9 +1143,8 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         if not sid or sid in self._pending_exit_structure_ids:
             return []
         self._pending_exit_structure_ids.add(sid)
-        self._force_reentry_direction = self._confirmed_direction
-        self._force_exit_after = self._closed_bar_time_ist(candle)
-        return [self._exit_intent(position, candle, ctx, "intrabar_supertrend_300")]
+        self._arm_sl_reentry(self._confirmed_direction, candle["timestamp"])
+        return [self._exit_intent(position, candle, ctx, "strategy_force_exit_300")]
 
     def on_main_entry_filled(
         self,
@@ -841,44 +1154,127 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         metadata_extras: Any = None,
         **kwargs: Any,
     ) -> List[Any]:
-        if structure_id:
-            self._restore_meta(str(structure_id), metadata_extras)
-        return []
+        sid = str(structure_id or "")
+        if sid:
+            self._restore_meta(sid, metadata_extras)
+        meta = self._meta_by_structure_id.get(sid) if sid else None
+        instrument = kwargs.get("instrument")
+        qty = kwargs.get("qty")
+        parent_intent_id = kwargs.get("intent_id")
+        candle_ts = kwargs.get("candle_ts")
+        if instrument is None:
+            positions = self._open_main_positions(ctx) if ctx is not None else []
+            for position in positions:
+                if str(getattr(position, "structure_id", "") or "") == sid:
+                    instrument = getattr(position, "instrument", None)
+                    qty = abs(int(getattr(position, "net_qty", 0) or 0)) or qty
+                    parent_intent_id = parent_intent_id or getattr(
+                        position, "intent_id", None
+                    )
+                    break
+        direction = (
+            meta.direction
+            if meta is not None
+            else (self._confirmed_direction if self._confirmed_direction is not None else 0)
+        )
+        supertrend = (
+            meta.supertrend
+            if meta is not None
+            else float(self._current_supertrend or 0)
+        )
+        if instrument is None or not direction or supertrend <= 0:
+            return []
+        # Option LIMIT (never market): prefer live ask; fall back to entry premium.
+        option_limit = None
+        if ctx is not None:
+            option_limit = self._live_option_limit_price(instrument, ctx, side="BUY")
+        if option_limit is None or float(option_limit) <= 0:
+            try:
+                option_limit = float(meta.entry_premium) if meta is not None else 0.0
+            except (TypeError, ValueError, AttributeError):
+                option_limit = 0.0
+        if option_limit is None or float(option_limit) <= 0:
+            try:
+                option_limit = float(kwargs.get("price") or 0)
+            except (TypeError, ValueError):
+                option_limit = 0.0
+        intent = self._build_main_sl_intent(
+            instrument=instrument,
+            qty=int(qty or ORDER_QTY_LOTS),
+            structure_id=sid,
+            parent_intent_id=str(parent_intent_id) if parent_intent_id else None,
+            candle_ts=candle_ts or datetime.now(),
+            direction=int(direction),
+            supertrend=float(supertrend),
+            option_limit=float(option_limit or 1.0),
+        )
+        logger.info(
+            "%s arm broker MAIN_SL sid=%s spot_trigger=%.2f option_limit=%.2f ST=%.2f direction=%s",
+            self.name,
+            sid,
+            self._trail_sl_level(int(direction), float(supertrend)),
+            float(option_limit or 1.0),
+            float(supertrend),
+            direction,
+        )
+        return [intent]
 
     def on_main_exit_filled(self, **kwargs: Any) -> List[Any]:
         sid = str(kwargs.get("structure_id") or "")
         if not sid:
             return []
+        tag = str(kwargs.get("tag") or "").upper()
+        meta = self._meta_by_structure_id.get(sid)
+        direction_at_exit = (
+            meta.direction
+            if meta is not None
+            else self._confirmed_direction
+        )
         self._pending_exit_structure_ids.discard(sid)
         self._meta_by_structure_id.pop(sid, None)
         transition = self._pending_transition
-        if transition is None or transition.previous_structure_id != sid:
-            return []
-        self._pending_transition = None
-        ctx = kwargs.get("ctx")
-        if ctx is None:
-            return []
-        candle = dict(self._latest_candle or {})
-        if not candle:
-            candle = {
-                "symbol": "BTCUSD",
-                "timestamp": kwargs.get("candle_ts") or datetime.now(),
-                "close": getattr(ctx, "spot_price", 0),
-                "exchange": "DELTA",
-            }
-        else:
-            candle["timestamp"] = kwargs.get("candle_ts") or candle["timestamp"]
-            if getattr(ctx, "spot_price", 0):
-                candle["close"] = float(ctx.spot_price)
-        intent = self._build_entry(
-            candle,
-            ctx,
-            transition.direction,
-            reason=transition.reason,
-            min_dte=transition.min_dte,
-            min_strike_distance=transition.min_strike_distance,
-        )
-        return [(intent, candle)] if intent is not None else []
+        if transition is not None and transition.previous_structure_id == sid:
+            self._pending_transition = None
+            self._clear_sl_reentry()
+            ctx = kwargs.get("ctx")
+            if ctx is None:
+                return []
+            candle = dict(self._latest_candle or {})
+            if not candle:
+                candle = {
+                    "symbol": "BTCUSD",
+                    "timestamp": kwargs.get("candle_ts") or datetime.now(),
+                    "close": getattr(ctx, "spot_price", 0),
+                    "exchange": "DELTA",
+                }
+            else:
+                candle["timestamp"] = kwargs.get("candle_ts") or candle["timestamp"]
+                if getattr(ctx, "spot_price", 0):
+                    candle["close"] = float(ctx.spot_price)
+            intent = self._build_entry(
+                candle,
+                ctx,
+                transition.direction,
+                reason=transition.reason,
+                min_dte=transition.min_dte,
+                min_strike_distance=transition.min_strike_distance,
+            )
+            return [(intent, candle)] if intent is not None else []
+
+        # Broker MAIN_SL or strategy MAIN_EXIT: wait for next 1hr close, then follow signal.
+        if tag == "MAIN_SL" and direction_at_exit is not None:
+            self._arm_sl_reentry(
+                direction_at_exit, kwargs.get("candle_ts") or datetime.now()
+            )
+        elif (
+            tag == "MAIN_EXIT"
+            and direction_at_exit is not None
+            and self._sl_reentry_direction is None
+        ):
+            self._arm_sl_reentry(
+                direction_at_exit, kwargs.get("candle_ts") or datetime.now()
+            )
+        return []
 
     def on_forced_exit(self, **kwargs: Any) -> None:
         sid = str(kwargs.get("structure_id") or "")

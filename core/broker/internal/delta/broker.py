@@ -236,6 +236,12 @@ class DeltaBroker(BaseBroker):
                 if ot in {"SL", "SL-M", "STOP", "STOP_MARKET", "STOP_LIMIT"}:
                     stop_ot = "MARKET" if ot in {"SL-M", "STOP_MARKET"} else "LIMIT"
                     limit_price = payload["price"] if stop_ot == "LIMIT" else None
+                    stop_trigger_method = "mark_price"
+                    extras = getattr(intent, "metadata_extras", None) or {}
+                    if isinstance(extras, dict):
+                        raw_method = extras.get("stop_trigger_method")
+                        if raw_method:
+                            stop_trigger_method = str(raw_method).strip().lower()
                     result = None
                     stop_retries = 3
                     for stop_attempt in range(stop_retries):
@@ -246,7 +252,7 @@ class DeltaBroker(BaseBroker):
                                 transaction_type=payload["transaction_type"],
                                 trigger_price=payload["trigger_price"] or payload["price"],
                                 price=limit_price,
-                                stop_trigger_method="mark_price",
+                                stop_trigger_method=stop_trigger_method,
                                 tag=payload.get("tag"),
                             )
                         except Exception as stop_e:
@@ -885,4 +891,35 @@ class DeltaBroker(BaseBroker):
             self.api.batch_edit(product_id=product_id, orders=orders)
             return True
         except Exception:
+            return False
+
+    def update_order_stop_price(
+        self,
+        product_id: int,
+        order_id: str,
+        new_stop_price: float,
+        *,
+        size: int,
+    ) -> bool:
+        """Update stop_price on a resting stop/bracket SL order. Returns True on success."""
+        oid = str(order_id or "").strip()
+        if not oid or not hasattr(self.api, "edit_order"):
+            return False
+        try:
+            self.api.edit_order(
+                {
+                    "id": int(oid) if str(oid).isdigit() else oid,
+                    "product_id": int(product_id),
+                    "size": int(size),
+                    "stop_price": str(float(new_stop_price)),
+                }
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Delta update_order_stop_price failed order_id=%s stop=%.4f: %s",
+                oid,
+                float(new_stop_price),
+                exc,
+            )
             return False

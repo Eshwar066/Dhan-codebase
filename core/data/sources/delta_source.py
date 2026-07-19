@@ -873,6 +873,12 @@ class DeltaSource:
     def batch_edit(self, product_id: int, orders: List[Dict]) -> Any:
         return self._client.batch_edit(product_id=product_id, orders=orders)
 
+    def edit_order(self, payload: Dict[str, Any]) -> Any:
+        return self._client.edit_order(payload)
+
+    def edit_bracket_order(self, payload: Dict[str, Any]) -> Any:
+        return self._client.edit_bracket_order(payload)
+
     def order_history(
         self, query: Optional[Dict] = None, page_size: int = 100, after: Any = None
     ) -> Any:

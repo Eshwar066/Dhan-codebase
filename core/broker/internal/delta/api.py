@@ -91,7 +91,7 @@ class DeltaBrokerApi:
             side="buy" if side == "buy" else "sell",
             stop_price=float(trigger_price),
             limit_price=float(price) if price is not None else None,
-            stop_trigger_method=stop_trigger_method,
+            stop_trigger_method=stop_trigger_method or "mark_price",
             client_order_id=tag,
         )
         return self._normalize_bracket_response(raw)
@@ -166,6 +166,14 @@ class DeltaBrokerApi:
     def batch_edit(self, product_id: int, orders: List[Dict[str, Any]]) -> Any:
         """Edit orders in batch (e.g. update limit_price). Each order: { 'id': order_id, 'limit_price': str }."""
         return self._source.batch_edit(product_id=product_id, orders=orders)
+
+    def edit_order(self, payload: Dict[str, Any]) -> Any:
+        """Edit a single order (limit_price and/or stop_price)."""
+        return self._source.edit_order(payload)
+
+    def edit_bracket_order(self, payload: Dict[str, Any]) -> Any:
+        """Edit bracket stop-loss / take-profit trigger prices."""
+        return self._source.edit_bracket_order(payload)
 
     def set_leverage(self, product_id: int, leverage: int) -> Any:
         """Set leverage for a Delta product (by product_id)."""
