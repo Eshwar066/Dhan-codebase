@@ -55,6 +55,8 @@ OTM2_STEPS = 2
 PREM_MIN = 50.0
 PREM_MAX = 110.0
 IDEAL_PREM = 100.0
+# Hard floor for every entry / re-entry (OTM and premium-band).
+MIN_ENTRY_PREMIUM = 5.0
 # Premium-band strategy: do not inherit MagicalLine-style delta gates (0.15–0.35).
 DELTA_MIN = 0.0
 DELTA_MAX = 1.0
@@ -561,10 +563,11 @@ class BTCZeroDTE(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             prem = float(premium)
         except (TypeError, ValueError):
             return None
-        if prem <= 0 or (mode == "PREMIUM" and prem > PREM_MAX):
+        if prem <= MIN_ENTRY_PREMIUM or (mode == "PREMIUM" and prem > PREM_MAX):
             logger.info(
-                "BTCZeroDTE: reject premium=%.2f mode=%s opt=%s",
+                "BTCZeroDTE: reject premium=%.2f (min=%.2f) mode=%s opt=%s",
                 prem,
+                MIN_ENTRY_PREMIUM,
                 mode,
                 option_type,
             )
@@ -772,7 +775,7 @@ class BTCZeroDTE(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                         current_premium = float(bid)
             except Exception:
                 pass
-        if current_premium is None or float(current_premium) <= 0:
+        if current_premium is None or float(current_premium) <= MIN_ENTRY_PREMIUM:
             return None
         current_premium = float(current_premium)
         if current_premium > float(meta.entry_premium):

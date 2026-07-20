@@ -50,6 +50,8 @@ SECOND_ENTRY_OTM_STEPS = 15
 SECOND_ENTRY_LOTS = 10
 # Backward-compatible alias for the original entry.
 OTM_STEPS = FIRST_ENTRY_OTM_STEPS
+# Hard floor for every entry / re-entry.
+MIN_ENTRY_PREMIUM = 5.0
 # Premium SL at 2x entry = 100% stop on short premium.
 SL_PREM_MULT = 2.0
 TP_TRIGGER_PRICE = 0.1
@@ -652,10 +654,11 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             prem = float(premium)
         except (TypeError, ValueError):
             return None
-        if prem <= 0:
+        if prem <= MIN_ENTRY_PREMIUM:
             logger.info(
-                "BTCZeroDTEElevenPM: reject non-positive premium=%.4f opt=%s",
+                "BTCZeroDTEElevenPM: reject premium=%.4f (min=%.2f) opt=%s",
                 prem,
+                MIN_ENTRY_PREMIUM,
                 option_type,
             )
             return None
@@ -827,7 +830,7 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             getattr(inst, "expiry", None),
             trading_symbol=trading_symbol,
         )
-        if current_premium is None or float(current_premium) <= 0:
+        if current_premium is None or float(current_premium) <= MIN_ENTRY_PREMIUM:
             return None
         current_premium = float(current_premium)
         if current_premium > float(meta.entry_premium):

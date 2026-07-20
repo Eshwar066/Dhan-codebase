@@ -55,6 +55,17 @@ class _PendingTransition:
     min_strike_distance: float = 0.0
 
 
+@dataclass(frozen=True)
+class _PendingClosedEntry:
+    """Entry retry after transition EXIT fill when immediate ENTRY could not be built."""
+
+    direction: int
+    reason: str
+    armed_after: pd.Timestamp
+    min_dte: int = 0
+    min_strike_distance: float = 0.0
+
+
 class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     """
     Sell one BTC Put after a confirmed bullish SuperTrend flip and one Call after
@@ -80,6 +91,8 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         self._meta_by_structure_id: Dict[str, _PositionMeta] = {}
         self._pending_exit_structure_ids: set[str] = set()
         self._pending_transition: Optional[_PendingTransition] = None
+        # After reversal EXIT fill: wait for the next closed 60m bar before entering.
+        self._pending_closed_entry: Optional[_PendingClosedEntry] = None
         # After any SL: wait for the next 1hr close, then enter current SuperTrend direction.
         # Stores the direction at SL time so same vs flip can be logged.
         self._sl_reentry_direction: Optional[int] = None
@@ -153,28 +166,123 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
 
     @staticmethod
     def _timestamp_ist(value: Any) -> pd.Timestamp:
+        """
+        Convert to IST. Naive values are treated as UTC (live engine stores UTC-naive).
+        Localizing naive as IST made forming 60m bars look closed ~5.5h early.
+        """
         ts = pd.Timestamp(value)
         if ts.tzinfo is None:
-            ts = ts.tz_localize(IST)
-        else:
-            ts = ts.tz_convert(IST)
-        return ts
+            ts = ts.tz_localize("UTC")
+        return ts.tz_convert(IST)
 
     def _closed_bar_time_ist(self, candle: dict) -> pd.Timestamp:
         """Hourly candle timestamps are bucket starts; return confirmed close time."""
+        bt = candle.get("bucket_ts")
+        if bt is not None:
+            try:
+                open_utc = pd.Timestamp(int(float(bt)), unit="s", tz="UTC")
+                return open_utc.tz_convert(IST) + pd.Timedelta(minutes=60)
+            except (TypeError, ValueError, OverflowError):
+                pass
         return self._timestamp_ist(candle["timestamp"]) + pd.Timedelta(minutes=60)
 
     def _bar_is_fully_closed(self, candle: dict, now: Optional[Any] = None) -> bool:
-        """True only after the 60m bar close (e.g. 14:30 bar → evaluate at/after 15:30)."""
+        """
+        True only after the 60m bar close (e.g. 14:30 bar → evaluate at/after 15:30).
+        Quote ticks never count as closed bars. A 2s buffer avoids race-at-close.
+        """
+        if candle.get("quote_tick"):
+            return False
         close_ist = self._closed_bar_time_ist(candle)
         if now is None:
             now_ist = pd.Timestamp.now(tz=IST)
         else:
             now_ist = self._timestamp_ist(now)
-        return now_ist >= close_ist
+        return now_ist >= (close_ist + pd.Timedelta(seconds=2))
+
+    @staticmethod
+    def _close_confirms_direction(
+        direction: int, close: float, supertrend: float
+    ) -> bool:
+        """
+        Closed-bar confirmation for a SuperTrend side.
+        Bullish: close above ST; bearish: close below ST.
+        Mid-bar risk is handled by broker MAIN_SL — do not reverse on flicker alone.
+        """
+        c = float(close)
+        st = float(supertrend)
+        if direction > 0:
+            return c > st
+        if direction < 0:
+            return c < st
+        return False
+
+    def _arm_closed_entry(
+        self,
+        *,
+        direction: int,
+        reason: str,
+        min_dte: int = 0,
+        min_strike_distance: float = 0.0,
+        armed_after: Optional[Any] = None,
+    ) -> None:
+        if armed_after is None:
+            after = pd.Timestamp.now(tz=IST)
+        else:
+            after = self._timestamp_ist(armed_after)
+        self._pending_closed_entry = _PendingClosedEntry(
+            direction=int(direction),
+            reason=str(reason),
+            armed_after=after,
+            min_dte=int(min_dte),
+            min_strike_distance=float(min_strike_distance),
+        )
+        logger.info(
+            "%s deferred entry armed direction=%s reason=%s after=%s "
+            "(wait for next closed 60m bar)",
+            self.name,
+            direction,
+            reason,
+            after,
+        )
+
+    def _consume_pending_closed_entry(
+        self, candle: dict, ctx: Any, direction: int
+    ) -> Optional[Any]:
+        pending = self._pending_closed_entry
+        if pending is None:
+            return None
+        # Only fire on a bar that has actually closed after the EXIT fill.
+        if not self._bar_is_fully_closed(candle):
+            return None
+        if self._closed_bar_time_ist(candle) <= pending.armed_after:
+            return None
+        self._pending_closed_entry = None
+        if self._open_main_positions(ctx):
+            return None
+        # Prefer the just-closed bar's SuperTrend direction if it still agrees;
+        # otherwise follow the closed-bar signal (may have flipped again).
+        enter_dir = int(direction) if direction else int(pending.direction)
+        intent = self._build_entry(
+            candle,
+            ctx,
+            enter_dir,
+            reason=pending.reason,
+            min_dte=pending.min_dte
+            if pending.min_dte
+            else self._min_dte_for_candle(candle),
+            min_strike_distance=pending.min_strike_distance,
+        )
+        return intent
 
     def _bar_key(self, candle: dict) -> str:
         symbol = str(candle.get("symbol") or "").strip().upper()
+        bt = candle.get("bucket_ts")
+        if bt is not None:
+            try:
+                return f"{symbol}|{int(float(bt))}"
+            except (TypeError, ValueError):
+                pass
         return f"{symbol}|{self._timestamp_ist(candle['timestamp']).isoformat()}"
 
     def should_evaluate(self, candle: dict) -> bool:
@@ -691,14 +799,17 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         intent = replace(intent, qty=ORDER_QTY_LOTS)
         self._meta_by_structure_id[structure_id] = meta
         logger.info(
-            "%s ENTRY reason=%s opt=%s strike=%.2f expiry=%s premium=%.2f ST=%.2f",
+            "%s ENTRY signaled reason=%s direction=%s opt=%s strike=%.2f "
+            "expiry=%s premium=%.2f ST=%.2f sid=%s",
             self.name,
             reason,
+            direction,
             option_type,
             strike,
             expiry,
             premium,
             supertrend,
+            structure_id,
         )
         return intent
 
@@ -728,6 +839,8 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         """True once this candle's close time is after the SL fill time."""
         if self._sl_reentry_direction is None or self._sl_reentry_after is None:
             return False
+        if not self._bar_is_fully_closed(candle):
+            return False
         # SL at 11:01 on the 10:30 bar → closed_bar_time 11:30 > 11:01 → ready.
         return self._closed_bar_time_ist(candle) > self._sl_reentry_after
 
@@ -748,6 +861,21 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         elif RUN_MODE != RunMode.BACKTEST:
             # Aggressive buy-to-cover limit for emergency exits.
             price = self._live_exit_limit_price(position, ctx)
+        sid = str(getattr(position, "structure_id", "") or "")
+        meta = self._meta_by_structure_id.get(sid) if sid else None
+        entry_reason = meta.entry_reason if meta is not None else None
+        inst = getattr(position, "instrument", None)
+        logger.info(
+            "%s EXIT signaled reason=%s entry_reason=%s symbol=%s strike=%s "
+            "sid=%s qty=%s",
+            self.name,
+            reason,
+            entry_reason or "unknown",
+            getattr(inst, "trading_symbol", None),
+            getattr(inst, "strike", None),
+            sid,
+            abs(int(getattr(position, "net_qty", 0) or 0)) or 1,
+        )
         return self.create_order_intent(
             inst=position.instrument,
             side="BUY" if int(position.net_qty) < 0 else "SELL",
@@ -760,8 +888,33 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             tag="MAIN_EXIT",
             symbol="BTCUSD",
             action="EXIT",
-            metadata_extras={"exit_reason": reason},
+            metadata_extras={
+                "exit_reason": reason,
+                "entry_reason": entry_reason or "unknown",
+            },
         )
+
+    @staticmethod
+    def _exit_reason_from_fill(
+        *,
+        tag: str,
+        metadata_extras: Any,
+        transition_reason: Optional[str] = None,
+    ) -> str:
+        extras = metadata_extras if isinstance(metadata_extras, dict) else {}
+        nested = extras.get("strategy_meta") if isinstance(extras.get("strategy_meta"), dict) else {}
+        for source in (extras, nested):
+            er = source.get("exit_reason")
+            if er:
+                return str(er)
+        tag_u = str(tag or "").upper()
+        if transition_reason:
+            return str(transition_reason)
+        if tag_u == "MAIN_SL":
+            return "broker_main_sl"
+        if tag_u == "MAIN_EXIT":
+            return "main_exit"
+        return tag_u or "unknown"
 
     def _live_exit_limit_price(self, position: Any, ctx: Any) -> Optional[float]:
         """Best ask (BUY cover) or best bid (SELL) when available."""
@@ -843,6 +996,7 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 "trail_sl_level": float(level),
                 "supertrend": float(supertrend),
                 "option_limit": float(limit_px),
+                "exit_reason": "broker_main_sl",
             },
         )
 
@@ -1222,8 +1376,14 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         if str(candle.get("symbol") or "").strip().upper() != "BTCUSD":
             return None
         # Live only: never confirm flips / entries on a forming hour bar.
-        # Example: 14:30–15:30 signal waits until 15:30 close before entry.
+        # Mid-bar risk = broker MAIN_SL (+ quote proximity / ST±300). ST reverse only at close.
         if RUN_MODE != RunMode.BACKTEST and not self._bar_is_fully_closed(candle):
+            logger.debug(
+                "%s skip forming bar ts=%s close_at=%s",
+                self.name,
+                candle.get("timestamp"),
+                self._closed_bar_time_ist(candle),
+            )
             return None
         direction = self._normal_direction(candle.get("supertrend_direction"))
         try:
@@ -1236,6 +1396,25 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
 
         previous = self._confirmed_direction
         previous_st = self._current_supertrend
+
+        # Signal change: require closed-bar close on the new side of SuperTrend.
+        # Ignore ephemeral indicator flips that leave close on the old side.
+        if (
+            previous is not None
+            and direction != previous
+            and not self._close_confirms_direction(direction, _close, supertrend)
+        ):
+            logger.info(
+                "%s ignore unconfirmed ST flip prev=%s new=%s close=%.2f ST=%.2f "
+                "(MAIN_SL covers mid-bar; reverse only when close confirms)",
+                self.name,
+                previous,
+                direction,
+                _close,
+                supertrend,
+            )
+            return None
+
         self._confirmed_direction = direction
         self._current_supertrend = supertrend
         self._latest_candle = dict(candle)
@@ -1257,8 +1436,23 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             )
 
         if previous is None:
+            deferred = self._consume_pending_closed_entry(candle, ctx, direction)
+            if deferred is not None:
+                return [deferred]
+            # Waiting for next closed bar after EXIT — do not enter early.
+            if self._pending_closed_entry is not None:
+                return None
             rollover = self._rollover_intent_if_due(candle, ctx, closed_bar=True)
             return [rollover] if rollover is not None else None
+
+        # Deferred reversal / rollover entry: only after a bar closes past arm time.
+        if not positions:
+            deferred = self._consume_pending_closed_entry(candle, ctx, direction)
+            if deferred is not None:
+                return [deferred]
+            # Still armed: block flip / SL-reentry until that closed bar arrives.
+            if self._pending_closed_entry is not None:
+                return None
 
         # After any SL: on the close of the candle that contained the SL fill,
         # enter current SuperTrend direction (same if unchanged, opposite if flipped).
@@ -1280,14 +1474,15 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             )
             return [intent] if intent is not None else None
 
+        # SuperTrend reversal EXIT/ENTRY: only on confirmed closed-bar signal change.
+        # Between bars, leave the position alone — MAIN_SL (ST±100) is the stop.
         if direction != previous:
             min_dte = self._min_dte_for_candle(candle)
             if positions:
                 self._clear_sl_reentry()
                 sid = str(getattr(positions[0], "structure_id", "") or "")
                 if sid in self._pending_exit_structure_ids:
-                    # The same closed bar can satisfy the intrabar stop and confirm a
-                    # reversal. Reuse that pending exit, then enter the opposite leg.
+                    # Pending risk exit already in flight; arm opposite entry for next close.
                     self._pending_transition = _PendingTransition(
                         previous_structure_id=sid,
                         direction=direction,
@@ -1305,9 +1500,9 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                         min_dte=min_dte,
                     )
                 return [intent] if intent is not None else None
-            # Flat + waiting for post-SL 1hr close: do not enter early.
+            # Confirmed ST flip takes priority over any pending post-SL hour wait.
             if self._sl_reentry_direction is not None:
-                return None
+                self._clear_sl_reentry()
             intent = self._build_entry(
                 candle,
                 ctx,
@@ -1482,6 +1677,18 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         )
         if instrument is None or not direction or supertrend <= 0:
             return []
+        entry_reason = meta.entry_reason if meta is not None else "unknown"
+        inst_sym = getattr(instrument, "trading_symbol", None)
+        logger.info(
+            "%s ENTRY filled reason=%s direction=%s symbol=%s sid=%s qty=%s ST=%.2f",
+            self.name,
+            entry_reason,
+            direction,
+            inst_sym,
+            sid,
+            int(qty or ORDER_QTY_LOTS),
+            float(supertrend),
+        )
         # Option LIMIT (never market): prefer live ask; fall back to entry premium.
         option_limit = None
         if ctx is not None:
@@ -1528,41 +1735,96 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             if meta is not None
             else self._confirmed_direction
         )
+        entry_reason = meta.entry_reason if meta is not None else "unknown"
+        transition = self._pending_transition
+        transition_reason = (
+            transition.reason
+            if transition is not None and transition.previous_structure_id == sid
+            else None
+        )
+        exit_reason = self._exit_reason_from_fill(
+            tag=tag,
+            metadata_extras=kwargs.get("metadata_extras"),
+            transition_reason=transition_reason,
+        )
+        inst = kwargs.get("instrument")
+        logger.info(
+            "%s EXIT filled reason=%s entry_reason=%s tag=%s symbol=%s sid=%s "
+            "qty=%s price=%s direction_at_exit=%s",
+            self.name,
+            exit_reason,
+            entry_reason,
+            tag or "unknown",
+            getattr(inst, "trading_symbol", None),
+            sid,
+            kwargs.get("qty"),
+            kwargs.get("price"),
+            direction_at_exit,
+        )
         self._pending_exit_structure_ids.discard(sid)
         self._meta_by_structure_id.pop(sid, None)
-        transition = self._pending_transition
         if transition is not None and transition.previous_structure_id == sid:
             self._pending_transition = None
             self._clear_sl_reentry()
+            # Signal reversal/rollover: close then immediately open the new direction.
+            # Engine expects (intent, candle) pairs from on_main_exit_filled.
             ctx = kwargs.get("ctx")
-            if ctx is None:
-                return []
-            candle = dict(self._latest_candle or {})
-            if not candle:
-                candle = {
-                    "symbol": "BTCUSD",
-                    "timestamp": kwargs.get("candle_ts") or datetime.now(),
-                    "close": getattr(ctx, "spot_price", 0),
-                    "exchange": "DELTA",
-                }
-            else:
-                candle["timestamp"] = kwargs.get("candle_ts") or candle["timestamp"]
-                if getattr(ctx, "spot_price", 0):
-                    candle["close"] = float(ctx.spot_price)
-            intent = self._build_entry(
-                candle,
-                ctx,
-                transition.direction,
+            candle_ts = kwargs.get("candle_ts") or datetime.now()
+            base = dict(self._latest_candle or {})
+            if not base.get("timestamp"):
+                base["timestamp"] = candle_ts
+            if not base.get("symbol"):
+                base["symbol"] = "BTCUSD"
+            if self._current_supertrend is not None:
+                base["supertrend"] = float(self._current_supertrend)
+            base["supertrend_direction"] = int(transition.direction)
+            candle = self._candle_with_supertrend(base)
+            intent = None
+            if ctx is not None:
+                intent = self._build_entry(
+                    candle,
+                    ctx,
+                    int(transition.direction),
+                    reason=transition.reason,
+                    min_dte=transition.min_dte
+                    if transition.min_dte
+                    else self._min_dte_for_candle(candle),
+                    min_strike_distance=transition.min_strike_distance,
+                )
+            if intent is not None:
+                logger.info(
+                    "%s after EXIT filled: ENTRY new direction reason=%s direction=%s",
+                    self.name,
+                    transition.reason,
+                    transition.direction,
+                )
+                return [(intent, candle)]
+            # Contract selection / ctx failed — retry on the next fully closed bar.
+            self._arm_closed_entry(
+                direction=transition.direction,
                 reason=transition.reason,
                 min_dte=transition.min_dte,
                 min_strike_distance=transition.min_strike_distance,
+                armed_after=candle_ts,
             )
-            return [(intent, candle)] if intent is not None else []
+            logger.warning(
+                "%s after EXIT filled: ENTRY failed, deferred reason=%s direction=%s",
+                self.name,
+                transition.reason,
+                transition.direction,
+            )
+            return []
 
         # Broker MAIN_SL or strategy MAIN_EXIT: wait for next 1hr close, then follow signal.
         if tag == "MAIN_SL" and direction_at_exit is not None:
             self._arm_sl_reentry(
                 direction_at_exit, kwargs.get("candle_ts") or datetime.now()
+            )
+            logger.info(
+                "%s after EXIT filled: SL reentry armed direction=%s "
+                "(wait for hour close; entry_reason will be sl_reentry_*)",
+                self.name,
+                direction_at_exit,
             )
         elif (
             tag == "MAIN_EXIT"
@@ -1572,11 +1834,47 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             self._arm_sl_reentry(
                 direction_at_exit, kwargs.get("candle_ts") or datetime.now()
             )
+            logger.info(
+                "%s after EXIT filled: reentry armed direction=%s "
+                "(wait for hour close; entry_reason will be sl_reentry_*)",
+                self.name,
+                direction_at_exit,
+            )
         return []
 
     def on_forced_exit(self, **kwargs: Any) -> None:
         sid = str(kwargs.get("structure_id") or "")
         self._pending_exit_structure_ids.discard(sid)
+        # Broker MAIN_SL fills are often classified as EXTERNAL_CLOSE (new broker
+        # order id after trail modify). That path calls on_forced_exit with the
+        # position tag MAIN — not MAIN_SL — so on_main_exit_filled never runs.
+        # Arm the same post-SL hour-close reentry so we do not stay flat.
+        if not kwargs.get("position_closed"):
+            return
+        if self._pending_transition is not None:
+            return
+        if self._sl_reentry_direction is not None:
+            return
+        meta = self._meta_by_structure_id.get(sid) if sid else None
+        direction = (
+            meta.direction
+            if meta is not None
+            else self._confirmed_direction
+        )
+        if direction is None:
+            return
+        exit_ts = kwargs.get("candle_ts") or datetime.now(timezone.utc)
+        self._arm_sl_reentry(int(direction), exit_ts)
+        logger.info(
+            "%s after forced/external close: SL reentry armed direction=%s "
+            "source=%s sid=%s",
+            self.name,
+            direction,
+            kwargs.get("execution_source") or kwargs.get("exit_reason") or "forced",
+            sid,
+        )
+        if sid:
+            self._meta_by_structure_id.pop(sid, None)
 
     def on_structure_exit(self, structure_id: str, **kwargs: Any) -> None:
         super().on_structure_exit(structure_id=structure_id, **kwargs)

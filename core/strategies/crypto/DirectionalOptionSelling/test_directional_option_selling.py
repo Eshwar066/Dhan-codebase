@@ -168,9 +168,23 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             "close": 64501.5,
         }
         mid_bar = datetime(2026, 7, 19, 9, 19, tzinfo=timezone.utc)  # 14:49 IST
-        at_close = datetime(2026, 7, 19, 10, 0, tzinfo=timezone.utc)  # 15:30 IST
+        at_close = datetime(2026, 7, 19, 10, 0, 2, tzinfo=timezone.utc)  # 15:30:02 IST
         self.assertFalse(self.strategy._bar_is_fully_closed(candle, now=mid_bar))
         self.assertTrue(self.strategy._bar_is_fully_closed(candle, now=at_close))
+        # Live engine stores UTC-naive; must not treat that wall clock as IST.
+        naive_utc = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 19, 9, 0),  # 09:00 UTC = 14:30 IST
+            "close": 64501.5,
+        }
+        self.assertFalse(
+            self.strategy._bar_is_fully_closed(naive_utc, now=datetime(2026, 7, 19, 9, 19))
+        )
+        self.assertTrue(
+            self.strategy._bar_is_fully_closed(
+                naive_utc, now=datetime(2026, 7, 19, 10, 0, 2)
+            )
+        )
         with patch.object(
             self.strategy,
             "_bar_is_fully_closed",
@@ -184,6 +198,102 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         ):
             self.assertTrue(self.strategy.should_evaluate(candle))
             self.assertFalse(self.strategy.should_evaluate(candle))
+
+    def test_reversal_exit_fill_enters_new_direction_immediately(self):
+        """Signal EXIT fill must open the opposite side right away (same signal cycle)."""
+        from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (
+            _PendingTransition,
+        )
+
+        self.strategy._pending_transition = _PendingTransition(
+            previous_structure_id="sid-rev",
+            direction=-1,
+            reason="supertrend_reversal",
+            min_dte=1,
+        )
+        self.strategy._confirmed_direction = -1
+        self.strategy._current_supertrend = 64600
+        self.strategy._latest_candle = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 19, 14, 0, tzinfo=timezone.utc),
+            "close": 64450,
+            "supertrend": 64600,
+            "supertrend_direction": -1,
+        }
+        ctx = SimpleNamespace(position_store=_PositionStore())
+        marker = object()
+        with patch.object(self.strategy, "_build_entry", return_value=marker) as build:
+            out = self.strategy.on_main_exit_filled(
+                structure_id="sid-rev",
+                tag="MAIN_EXIT",
+                candle_ts=datetime(2026, 7, 19, 14, 54, tzinfo=timezone.utc),
+                ctx=ctx,
+            )
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0][0], marker)
+        self.assertIsInstance(out[0][1], dict)
+        self.assertIsNone(self.strategy._pending_closed_entry)
+        self.assertIsNone(self.strategy._pending_transition)
+        self.assertEqual(build.call_args.args[2], -1)
+        self.assertEqual(build.call_args.kwargs["reason"], "supertrend_reversal")
+
+    def test_reversal_exit_fill_defers_when_entry_build_fails(self):
+        """If immediate ENTRY cannot be built, fall back to next closed-bar retry."""
+        from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (
+            _PendingTransition,
+        )
+
+        self.strategy._pending_transition = _PendingTransition(
+            previous_structure_id="sid-rev",
+            direction=-1,
+            reason="supertrend_reversal",
+            min_dte=1,
+        )
+        self.strategy._current_supertrend = 64600
+        self.strategy._latest_candle = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 19, 14, 0, tzinfo=timezone.utc),
+            "close": 64450,
+            "supertrend": 64600,
+        }
+        with patch.object(self.strategy, "_build_entry", return_value=None):
+            out = self.strategy.on_main_exit_filled(
+                structure_id="sid-rev",
+                tag="MAIN_EXIT",
+                candle_ts=datetime(2026, 7, 19, 14, 54, tzinfo=timezone.utc),
+                ctx=SimpleNamespace(position_store=_PositionStore()),
+            )
+        self.assertEqual(out, [])
+        self.assertIsNotNone(self.strategy._pending_closed_entry)
+        self.assertEqual(self.strategy._pending_closed_entry.direction, -1)
+
+    def test_st_flip_while_sl_reentry_pending_enters_immediately(self):
+        """Confirmed ST flip must not wait for post-SL hour close when flat."""
+        ctx = SimpleNamespace(position_store=_PositionStore())
+        self.strategy._confirmed_direction = -1
+        self.strategy._current_supertrend = 64616.31
+        self.strategy._arm_sl_reentry(
+            -1, datetime(2026, 7, 20, 3, 45, tzinfo=timezone.utc)
+        )
+        # Flip bar not yet "ready" for SL reentry path if we force ready=False;
+        # flip path should still clear wait and enter.
+        candle = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 20, 3, 30, tzinfo=timezone.utc),
+            "close": 64648.5,
+            "supertrend": 64317.25,
+            "supertrend_direction": 1,
+        }
+        marker = object()
+        with patch.object(self.strategy, "_bar_is_fully_closed", return_value=True):
+            with patch.object(self.strategy, "_sl_reentry_ready", return_value=False):
+                with patch.object(
+                    self.strategy, "_build_entry", return_value=marker
+                ) as build:
+                    result = self.strategy.on_candle(candle, ctx)
+        self.assertEqual(result, [marker])
+        self.assertEqual(build.call_args.kwargs["reason"], "supertrend_reversal")
+        self.assertIsNone(self.strategy._sl_reentry_direction)
 
     def test_rollover_selection_enforces_200_point_strike_distance(self):
         products = [
@@ -270,6 +380,84 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             result = self.strategy.on_candle(bearish, ctx)
         self.assertEqual(result, [marker])
         self.assertEqual(build.call_args.args[2], -1)
+
+    def test_unconfirmed_st_flip_does_not_exit_open_position(self):
+        """ST direction flicker with close still on old side must not reverse (MAIN_SL covers)."""
+        instrument = SimpleNamespace(
+            option_type="CE",
+            expiry="200726",
+            strike=64800,
+            trading_symbol="C-BTC-64800-200726",
+        )
+        position = SimpleNamespace(
+            tag="MAIN",
+            net_qty=-10,
+            structure_id="DirectionalOptionSelling:BTCUSD:test-ce",
+            instrument=instrument,
+            intent_id=None,
+            avg_price=272,
+        )
+        ctx = SimpleNamespace(
+            position_store=_PositionStore([position]),
+            intent_store=None,
+            order_router=None,
+        )
+        self.strategy._confirmed_direction = -1
+        self.strategy._current_supertrend = 64616.31
+        # Indicator says bullish (+1) but close is still below ST → ignore.
+        flicker = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 19, 16, 0, tzinfo=timezone.utc),
+            "close": 64550.0,
+            "supertrend": 64616.31,
+            "supertrend_direction": 1,
+        }
+        with patch.object(self.strategy, "_bar_is_fully_closed", return_value=True):
+            with patch.object(self.strategy, "_begin_transition") as begin:
+                result = self.strategy.on_candle(flicker, ctx)
+        self.assertIsNone(result)
+        begin.assert_not_called()
+        self.assertEqual(self.strategy._confirmed_direction, -1)
+
+    def test_confirmed_st_flip_exits_on_closed_bar(self):
+        """Closed bar with close on the new ST side may reverse."""
+        instrument = SimpleNamespace(
+            option_type="CE",
+            expiry="200726",
+            strike=64800,
+            trading_symbol="C-BTC-64800-200726",
+        )
+        position = SimpleNamespace(
+            tag="MAIN",
+            net_qty=-10,
+            structure_id="DirectionalOptionSelling:BTCUSD:test-ce2",
+            instrument=instrument,
+            intent_id=None,
+            avg_price=272,
+        )
+        ctx = SimpleNamespace(
+            position_store=_PositionStore([position]),
+            intent_store=None,
+            order_router=None,
+        )
+        self.strategy._confirmed_direction = -1
+        self.strategy._current_supertrend = 64616.31
+        confirmed = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 19, 16, 0, tzinfo=timezone.utc),
+            "close": 64700.0,  # above ST → confirms bullish
+            "supertrend": 64616.31,
+            "supertrend_direction": 1,
+        }
+        marker = object()
+        with patch.object(self.strategy, "_bar_is_fully_closed", return_value=True):
+            with patch.object(
+                self.strategy, "_begin_transition", return_value=marker
+            ) as begin:
+                result = self.strategy.on_candle(confirmed, ctx)
+        self.assertEqual(result, [marker])
+        begin.assert_called_once()
+        self.assertEqual(self.strategy._confirmed_direction, 1)
 
     def test_trail_sl_levels_follow_supertrend(self):
         self.assertEqual(self.strategy._trail_sl_level(1, 118000), 117900)
@@ -497,6 +685,34 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertEqual(out, [])
         self.assertEqual(self.strategy._sl_reentry_direction, 1)
         self.assertIsNotNone(self.strategy._sl_reentry_after)
+
+    def test_external_close_arms_sl_reentry(self):
+        """EXTERNAL_CLOSE (misclassified MAIN_SL) must still arm hour-close reentry."""
+        from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (
+            _PositionMeta,
+        )
+
+        self.strategy._meta_by_structure_id["sid-ext"] = _PositionMeta(
+            symbol="BTCUSD",
+            direction=1,
+            option_type="PE",
+            supertrend=64348.41,
+            strike=64200,
+            expiry="210726",
+            entry_premium=335,
+            entry_reason="supertrend_reversal",
+        )
+        self.strategy._confirmed_direction = 1
+        self.strategy.on_forced_exit(
+            structure_id="sid-ext",
+            position_closed=True,
+            execution_source="EXTERNAL_CLOSE",
+            exit_reason="EXTERNAL_CLOSE",
+            candle_ts=datetime(2026, 7, 20, 1, 56, tzinfo=timezone.utc),
+        )
+        self.assertEqual(self.strategy._sl_reentry_direction, 1)
+        self.assertIsNotNone(self.strategy._sl_reentry_after)
+        self.assertNotIn("sid-ext", self.strategy._meta_by_structure_id)
 
     def test_rollover_cancels_pending_main_sl_and_exits(self):
         """17:25 rollover must cancel resting FORCE_EXIT (MAIN_SL) then place MAIN_EXIT."""
