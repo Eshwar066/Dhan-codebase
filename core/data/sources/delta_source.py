@@ -674,7 +674,7 @@ class DeltaSource:
         size: int,
         side: str,
         limit_price: Optional[float] = None,
-        order_type: str = "MARKET",
+        order_type: str = "LIMIT",
         client_order_id: Optional[str] = None,
         reduce_only: str = "false",
         time_in_force: Optional[str] = None,
@@ -683,46 +683,49 @@ class DeltaSource:
         """
         Place order via Delta. Returns { status, order_id }.
         side: buy | sell (lowercase).
-        order_type: MARKET | LIMIT.
+        order_type: LIMIT only (MARKET is refused / coerced).
         """
         side = (side or "buy").lower()
-        ot = (
-            OrderType.MARKET
-            if (order_type or "MARKET").upper() == "MARKET"
-            else OrderType.LIMIT
-        )
+        ot_raw = (order_type or "LIMIT").upper()
+        if ot_raw == "MARKET":
+            logger.warning(
+                "Delta place_order coerced MARKET→LIMIT product_id=%s "
+                "(market orders disabled)",
+                product_id,
+            )
+        try:
+            effective_limit_price = (
+                float(limit_price) if limit_price is not None else None
+            )
+        except (TypeError, ValueError):
+            effective_limit_price = None
+        if effective_limit_price is None or effective_limit_price <= 0:
+            return {
+                "status": "error",
+                "order_id": None,
+                "message": "Delta LIMIT price required (market orders disabled)",
+            }
+        ot = OrderType.LIMIT
         tif = None
         if time_in_force:
             tif = getattr(TimeInForce, time_in_force.upper(), None)
         # Round limit price to exchange tick size to avoid invalid price precision
         tick_size = self._get_tick_size_for_product(product_id)
-        effective_limit_price = limit_price
-        if limit_price is not None and tick_size is not None:
-            effective_limit_price = round_by_tick_size(limit_price, tick_size)
+        if tick_size is not None:
+            effective_limit_price = round_by_tick_size(
+                effective_limit_price, tick_size
+            )
         try:
-            if ot == OrderType.LIMIT and effective_limit_price is not None:
-                # Build exchange order payload via create_order_format, then add extra fields
-                order = create_order_format(
-                    effective_limit_price, size, side, product_id, post_only=post_only
-                )
-                order["reduce_only"] = reduce_only
-                if client_order_id:
-                    order["client_order_id"] = client_order_id
-                if tif is not None:
-                    order["time_in_force"] = tif.value
-                result = self._client.create_order(order)
-            else:
-                result = self._client.place_order(
-                    product_id=product_id,
-                    size=size,
-                    side=side,
-                    limit_price=effective_limit_price,
-                    time_in_force=tif,
-                    order_type=ot,
-                    post_only=post_only,
-                    client_order_id=client_order_id,
-                    reduce_only=reduce_only,
-                )
+            # Build exchange order payload via create_order_format, then add extra fields
+            order = create_order_format(
+                effective_limit_price, size, side, product_id, post_only=post_only
+            )
+            order["reduce_only"] = reduce_only
+            if client_order_id:
+                order["client_order_id"] = client_order_id
+            if tif is not None:
+                order["time_in_force"] = tif.value
+            result = self._client.create_order(order)
             oid = result.get("id") or result.get("order_id")
             return {
                 "status": "success",
@@ -790,13 +793,27 @@ class DeltaSource:
         stop_price: float,
         limit_price: Optional[float] = None,
     ) -> Dict[str, str]:
-        leg: Dict[str, str] = {
-            "order_type": "limit_order" if limit_price is not None else "market_order",
-            "stop_price": str(stop_price),
+        """Always limit_order — Delta market bracket legs are disabled."""
+        try:
+            stop_px = float(stop_price)
+        except (TypeError, ValueError):
+            stop_px = 0.0
+        try:
+            lim_px = float(limit_price) if limit_price is not None else 0.0
+        except (TypeError, ValueError):
+            lim_px = 0.0
+        if lim_px <= 0:
+            lim_px = stop_px
+        if lim_px <= 0:
+            raise ValueError(
+                "Delta bracket leg requires a positive limit_price "
+                "(market_order disabled)"
+            )
+        return {
+            "order_type": "limit_order",
+            "stop_price": str(stop_px),
+            "limit_price": str(lim_px),
         }
-        if limit_price is not None:
-            leg["limit_price"] = str(limit_price)
-        return leg
 
     def place_bracket_stop_loss(
         self,

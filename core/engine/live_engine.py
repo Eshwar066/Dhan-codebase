@@ -24,6 +24,10 @@ IST = ZoneInfo("Asia/Kolkata")
 
 logger = logging.getLogger(__name__)
 
+# Delta: if MAIN_SL never rests on exchange, re-arm every 3 min up to 10 times, then flatten.
+DELTA_MAIN_SL_RETRY_INTERVAL_SEC = 180
+DELTA_MAIN_SL_RETRY_MAX_ATTEMPTS = 10
+
 
 def _position_allows_strategy_exit(pos: Any) -> bool:
     """MAIN book and post-partial trail legs (tag may become MAIN_TARGET after TARGET fill)."""
@@ -166,6 +170,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         # Duplicate signal protection
         self._last_signal_hash_per_symbol: Dict[str, int] = {}
         self._delta_align_log_keys: set[str] = set()
+        # Delta MAIN_SL placement watch: structure_id -> {attempts, next_at}
+        self._delta_main_sl_retry: Dict[str, Dict[str, Any]] = {}
         # Time-of-day guard
         self.allowed_trading_hours = allowed_trading_hours or []
         # Order state check (Fix 2: Default to 1m if not set)
@@ -1090,6 +1096,241 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 or meta_bucket.get("intent_id"),
                 metadata_extras=meta_bucket.get("strategy_meta"),
             )
+
+    def _maybe_retry_delta_missing_main_sl(self) -> None:
+        """
+        Delta only: if an open MAIN has no MAIN_SL (intent or exchange),
+        re-arm every 3 minutes up to 10 times; then force-close the position.
+        """
+        if str(self.venue or "").upper() != "DELTA":
+            return
+        intent_store = getattr(self.order_router, "intent_store", None)
+        if not intent_store:
+            return
+        broker = getattr(self.order_router, "broker", None)
+        now = time.time()
+        active_sids: set[str] = set()
+
+        for sym, pos in list(self.position_manager.positions.items()):
+            if int(pos.net_qty or 0) == 0:
+                continue
+            if str(getattr(pos, "tag", "") or "").upper() != "MAIN":
+                continue
+            self._resolve_position_ownership_from_intent_store(sym, pos, intent_store)
+            strategy_name = str(getattr(pos, "strategy", None) or "").strip()
+            if not strategy_name:
+                meta_bucket = self.position_manager.get_position_metadata(sym) or {}
+                strategy_name = str(meta_bucket.get("strategy") or "").strip()
+            if not strategy_name:
+                continue
+            strategy_obj = self._strategy_obj_for_name(strategy_name)
+            if strategy_obj is None:
+                continue
+            bracket_tags = list(
+                getattr(strategy_obj, "bracket_leg_tags", None)
+                or ["MAIN_SL", "MAIN_TARGET"]
+            )
+            if "MAIN_SL" not in [str(t).upper() for t in bracket_tags]:
+                continue
+            struct_id = getattr(pos, "structure_id", None)
+            if not struct_id:
+                meta_bucket = self.position_manager.get_position_metadata(sym) or {}
+                struct_id = meta_bucket.get("structure_id")
+            if not struct_id:
+                continue
+            sid = str(struct_id)
+            active_sids.add(sid)
+            trading_sym = (
+                getattr(getattr(pos, "instrument", None), "trading_symbol", None) or sym
+            )
+
+            if self.run_mode == RunMode.PAPER and broker is not None:
+                pending_sl = getattr(broker, "_pending_sl", {}) or {}
+                sl_ok = sid in pending_sl
+            else:
+                sl_ok = self._bracket_leg_satisfied(
+                    strategy_name,
+                    sid,
+                    "MAIN_SL",
+                    intent_store,
+                    broker,
+                    trading_sym,
+                )
+            if sl_ok:
+                self._delta_main_sl_retry.pop(sid, None)
+                continue
+
+            state = self._delta_main_sl_retry.setdefault(
+                sid, {"attempts": 0, "next_at": 0.0}
+            )
+            if now < float(state.get("next_at") or 0):
+                continue
+
+            attempts = int(state.get("attempts") or 0)
+            if attempts >= DELTA_MAIN_SL_RETRY_MAX_ATTEMPTS:
+                logger.error(
+                    "Delta MAIN_SL missing after %s retries; force-closing "
+                    "strategy=%s sid=%s symbol=%s",
+                    DELTA_MAIN_SL_RETRY_MAX_ATTEMPTS,
+                    strategy_name,
+                    sid,
+                    trading_sym,
+                )
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "delta_main_sl_force_close",
+                        f"sid={sid} symbol={trading_sym} attempts={attempts}",
+                    )
+                state["next_at"] = now + DELTA_MAIN_SL_RETRY_INTERVAL_SEC
+                self._force_close_position_missing_main_sl(
+                    strategy_obj=strategy_obj,
+                    strategy_name=strategy_name,
+                    pos=pos,
+                    symbol=str(sym),
+                    structure_id=sid,
+                )
+                continue
+
+            attempts += 1
+            state["attempts"] = attempts
+            state["next_at"] = now + DELTA_MAIN_SL_RETRY_INTERVAL_SEC
+            meta_bucket = self.position_manager.get_position_metadata(sym) or {}
+            inst = pos.instrument
+            lot_size = max(1, int(getattr(inst, "lot_size", 0) or 1))
+            fill_qty = max(1, abs(int(pos.net_qty)) // lot_size)
+            candle_ts = dt.datetime.now(dt.timezone.utc)
+            logger.warning(
+                "Delta MAIN_SL missing; retry place %s/%s strategy=%s sid=%s symbol=%s",
+                attempts,
+                DELTA_MAIN_SL_RETRY_MAX_ATTEMPTS,
+                strategy_name,
+                sid,
+                trading_sym,
+            )
+            if self.engine_logger:
+                self.engine_logger.log(
+                    "delta_main_sl_retry",
+                    f"attempt={attempts}/{DELTA_MAIN_SL_RETRY_MAX_ATTEMPTS} "
+                    f"sid={sid} symbol={trading_sym}",
+                )
+            try:
+                self._on_pm_main_entry_fill(
+                    instrument=inst,
+                    side="SELL" if pos.net_qty < 0 else "BUY",
+                    qty=fill_qty,
+                    price=float(pos.avg_price or 0),
+                    strategy=strategy_name,
+                    structure_id=sid,
+                    tag="MAIN",
+                    action="ENTRY",
+                    candle_ts=candle_ts,
+                    intent_id=getattr(pos, "intent_id", None)
+                    or meta_bucket.get("intent_id"),
+                    metadata_extras=meta_bucket.get("strategy_meta"),
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Delta MAIN_SL retry failed strategy=%s sid=%s: %s",
+                    strategy_name,
+                    sid,
+                    exc,
+                )
+
+        for stale_sid in list(self._delta_main_sl_retry.keys()):
+            if stale_sid not in active_sids:
+                self._delta_main_sl_retry.pop(stale_sid, None)
+
+    def _force_close_position_missing_main_sl(
+        self,
+        *,
+        strategy_obj: Any,
+        strategy_name: str,
+        pos: Any,
+        symbol: str,
+        structure_id: str,
+    ) -> None:
+        """Flatten MAIN after MAIN_SL placement retries are exhausted."""
+        candle_ts = dt.datetime.now(dt.timezone.utc)
+        spot = self.get_price_map(symbol)
+        if spot is None:
+            spot = 0.0
+        candle = {
+            "symbol": symbol,
+            "timestamp": candle_ts,
+            "close": float(spot),
+            "exchange": None,
+        }
+        ctx = self.build_context_only(candle)
+        reason = "missing_main_sl_after_retries"
+        exit_intent = None
+        exit_fn = getattr(strategy_obj, "_exit_intent", None)
+        if callable(exit_fn):
+            try:
+                exit_intent = exit_fn(pos, candle, ctx, reason)
+            except Exception as exc:
+                logger.exception(
+                    "Delta force-close _exit_intent failed strategy=%s sid=%s: %s",
+                    strategy_name,
+                    structure_id,
+                    exc,
+                )
+        if exit_intent is None:
+            create_fn = getattr(strategy_obj, "create_order_intent", None)
+            if not callable(create_fn):
+                logger.error(
+                    "Delta force-close skipped: no exit builder strategy=%s sid=%s",
+                    strategy_name,
+                    structure_id,
+                )
+                return
+            net_qty = int(getattr(pos, "net_qty", 0) or 0)
+            required_exit_side = "BUY" if net_qty < 0 else "SELL"
+            trading_sym = str(
+                getattr(getattr(pos, "instrument", None), "trading_symbol", None)
+                or symbol
+            )
+            is_sell = required_exit_side == "SELL"
+            exit_price = (
+                self._exit_price_from_depth(trading_sym, is_sell)
+                or self.get_price_map(trading_sym)
+                or self._positive_price(getattr(pos, "avg_price", None))
+                or self.get_price_map(symbol)
+            )
+            if exit_price is None or float(exit_price) <= 0:
+                logger.error(
+                    "Delta force-close skipped: no LIMIT price strategy=%s sid=%s "
+                    "(market orders disabled)",
+                    strategy_name,
+                    structure_id,
+                )
+                return
+            exit_intent = create_fn(
+                inst=pos.instrument,
+                side=required_exit_side,
+                qty=abs(net_qty) or 1,
+                price=float(exit_price),
+                order_type="LIMIT",
+                strategy=strategy_name,
+                candle_ts=candle_ts,
+                structure_id=structure_id,
+                tag="MAIN_EXIT",
+                symbol=symbol,
+                action="EXIT",
+                metadata_extras={"exit_reason": reason},
+            )
+        required_exit_side = "BUY" if int(pos.net_qty or 0) < 0 else "SELL"
+        risk_manager = getattr(self.order_router, "risk", None)
+        self._process_strategy_exit_intent(
+            exit_intent,
+            strategy_obj,
+            symbol,
+            candle,
+            pos,
+            required_exit_side,
+            None,
+            getattr(strategy_obj, "timeframe", None),
+            risk_manager,
+        )
 
     def _do_order_state_check(self) -> None:
         # PAPER: skip broker order comparison (SimulatedBroker has no real orders; avoids false mismatches).
@@ -2737,6 +2978,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             self._do_entry_order_refresh()
             self._do_exit_order_refresh()
             self._run_gtt_fallback_tick()
+            self._maybe_retry_delta_missing_main_sl()
             self._maybe_run_scheduled_evaluations(exchange)
 
             # Export eod report funtion

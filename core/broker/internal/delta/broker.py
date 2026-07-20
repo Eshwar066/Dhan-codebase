@@ -19,6 +19,26 @@ def _get_reduce_only(action: str) -> bool:
     return (action or "").upper() in {"EXIT", "FORCE_EXIT"}
 
 
+# Delta Exchange: market orders are forbidden (plain MARKET and stop-market).
+_DELTA_MARKET_ORDER_TYPES = frozenset({"MARKET", "MKT"})
+_DELTA_STOP_ORDER_TYPES = frozenset(
+    {"SL", "SL-M", "STOP", "STOP_MARKET", "STOP_LIMIT"}
+)
+_DELTA_STOP_MARKET_TYPES = frozenset({"SL-M", "STOP_MARKET"})
+
+
+def _delta_limit_price_from_payload(payload: Dict[str, Any]) -> Optional[float]:
+    """Pick a positive limit from price / trigger (never allow bare market)."""
+    for key in ("price", "trigger_price"):
+        try:
+            px = float(payload.get(key) or 0)
+        except (TypeError, ValueError):
+            px = 0.0
+        if px > 0:
+            return px
+    return None
+
+
 def _intent_to_delta_payload(intent, execution_price=None):
     """Build payload for DeltaBrokerApi.place_order from OrderIntent or dict."""
     if hasattr(intent, "instrument"):
@@ -38,7 +58,8 @@ def _intent_to_delta_payload(intent, execution_price=None):
             "quantity": total_qty,
             "price": float(price),
             "trigger_price": float(getattr(intent, "trigger_price", 0) or 0),
-            "order_type": getattr(intent, "order_type", "MARKET"),
+            # Default LIMIT — Delta never places market orders.
+            "order_type": getattr(intent, "order_type", "LIMIT"),
             "transaction_type": intent.side,
             "trade_type": getattr(intent, "trade_type", "MARGIN"),
             "tag": intent.intent_id,
@@ -59,7 +80,7 @@ def _intent_to_delta_payload(intent, execution_price=None):
         "quantity": total_qty,
         "price": price,
         "trigger_price": float(intent.get("trigger_price", 0) or 0),
-        "order_type": intent.get("order_type", "MARKET"),
+        "order_type": intent.get("order_type", "LIMIT"),
         "transaction_type": intent.get("side", "BUY"),
         "trade_type": intent.get("trade_type", "MARGIN"),
         "tag": intent.get("intent_id"),
@@ -232,10 +253,29 @@ class DeltaBroker(BaseBroker):
         payload = _intent_to_delta_payload(intent, execution_price)
         for attempt in range(retries + 1):
             try:
-                ot = str(payload.get("order_type") or "MARKET").upper()
-                if ot in {"SL", "SL-M", "STOP", "STOP_MARKET", "STOP_LIMIT"}:
-                    stop_ot = "MARKET" if ot in {"SL-M", "STOP_MARKET"} else "LIMIT"
-                    limit_price = payload["price"] if stop_ot == "LIMIT" else None
+                ot = str(payload.get("order_type") or "LIMIT").upper()
+                if ot in _DELTA_STOP_ORDER_TYPES:
+                    # Always stop-LIMIT on Delta (SL-M / STOP_MARKET coerced).
+                    if ot in _DELTA_STOP_MARKET_TYPES:
+                        logger.warning(
+                            "Delta coercing %s → stop-LIMIT for %s (market orders disabled)",
+                            ot,
+                            payload.get("tradingsymbol"),
+                        )
+                    limit_price = _delta_limit_price_from_payload(payload)
+                    if limit_price is None:
+                        self._last_place_order_failure = {
+                            "message": "Delta stop-LIMIT requires a positive limit price "
+                            "(market stop orders disabled)",
+                            "error_code": "market_order_forbidden",
+                            "retryable": False,
+                        }
+                        logger.error(
+                            "Delta refused stop-market for %s: no limit price",
+                            payload.get("tradingsymbol"),
+                        )
+                        return None
+                    payload["price"] = float(limit_price)
                     stop_trigger_method = "mark_price"
                     extras = getattr(intent, "metadata_extras", None) or {}
                     if isinstance(extras, dict):
@@ -251,7 +291,7 @@ class DeltaBroker(BaseBroker):
                                 quantity=payload["quantity"],
                                 transaction_type=payload["transaction_type"],
                                 trigger_price=payload["trigger_price"] or payload["price"],
-                                price=limit_price,
+                                price=float(limit_price),
                                 stop_trigger_method=stop_trigger_method,
                                 tag=payload.get("tag"),
                             )
@@ -289,13 +329,32 @@ class DeltaBroker(BaseBroker):
                             continue
                         break
                 else:
+                    if ot in _DELTA_MARKET_ORDER_TYPES:
+                        logger.warning(
+                            "Delta coercing MARKET → LIMIT for %s (market orders disabled)",
+                            payload.get("tradingsymbol"),
+                        )
+                        ot = "LIMIT"
+                    limit_price = _delta_limit_price_from_payload(payload)
+                    if limit_price is None:
+                        self._last_place_order_failure = {
+                            "message": "Delta LIMIT order requires a positive price "
+                            "(market orders disabled)",
+                            "error_code": "market_order_forbidden",
+                            "retryable": False,
+                        }
+                        logger.error(
+                            "Delta refused MARKET/empty-price order for %s",
+                            payload.get("tradingsymbol"),
+                        )
+                        return None
                     result = self.api.place_order(
                         tradingsymbol=payload["tradingsymbol"],
                         exchange=payload["exchange"],
                         quantity=payload["quantity"],
-                        price=payload["price"],
+                        price=float(limit_price),
                         trigger_price=payload["trigger_price"],
-                        order_type=payload["order_type"],
+                        order_type="LIMIT",
                         transaction_type=payload["transaction_type"],
                         trade_type=payload["trade_type"],
                         tag=payload.get("tag"),
@@ -318,8 +377,8 @@ class DeltaBroker(BaseBroker):
             except Exception as e:
                 err_txt = str(e).lower()
                 if attempt == retries:
-                    ot = str(payload.get("order_type") or "MARKET").upper()
-                    if ot in {"SL", "SL-M", "STOP", "STOP_MARKET", "STOP_LIMIT"} and (
+                    ot = str(payload.get("order_type") or "LIMIT").upper()
+                    if ot in _DELTA_STOP_ORDER_TYPES and (
                         "no_open_position" in err_txt
                     ):
                         self._last_place_order_failure = {
@@ -334,7 +393,7 @@ class DeltaBroker(BaseBroker):
                             e,
                         )
                         return None
-                    if ot in {"SL", "SL-M", "STOP", "STOP_MARKET", "STOP_LIMIT"} and (
+                    if ot in _DELTA_STOP_ORDER_TYPES and (
                         "bracket_order_exists" in err_txt
                     ):
                         self._last_place_order_failure = {
@@ -349,7 +408,7 @@ class DeltaBroker(BaseBroker):
                             e,
                         )
                         return None
-                    if ot in {"SL", "SL-M", "STOP", "STOP_MARKET", "STOP_LIMIT"} and (
+                    if ot in _DELTA_STOP_ORDER_TYPES and (
                         "unsupported" in err_txt or "400" in err_txt
                     ):
                         self._last_place_order_failure = {
@@ -376,8 +435,29 @@ class DeltaBroker(BaseBroker):
         side: str,
         segment: str = "EQ",
         lot_size: int = 1,
+        limit_price: Optional[float] = None,
     ) -> Optional[str]:
+        """Flatten via LIMIT only — Delta never places market exits."""
         exit_side = "SELL" if side == "BUY" else "BUY"
+        px = None
+        try:
+            px = float(limit_price) if limit_price is not None else None
+        except (TypeError, ValueError):
+            px = None
+        if px is None or px <= 0:
+            px = self._delta_symbol_limit_price(trading_symbol, exit_side)
+        if px is None or px <= 0:
+            self._last_place_order_failure = {
+                "message": "Delta exit_position requires a positive limit price "
+                "(market orders disabled)",
+                "error_code": "market_order_forbidden",
+                "retryable": False,
+            }
+            logger.error(
+                "Delta exit_position refused for %s: no limit price",
+                trading_symbol,
+            )
+            return None
         intent = {
             "intent_id": f"exit_{uuid.uuid4().hex[:6]}",
             "trading_symbol": trading_symbol,
@@ -385,11 +465,40 @@ class DeltaBroker(BaseBroker):
             "qty": int(qty),
             "segment": segment,
             "lot_size": int(lot_size),
-            "order_type": "MARKET",
+            "order_type": "LIMIT",
+            "price": float(px),
             "trade_type": "MARGIN",
             "reduce_only": "true",
+            "action": "EXIT",
         }
-        return self.place_order(intent, execution_price=None)
+        return self.place_order(intent, execution_price=float(px))
+
+    def _delta_symbol_limit_price(
+        self, trading_symbol: str, side: str
+    ) -> Optional[float]:
+        """Best-effort LTP/mark for LIMIT exits when caller omits a price."""
+        source = getattr(self.api, "_source", None)
+        if source is None or not hasattr(source, "get_ticker"):
+            return None
+        try:
+            ticker = source.get_ticker(trading_symbol) or {}
+        except Exception:
+            return None
+        if not isinstance(ticker, dict):
+            return None
+        side_u = str(side or "").upper()
+        for key in (
+            ("ask", "best_ask", "mark_price", "last_price", "close")
+            if side_u == "BUY"
+            else ("bid", "best_bid", "mark_price", "last_price", "close")
+        ):
+            try:
+                val = float(ticker.get(key) or 0)
+            except (TypeError, ValueError):
+                val = 0.0
+            if val > 0:
+                return val
+        return None
 
     def find_order_by_client_id(self, client_order_id: str):
         """Find order in live list; if not there, look up in /v2/orders/history and /v2/fills."""
@@ -744,14 +853,36 @@ class DeltaBroker(BaseBroker):
         last_err: Optional[str] = None
         for attempt in range(stop_retries):
             try:
+                sl_trigger = float(
+                    sl_payload["trigger_price"] or sl_payload["price"] or 0
+                )
+                tp_trigger = float(
+                    tgt_payload["trigger_price"] or tgt_payload["price"] or 0
+                )
+                sl_limit = _delta_limit_price_from_payload(sl_payload) or sl_trigger
+                tp_limit = _delta_limit_price_from_payload(tgt_payload) or tp_trigger
+                if sl_limit <= 0 or tp_limit <= 0:
+                    self._last_place_order_failure = {
+                        "message": "Delta combined bracket requires limit prices "
+                        "(market orders disabled)",
+                        "error_code": "market_order_forbidden",
+                        "retryable": False,
+                    }
+                    return {
+                        "ok": False,
+                        "sl_order_id": None,
+                        "tp_order_id": None,
+                        "reason": "market_order_forbidden",
+                        "message": self._last_place_order_failure["message"],
+                    }
                 result = self.api.place_bracket_tp_sl(
                     tradingsymbol=sl_payload["tradingsymbol"],
                     quantity=sl_payload["quantity"],
                     transaction_type=sl_payload["transaction_type"],
-                    stop_loss_trigger=sl_payload["trigger_price"]
-                    or sl_payload["price"],
-                    take_profit_trigger=tgt_payload["trigger_price"]
-                    or tgt_payload["price"],
+                    stop_loss_trigger=sl_trigger,
+                    take_profit_trigger=tp_trigger,
+                    stop_loss_limit=float(sl_limit),
+                    take_profit_limit=float(tp_limit),
                     stop_trigger_method="mark_price",
                     tag=sl_payload.get("tag"),
                 )

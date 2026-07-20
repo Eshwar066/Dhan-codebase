@@ -26,7 +26,7 @@ class DeltaBrokerApi:
         quantity: int,
         price: float = 0,
         trigger_price: float = 0,
-        order_type: str = "MARKET",
+        order_type: str = "LIMIT",
         transaction_type: str = "BUY",
         trade_type: str = "MARGIN",
         disclosed_quantity: int = 0,
@@ -46,17 +46,25 @@ class DeltaBrokerApi:
                 "message": f"Unknown symbol: {tradingsymbol}",
             }
         side = (transaction_type or "BUY").lower()
-        limit_price = (
-            float(price)
-            if price and (order_type or "MARKET").upper() == "LIMIT"
-            else None
-        )
+        ot = (order_type or "LIMIT").upper()
+        if ot == "MARKET":
+            ot = "LIMIT"
+        try:
+            limit_price = float(price or 0)
+        except (TypeError, ValueError):
+            limit_price = 0.0
+        if limit_price <= 0:
+            return {
+                "status": "error",
+                "order_id": None,
+                "message": "Delta LIMIT price required (market orders disabled)",
+            }
         return self._source.place_order(
             product_id=int(product_id),
             size=int(quantity),
             side="buy" if side == "buy" else "sell",
             limit_price=limit_price,
-            order_type=order_type or "MARKET",
+            order_type="LIMIT",
             client_order_id=tag,
             reduce_only=reduce_only,
         )
@@ -85,12 +93,29 @@ class DeltaBrokerApi:
                 "message": f"Unknown symbol: {tradingsymbol}",
             }
         side = (transaction_type or "BUY").lower()
+        try:
+            trigger = float(trigger_price or 0)
+        except (TypeError, ValueError):
+            trigger = 0.0
+        try:
+            lim = float(price) if price is not None else 0.0
+        except (TypeError, ValueError):
+            lim = 0.0
+        if lim <= 0:
+            lim = trigger
+        if lim <= 0:
+            return {
+                "status": "error",
+                "order_id": None,
+                "message": "Delta stop-LIMIT requires a positive limit price "
+                "(market orders disabled)",
+            }
         raw = self._source.place_bracket_stop_loss(
             product_id=int(product_id),
             size=int(quantity),
             side="buy" if side == "buy" else "sell",
-            stop_price=float(trigger_price),
-            limit_price=float(price) if price is not None else None,
+            stop_price=trigger if trigger > 0 else lim,
+            limit_price=float(lim),
             stop_trigger_method=stop_trigger_method or "mark_price",
             client_order_id=tag,
         )
@@ -117,14 +142,41 @@ class DeltaBrokerApi:
                 "message": f"Unknown symbol: {tradingsymbol}",
             }
         side = (transaction_type or "BUY").lower()
+        try:
+            sl_trig = float(stop_loss_trigger or 0)
+            tp_trig = float(take_profit_trigger or 0)
+        except (TypeError, ValueError):
+            return {
+                "status": "error",
+                "order_id": None,
+                "message": "Invalid bracket trigger prices",
+            }
+        try:
+            sl_lim = float(stop_loss_limit) if stop_loss_limit is not None else 0.0
+        except (TypeError, ValueError):
+            sl_lim = 0.0
+        try:
+            tp_lim = float(take_profit_limit) if take_profit_limit is not None else 0.0
+        except (TypeError, ValueError):
+            tp_lim = 0.0
+        if sl_lim <= 0:
+            sl_lim = sl_trig
+        if tp_lim <= 0:
+            tp_lim = tp_trig
+        if sl_lim <= 0 or tp_lim <= 0:
+            return {
+                "status": "error",
+                "order_id": None,
+                "message": "Delta bracket LIMIT prices required (market orders disabled)",
+            }
         raw = self._source.place_bracket_tp_sl(
             product_id=int(product_id),
             size=int(quantity),
             side="buy" if side == "buy" else "sell",
-            stop_loss_price=float(stop_loss_trigger),
-            take_profit_price=float(take_profit_trigger),
-            stop_loss_limit_price=stop_loss_limit,
-            take_profit_limit_price=take_profit_limit,
+            stop_loss_price=sl_trig,
+            take_profit_price=tp_trig,
+            stop_loss_limit_price=float(sl_lim),
+            take_profit_limit_price=float(tp_lim),
             stop_trigger_method=stop_trigger_method,
             client_order_id=tag,
         )
