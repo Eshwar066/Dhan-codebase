@@ -2101,6 +2101,11 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             if tf_s and tf_s not in seen:
                 seen.add(tf_s)
                 out.append(tf_s)
+            for extra in getattr(s, "extra_timeframes", None) or []:
+                extra_s = str(extra or "").strip()
+                if extra_s and extra_s not in seen:
+                    seen.add(extra_s)
+                    out.append(extra_s)
         if not out:
             if not LiveEngine._is_scheduled_strategy(primary, strategy_eval_modes):
                 p = str(getattr(primary, "timeframe", "") or "").strip()

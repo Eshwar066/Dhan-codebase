@@ -5,8 +5,8 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, replace
-from datetime import date, datetime, time, timezone
-from typing import Any, Dict, List, Optional
+from datetime import date, datetime, time, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -30,8 +30,15 @@ FORCE_EXIT_POINTS = 300.0
 STRIKE_PROXIMITY_EXIT_POINTS = 50.0
 ROLLOVER_TIME = time(17, 25)
 ROLLOVER_MIN_STRIKE_DISTANCE = 200.0
-ORDER_QTY_LOTS = 10
+ORDER_QTY_LOTS = 2
 META_KEY = "directional_option_selling"
+# Higher-TF SuperTrend: weekly on 1D+4H align; daily on 1H with 1D+4H filter.
+HTF_TIMEFRAMES = ("4h", "1d")
+HTF_LOOKBACK_DAYS = {"4h": 45, "1d": 120}
+SLEEVE_WEEKLY = "weekly"
+SLEEVE_DAILY = "daily"
+# Weekly entry: if selected Friday is within 2 DTE, roll to next weekly Friday.
+WEEKLY_MIN_DTE = 3
 
 
 @dataclass(frozen=True)
@@ -44,6 +51,7 @@ class _PositionMeta:
     expiry: str
     entry_premium: float
     entry_reason: str
+    sleeve: str = SLEEVE_DAILY
 
 
 @dataclass(frozen=True)
@@ -53,6 +61,7 @@ class _PendingTransition:
     reason: str
     min_dte: int = 0
     min_strike_distance: float = 0.0
+    sleeve: str = SLEEVE_DAILY
 
 
 @dataclass(frozen=True)
@@ -64,17 +73,26 @@ class _PendingClosedEntry:
     armed_after: pd.Timestamp
     min_dte: int = 0
     min_strike_distance: float = 0.0
+    sleeve: str = SLEEVE_DAILY
 
 
 class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     """
-    Sell one BTC Put after a confirmed bullish SuperTrend flip and one Call after
-    a bearish flip. Reversals wait for the existing option exit fill.
+    Dual-sleeve BTC SuperTrend option selling:
+
+    - Weekly: when 1D and 4H SuperTrend agree, sell near 4H SuperTrend on the
+      weekly Friday (skip to next week if DTE <= 2).
+    - Daily (0DTE/1DTE): 1H SuperTrend signals, only when 1D and 4H agree with
+      that 1H direction; sell near 1H SuperTrend (0DTE before 17:25 IST, else 1DTE).
+
+    Both sleeves may be open together. Broker MAIN_SL trails at ST±100.
     """
 
     name = "DirectionalOptionSelling"
     underlying_symbols = ["BTCUSD"]
     timeframe = "60"
+    # Subscribe WS/REST for HTF bars used by the entry filter.
+    extra_timeframes = list(HTF_TIMEFRAMES)
     required_context = ["option_chain"]
     api = "DELTA"
     expiryType = "Daily"
@@ -97,8 +115,15 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         # Stores the direction at SL time so same vs flip can be logged.
         self._sl_reentry_direction: Optional[int] = None
         self._sl_reentry_after: Optional[pd.Timestamp] = None
+        self._sl_reentry_sleeve: Optional[str] = None
         self._evaluated_bars: set[str] = set()
         self._rollover_dates: set[date] = set()
+        # Cache last closed HTF SuperTrend per timeframe: {tf: (dir, st, bar_open_utc)}.
+        self._htf_st_cache: Dict[str, Tuple[int, float, pd.Timestamp]] = {}
+        self._confirmed_4h_direction: Optional[int] = None
+        self._confirmed_1d_direction: Optional[int] = None
+        self._last_seen_4h_bar_open: Optional[pd.Timestamp] = None
+        self._current_4h_supertrend: Optional[float] = None
 
     def get_warmup_period(self) -> int:
         return max(50, SUPER_TREND_LENGTH * 4)
@@ -118,6 +143,250 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             length=self.supertrend_length,
             factor=self.supertrend_factor,
         )
+
+    @staticmethod
+    def _tf_bar_seconds(timeframe: str) -> int:
+        from core.data.candle_aggregator import TIMEFRAME_SECONDS
+
+        key = str(timeframe or "").strip()
+        return int(TIMEFRAME_SECONDS.get(key) or TIMEFRAME_SECONDS.get(key.lower()) or 0)
+
+    def _as_of_utc(self, candle: dict) -> pd.Timestamp:
+        """Evaluation instant: prefer closed 1H bar time, else candle timestamp."""
+        try:
+            if self._bar_is_fully_closed(candle):
+                return self._closed_bar_time_ist(candle).tz_convert("UTC")
+        except Exception:
+            pass
+        ts = self._timestamp_ist(candle["timestamp"]).tz_convert("UTC")
+        return ts
+
+    def _latest_closed_st_from_df(
+        self, df: pd.DataFrame, *, timeframe: str, as_of_utc: pd.Timestamp
+    ) -> Optional[Tuple[int, float, pd.Timestamp]]:
+        """Return (direction, supertrend, bar_open_utc) for the last fully closed HTF bar."""
+        if df is None or df.empty:
+            return None
+        bar_sec = self._tf_bar_seconds(timeframe)
+        if bar_sec <= 0:
+            return None
+        work = df.copy()
+        work["timestamp"] = pd.to_datetime(work["timestamp"], utc=True)
+        work = work.sort_values("timestamp").reset_index(drop=True)
+        work = self.prepare_indicators(work)
+        if "supertrend" not in work.columns or "supertrend_direction" not in work.columns:
+            return None
+        close_at = work["timestamp"] + pd.Timedelta(seconds=bar_sec)
+        as_of = pd.Timestamp(as_of_utc)
+        if as_of.tzinfo is None:
+            as_of = as_of.tz_localize("UTC")
+        else:
+            as_of = as_of.tz_convert("UTC")
+        closed = work.loc[close_at <= as_of]
+        if closed.empty:
+            return None
+        row = closed.iloc[-1]
+        direction = self._normal_direction(row.get("supertrend_direction"))
+        try:
+            st = float(row.get("supertrend"))
+        except (TypeError, ValueError):
+            return None
+        if direction is None or pd.isna(st) or st <= 0:
+            return None
+        return direction, st, pd.Timestamp(row["timestamp"]).tz_convert("UTC")
+
+    def _fetch_htf_ohlc(
+        self, ctx: Any, timeframe: str, as_of_utc: pd.Timestamp
+    ) -> Optional[pd.DataFrame]:
+        source = _delta_source_from_ctx(ctx)
+        if source is None or not hasattr(source, "get_intraday"):
+            return None
+        lookback = int(HTF_LOOKBACK_DAYS.get(timeframe, 60))
+        end_d = pd.Timestamp(as_of_utc).tz_convert("UTC").date()
+        start_d = end_d - timedelta(days=lookback)
+        try:
+            return source.get_intraday(
+                "BTCUSD",
+                start_d.isoformat(),
+                end_d.isoformat(),
+                timeframe,
+                force_refresh_tail=True,
+            )
+        except Exception as exc:
+            logger.warning(
+                "%s HTF fetch failed tf=%s: %s", self.name, timeframe, exc
+            )
+            return None
+
+    def _htf_supertrend(
+        self, ctx: Any, timeframe: str, candle: dict
+    ) -> Optional[Tuple[int, float, pd.Timestamp]]:
+        """Cached last-closed SuperTrend for ``timeframe`` (4h / 1d)."""
+        as_of = self._as_of_utc(candle)
+        cached = self._htf_st_cache.get(timeframe)
+        bar_sec = self._tf_bar_seconds(timeframe)
+        if cached is not None and bar_sec > 0:
+            _dir, _st, bar_open = cached
+            next_close = bar_open + pd.Timedelta(seconds=bar_sec)
+            # Still on the same closed HTF bar — reuse cache.
+            if as_of < next_close + pd.Timedelta(seconds=bar_sec):
+                return cached
+        df = self._fetch_htf_ohlc(ctx, timeframe, as_of)
+        snap = self._latest_closed_st_from_df(df, timeframe=timeframe, as_of_utc=as_of)
+        if snap is not None:
+            self._htf_st_cache[timeframe] = snap
+        return snap
+
+    def _htf_snapshot(
+        self, ctx: Any, candle: dict
+    ) -> Optional[Dict[str, Tuple[int, float]]]:
+        """
+        Return ``{"4h": (dir, st), "1d": (dir, st)}`` when both HTFs are available.
+        """
+        out: Dict[str, Tuple[int, float]] = {}
+        for tf in HTF_TIMEFRAMES:
+            snap = self._htf_supertrend(ctx, tf, candle)
+            if snap is None:
+                return None
+            direction, st, _bar = snap
+            out[tf] = (int(direction), float(st))
+        return out
+
+    def _htf_entry_allowed(
+        self, direction: int, ctx: Any, candle: dict
+    ) -> bool:
+        """Backward-compatible alias: weekly-style 1D+4H alignment."""
+        return self._weekly_htf_aligned(direction, ctx, candle)
+
+    def _stamp_htf_on_candle(
+        self, candle: dict, snap: Dict[str, Tuple[int, float]]
+    ) -> None:
+        d4, st4 = snap["4h"]
+        d1d, st1d = snap["1d"]
+        candle["supertrend_4h"] = st4
+        candle["supertrend_4h_direction"] = d4
+        candle["supertrend_1d"] = st1d
+        candle["supertrend_1d_direction"] = d1d
+
+    def _weekly_htf_aligned(
+        self, direction: int, ctx: Any, candle: dict
+    ) -> bool:
+        """Weekly sleeve: 1D and 4H SuperTrend must both match direction."""
+        want = self._normal_direction(direction)
+        if want is None:
+            return False
+        snap = self._htf_snapshot(ctx, candle)
+        if snap is None:
+            logger.info(
+                "%s weekly entry blocked: missing 1D/4H SuperTrend",
+                self.name,
+            )
+            return False
+        self._stamp_htf_on_candle(candle, snap)
+        d4, st4 = snap["4h"]
+        d1d, st1d = snap["1d"]
+        if d4 != want or d1d != want:
+            logger.info(
+                "%s weekly entry blocked: want=%s 4h=%s (%.2f) 1d=%s (%.2f)",
+                self.name,
+                want,
+                d4,
+                st4,
+                d1d,
+                st1d,
+            )
+            return False
+        logger.info(
+            "%s weekly HTF aligned direction=%s 4h_ST=%.2f 1d_ST=%.2f",
+            self.name,
+            want,
+            st4,
+            st1d,
+        )
+        return True
+
+    def _daily_htf_aligned(
+        self, direction: int, ctx: Any, candle: dict
+    ) -> bool:
+        """
+        Daily sleeve filter: long only if 1D+4H green; short only if 1D+4H red.
+        Entry/exit timing itself is driven by the 1H SuperTrend.
+        """
+        want = self._normal_direction(direction)
+        if want is None:
+            return False
+        snap = self._htf_snapshot(ctx, candle)
+        if snap is None:
+            logger.info(
+                "%s daily entry blocked: missing 1D/4H SuperTrend",
+                self.name,
+            )
+            return False
+        self._stamp_htf_on_candle(candle, snap)
+        d4, st4 = snap["4h"]
+        d1d, st1d = snap["1d"]
+        if d4 != want or d1d != want:
+            logger.info(
+                "%s daily entry blocked: 1H want=%s needs 4h+1d same; "
+                "4h=%s (%.2f) 1d=%s (%.2f)",
+                self.name,
+                want,
+                d4,
+                st4,
+                d1d,
+                st1d,
+            )
+            return False
+        logger.info(
+            "%s daily HTF aligned with 1H direction=%s 4h_ST=%.2f 1d_ST=%.2f",
+            self.name,
+            want,
+            st4,
+            st1d,
+        )
+        return True
+
+    def _refresh_htf_state(
+        self, ctx: Any, candle: dict
+    ) -> Optional[Dict[str, Tuple[int, float]]]:
+        """Update cached 1D/4H directions. Returns snapshot or None."""
+        snap = self._htf_snapshot(ctx, candle)
+        if snap is None:
+            return None
+        self._stamp_htf_on_candle(candle, snap)
+        d4, st4 = snap["4h"]
+        d1d, _st1d = snap["1d"]
+        self._current_4h_supertrend = float(st4)
+        bar_open = None
+        cached = self._htf_st_cache.get("4h")
+        if cached is not None:
+            bar_open = cached[2]
+        if bar_open is not None:
+            self._last_seen_4h_bar_open = bar_open
+        self._confirmed_4h_direction = int(d4)
+        self._confirmed_1d_direction = int(d1d)
+        return snap
+
+    def _weekly_expiry_for_entry(self, candle: dict, ctx: Any) -> str:
+        """
+        Friday weekly expiry code. If DTE <= 2, shift to the next weekly Friday.
+        """
+        code = str(self.weeklyExpiry(candle, ctx) or "").strip()
+        trade_date = self._timestamp_ist(candle["timestamp"]).date()
+        exp = self._expiry_date(code)
+        if exp is None:
+            return code
+        while (exp - trade_date).days < WEEKLY_MIN_DTE:
+            exp = exp + timedelta(days=7)
+            code = exp.strftime("%d%m%y")
+        ctx.selected_expiry = code
+        logger.info(
+            "%s weekly expiry selected code=%s dte=%s",
+            self.name,
+            code,
+            (exp - trade_date).days,
+        )
+        return code
 
     @staticmethod
     def _normal_direction(value: Any) -> Optional[int]:
@@ -225,6 +494,7 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         min_dte: int = 0,
         min_strike_distance: float = 0.0,
         armed_after: Optional[Any] = None,
+        sleeve: str = SLEEVE_DAILY,
     ) -> None:
         if armed_after is None:
             after = pd.Timestamp.now(tz=IST)
@@ -236,13 +506,15 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             armed_after=after,
             min_dte=int(min_dte),
             min_strike_distance=float(min_strike_distance),
+            sleeve=str(sleeve or SLEEVE_DAILY),
         )
         logger.info(
-            "%s deferred entry armed direction=%s reason=%s after=%s "
+            "%s deferred entry armed direction=%s reason=%s sleeve=%s after=%s "
             "(wait for next closed 60m bar)",
             self.name,
             direction,
             reason,
+            sleeve,
             after,
         )
 
@@ -257,8 +529,9 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             return None
         if self._closed_bar_time_ist(candle) <= pending.armed_after:
             return None
-        self._pending_closed_entry = None
-        if self._open_main_positions(ctx):
+        sleeve = str(pending.sleeve or SLEEVE_DAILY)
+        if self._open_main_positions(ctx, sleeve=sleeve):
+            self._pending_closed_entry = None
             return None
         # Prefer the just-closed bar's SuperTrend direction if it still agrees;
         # otherwise follow the closed-bar signal (may have flipped again).
@@ -272,7 +545,11 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             if pending.min_dte
             else self._min_dte_for_candle(candle),
             min_strike_distance=pending.min_strike_distance,
+            sleeve=sleeve,
         )
+        # Keep armed when HTF/contract selection blocks — retry next closed 1H bar.
+        if intent is not None:
+            self._pending_closed_entry = None
         return intent
 
     def _bar_key(self, candle: dict) -> str:
@@ -383,6 +660,7 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 "expiry": meta.expiry,
                 "entry_premium": meta.entry_premium,
                 "entry_reason": meta.entry_reason,
+                "sleeve": meta.sleeve,
             },
         )
 
@@ -397,6 +675,9 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         if not isinstance(raw, dict):
             return False
         try:
+            sleeve = str(raw.get("sleeve") or SLEEVE_DAILY).strip().lower()
+            if sleeve not in (SLEEVE_WEEKLY, SLEEVE_DAILY):
+                sleeve = SLEEVE_DAILY
             meta = _PositionMeta(
                 symbol=str(raw["symbol"]).upper(),
                 direction=int(raw["direction"]),
@@ -406,6 +687,7 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 expiry=str(raw["expiry"]),
                 entry_premium=float(raw["entry_premium"]),
                 entry_reason=str(raw.get("entry_reason") or "signal"),
+                sleeve=sleeve,
             )
         except (KeyError, TypeError, ValueError):
             return False
@@ -438,6 +720,7 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 expiry=str(getattr(inst, "expiry", "") or ""),
                 entry_premium=float(getattr(position, "avg_price", 0) or 0),
                 entry_reason="restored",
+                sleeve=SLEEVE_DAILY,
             )
         except (TypeError, ValueError):
             return None
@@ -478,13 +761,26 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 self._confirmed_direction = meta.direction
                 self._current_supertrend = meta.supertrend
 
-    def _open_main_positions(self, ctx: Any) -> List[Any]:
-        return [
-            position
-            for position in (ctx.position_store.get_open_positions(strategy=self.name) or [])
-            if getattr(position, "tag", None) == "MAIN"
-            and int(getattr(position, "net_qty", 0) or 0) != 0
-        ]
+    def _open_main_positions(
+        self, ctx: Any, *, sleeve: Optional[str] = None
+    ) -> List[Any]:
+        out: List[Any] = []
+        for position in (
+            ctx.position_store.get_open_positions(strategy=self.name) or []
+        ):
+            if getattr(position, "tag", None) != "MAIN":
+                continue
+            if int(getattr(position, "net_qty", 0) or 0) == 0:
+                continue
+            if sleeve is not None:
+                meta = self._ensure_meta(position, ctx)
+                pos_sleeve = (
+                    str(meta.sleeve) if meta is not None else SLEEVE_DAILY
+                )
+                if pos_sleeve != str(sleeve):
+                    continue
+            out.append(position)
+        return out
 
     @staticmethod
     def _expiry_date(value: Any) -> Optional[date]:
@@ -544,15 +840,42 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         return (premium, bid, ask) if premium > 0 else None
 
     @staticmethod
-    def _ordered_expiries(expiries: List[str], trade_date: date, min_dte: int) -> List[str]:
+    def _ordered_expiries(
+        expiries: List[str],
+        trade_date: date,
+        min_dte: int,
+        target_expiry: Optional[str] = None,
+    ) -> List[str]:
         dated = []
         for code in set(expiries):
             parsed = DirectionalOptionSelling._expiry_date(code)
             if parsed is not None and parsed >= trade_date:
                 dated.append((parsed, code))
         dated.sort()
+        if target_expiry:
+            target = str(target_expiry).strip()
+            target_d = DirectionalOptionSelling._expiry_date(target)
+            ordered: List[str] = []
+            if target_d is not None:
+                for expiry, code in dated:
+                    if expiry == target_d or code == target:
+                        ordered.append(code)
+                        break
+                # Fallback: next listed expiry after the weekly target.
+                if not ordered:
+                    for expiry, code in dated:
+                        if expiry > target_d:
+                            ordered.append(code)
+                            break
+            elif target:
+                ordered.append(target)
+            return ordered[:2]
         if min_dte > 0:
-            return [code for expiry, code in dated if expiry > trade_date][:1]
+            return [
+                code
+                for expiry, code in dated
+                if (expiry - trade_date).days >= int(min_dte)
+            ][:1] or [code for expiry, code in dated if expiry > trade_date][:1]
         today = [code for expiry, code in dated if expiry == trade_date]
         future = [code for expiry, code in dated if expiry > trade_date]
         return (today[:1] + future[:1])[:2]
@@ -566,6 +889,7 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         *,
         min_dte: int,
         min_strike_distance: float,
+        target_expiry: Optional[str] = None,
     ) -> Optional[tuple[float, float, pd.Series, str]]:
         source = _delta_source_from_ctx(ctx)
         if source is None:
@@ -585,6 +909,7 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             [self._product_expiry(product) for product in matching],
             trade_date,
             min_dte,
+            target_expiry=target_expiry,
         )
         for expiry in expiry_order:
             candidates = []
@@ -641,6 +966,7 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         *,
         min_dte: int,
         min_strike_distance: float,
+        target_expiry: Optional[str] = None,
     ) -> Optional[tuple[float, float, pd.Series, str]]:
         df = self.load_delta_data_for_candle(candle, ctx)
         if df is None or df.empty:
@@ -669,6 +995,7 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             work["expiry"].dropna().astype(str).tolist(),
             self._timestamp_ist(candle["timestamp"]).date(),
             min_dte,
+            target_expiry=target_expiry,
         )
         for expiry in expiry_order:
             latest = (
@@ -707,6 +1034,7 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         *,
         min_dte: int = 0,
         min_strike_distance: float = 0.0,
+        target_expiry: Optional[str] = None,
     ) -> Optional[tuple[float, float, pd.Series, str]]:
         option_type = self._option_type(direction)
         if RUN_MODE == RunMode.BACKTEST:
@@ -717,6 +1045,7 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 supertrend,
                 min_dte=min_dte,
                 min_strike_distance=min_strike_distance,
+                target_expiry=target_expiry,
             )
         return self._select_live_contract(
             candle,
@@ -725,6 +1054,7 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             supertrend,
             min_dte=min_dte,
             min_strike_distance=min_strike_distance,
+            target_expiry=target_expiry,
         )
 
     def _build_entry(
@@ -736,24 +1066,54 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         reason: str,
         min_dte: int = 0,
         min_strike_distance: float = 0.0,
+        sleeve: str = SLEEVE_DAILY,
     ) -> Optional[Any]:
-        if self._open_main_positions(ctx):
+        sleeve_u = str(sleeve or SLEEVE_DAILY).strip().lower()
+        if sleeve_u not in (SLEEVE_WEEKLY, SLEEVE_DAILY):
+            sleeve_u = SLEEVE_DAILY
+        if self._open_main_positions(ctx, sleeve=sleeve_u):
             return None
-        supertrend = float(self._current_supertrend or candle.get("supertrend") or 0)
+        if sleeve_u == SLEEVE_WEEKLY:
+            if not self._weekly_htf_aligned(int(direction), ctx, candle):
+                return None
+            # Prefer 4H SuperTrend for weekly strike / trail reference.
+            supertrend = float(
+                candle.get("supertrend_4h")
+                or self._current_4h_supertrend
+                or self._current_supertrend
+                or candle.get("supertrend")
+                or 0
+            )
+        else:
+            # Daily: 1H signal TF; require 1D+4H same color as 1H direction.
+            if not self._daily_htf_aligned(int(direction), ctx, candle):
+                return None
+            supertrend = float(
+                self._current_supertrend
+                or candle.get("supertrend")
+                or 0
+            )
         if supertrend <= 0:
             return None
+        target_expiry = None
+        entry_min_dte = int(min_dte)
+        if sleeve_u == SLEEVE_WEEKLY:
+            target_expiry = self._weekly_expiry_for_entry(candle, ctx)
+            entry_min_dte = WEEKLY_MIN_DTE
         selected = self._select_contract(
             candle,
             ctx,
             direction,
             supertrend,
-            min_dte=min_dte,
+            min_dte=entry_min_dte,
             min_strike_distance=min_strike_distance,
+            target_expiry=target_expiry,
         )
         if selected is None:
             logger.warning(
-                "%s: no %s contract premium >= %.2f near SuperTrend %.2f",
+                "%s: no %s %s contract premium >= %.2f near SuperTrend %.2f",
                 self.name,
+                sleeve_u,
                 self._option_type(direction),
                 MIN_PREMIUM_USD,
                 supertrend,
@@ -771,7 +1131,8 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         if inst is None:
             return None
         structure_id = (
-            f"{self.name}:BTCUSD:{self._timestamp_ist(candle['timestamp']).date()}:"
+            f"{self.name}:BTCUSD:{sleeve_u}:"
+            f"{self._timestamp_ist(candle['timestamp']).date()}:"
             f"{option_type}:{uuid.uuid4().hex[:8]}"
         )
         meta = _PositionMeta(
@@ -783,6 +1144,7 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             expiry=expiry,
             entry_premium=premium,
             entry_reason=reason,
+            sleeve=sleeve_u,
         )
         intent = self.map_instrument_to_intent(
             inst=inst,
@@ -799,21 +1161,30 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         intent = replace(intent, qty=ORDER_QTY_LOTS)
         self._meta_by_structure_id[structure_id] = meta
         logger.info(
-            "%s ENTRY signaled reason=%s direction=%s opt=%s strike=%.2f "
-            "expiry=%s premium=%.2f ST=%.2f sid=%s",
+            "%s ENTRY signaled reason=%s sleeve=%s direction=%s opt=%s strike=%.2f "
+            "expiry=%s premium=%.2f ST=%.2f ST_4h=%s ST_1d=%s sid=%s",
             self.name,
             reason,
+            sleeve_u,
             direction,
             option_type,
             strike,
             expiry,
             premium,
             supertrend,
+            candle.get("supertrend_4h"),
+            candle.get("supertrend_1d"),
             structure_id,
         )
         return intent
 
-    def _arm_sl_reentry(self, direction: Optional[int], exit_ts: Any) -> None:
+    def _arm_sl_reentry(
+        self,
+        direction: Optional[int],
+        exit_ts: Any,
+        *,
+        sleeve: str = SLEEVE_DAILY,
+    ) -> None:
         """
         After SL, re-enter on the close of the 1hr candle that contained the SL.
 
@@ -824,16 +1195,20 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             return
         self._sl_reentry_direction = int(direction)
         self._sl_reentry_after = self._timestamp_ist(exit_ts)
+        self._sl_reentry_sleeve = str(sleeve or SLEEVE_DAILY)
         logger.info(
-            "%s SL reentry armed direction=%s after=%s (reenter on that bar's close)",
+            "%s SL reentry armed direction=%s sleeve=%s after=%s "
+            "(reenter on that bar's close)",
             self.name,
             self._sl_reentry_direction,
+            self._sl_reentry_sleeve,
             self._sl_reentry_after,
         )
 
     def _clear_sl_reentry(self) -> None:
         self._sl_reentry_direction = None
         self._sl_reentry_after = None
+        self._sl_reentry_sleeve = None
 
     def _sl_reentry_ready(self, candle: dict) -> bool:
         """True once this candle's close time is after the SL fill time."""
@@ -1268,10 +1643,17 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         reason: str,
         min_dte: int = 0,
         min_strike_distance: float = 0.0,
+        sleeve: Optional[str] = None,
     ) -> Optional[Any]:
         sid = str(getattr(position, "structure_id", "") or "")
         if not sid or sid in self._pending_exit_structure_ids:
             return None
+        meta = self._ensure_meta(position, ctx)
+        sleeve_u = str(
+            sleeve
+            or (meta.sleeve if meta is not None else SLEEVE_DAILY)
+            or SLEEVE_DAILY
+        )
         # Resting MAIN_SL is action=FORCE_EXIT; cancel it so MAIN_EXIT can be placed
         # (17:25 rollover was blocked all afternoon by the open trail SL).
         self._cancel_resting_main_sl(ctx, position)
@@ -1295,6 +1677,7 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             reason=reason,
             min_dte=min_dte,
             min_strike_distance=min_strike_distance,
+            sleeve=sleeve_u,
         )
         return self._exit_intent(position, candle, ctx, reason)
 
@@ -1360,6 +1743,7 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             reason="expiry_rollover",
             min_dte=1,
             min_strike_distance=ROLLOVER_MIN_STRIKE_DISTANCE,
+            sleeve=str(meta.sleeve) if meta is not None else SLEEVE_DAILY,
         )
         if intent is not None:
             self._rollover_dates.add(now.date())
@@ -1418,102 +1802,181 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         self._confirmed_direction = direction
         self._current_supertrend = supertrend
         self._latest_candle = dict(candle)
-        positions = self._open_main_positions(ctx)
 
-        # Same-direction SuperTrend move: modify broker MAIN_SL to ST ± 100.
-        if (
-            positions
-            and previous is not None
-            and direction == previous
-            and previous_st is not None
-            and abs(float(supertrend) - float(previous_st)) > 1e-9
-        ):
-            self._modify_broker_trail_sl(
-                ctx,
-                positions[0],
-                direction=direction,
-                supertrend=supertrend,
+        htf = self._refresh_htf_state(ctx, candle)
+        one_h_signal = previous is not None and direction != previous
+        intents: List[Any] = []
+
+        # Trail broker SL: weekly on 4H ST, daily on 1H ST.
+        for position in self._open_main_positions(ctx):
+            meta = self._ensure_meta(position, ctx)
+            pos_dir = int(meta.direction) if meta is not None else int(direction)
+            sleeve = (
+                str(meta.sleeve) if meta is not None else SLEEVE_DAILY
             )
+            if sleeve == SLEEVE_WEEKLY:
+                ref_st = float(
+                    candle.get("supertrend_4h")
+                    or self._current_4h_supertrend
+                    or supertrend
+                )
+            else:
+                ref_st = float(supertrend)
+            prev_ref = float(meta.supertrend) if meta is not None else previous_st
+            if prev_ref is not None and abs(ref_st - float(prev_ref)) > 1e-9:
+                self._modify_broker_trail_sl(
+                    ctx,
+                    position,
+                    direction=pos_dir,
+                    supertrend=ref_st,
+                )
+                if meta is not None:
+                    sid = str(getattr(position, "structure_id", "") or "")
+                    if sid:
+                        self._meta_by_structure_id[sid] = replace(
+                            meta, supertrend=ref_st
+                        )
 
-        if previous is None:
-            deferred = self._consume_pending_closed_entry(candle, ctx, direction)
-            if deferred is not None:
-                return [deferred]
-            # Waiting for next closed bar after EXIT — do not enter early.
-            if self._pending_closed_entry is not None:
-                return None
+        deferred = self._consume_pending_closed_entry(candle, ctx, direction)
+        if deferred is not None:
+            intents.append(deferred)
+        elif self._pending_closed_entry is not None:
             rollover = self._rollover_intent_if_due(candle, ctx, closed_bar=True)
             return [rollover] if rollover is not None else None
 
-        # Deferred reversal / rollover entry: only after a bar closes past arm time.
-        if not positions:
-            deferred = self._consume_pending_closed_entry(candle, ctx, direction)
-            if deferred is not None:
-                return [deferred]
-            # Still armed: block flip / SL-reentry until that closed bar arrives.
-            if self._pending_closed_entry is not None:
-                return None
-
-        # After any SL: on the close of the candle that contained the SL fill,
-        # enter current SuperTrend direction (same if unchanged, opposite if flipped).
-        # e.g. SL at 11:01 in 10:30→11:30 bar → re-enter when that bar closes at 11:30.
-        if not positions and self._sl_reentry_ready(candle):
-            direction_at_sl = int(self._sl_reentry_direction or 0)
-            self._clear_sl_reentry()
-            reason = (
-                "sl_reentry_same"
-                if direction == direction_at_sl
-                else "sl_reentry_flip"
-            )
-            intent = self._build_entry(
-                candle,
-                ctx,
-                direction,
-                reason=reason,
-                min_dte=self._min_dte_for_candle(candle),
-            )
-            return [intent] if intent is not None else None
-
-        # SuperTrend reversal EXIT/ENTRY: only on confirmed closed-bar signal change.
-        # Between bars, leave the position alone — MAIN_SL (ST±100) is the stop.
-        if direction != previous:
-            min_dte = self._min_dte_for_candle(candle)
-            if positions:
-                self._clear_sl_reentry()
-                sid = str(getattr(positions[0], "structure_id", "") or "")
-                if sid in self._pending_exit_structure_ids:
-                    # Pending risk exit already in flight; arm opposite entry for next close.
-                    self._pending_transition = _PendingTransition(
-                        previous_structure_id=sid,
-                        direction=direction,
-                        reason="supertrend_reversal",
-                        min_dte=min_dte,
-                    )
-                    intent = None
+        # SL reentry for the sleeve that was stopped out.
+        entered_sleeves: set[str] = set()
+        if self._sl_reentry_ready(candle):
+            sleeve = str(self._sl_reentry_sleeve or SLEEVE_DAILY)
+            if not self._open_main_positions(ctx, sleeve=sleeve):
+                direction_at_sl = int(self._sl_reentry_direction or 0)
+                if sleeve == SLEEVE_WEEKLY and self._confirmed_4h_direction is not None:
+                    enter_dir = int(self._confirmed_4h_direction)
                 else:
+                    enter_dir = int(direction)
+                reason = (
+                    "sl_reentry_same"
+                    if enter_dir == direction_at_sl
+                    else "sl_reentry_flip"
+                )
+                intent = self._build_entry(
+                    candle,
+                    ctx,
+                    enter_dir,
+                    reason=reason,
+                    min_dte=(
+                        WEEKLY_MIN_DTE
+                        if sleeve == SLEEVE_WEEKLY
+                        else self._min_dte_for_candle(candle)
+                    ),
+                    sleeve=sleeve,
+                )
+                if intent is not None:
+                    self._clear_sl_reentry()
+                    intents.append(intent)
+                    entered_sleeves.add(sleeve)
+
+        # Exit weekly when 1D or 4H no longer agrees with the open weekly direction.
+        weekly_positions = self._open_main_positions(ctx, sleeve=SLEEVE_WEEKLY)
+        if weekly_positions and htf is not None:
+            wpos = weekly_positions[0]
+            wmeta = self._ensure_meta(wpos, ctx)
+            wdir = int(wmeta.direction) if wmeta is not None else 0
+            if wdir and (
+                htf["4h"][0] != wdir or htf["1d"][0] != wdir
+            ):
+                sid = str(getattr(wpos, "structure_id", "") or "")
+                new_dir = (
+                    int(htf["4h"][0])
+                    if htf["4h"][0] == htf["1d"][0]
+                    else int(htf["4h"][0])
+                )
+                if sid not in self._pending_exit_structure_ids:
                     intent = self._begin_transition(
-                        positions[0],
+                        wpos,
                         candle,
                         ctx,
-                        direction=direction,
-                        reason="supertrend_reversal",
-                        min_dte=min_dte,
+                        direction=new_dir,
+                        reason="weekly_htf_misaligned",
+                        min_dte=WEEKLY_MIN_DTE,
+                        sleeve=SLEEVE_WEEKLY,
                     )
-                return [intent] if intent is not None else None
-            # Confirmed ST flip takes priority over any pending post-SL hour wait.
-            if self._sl_reentry_direction is not None:
-                self._clear_sl_reentry()
-            intent = self._build_entry(
-                candle,
-                ctx,
-                direction,
-                reason="supertrend_reversal",
-                min_dte=min_dte,
-            )
-            return [intent] if intent is not None else None
+                    if intent is not None:
+                        intents.append(intent)
+
+        # Exit daily on confirmed 1H SuperTrend flip against the open daily direction.
+        daily_positions = self._open_main_positions(ctx, sleeve=SLEEVE_DAILY)
+        if daily_positions and one_h_signal:
+            dpos = daily_positions[0]
+            dmeta = self._ensure_meta(dpos, ctx)
+            ddir = int(dmeta.direction) if dmeta is not None else 0
+            if ddir and direction != ddir:
+                sid = str(getattr(dpos, "structure_id", "") or "")
+                if sid not in self._pending_exit_structure_ids:
+                    intent = self._begin_transition(
+                        dpos,
+                        candle,
+                        ctx,
+                        direction=int(direction),
+                        reason="one_h_reversal",
+                        min_dte=self._min_dte_for_candle(candle),
+                        sleeve=SLEEVE_DAILY,
+                    )
+                    if intent is not None:
+                        intents.append(intent)
+
+        # Weekly entry: 1D + 4H already green/red together → weekly near 4H ST.
+        if (
+            SLEEVE_WEEKLY not in entered_sleeves
+            and htf is not None
+            and htf["4h"][0] == htf["1d"][0]
+        ):
+            want = int(htf["4h"][0])
+            if not self._open_main_positions(ctx, sleeve=SLEEVE_WEEKLY):
+                intent = self._build_entry(
+                    candle,
+                    ctx,
+                    want,
+                    reason="weekly_htf_aligned",
+                    min_dte=WEEKLY_MIN_DTE,
+                    sleeve=SLEEVE_WEEKLY,
+                )
+                if intent is not None:
+                    intents.append(intent)
+                    entered_sleeves.add(SLEEVE_WEEKLY)
+
+        # Daily 0DTE/1DTE: 1H signal (or flat catch-up) only when 1D+4H match 1H.
+        if (
+            SLEEVE_DAILY not in entered_sleeves
+            and not self._open_main_positions(ctx, sleeve=SLEEVE_DAILY)
+        ):
+            daily_reason = None
+            if one_h_signal:
+                daily_reason = "one_h_signal"
+            elif previous is not None and htf is not None:
+                # Flat catch-up: 1H already on side and HTF agrees.
+                if (
+                    htf["4h"][0] == direction
+                    and htf["1d"][0] == direction
+                ):
+                    daily_reason = "one_h_htf_aligned"
+            if daily_reason is not None:
+                intent = self._build_entry(
+                    candle,
+                    ctx,
+                    int(direction),
+                    reason=daily_reason,
+                    min_dte=self._min_dte_for_candle(candle),
+                    sleeve=SLEEVE_DAILY,
+                )
+                if intent is not None:
+                    intents.append(intent)
+                    entered_sleeves.add(SLEEVE_DAILY)
 
         rollover = self._rollover_intent_if_due(candle, ctx, closed_bar=True)
-        return [rollover] if rollover is not None else None
+        if rollover is not None:
+            intents.append(rollover)
+        return intents or None
 
     def on_quote(self, quote: dict, ctx: Any) -> Optional[List[Any]]:
         if str(quote.get("symbol") or "").strip().upper() != "BTCUSD":
@@ -1544,56 +2007,83 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         positions = self._open_main_positions(ctx)
         if not positions:
             return None
-        position = positions[0]
-        sid = str(getattr(position, "structure_id", "") or "")
-        if sid in self._pending_exit_structure_ids:
-            return None
-        meta = self._ensure_meta(position, ctx)
-        pos_strike = self._position_strike(position, meta)
-        if pos_strike is not None and self._spot_near_position_strike(
-            spot=spot, strike=pos_strike
-        ):
+        # Risk-check every open sleeve (weekly and/or daily).
+        for position in positions:
+            sid = str(getattr(position, "structure_id", "") or "")
+            if sid in self._pending_exit_structure_ids:
+                continue
+            meta = self._ensure_meta(position, ctx)
+            sleeve = (
+                str(meta.sleeve)
+                if meta is not None
+                else SLEEVE_DAILY
+            )
+            pos_strike = self._position_strike(position, meta)
+            if pos_strike is not None and self._spot_near_position_strike(
+                spot=spot, strike=pos_strike
+            ):
+                if not self._broker_still_has_position(ctx, position):
+                    continue
+                self._arm_sl_reentry(
+                    meta.direction if meta is not None else self._confirmed_direction,
+                    tick_dt,
+                    sleeve=sleeve,
+                )
+                self._pending_exit_structure_ids.add(sid)
+                logger.warning(
+                    "%s FORCE EXIT (strike proximity ±%.0f) sleeve=%s "
+                    "spot=%.2f strike=%.2f",
+                    self.name,
+                    STRIKE_PROXIMITY_EXIT_POINTS,
+                    sleeve,
+                    spot,
+                    pos_strike,
+                )
+                return [
+                    self._exit_intent(
+                        position, candle, ctx, "strategy_strike_proximity_exit"
+                    )
+                ]
+            trail_st = float(
+                (meta.supertrend if meta is not None else 0)
+                or self._current_4h_supertrend
+                or self._current_supertrend
+                or 0
+            )
+            if trail_st <= 0 or self._confirmed_direction is None:
+                continue
+            position_direction = (
+                meta.direction if meta is not None else self._confirmed_direction
+            )
+            force_level = self._force_exit_level(
+                int(position_direction), trail_st
+            )
+            if not self._spot_hits_level(
+                direction=int(position_direction),
+                level=force_level,
+                spot=spot,
+            ):
+                continue
             if not self._broker_still_has_position(ctx, position):
-                return None
-            self._arm_sl_reentry(self._confirmed_direction, tick_dt)
+                continue
+            self._arm_sl_reentry(
+                int(position_direction), tick_dt, sleeve=sleeve
+            )
             self._pending_exit_structure_ids.add(sid)
             logger.warning(
-                "%s FORCE EXIT (strike proximity ±%.0f) spot=%.2f strike=%.2f",
+                "%s FORCE EXIT (strategy 300) sleeve=%s spot=%.2f ST=%.2f "
+                "level=%.2f direction=%s",
                 self.name,
-                STRIKE_PROXIMITY_EXIT_POINTS,
+                sleeve,
                 spot,
-                pos_strike,
+                trail_st,
+                force_level,
+                position_direction,
             )
             return [
-                self._exit_intent(
-                    position, candle, ctx, "strategy_strike_proximity_exit"
-                )
+                self._exit_intent(position, candle, ctx, "strategy_force_exit_300")
             ]
-        if self._current_supertrend is None or self._confirmed_direction is None:
-            return None
-        position_direction = meta.direction if meta is not None else self._confirmed_direction
-        force_level = self._force_exit_level(
-            int(position_direction), float(self._current_supertrend)
-        )
-        if not self._spot_hits_level(
-            direction=int(position_direction),
-            level=force_level,
-            spot=spot,
-        ):
-            return None
-        if not self._broker_still_has_position(ctx, position):
-            return None
-        self._arm_sl_reentry(self._confirmed_direction, tick_dt)
-        self._pending_exit_structure_ids.add(sid)
-        logger.warning(
-            "%s FORCE EXIT (strategy 300) spot=%.2f ST=%.2f level=%.2f direction=%s",
-            self.name,
-            spot,
-            self._current_supertrend,
-            force_level,
-            position_direction,
-        )
-        return [self._exit_intent(position, candle, ctx, "strategy_force_exit_300")]
+        return None
 
     def should_exit(self, position: Any, candle: dict, ctx: Any = None) -> bool:
         if ctx is None or getattr(position, "tag", None) != "MAIN":
@@ -1626,8 +2116,13 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         if not sid or sid in self._pending_exit_structure_ids:
             return []
         self._pending_exit_structure_ids.add(sid)
-        self._arm_sl_reentry(self._confirmed_direction, candle["timestamp"])
         meta = self._ensure_meta(position, ctx)
+        sleeve = str(meta.sleeve) if meta is not None else SLEEVE_DAILY
+        self._arm_sl_reentry(
+            meta.direction if meta is not None else self._confirmed_direction,
+            candle["timestamp"],
+            sleeve=sleeve,
+        )
         pos_strike = self._position_strike(position, meta)
         spot = float(candle.get("close") or 0)
         low = float(candle.get("low") or spot or 0)
@@ -1762,6 +2257,15 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             direction_at_exit,
         )
         self._pending_exit_structure_ids.discard(sid)
+        exit_sleeve = (
+            str(meta.sleeve)
+            if meta is not None
+            else (
+                str(transition.sleeve)
+                if transition is not None
+                else SLEEVE_DAILY
+            )
+        )
         self._meta_by_structure_id.pop(sid, None)
         if transition is not None and transition.previous_structure_id == sid:
             self._pending_transition = None
@@ -1790,13 +2294,16 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                     if transition.min_dte
                     else self._min_dte_for_candle(candle),
                     min_strike_distance=transition.min_strike_distance,
+                    sleeve=str(transition.sleeve or SLEEVE_DAILY),
                 )
             if intent is not None:
                 logger.info(
-                    "%s after EXIT filled: ENTRY new direction reason=%s direction=%s",
+                    "%s after EXIT filled: ENTRY new direction reason=%s "
+                    "direction=%s sleeve=%s",
                     self.name,
                     transition.reason,
                     transition.direction,
+                    transition.sleeve,
                 )
                 return [(intent, candle)]
             # Contract selection / ctx failed — retry on the next fully closed bar.
@@ -1806,25 +2313,31 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 min_dte=transition.min_dte,
                 min_strike_distance=transition.min_strike_distance,
                 armed_after=candle_ts,
+                sleeve=str(transition.sleeve or SLEEVE_DAILY),
             )
             logger.warning(
-                "%s after EXIT filled: ENTRY failed, deferred reason=%s direction=%s",
+                "%s after EXIT filled: ENTRY failed, deferred reason=%s "
+                "direction=%s sleeve=%s",
                 self.name,
                 transition.reason,
                 transition.direction,
+                transition.sleeve,
             )
             return []
 
         # Broker MAIN_SL or strategy MAIN_EXIT: wait for next 1hr close, then follow signal.
         if tag == "MAIN_SL" and direction_at_exit is not None:
             self._arm_sl_reentry(
-                direction_at_exit, kwargs.get("candle_ts") or datetime.now()
+                direction_at_exit,
+                kwargs.get("candle_ts") or datetime.now(),
+                sleeve=exit_sleeve,
             )
             logger.info(
-                "%s after EXIT filled: SL reentry armed direction=%s "
+                "%s after EXIT filled: SL reentry armed direction=%s sleeve=%s "
                 "(wait for hour close; entry_reason will be sl_reentry_*)",
                 self.name,
                 direction_at_exit,
+                exit_sleeve,
             )
         elif (
             tag == "MAIN_EXIT"
@@ -1832,13 +2345,16 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             and self._sl_reentry_direction is None
         ):
             self._arm_sl_reentry(
-                direction_at_exit, kwargs.get("candle_ts") or datetime.now()
+                direction_at_exit,
+                kwargs.get("candle_ts") or datetime.now(),
+                sleeve=exit_sleeve,
             )
             logger.info(
-                "%s after EXIT filled: reentry armed direction=%s "
+                "%s after EXIT filled: reentry armed direction=%s sleeve=%s "
                 "(wait for hour close; entry_reason will be sl_reentry_*)",
                 self.name,
                 direction_at_exit,
+                exit_sleeve,
             )
         return []
 
@@ -1864,7 +2380,8 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         if direction is None:
             return
         exit_ts = kwargs.get("candle_ts") or datetime.now(timezone.utc)
-        self._arm_sl_reentry(int(direction), exit_ts)
+        sleeve = str(meta.sleeve) if meta is not None else SLEEVE_DAILY
+        self._arm_sl_reentry(int(direction), exit_ts, sleeve=sleeve)
         logger.info(
             "%s after forced/external close: SL reentry armed direction=%s "
             "source=%s sid=%s",

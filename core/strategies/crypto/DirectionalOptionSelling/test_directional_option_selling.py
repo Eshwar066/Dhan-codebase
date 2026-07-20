@@ -44,6 +44,18 @@ def _ticker(bid):
 class DirectionalOptionSellingTests(unittest.TestCase):
     def setUp(self):
         self.strategy = DirectionalOptionSelling()
+        # Default: allow entries in _build_entry; keep snapshot empty so the
+        # flat ``htf_aligned`` path does not auto-fire in unrelated tests.
+        self._htf_allow = patch.object(
+            self.strategy, "_htf_entry_allowed", return_value=True
+        )
+        self._htf_snap = patch.object(
+            self.strategy, "_htf_snapshot", return_value=None
+        )
+        self._htf_allow.start()
+        self._htf_snap.start()
+        self.addCleanup(self._htf_allow.stop)
+        self.addCleanup(self._htf_snap.stop)
 
     def test_live_selection_uses_nearest_eligible_strike(self):
         products = [
@@ -268,15 +280,13 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertEqual(self.strategy._pending_closed_entry.direction, -1)
 
     def test_st_flip_while_sl_reentry_pending_enters_immediately(self):
-        """Confirmed ST flip must not wait for post-SL hour close when flat."""
+        """1H flip with 1D+4H green should open daily even if SL-reentry is armed."""
         ctx = SimpleNamespace(position_store=_PositionStore())
         self.strategy._confirmed_direction = -1
         self.strategy._current_supertrend = 64616.31
         self.strategy._arm_sl_reentry(
             -1, datetime(2026, 7, 20, 3, 45, tzinfo=timezone.utc)
         )
-        # Flip bar not yet "ready" for SL reentry path if we force ready=False;
-        # flip path should still clear wait and enter.
         candle = {
             "symbol": "BTCUSD",
             "timestamp": datetime(2026, 7, 20, 3, 30, tzinfo=timezone.utc),
@@ -288,12 +298,20 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         with patch.object(self.strategy, "_bar_is_fully_closed", return_value=True):
             with patch.object(self.strategy, "_sl_reentry_ready", return_value=False):
                 with patch.object(
-                    self.strategy, "_build_entry", return_value=marker
-                ) as build:
-                    result = self.strategy.on_candle(candle, ctx)
-        self.assertEqual(result, [marker])
-        self.assertEqual(build.call_args.kwargs["reason"], "supertrend_reversal")
-        self.assertIsNone(self.strategy._sl_reentry_direction)
+                    self.strategy,
+                    "_refresh_htf_state",
+                    return_value={"4h": (1, 64300.0), "1d": (1, 64000.0)},
+                ):
+                    with patch.object(
+                        self.strategy, "_build_entry", return_value=marker
+                    ) as build:
+                        result = self.strategy.on_candle(candle, ctx)
+        daily_calls = [
+            c for c in build.call_args_list if c.kwargs.get("sleeve") == "daily"
+        ]
+        self.assertEqual(len(daily_calls), 1)
+        self.assertEqual(daily_calls[0].kwargs["reason"], "one_h_signal")
+        self.assertIn(marker, result or [])
 
     def test_rollover_selection_enforces_200_point_strike_distance(self):
         products = [
@@ -360,6 +378,7 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertFalse(pd.isna(result.iloc[-1]["supertrend"]))
 
     def test_first_direction_only_initializes_then_flip_enters(self):
+        """1H flip enters daily only when 1D+4H match that 1H direction."""
         ctx = SimpleNamespace(position_store=_PositionStore())
         bullish = {
             "symbol": "BTCUSD",
@@ -368,18 +387,36 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             "supertrend": 118000,
             "supertrend_direction": 1,
         }
+        with patch.object(
+            self.strategy,
+            "_refresh_htf_state",
+            return_value={"4h": (1, 118000.0), "1d": (-1, 117000.0)},
+        ):
+            self.assertIsNone(self.strategy.on_candle(bullish, ctx))
         bearish = {
             **bullish,
             "timestamp": datetime(2026, 7, 17, 7, 0, tzinfo=timezone.utc),
             "close": 117800,
             "supertrend_direction": -1,
         }
-        self.assertIsNone(self.strategy.on_candle(bullish, ctx))
         marker = object()
-        with patch.object(self.strategy, "_build_entry", return_value=marker) as build:
-            result = self.strategy.on_candle(bearish, ctx)
-        self.assertEqual(result, [marker])
-        self.assertEqual(build.call_args.args[2], -1)
+        with patch.object(
+            self.strategy,
+            "_refresh_htf_state",
+            return_value={"4h": (-1, 118200.0), "1d": (-1, 117000.0)},
+        ):
+            with patch.object(
+                self.strategy, "_build_entry", return_value=marker
+            ) as build:
+                result = self.strategy.on_candle(bearish, ctx)
+        # Weekly + daily both want -1 when HTF is fully bearish on a 1H flip.
+        self.assertIn(marker, result or [])
+        daily_calls = [
+            c for c in build.call_args_list if c.kwargs.get("sleeve") == "daily"
+        ]
+        self.assertEqual(len(daily_calls), 1)
+        self.assertEqual(daily_calls[0].args[2], -1)
+        self.assertEqual(daily_calls[0].kwargs["reason"], "one_h_signal")
 
     def test_unconfirmed_st_flip_does_not_exit_open_position(self):
         """ST direction flicker with close still on old side must not reverse (MAIN_SL covers)."""
@@ -420,7 +457,11 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertEqual(self.strategy._confirmed_direction, -1)
 
     def test_confirmed_st_flip_exits_on_closed_bar(self):
-        """Closed bar with close on the new ST side may reverse."""
+        """4H flip against an open daily sleeve exits that sleeve."""
+        from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (
+            _PositionMeta,
+        )
+
         instrument = SimpleNamespace(
             option_type="CE",
             expiry="200726",
@@ -442,21 +483,41 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         )
         self.strategy._confirmed_direction = -1
         self.strategy._current_supertrend = 64616.31
+        self.strategy._meta_by_structure_id[position.structure_id] = _PositionMeta(
+            symbol="BTCUSD",
+            direction=-1,
+            option_type="CE",
+            supertrend=64616.31,
+            strike=64800,
+            expiry="200726",
+            entry_premium=272,
+            entry_reason="one_h_signal",
+            sleeve="daily",
+        )
         confirmed = {
             "symbol": "BTCUSD",
             "timestamp": datetime(2026, 7, 19, 16, 0, tzinfo=timezone.utc),
-            "close": 64700.0,  # above ST → confirms bullish
+            "close": 64700.0,
             "supertrend": 64616.31,
             "supertrend_direction": 1,
         }
         marker = object()
         with patch.object(self.strategy, "_bar_is_fully_closed", return_value=True):
             with patch.object(
-                self.strategy, "_begin_transition", return_value=marker
-            ) as begin:
-                result = self.strategy.on_candle(confirmed, ctx)
+                self.strategy,
+                "_refresh_htf_state",
+                return_value={"4h": (1, 64600.0), "1d": (1, 64000.0)},
+            ):
+                with patch.object(
+                    self.strategy, "_begin_transition", return_value=marker
+                ) as begin:
+                    with patch.object(
+                        self.strategy, "_build_entry", return_value=None
+                    ):
+                        result = self.strategy.on_candle(confirmed, ctx)
         self.assertEqual(result, [marker])
-        begin.assert_called_once()
+        self.assertEqual(begin.call_args.kwargs["reason"], "one_h_reversal")
+        self.assertEqual(begin.call_args.kwargs["sleeve"], "daily")
         self.assertEqual(self.strategy._confirmed_direction, 1)
 
     def test_trail_sl_levels_follow_supertrend(self):
@@ -507,6 +568,10 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertEqual(self.strategy._sl_reentry_direction, 1)
 
     def test_same_direction_supertrend_modifies_broker_sl(self):
+        from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (
+            _PositionMeta,
+        )
+
         instrument = SimpleNamespace(
             option_type="PE",
             expiry="180726",
@@ -533,6 +598,17 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         )
         self.strategy._confirmed_direction = 1
         self.strategy._current_supertrend = 118000
+        self.strategy._meta_by_structure_id[position.structure_id] = _PositionMeta(
+            symbol="BTCUSD",
+            direction=1,
+            option_type="PE",
+            supertrend=118000,
+            strike=118000,
+            expiry="180726",
+            entry_premium=350,
+            entry_reason="weekly_htf_aligned",
+            sleeve="weekly",
+        )
         candle = {
             "symbol": "BTCUSD",
             "timestamp": datetime(2026, 7, 17, 7, 0, tzinfo=timezone.utc),
@@ -541,9 +617,15 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             "supertrend_direction": 1,
         }
         with patch.object(
-            self.strategy, "_modify_broker_trail_sl", return_value=True
-        ) as modify:
-            self.assertIsNone(self.strategy.on_candle(candle, ctx))
+            self.strategy,
+            "_refresh_htf_state",
+            return_value={"4h": (1, 118200.0), "1d": (1, 117500.0)},
+        ):
+            with patch.object(
+                self.strategy, "_modify_broker_trail_sl", return_value=True
+            ) as modify:
+                with patch.object(self.strategy, "_build_entry", return_value=None):
+                    self.assertIsNone(self.strategy.on_candle(candle, ctx))
         self.assertEqual(self.strategy._current_supertrend, 118200)
         self.assertEqual(modify.call_args.kwargs["supertrend"], 118200)
         self.assertEqual(modify.call_args.kwargs["direction"], 1)
@@ -634,7 +716,12 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         }
         marker = object()
         with patch.object(self.strategy, "_build_entry", return_value=marker) as build:
-            result = self.strategy.on_candle(candle, ctx)
+            with patch.object(
+                self.strategy,
+                "_refresh_htf_state",
+                return_value=None,
+            ):
+                result = self.strategy.on_candle(candle, ctx)
         self.assertEqual(result, [marker])
         self.assertEqual(build.call_args.kwargs["reason"], "sl_reentry_same")
         self.assertIsNone(self.strategy._sl_reentry_direction)
@@ -654,7 +741,12 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         }
         marker = object()
         with patch.object(self.strategy, "_build_entry", return_value=marker) as build:
-            result = self.strategy.on_candle(candle, ctx)
+            with patch.object(
+                self.strategy,
+                "_refresh_htf_state",
+                return_value=None,
+            ):
+                result = self.strategy.on_candle(candle, ctx)
         self.assertEqual(result, [marker])
         self.assertEqual(build.call_args.kwargs["reason"], "sl_reentry_flip")
         self.assertEqual(build.call_args.args[2], -1)
@@ -819,6 +911,191 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertAlmostEqual(self.strategy._current_supertrend, 64827.25)
         exit_fn.assert_called_once()
         self.assertIn(datetime(2026, 7, 19).date(), self.strategy._rollover_dates)
+
+    def test_htf_entry_allowed_requires_1d_and_4h_match(self):
+        s = DirectionalOptionSelling()
+        candle = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 20, 10, 0, tzinfo=timezone.utc),
+            "close": 65000,
+        }
+        ctx = SimpleNamespace()
+        with patch.object(
+            s,
+            "_htf_snapshot",
+            return_value={"4h": (1, 64000.0), "1d": (1, 63000.0)},
+        ):
+            self.assertTrue(s._htf_entry_allowed(1, ctx, candle))
+            self.assertFalse(s._htf_entry_allowed(-1, ctx, candle))
+        with patch.object(
+            s,
+            "_htf_snapshot",
+            return_value={"4h": (-1, 66000.0), "1d": (1, 63000.0)},
+        ):
+            self.assertFalse(s._htf_entry_allowed(1, ctx, candle))
+            self.assertFalse(s._htf_entry_allowed(-1, ctx, candle))
+        with patch.object(
+            s,
+            "_htf_snapshot",
+            return_value={"4h": (-1, 66000.0), "1d": (-1, 67000.0)},
+        ):
+            self.assertTrue(s._htf_entry_allowed(-1, ctx, candle))
+
+    def test_build_entry_blocked_when_htf_misaligned(self):
+        self.strategy._current_supertrend = 64000.0
+        candle = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 20, 10, 0, tzinfo=timezone.utc),
+            "close": 65000,
+            "supertrend": 64000,
+        }
+        ctx = SimpleNamespace(position_store=_PositionStore())
+        with patch.object(self.strategy, "_htf_entry_allowed", return_value=False):
+            with patch.object(self.strategy, "_select_contract") as select:
+                self.assertIsNone(
+                    self.strategy._build_entry(
+                        candle, ctx, 1, reason="supertrend_reversal"
+                    )
+                )
+                select.assert_not_called()
+
+    def test_flat_htf_aligned_enters_without_1h_flip(self):
+        self.strategy._confirmed_direction = 1
+        self.strategy._current_supertrend = 64000.0
+        candle = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 20, 10, 0, tzinfo=timezone.utc),
+            "close": 65000,
+            "supertrend": 64000,
+            "supertrend_direction": 1,
+        }
+        ctx = SimpleNamespace(position_store=_PositionStore())
+        marker = object()
+        with patch.object(
+            self.strategy,
+            "_refresh_htf_state",
+            return_value={"4h": (1, 63500.0), "1d": (1, 62000.0)},
+        ):
+            with patch.object(
+                self.strategy, "_bar_is_fully_closed", return_value=True
+            ):
+                with patch.object(
+                    self.strategy, "_build_entry", return_value=marker
+                ) as build:
+                    result = self.strategy.on_candle(candle, ctx)
+        weekly_calls = [
+            c for c in build.call_args_list if c.kwargs.get("sleeve") == "weekly"
+        ]
+        self.assertTrue(weekly_calls)
+        self.assertEqual(weekly_calls[0].kwargs["reason"], "weekly_htf_aligned")
+        self.assertIn(marker, result or [])
+
+    def test_weekly_expiry_shifts_when_dte_le_2(self):
+        s = DirectionalOptionSelling()
+        # Wednesday 2026-07-15 → this week's Friday is 17 Jul (DTE=2) → shift to 24 Jul.
+        candle = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 15, 6, 0, tzinfo=timezone.utc),
+            "close": 65000,
+        }
+        ctx = SimpleNamespace()
+        code = s._weekly_expiry_for_entry(candle, ctx)
+        self.assertEqual(code, "240726")
+        self.assertEqual(ctx.selected_expiry, "240726")
+
+    def test_dual_sleeve_weekly_and_daily_can_both_enter(self):
+        ctx = SimpleNamespace(position_store=_PositionStore())
+        self.strategy._confirmed_direction = 1
+        self.strategy._current_supertrend = 64000.0
+        candle = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 20, 10, 0, tzinfo=timezone.utc),
+            "close": 65000,
+            "supertrend": 64000,
+            "supertrend_direction": 1,
+        }
+        weekly_marker = object()
+        daily_marker = object()
+
+        def _build(candle, ctx, direction, **kwargs):
+            if kwargs.get("sleeve") == "weekly":
+                return weekly_marker
+            return daily_marker
+
+        with patch.object(
+            self.strategy,
+            "_refresh_htf_state",
+            return_value={"4h": (1, 63500.0), "1d": (1, 62000.0)},
+        ):
+            with patch.object(
+                self.strategy, "_bar_is_fully_closed", return_value=True
+            ):
+                with patch.object(
+                    self.strategy, "_build_entry", side_effect=_build
+                ) as build:
+                    result = self.strategy.on_candle(candle, ctx)
+        self.assertEqual(result, [weekly_marker, daily_marker])
+        sleeves = [c.kwargs.get("sleeve") for c in build.call_args_list]
+        self.assertEqual(sleeves, ["weekly", "daily"])
+        self.assertEqual(
+            build.call_args_list[1].kwargs["reason"], "one_h_htf_aligned"
+        )
+
+    def test_latest_closed_st_from_df(self):
+        s = DirectionalOptionSelling()
+        rows = []
+        start = pd.Timestamp("2026-07-01", tz="UTC")
+        price = 60000.0
+        direction = 1
+        for i in range(40):
+            o = price
+            c = price + (80 if direction > 0 else -80)
+            h = max(o, c) + 50
+            l = min(o, c) - 50
+            rows.append(
+                {
+                    "timestamp": start + pd.Timedelta(hours=4 * i),
+                    "open": o,
+                    "high": h,
+                    "low": l,
+                    "close": c,
+                    "volume": 1,
+                }
+            )
+            price = c
+        df = pd.DataFrame(rows)
+        as_of = start + pd.Timedelta(hours=4 * 39 + 4)  # last bar closed
+        snap = s._latest_closed_st_from_df(
+            df, timeframe="4h", as_of_utc=as_of
+        )
+        self.assertIsNotNone(snap)
+        direction, st, bar_open = snap
+        self.assertIn(direction, (1, -1))
+        self.assertGreater(st, 0)
+        self.assertEqual(bar_open, start + pd.Timedelta(hours=4 * 39))
+
+
+    def test_daily_blocked_when_htf_not_both_green(self):
+        s = DirectionalOptionSelling()
+        candle = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 20, 10, 0, tzinfo=timezone.utc),
+            "close": 65000,
+        }
+        ctx = SimpleNamespace()
+        with patch.object(
+            s,
+            "_htf_snapshot",
+            return_value={"4h": (1, 64000.0), "1d": (-1, 63000.0)},
+        ):
+            self.assertFalse(s._daily_htf_aligned(1, ctx, candle))
+        with patch.object(
+            s,
+            "_htf_snapshot",
+            return_value={"4h": (1, 64000.0), "1d": (1, 63000.0)},
+        ):
+            self.assertTrue(s._daily_htf_aligned(1, ctx, candle))
+            self.assertFalse(s._daily_htf_aligned(-1, ctx, candle))
 
 
 if __name__ == "__main__":

@@ -4,17 +4,23 @@ Refresh shared crypto indicator history from Delta Exchange REST.
 
 Default outputs (schema v2 JSONL, preserves ``live_append`` rows)::
 
-    logs/indicators/BTCUSD/1/indicator_history.jsonl  — 1m market structure (RSIBreadAndButter entry TF)
-    logs/indicators/BTCUSD/5/indicator_history.jsonl  — 5m market structure (signal TF)
     logs/indicators/BTCUSD/60/indicator_history.jsonl — 1h SuperTrend (DirectionalOptionSelling)
+    logs/indicators/BTCUSD/4h/indicator_history.jsonl — 4h SuperTrend
+    logs/indicators/BTCUSD/1d/indicator_history.jsonl — 1d SuperTrend
+
+Also supports structure TFs used by RSIBreadAndButter::
+
+    logs/indicators/BTCUSD/1/indicator_history.jsonl  — 1m market structure
+    logs/indicators/BTCUSD/5/indicator_history.jsonl  — 5m market structure
 
 Usage (from repo root)::
 
     python utils/delta/refresh_crypto_indicator_history.py
     python utils/delta/refresh_crypto_indicator_history.py --dry-run
-    python utils/delta/refresh_crypto_indicator_history.py --only 1 --days 14
-    python utils/delta/refresh_crypto_indicator_history.py --symbol BTCUSD --only 5
-    python utils/delta/refresh_crypto_indicator_history.py --symbol BTCUSD --only 60
+    python utils/delta/refresh_crypto_indicator_history.py --only 60,4h,1d
+    python utils/delta/refresh_crypto_indicator_history.py --only 4h --days 90
+    python utils/delta/refresh_crypto_indicator_history.py --structure
+    python utils/delta/refresh_crypto_indicator_history.py --symbol BTCUSD --only 1,5
 """
 
 from __future__ import annotations
@@ -54,6 +60,27 @@ from core.utils.json_numeric import round_json_floats  # noqa: E402
 LIVE_SOURCE = "live_append"
 REFRESH_SOURCE = "delta_refresh"
 IST = __import__("zoneinfo").ZoneInfo("Asia/Kolkata")
+
+# DirectionalOptionSelling dual-sleeve HTF + signal TF.
+SUPER_TREND_TIMEFRAMES = ("60", "4h", "1d")
+STRUCTURE_TIMEFRAMES = ("1", "5")
+ALL_TIMEFRAMES = SUPER_TREND_TIMEFRAMES + STRUCTURE_TIMEFRAMES
+
+# Enough history for SuperTrend(16) warmup on slower TFs.
+DEFAULT_DAYS_BY_TF = {
+    "1": 14,
+    "5": 21,
+    "60": 60,
+    "4h": 120,
+    "1d": 365,
+}
+DEFAULT_MIN_ROWS_BY_TF = {
+    "1": 350,
+    "5": 350,
+    "60": 80,
+    "4h": 50,
+    "1d": 40,
+}
 
 
 def _float_or_none(val: Any) -> Optional[float]:
@@ -231,10 +258,14 @@ def _rows_from_df(
             ts_utc = ts_utc.tz_localize("UTC")
         else:
             ts_utc = ts_utc.tz_convert("UTC")
-        ist_key = ts_utc.tz_convert(IST).strftime("%Y-%m-%d %H:%M")
+        # Skip warmup rows with null SuperTrend / structure fields.
         indicators = {k: row.get(k) for k in keys if k in row.index}
         if not indicators:
             continue
+        # Drop SuperTrend warmup rows (null ST value).
+        if "supertrend" in indicators and _float_or_none(indicators.get("supertrend")) is None:
+            continue
+        ist_key = ts_utc.tz_convert(IST).strftime("%Y-%m-%d %H:%M")
         out[ist_key] = _build_schema_row(
             symbol=symbol,
             timeframe=timeframe,
@@ -248,6 +279,29 @@ def _rows_from_df(
         )
     if len(out) < min_rows:
         return {}
+    return out
+
+
+def _last_supertrend_snapshot(refreshed: Dict[str, dict]) -> Dict[str, Any]:
+    if not refreshed:
+        return {}
+    last_key = max(refreshed.keys())
+    row = refreshed[last_key]
+    ind = row.get("indicators") or {}
+    out: Dict[str, Any] = {"last_bar_ist": last_key}
+    for key in (
+        "supertrend",
+        "supertrend_direction",
+        "supertrend_is_bullish",
+        "supertrend_upper",
+        "supertrend_lower",
+        "supertrend_atr",
+    ):
+        if key in ind:
+            out[key] = ind[key]
+    ohlc = row.get("ohlc") or {}
+    if ohlc.get("close") is not None:
+        out["close"] = ohlc.get("close")
     return out
 
 
@@ -290,10 +344,13 @@ def refresh_file(
         "total_out": len(merged),
         "dry_run": dry_run,
         "ignore_cache": ignore_cache,
+        "days": int(days),
+        "min_rows": int(min_rows),
     }
     if df is not None and len(df) > 0:
         last_ts = pd.to_datetime(df["timestamp"].iloc[-1], utc=True)
         stats["last_bar_ist"] = last_ts.tz_convert(IST).strftime("%Y-%m-%d %H:%M")
+    stats.update(_last_supertrend_snapshot(refreshed))
     if not refreshed:
         stats["error"] = "insufficient_rows_after_indicators"
         return stats
@@ -306,9 +363,38 @@ def refresh_file(
     return stats
 
 
+def _parse_only(raw: Optional[str]) -> List[str]:
+    if not raw:
+        return []
+    out: List[str] = []
+    for part in str(raw).split(","):
+        tf = part.strip()
+        if not tf:
+            continue
+        # Accept 1h as alias for engine key 60.
+        if tf in ("1h", "60m"):
+            tf = "60"
+        if tf not in ALL_TIMEFRAMES:
+            raise SystemExit(
+                f"Unknown timeframe {part!r}. Choose from: {', '.join(ALL_TIMEFRAMES)}"
+            )
+        if tf not in out:
+            out.append(tf)
+    return out
+
+
+def _strategy_for_tf(tf: str) -> Any:
+    if tf in SUPER_TREND_TIMEFRAMES:
+        return DirectionalOptionSelling()
+    return RSIBreadAndButter()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Refresh logs/indicators/{SYMBOL}/{tf}/indicator_history.jsonl from Delta REST."
+        description=(
+            "Refresh logs/indicators/{SYMBOL}/{tf}/indicator_history.jsonl from Delta REST. "
+            "Default: BTC SuperTrend for 1h (60), 4h, and 1d."
+        )
     )
     parser.add_argument(
         "--log-root",
@@ -318,16 +404,28 @@ def main() -> None:
     parser.add_argument("--symbol", default="BTCUSD", help="Delta symbol (default: BTCUSD)")
     parser.add_argument(
         "--only",
-        choices=("1", "5", "60"),
         default=None,
-        help="Refresh only 1m, 5m, or 60m file (default: 1m and 5m)",
+        help=(
+            "Comma-separated TFs to refresh: 60,4h,1d,1,5 "
+            "(aliases: 1h→60). Default: 60,4h,1d"
+        ),
     )
-    parser.add_argument("--days", type=int, default=30, help="Calendar days of history to fetch")
+    parser.add_argument(
+        "--structure",
+        action="store_true",
+        help="Refresh 1m+5m structure files (RSIBreadAndButter) instead of SuperTrend defaults",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        help="Calendar days of history (default: per-TF; 60→60, 4h→120, 1d→365)",
+    )
     parser.add_argument(
         "--min-rows",
         type=int,
-        default=350,
-        help="Minimum indicator rows required to write file",
+        default=None,
+        help="Minimum indicator rows required to write file (default: per-TF)",
     )
     parser.add_argument("--india", action="store_true", default=True, help="Delta India API")
     parser.add_argument("--global", dest="global_api", action="store_true", help="Delta global API")
@@ -342,26 +440,35 @@ def main() -> None:
 
     log_root = os.path.abspath(args.log_root)
     symbol = str(args.symbol).strip().upper()
-    modes = ["1", "5"] if not args.only else [args.only.strip()]
+    if args.structure and args.only:
+        raise SystemExit("Use either --structure or --only, not both")
+    if args.structure:
+        modes = list(STRUCTURE_TIMEFRAMES)
+    elif args.only:
+        modes = _parse_only(args.only)
+    else:
+        modes = list(SUPER_TREND_TIMEFRAMES)
+
     india = not args.global_api
     delta = DeltaSource(testnet=bool(args.testnet), india=india, symbols=[symbol])
-    strategies = {
-        "1": RSIBreadAndButter(),
-        "5": RSIBreadAndButter(),
-        "60": DirectionalOptionSelling(),
-    }
 
     all_stats: List[dict] = []
     for tf in modes:
         path = indicator_history_path(symbol, tf, log_root=log_root)
+        days = int(args.days) if args.days is not None else int(
+            DEFAULT_DAYS_BY_TF.get(tf, 60)
+        )
+        min_rows = int(args.min_rows) if args.min_rows is not None else int(
+            DEFAULT_MIN_ROWS_BY_TF.get(tf, 50)
+        )
         stats = refresh_file(
             hist_path=path,
             symbol=symbol,
             timeframe=tf,
             source=delta,
-            strategy=strategies[tf],
-            days=args.days,
-            min_rows=args.min_rows,
+            strategy=_strategy_for_tf(tf),
+            days=days,
+            min_rows=min_rows,
             dry_run=bool(args.dry_run),
             ignore_cache=bool(args.no_cache),
         )
@@ -372,6 +479,32 @@ def main() -> None:
                 f"Refresh failed for {symbol}/{tf}: {stats['error']} "
                 f"(fetched={stats.get('fetched_bars')}, refreshed={stats.get('refreshed_rows')})"
             )
+
+    # Compact SuperTrend summary across refreshed TFs.
+    summary = []
+    for s in all_stats:
+        if "supertrend" not in s:
+            continue
+        direction = s.get("supertrend_direction")
+        side = (
+            "green"
+            if direction is not None and float(direction) > 0
+            else "red"
+            if direction is not None and float(direction) < 0
+            else "?"
+        )
+        summary.append(
+            {
+                "timeframe": s.get("timeframe"),
+                "bar_ist": s.get("last_bar_ist"),
+                "supertrend": s.get("supertrend"),
+                "direction": side,
+                "close": s.get("close"),
+            }
+        )
+    if summary:
+        print("\n=== SuperTrend snapshot ===")
+        print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":
