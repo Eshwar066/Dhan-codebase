@@ -1,7 +1,8 @@
 from datetime import datetime, timezone
 from types import SimpleNamespace
+import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
@@ -690,6 +691,90 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertAlmostEqual(
             self.strategy._meta_by_structure_id[position.structure_id].supertrend,
             64497.31,
+        )
+
+    def test_trail_sl_modify_fail_keeps_meta_and_retries(self):
+        """ST move + broker modify False → ERROR path, meta stays, pending retry works."""
+        from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (
+            TRAIL_SL_PENDING_RETRY_GAP_SEC,
+            _PositionMeta,
+        )
+
+        instrument = SimpleNamespace(
+            option_type="PE",
+            expiry="240726",
+            strike=64000,
+            trading_symbol="P-BTC-64000-240726",
+            lot_size=1,
+            product_id=99,
+        )
+        position = SimpleNamespace(
+            tag="MAIN",
+            net_qty=-2,
+            structure_id="DirectionalOptionSelling:BTCUSD:weekly:trail-retry",
+            instrument=instrument,
+            intent_id="entry1",
+            avg_price=303,
+        )
+        update_fn = MagicMock(side_effect=[False, False, False, True])
+        broker = SimpleNamespace(
+            find_bracket_leg_order_id=lambda *_a, **_k: "oid-1",
+            update_order_stop_price=update_fn,
+        )
+        ctx = SimpleNamespace(
+            position_store=_PositionStore([position]),
+            intent_store=None,
+            order_router=SimpleNamespace(broker=broker),
+        )
+        sid = position.structure_id
+        self.strategy._confirmed_direction = 1
+        self.strategy._current_supertrend = 65000
+        self.strategy._current_4h_supertrend = 64896.29
+        self.strategy._meta_by_structure_id[sid] = _PositionMeta(
+            symbol="BTCUSD",
+            direction=1,
+            option_type="PE",
+            supertrend=64497.31,
+            strike=64000,
+            expiry="240726",
+            entry_premium=303,
+            entry_reason="weekly_htf_aligned",
+            sleeve="weekly",
+        )
+        candle = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 21, 8, 0, tzinfo=timezone.utc),
+            "close": 65500,
+            "supertrend": 65000,
+            "supertrend_direction": 1,
+            "supertrend_4h": 64896.29,
+        }
+        with patch.object(
+            self.strategy,
+            "_refresh_htf_state",
+            return_value={"4h": (1, 64896.29), "1d": (1, 64000.0)},
+        ):
+            with patch.object(self.strategy, "_build_entry", return_value=None):
+                self.strategy.on_candle(candle, ctx)
+
+        # Immediate attempts exhausted; meta must stay at old ST until broker accepts.
+        self.assertEqual(update_fn.call_count, 3)
+        self.assertAlmostEqual(
+            self.strategy._meta_by_structure_id[sid].supertrend, 64497.31
+        )
+        self.assertIn(sid, self.strategy._pending_trail_retries)
+        pending = self.strategy._pending_trail_retries[sid]
+        self.assertAlmostEqual(pending.target_supertrend, 64896.29)
+
+        # Force pending gap elapsed and retry once more — 4th broker call succeeds.
+        pending.last_attempt_mono = (
+            time.monotonic() - float(TRAIL_SL_PENDING_RETRY_GAP_SEC) - 1.0
+        )
+        self.strategy._retry_pending_trail_sl(ctx)
+        self.assertEqual(update_fn.call_count, 4)
+        self.assertNotIn(sid, self.strategy._pending_trail_retries)
+        self.assertAlmostEqual(
+            self.strategy._meta_by_structure_id[sid].supertrend, 64896.29
         )
 
     def test_htf_prefers_indicator_history_over_rest(self):

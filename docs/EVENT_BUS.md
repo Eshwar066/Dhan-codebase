@@ -35,9 +35,9 @@ Low-level helpers (`_evaluate_strategies_parallel`, `_enqueue_entry_intents_grou
 |-------|-----------|-------------|
 | `BarClosed` | LiveEngine (closed bar pipeline) | Exit handler (p10) → Entry handler (p20) |
 | `ScheduledSlot` | LiveEngine scheduler | ScheduledEvalHandler |
-| `QuoteUpdated` | Feed tick drain (watched GTT symbols); maintenance every loop | GttFallbackBook `on_quote` / `maintenance_tick` |
+| `QuoteUpdated` | Feed tick drain (GTT / reentry / strategy symbols); reentry maintenance each loop | GttFallbackBook; **reentry-at-cost** tick when opted in |
 | `IntentCreated` | Strategy eval / `_run_strategy` | ExecutionHandler → OMS enqueue |
-| `IntentFilled` | OrderRouter `process_fill` | Fill audit |
+| `IntentFilled` | OrderRouter `process_fill` | Fill audit; **reentry-at-cost** arm/stop when strategy opts in |
 | `PositionClosed` | OrderRouter when flat | Fill audit |
 | `FeedDisconnected` | Feed stall detector | FeedSupervisor |
 | `FeedRecovered` | Feed stall cleared | FeedSupervisor |
@@ -52,17 +52,22 @@ Always-on for any live engine: `IntentCreated`, `IntentFilled`, `PositionClosed`
 
 `BarClosed` handlers use a filter built from each strategy's `timeframes` / `symbols` lists (empty = any).
 
+Reentry-at-cost (when a strategy opts in): **bus-only** after `wire_event_bus` — `IntentFilled` arms/stops, `QuoteUpdated` ticks. LiveEngine PM hooks and direct loop ticks no-op (`hooks XOR bus`). Without the bus, the same helpers run from PM hooks / `_maybe_tick_reentry_at_cost`.
+
 ## QuoteUpdated (push, not poll)
 
 ```
 WS tick → tick_queue → _drain_tick_queue
   → candle_aggregator.on_tick
-  → if symbol in GttFallbackBook.active_trading_symbols:
+  → if symbol in GTT / reentry / strategy quote watches:
        publish QuoteUpdated {symbol, bid, ask, ltp, source: feed}
   → GttQuoteHandler → book.on_quote(symbol, quote)
+  → ReentryAtCostQuoteHandler → book.tick()
 ```
 
 Main loop still calls `_run_gtt_fallback_tick` for **maintenance** only (`source: gtt_maintenance` → fill sync + `active_until`). If no feed quote for ≥3s while watches are active, falls back to `book.tick()` (QuoteProvider: feed cache + REST).
+
+When reentry is bus-wired, `_maybe_tick_reentry_at_cost` publishes `QuoteUpdated {source: reentry_maintenance}` instead of calling the book directly.
 
 Scheduled-only engines (empty timeframes) still get a tick queue when `subscriptions.QuoteUpdated` is enabled (`LiveEngine.needs_tick_queue`), and drain ticks while GTT watches are active.
 

@@ -539,8 +539,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         }
         kwargs.pop("ctx", None)
         ctx = self.build_context_only(candle)
-        # OMS reentry-at-cost: stop wait once MAIN is open (handler also listens
-        # to IntentFilled; helper is idempotent / safe if bus unwired).
+        # OMS reentry-at-cost: stop on MAIN open when bus is not wired
+        # (bus path: IntentFilled → ReentryAtCostFillHandler).
         from core.events.handlers.reentry_at_cost import stop_on_main_opened
 
         stop_on_main_opened(
@@ -628,7 +628,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         }
         kwargs.pop("ctx", None)
         ctx = self.build_context_only(candle_stub) if sym else None
-        # OMS reentry-at-cost: arm/cancel via shared helpers (also wired on bus).
+        # OMS reentry-at-cost: arm/cancel when bus is not wired
+        # (bus path: IntentFilled → ReentryAtCostFillHandler).
         from core.events.handlers.reentry_at_cost import (
             arm_from_main_sl,
             cancel_for_structure,
@@ -2725,9 +2726,34 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         book.set_premium_fn(_premium)
 
     def _maybe_tick_reentry_at_cost(self) -> None:
-        """OMS poll: place same-contract re-entries when premium returns to cost."""
-        from core.events.handlers.reentry_at_cost import tick_book
+        """OMS poll: place same-contract re-entries when premium returns to cost.
 
+        When the bus owns reentry, publish ``QuoteUpdated`` (maintenance) so the
+        quote handler is the only tick path. Otherwise call ``tick_book`` directly.
+        """
+        from core.events.handlers.reentry_at_cost import (
+            get_book,
+            reentry_driven_by_bus,
+            tick_book,
+        )
+
+        if reentry_driven_by_bus(self):
+            book = get_book(self)
+            if book is None or not getattr(book, "has_pending", lambda: False)():
+                return
+            bus = getattr(self, "event_bus", None)
+            if bus is None:
+                return
+            from core.events.types import EventType, make_event
+
+            bus.publish(
+                make_event(
+                    EventType.QUOTE_UPDATED,
+                    {"source": "reentry_maintenance", "symbol": ""},
+                    engine_id=getattr(self, "engine_id", None) or "live",
+                )
+            )
+            return
         tick_book(self)
 
     @staticmethod

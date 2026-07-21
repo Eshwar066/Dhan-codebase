@@ -52,10 +52,12 @@ reentry_at_cost = {
 ```
 
 OMS flow (Delta / LiveEngine):
-1. `MAIN_SL` fill → `ReentryAtCostBook.maybe_arm_from_main_sl` (cost = entry premium)
-2. Engine tick polls book; when premium ≤ cost, places same-contract MAIN ENTRY (`:R{n}`)
+1. `MAIN_SL` fill → `IntentFilled` → `ReentryAtCostBook.maybe_arm_from_main_sl` (cost = entry premium)
+2. `QuoteUpdated` (feed or `reentry_maintenance`) → book poll; when premium ≤ cost, places same-contract MAIN ENTRY (`:R{n}`)
 3. Stops when MAIN opens on that contract, max reentries hit, or expiry day ends
 4. Persists under `logs/oms/reentry_at_cost.json`
+
+Path rule: **hooks XOR bus**. After `wire_event_bus`, arm/stop/tick are bus-only; LiveEngine PM hooks no-op. Without the bus, the same helpers run from PM fill hooks / loop tick.
 
 Opt-in fallback spec (`gtt_fallback` in strategy_meta):
 ```python

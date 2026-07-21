@@ -1137,7 +1137,7 @@ class DeltaBroker(BaseBroker):
             return True
         except Exception as exc:
             logger.warning(
-                "Delta update_order_stop_price failed order_id=%s stop=%.4f: %s",
+                "Delta update_order_stop_price FAILED order_id=%s stop=%.4f: %s",
                 oid,
                 float(new_stop_price),
                 exc,

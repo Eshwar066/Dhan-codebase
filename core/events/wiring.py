@@ -16,6 +16,7 @@ from core.events.handlers.logging import register_event_tap
 from core.events.handlers.market import register_bar_closed_handlers
 from core.events.handlers.quotes import register_strategy_quote_handler
 from core.events.handlers.reentry_at_cost import (
+    mark_reentry_bus_wired,
     register_reentry_at_cost_handlers,
     strategy_opts_into_reentry,
 )
@@ -113,9 +114,11 @@ def wire_event_bus(engine: object, bus: EventBus | None = None) -> EventBus:
         register_gtt_quote_handler(ctx)
     if "IntentFilled" in enabled or "PositionClosed" in enabled:
         register_fill_handlers(ctx)
-    # Reentry-at-cost: fill arm/stop + quote poll (needs book + opt-in strategy).
+    # Reentry-at-cost: bus-only arm/stop/tick when handlers register (hooks XOR bus).
     if any(strategy_opts_into_reentry(s) for s in strategies):
         register_reentry_at_cost_handlers(ctx)
+    else:
+        mark_reentry_bus_wired(engine, False)
     if "FeedDisconnected" in enabled or "FeedRecovered" in enabled:
         register_feed_handlers(ctx)
 

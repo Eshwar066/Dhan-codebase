@@ -1156,6 +1156,17 @@ class LiveEngineHelpersMixin:
             return set()
         return {str(s).strip().upper() for s in (fn() or []) if str(s).strip()}
 
+    def _reentry_watch_symbols(self) -> set:
+        book = getattr(
+            getattr(self, "order_router", None), "reentry_at_cost_book", None
+        )
+        if book is None or not getattr(book, "has_pending", lambda: False)():
+            return set()
+        fn = getattr(book, "active_trading_symbols", None)
+        if not callable(fn):
+            return set()
+        return {str(s).strip().upper() for s in (fn() or []) if str(s).strip()}
+
     def _strategy_quote_symbols(self) -> set:
         """Underlying symbols explicitly subscribed to strategy quote hooks."""
         cached = getattr(self, "_strategy_quote_symbols_cache", None)
@@ -1181,7 +1192,11 @@ class LiveEngineHelpersMixin:
         return symbols
 
     def _quote_update_symbols(self) -> set:
-        return self._gtt_watch_symbols() | self._strategy_quote_symbols()
+        return (
+            self._gtt_watch_symbols()
+            | self._strategy_quote_symbols()
+            | self._reentry_watch_symbols()
+        )
 
     def _quote_fields_from_feed(self, symbol: str, ltp: Any) -> dict:
         """Best bid/ask/ltp from realtime feed cache for QuoteUpdated payload."""

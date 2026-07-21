@@ -172,7 +172,7 @@ core/data/
 
 ## Systemd services
 
-Unit files live in `utils/systemd/`. They assume the repo at `/root/Dhan-codebase`, a `.env` in that directory, and Python in `.venv` (except `delta.service`, which uses `venv`).
+Unit files live in `utils/systemd/`. They assume the repo at `/root/Dhan-codebase`, a `.env` in that directory, and Python in **`.venv`** (single shared venv for Dhan and Delta).
 
 ### One-time install
 
@@ -186,11 +186,13 @@ sudo cp utils/systemd/option-buildup-scheduler.service /etc/systemd/system/
 # Optional / legacy:
 sudo cp utils/systemd/dhan-trading.service /etc/systemd/system/
 sudo cp utils/systemd/delta.service /etc/systemd/system/
+sudo cp utils/systemd/delta-instrument-refresh.service /etc/systemd/system/
+sudo cp utils/systemd/delta-instrument-refresh.timer /etc/systemd/system/
 
 sudo systemctl daemon-reload
 ```
 
-If your virtualenv is `venv` instead of `.venv`, edit the `ExecStart=` lines in `/etc/systemd/system/` before running `daemon-reload`.
+All `ExecStart=` lines use `/root/Dhan-codebase/.venv/bin/python`. Do not create a second `venv/` alongside `.venv`.
 
 ### Both Dhan engines (recommended)
 
@@ -258,7 +260,7 @@ Runs `python -m run.main --venue DELTA`.
 
 ```bash
 cd /root/Dhan-codebase
-source .venv/bin/activate   # or: source venv/bin/activate for delta
+source .venv/bin/activate
 
 python -m run.main --engine-id dhan_leaps_rsi
 python -m run.main --engine-id dhan_oi_positional_buy

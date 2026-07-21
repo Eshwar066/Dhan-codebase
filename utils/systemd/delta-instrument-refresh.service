@@ -7,4 +7,4 @@ Wants=network-online.target
 Type=oneshot
 User=root
 WorkingDirectory=/root/Dhan-codebase
-ExecStart=/root/Dhan-codebase/venv/bin/python /root/Dhan-codebase/utils/delta/refresh_delta_instruments.py
+ExecStart=/root/Dhan-codebase/.venv/bin/python /root/Dhan-codebase/utils/delta/refresh_delta_instruments.py

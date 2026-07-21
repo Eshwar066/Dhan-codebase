@@ -170,6 +170,15 @@ class ReentryAtCostBook:
         with self._lock:
             return len(self._watches)
 
+    def active_trading_symbols(self) -> list:
+        """Trading symbols with an armed cost-wait (for QuoteUpdated push)."""
+        with self._lock:
+            return [
+                str(w.trading_symbol).strip()
+                for w in self._watches.values()
+                if str(getattr(w, "trading_symbol", "") or "").strip()
+            ]
+
     # ---------- arm / stop ----------
 
     def maybe_arm_from_main_sl(

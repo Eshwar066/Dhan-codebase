@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time as time_mod
 import uuid
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
@@ -40,6 +41,10 @@ SLEEVE_WEEKLY = "weekly"
 SLEEVE_DAILY = "daily"
 # Weekly entry: if selected Friday is within 2 DTE, roll to next weekly Friday.
 WEEKLY_MIN_DTE = 3
+# Broker MAIN_SL trail modify: loud failure + retries when ST moved but SL did not.
+TRAIL_SL_MODIFY_ATTEMPTS = 3
+TRAIL_SL_IMMEDIATE_RETRY_SLEEP_SEC = 0.35
+TRAIL_SL_PENDING_RETRY_GAP_SEC = 5.0
 
 
 @dataclass(frozen=True)
@@ -53,6 +58,18 @@ class _PositionMeta:
     entry_premium: float
     entry_reason: str
     sleeve: str = SLEEVE_DAILY
+
+
+@dataclass
+class _PendingTrailRetry:
+    """Queued when SuperTrend moved but broker MAIN_SL modify failed."""
+
+    structure_id: str
+    direction: int
+    target_supertrend: float
+    sleeve: str
+    attempts: int = 0
+    last_attempt_mono: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -126,6 +143,8 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         self._confirmed_1d_direction: Optional[int] = None
         self._last_seen_4h_bar_open: Optional[pd.Timestamp] = None
         self._current_4h_supertrend: Optional[float] = None
+        # structure_id → pending broker trail SL retry after failed modify.
+        self._pending_trail_retries: Dict[str, _PendingTrailRetry] = {}
 
     def get_warmup_period(self) -> int:
         return max(50, SUPER_TREND_LENGTH * 4)
@@ -1635,11 +1654,22 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     def _modify_broker_trail_sl(
         self, ctx: Any, position: Any, *, direction: int, supertrend: float
     ) -> bool:
-        """Update resting broker MAIN_SL stop_price to the latest SuperTrend trail level."""
+        """Update resting broker MAIN_SL stop_price to the latest SuperTrend trail level.
+
+        Retries a few times immediately. Callers must treat False as stale SL and
+        queue ``_pending_trail_retries`` so later candles/quotes keep trying.
+        """
         level = self._trail_sl_level(direction, supertrend)
         router = getattr(ctx, "order_router", None)
         broker = getattr(router, "broker", None) if router is not None else None
         if broker is None:
+            logger.error(
+                "%s TRAIL_SL_STALE broker missing sid=%s desired_sl=%.2f ST=%.2f",
+                self.name,
+                getattr(position, "structure_id", None),
+                level,
+                float(supertrend),
+            )
             return False
         sid = str(getattr(position, "structure_id", "") or "")
         qty = abs(int(getattr(position, "net_qty", 0) or 0)) or 1
@@ -1673,9 +1703,9 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 product_id = pid_fn(trading_symbol)
         update_fn = getattr(broker, "update_order_stop_price", None)
         if not callable(update_fn) or not order_id or product_id is None:
-            logger.warning(
-                "%s broker trail SL skipped sid=%s order_id=%s product_id=%s "
-                "level=%.2f ST=%.2f (missing broker update path)",
+            logger.error(
+                "%s TRAIL_SL_STALE sid=%s order_id=%s product_id=%s "
+                "desired_sl=%.2f ST=%.2f (missing broker update path) — will retry",
                 self.name,
                 sid,
                 order_id,
@@ -1684,15 +1714,50 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 float(supertrend),
             )
             return False
-        ok = bool(
-            update_fn(
-                product_id=int(product_id),
-                order_id=str(order_id),
-                new_stop_price=float(level),
-                size=int(qty),
+
+        attempts = max(1, int(TRAIL_SL_MODIFY_ATTEMPTS))
+        last_ok = False
+        for attempt in range(1, attempts + 1):
+            try:
+                last_ok = bool(
+                    update_fn(
+                        product_id=int(product_id),
+                        order_id=str(order_id),
+                        new_stop_price=float(level),
+                        size=int(qty),
+                    )
+                )
+            except Exception as exc:
+                last_ok = False
+                logger.error(
+                    "%s TRAIL_SL_MODIFY_ERROR sid=%s order=%s desired_sl=%.2f "
+                    "ST=%.2f attempt=%s/%s err=%s",
+                    self.name,
+                    sid,
+                    order_id,
+                    level,
+                    float(supertrend),
+                    attempt,
+                    attempts,
+                    exc,
+                )
+            if last_ok:
+                break
+            logger.error(
+                "%s TRAIL_SL_STALE sid=%s order=%s desired_sl=%.2f ST=%.2f "
+                "attempt=%s/%s broker_modify_failed",
+                self.name,
+                sid,
+                order_id,
+                level,
+                float(supertrend),
+                attempt,
+                attempts,
             )
-        )
-        if ok:
+            if attempt < attempts and RUN_MODE != RunMode.BACKTEST:
+                time_mod.sleep(float(TRAIL_SL_IMMEDIATE_RETRY_SLEEP_SEC))
+
+        if last_ok:
             logger.info(
                 "%s broker trail SL updated sid=%s order=%s level=%.2f ST=%.2f",
                 self.name,
@@ -1710,16 +1775,144 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 meta["supertrend"] = float(supertrend)
                 payload["strategy_meta"] = meta
                 rec["payload"] = payload
-        else:
-            logger.warning(
-                "%s broker trail SL update FAILED sid=%s order=%s level=%.2f ST=%.2f",
+            return True
+
+        logger.error(
+            "%s TRAIL_SL_STALE FINAL sid=%s order=%s desired_sl=%.2f ST=%.2f "
+            "after %s attempts — SL not moved; queued for retry",
+            self.name,
+            sid,
+            order_id,
+            level,
+            float(supertrend),
+            attempts,
+        )
+        return False
+
+    def _queue_trail_sl_retry(
+        self,
+        *,
+        structure_id: str,
+        direction: int,
+        target_supertrend: float,
+        sleeve: str,
+        prev_ref: Optional[float],
+    ) -> None:
+        sid = str(structure_id or "").strip()
+        if not sid:
+            return
+        desired = self._trail_sl_level(int(direction), float(target_supertrend))
+        stale = (
+            self._trail_sl_level(int(direction), float(prev_ref))
+            if prev_ref is not None
+            else None
+        )
+        existing = self._pending_trail_retries.get(sid)
+        attempts = int(existing.attempts) if existing is not None else 0
+        self._pending_trail_retries[sid] = _PendingTrailRetry(
+            structure_id=sid,
+            direction=int(direction),
+            target_supertrend=float(target_supertrend),
+            sleeve=str(sleeve or SLEEVE_DAILY),
+            attempts=attempts,
+            last_attempt_mono=time_mod.monotonic(),
+        )
+        logger.error(
+            "%s TRAIL_SL_RETRY_QUEUED sid=%s sleeve=%s ST %.2f -> %.2f "
+            "broker_sl %.2f -> %.2f (meta not advanced until modify succeeds)",
+            self.name,
+            sid,
+            sleeve,
+            float(prev_ref) if prev_ref is not None else float("nan"),
+            float(target_supertrend),
+            float(stale) if stale is not None else float("nan"),
+            float(desired),
+        )
+
+    def _clear_trail_sl_retry(self, structure_id: Any) -> None:
+        sid = str(structure_id or "").strip()
+        if sid:
+            self._pending_trail_retries.pop(sid, None)
+
+    def _apply_trail_sl_update(
+        self,
+        ctx: Any,
+        position: Any,
+        *,
+        direction: int,
+        ref_st: float,
+        sleeve: str,
+        prev_ref: Optional[float],
+    ) -> bool:
+        """Modify broker SL to ``ref_st`` trail; update meta only on success."""
+        sid = str(getattr(position, "structure_id", "") or "")
+        updated = self._modify_broker_trail_sl(
+            ctx,
+            position,
+            direction=int(direction),
+            supertrend=float(ref_st),
+        )
+        meta = self._meta_by_structure_id.get(sid) if sid else None
+        if updated:
+            self._clear_trail_sl_retry(sid)
+            if meta is not None and sid:
+                self._meta_by_structure_id[sid] = replace(
+                    meta, supertrend=float(ref_st)
+                )
+            return True
+        self._queue_trail_sl_retry(
+            structure_id=sid,
+            direction=int(direction),
+            target_supertrend=float(ref_st),
+            sleeve=str(sleeve or SLEEVE_DAILY),
+            prev_ref=float(prev_ref) if prev_ref is not None else None,
+        )
+        return False
+
+    def _retry_pending_trail_sl(self, ctx: Any) -> None:
+        """Re-attempt broker trail modifies that failed after an ST move."""
+        if not self._pending_trail_retries:
+            return
+        now = time_mod.monotonic()
+        gap = float(TRAIL_SL_PENDING_RETRY_GAP_SEC)
+        open_by_sid = {
+            str(getattr(p, "structure_id", "") or ""): p
+            for p in self._open_main_positions(ctx)
+        }
+        for sid, pending in list(self._pending_trail_retries.items()):
+            position = open_by_sid.get(sid)
+            if position is None or sid in self._pending_exit_structure_ids:
+                self._clear_trail_sl_retry(sid)
+                continue
+            if (now - float(pending.last_attempt_mono or 0.0)) < gap:
+                continue
+            meta = self._ensure_meta(position, ctx)
+            prev_ref = float(meta.supertrend) if meta is not None else None
+            target = float(pending.target_supertrend)
+            if prev_ref is not None and abs(target - prev_ref) <= 1e-9:
+                # Meta already matches target (e.g. restored); still push broker.
+                pass
+            pending.attempts = int(pending.attempts or 0) + 1
+            pending.last_attempt_mono = now
+            logger.error(
+                "%s TRAIL_SL_RETRY sid=%s sleeve=%s attempt=%s desired_ST=%.2f "
+                "desired_sl=%.2f meta_ST=%s",
                 self.name,
                 sid,
-                order_id,
-                level,
-                float(supertrend),
+                pending.sleeve,
+                pending.attempts,
+                target,
+                self._trail_sl_level(int(pending.direction), target),
+                f"{prev_ref:.2f}" if prev_ref is not None else "None",
             )
-        return ok
+            self._apply_trail_sl_update(
+                ctx,
+                position,
+                direction=int(pending.direction),
+                ref_st=target,
+                sleeve=str(pending.sleeve or SLEEVE_DAILY),
+                prev_ref=prev_ref,
+            )
 
     def _broker_still_has_position(self, ctx: Any, position: Any) -> bool:
         """True when local MAIN is open; prefer live broker position check when available."""
@@ -2074,28 +2267,16 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 continue
             prev_ref = float(meta.supertrend) if meta is not None else previous_st
             if prev_ref is not None and abs(ref_st - float(prev_ref)) > 1e-9:
-                updated = self._modify_broker_trail_sl(
+                self._apply_trail_sl_update(
                     ctx,
                     position,
                     direction=pos_dir,
-                    supertrend=ref_st,
+                    ref_st=ref_st,
+                    sleeve=sleeve,
+                    prev_ref=float(prev_ref),
                 )
-                if meta is not None and updated:
-                    sid = str(getattr(position, "structure_id", "") or "")
-                    if sid:
-                        self._meta_by_structure_id[sid] = replace(
-                            meta, supertrend=ref_st
-                        )
-                elif meta is not None and not updated:
-                    logger.warning(
-                        "%s weekly/daily trail ST moved %.2f -> %.2f but broker "
-                        "MAIN_SL was not updated sid=%s sleeve=%s",
-                        self.name,
-                        float(prev_ref),
-                        ref_st,
-                        getattr(position, "structure_id", None),
-                        sleeve,
-                    )
+        # Keep retrying any prior ST-move where broker MAIN_SL stayed stale.
+        self._retry_pending_trail_sl(ctx)
 
         deferred = self._consume_pending_closed_entry(candle, ctx, direction)
         if deferred is not None:
@@ -2232,6 +2413,8 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     def on_quote(self, quote: dict, ctx: Any) -> Optional[List[Any]]:
         if str(quote.get("symbol") or "").strip().upper() != "BTCUSD":
             return None
+        # Broker trail SL may have failed on the last ST move — retry between bars.
+        self._retry_pending_trail_sl(ctx)
         timestamp = quote.get("ts")
         try:
             tick_dt = datetime.fromtimestamp(float(timestamp), tz=timezone.utc)
@@ -2518,6 +2701,7 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             )
         )
         self._meta_by_structure_id.pop(sid, None)
+        self._clear_trail_sl_retry(sid)
         if transition is not None and transition.previous_structure_id == sid:
             self._pending_transition = None
             self._clear_sl_reentry()

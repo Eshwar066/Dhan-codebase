@@ -171,7 +171,7 @@ flowchart TD
 
 | Rule | Level | Who fires |
 |------|-------|-----------|
-| Trail SL | ST ± **100** | Broker `MAIN_SL` (weekly uses 4H ST; daily uses 1H ST) |
+| Trail SL | ST ± **100** | Broker `MAIN_SL` (weekly uses 4H ST; daily uses 1H ST). Modify failures log `TRAIL_SL_STALE` at ERROR, retry 3× immediately, then every ~5s via quote/candle until broker accepts (meta ST advances only on success). |
 | Force exit | ST ± **300** | Strategy (quote / candle) |
 | Strike proximity | Spot within ± **50** of option strike | Strategy |
 | Expiry rollover | **17:25 IST** if holding today’s expiry | Exit + re-enter next daily (≥ 200 pts from ST) |

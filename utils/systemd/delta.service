@@ -5,7 +5,7 @@ After=network.target
 [Service]
 User=root
 WorkingDirectory=/root/Dhan-codebase
-ExecStart=/root/Dhan-codebase/venv/bin/python -m run.main --venue DELTA
+ExecStart=/root/Dhan-codebase/.venv/bin/python -m run.main --venue DELTA
 Restart=always
 RestartSec=5
 StandardOutput=append:/root/delta.log
