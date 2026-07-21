@@ -2,6 +2,15 @@
 
 BTC SuperTrend **directional option selling** on Delta Exchange.
 
+## Layout
+
+| File | Owns |
+|------|------|
+| `DirectionalOptionSelling.py` | Strategy lifecycle (entry/exit/rollover/eval) |
+| `htf.py` (`DosHtfMixin`) | 1D/4H SuperTrend fetch, cache, entry alignment |
+| `trail_sl.py` (`DosTrailSlMixin`) | Broker MAIN_SL trail levels, modify, pending retry |
+| `constants.py` | Shared knobs (ST params, trail points, sleeves) |
+
 Sells puts when bullish, sells calls when bearish. Runs **two sleeves in parallel**:
 
 | Sleeve | Signal | HTF filter | Strike reference | Expiry |

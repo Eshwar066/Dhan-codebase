@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import logging
-import time as time_mod
 import uuid
 from dataclasses import dataclass, replace
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -16,35 +15,29 @@ from core.strategies.base import BaseStrategy
 from core.strategies.IndiaMktMixins import IST, IndiaMktMixins
 from core.strategies.deltaMktMixins import DeltaMktMixins, _delta_source_from_ctx
 from core.strategies.meta import pack_strategy_meta, unpack_strategy_meta
-from core.utils import indicator_history as ind_hist
 from core.utils.structure.supertrend import add_supertrend, supertrend_column_names
 
-logger = logging.getLogger(__name__)
+from .constants import (
+    HTF_TIMEFRAMES,
+    META_KEY,
+    MIN_PREMIUM_USD,
+    ORDER_QTY_LOTS,
+    ROLLOVER_MIN_STRIKE_DISTANCE,
+    ROLLOVER_TIME,
+    SLEEVE_DAILY,
+    SLEEVE_WEEKLY,
+    STRIKE_PROXIMITY_EXIT_POINTS,
+    SUPER_TREND_FACTOR,
+    SUPER_TREND_LENGTH,
+    # Re-exported for tests / callers that import from this module.
+    TRAIL_SL_PENDING_RETRY_GAP_SEC,
+    TRAIL_SL_POINTS,
+    WEEKLY_MIN_DTE,
+)
+from .htf import DosHtfMixin
+from .trail_sl import DosTrailSlMixin, PendingTrailRetry as _PendingTrailRetry
 
-SUPER_TREND_LENGTH = 16
-SUPER_TREND_FACTOR = 1.5
-MIN_PREMIUM_USD = 120
-# Broker MAIN_SL trails SuperTrend on the spot index: bullish ST-100 / bearish ST+100.
-TRAIL_SL_POINTS = 100.0
-# Strategy emergency: if spot breaches ST±300 and the position is still open, fire LIMIT exit.
-FORCE_EXIT_POINTS = 300.0
-# Extra risk: if spot trades within ±50 of the open option strike, exit immediately.
-STRIKE_PROXIMITY_EXIT_POINTS = 50.0
-ROLLOVER_TIME = time(17, 25)
-ROLLOVER_MIN_STRIKE_DISTANCE = 200.0
-ORDER_QTY_LOTS = 2
-META_KEY = "directional_option_selling"
-# Higher-TF SuperTrend: weekly on 1D+4H align; daily on 1H with 1D+4H filter.
-HTF_TIMEFRAMES = ("4h", "1d")
-HTF_LOOKBACK_DAYS = {"4h": 45, "1d": 120}
-SLEEVE_WEEKLY = "weekly"
-SLEEVE_DAILY = "daily"
-# Weekly entry: if selected Friday is within 2 DTE, roll to next weekly Friday.
-WEEKLY_MIN_DTE = 3
-# Broker MAIN_SL trail modify: loud failure + retries when ST moved but SL did not.
-TRAIL_SL_MODIFY_ATTEMPTS = 3
-TRAIL_SL_IMMEDIATE_RETRY_SLEEP_SEC = 0.35
-TRAIL_SL_PENDING_RETRY_GAP_SEC = 5.0
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -58,18 +51,6 @@ class _PositionMeta:
     entry_premium: float
     entry_reason: str
     sleeve: str = SLEEVE_DAILY
-
-
-@dataclass
-class _PendingTrailRetry:
-    """Queued when SuperTrend moved but broker MAIN_SL modify failed."""
-
-    structure_id: str
-    direction: int
-    target_supertrend: float
-    sleeve: str
-    attempts: int = 0
-    last_attempt_mono: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -94,7 +75,7 @@ class _PendingClosedEntry:
     sleeve: str = SLEEVE_DAILY
 
 
-class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
+class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     """
     Dual-sleeve BTC SuperTrend option selling:
 
@@ -164,297 +145,6 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             length=self.supertrend_length,
             factor=self.supertrend_factor,
         )
-
-    @staticmethod
-    def _tf_bar_seconds(timeframe: str) -> int:
-        from core.data.candle_aggregator import TIMEFRAME_SECONDS
-
-        key = str(timeframe or "").strip()
-        return int(TIMEFRAME_SECONDS.get(key) or TIMEFRAME_SECONDS.get(key.lower()) or 0)
-
-    def _as_of_utc(self, candle: dict) -> pd.Timestamp:
-        """Evaluation instant: prefer closed 1H bar time, else candle timestamp."""
-        try:
-            if self._bar_is_fully_closed(candle):
-                return self._closed_bar_time_ist(candle).tz_convert("UTC")
-        except Exception:
-            pass
-        ts = self._timestamp_ist(candle["timestamp"]).tz_convert("UTC")
-        return ts
-
-    def _latest_closed_st_from_df(
-        self, df: pd.DataFrame, *, timeframe: str, as_of_utc: pd.Timestamp
-    ) -> Optional[Tuple[int, float, pd.Timestamp]]:
-        """Return (direction, supertrend, bar_open_utc) for the last fully closed HTF bar."""
-        if df is None or df.empty:
-            return None
-        bar_sec = self._tf_bar_seconds(timeframe)
-        if bar_sec <= 0:
-            return None
-        work = df.copy()
-        work["timestamp"] = pd.to_datetime(work["timestamp"], utc=True)
-        work = work.sort_values("timestamp").reset_index(drop=True)
-        work = self.prepare_indicators(work)
-        if "supertrend" not in work.columns or "supertrend_direction" not in work.columns:
-            return None
-        close_at = work["timestamp"] + pd.Timedelta(seconds=bar_sec)
-        as_of = pd.Timestamp(as_of_utc)
-        if as_of.tzinfo is None:
-            as_of = as_of.tz_localize("UTC")
-        else:
-            as_of = as_of.tz_convert("UTC")
-        closed = work.loc[close_at <= as_of]
-        if closed.empty:
-            return None
-        row = closed.iloc[-1]
-        direction = self._normal_direction(row.get("supertrend_direction"))
-        try:
-            st = float(row.get("supertrend"))
-        except (TypeError, ValueError):
-            return None
-        if direction is None or pd.isna(st) or st <= 0:
-            return None
-        return direction, st, pd.Timestamp(row["timestamp"]).tz_convert("UTC")
-
-    def _fetch_htf_ohlc(
-        self, ctx: Any, timeframe: str, as_of_utc: pd.Timestamp
-    ) -> Optional[pd.DataFrame]:
-        source = _delta_source_from_ctx(ctx)
-        if source is None or not hasattr(source, "get_intraday"):
-            return None
-        lookback = int(HTF_LOOKBACK_DAYS.get(timeframe, 60))
-        end_d = pd.Timestamp(as_of_utc).tz_convert("UTC").date()
-        start_d = end_d - timedelta(days=lookback)
-        try:
-            return source.get_intraday(
-                "BTCUSD",
-                start_d.isoformat(),
-                end_d.isoformat(),
-                timeframe,
-                force_refresh_tail=True,
-            )
-        except Exception as exc:
-            logger.warning(
-                "%s HTF fetch failed tf=%s: %s", self.name, timeframe, exc
-            )
-            return None
-
-    def _latest_closed_st_from_indicator_history(
-        self, timeframe: str, as_of_utc: pd.Timestamp
-    ) -> Optional[Tuple[int, float, pd.Timestamp]]:
-        """
-        Last fully closed SuperTrend from live ``indicator_history.jsonl``.
-
-        Preferred over REST for trailing: live_append already has the new 4H ST
-        while get_intraday can lag and leave MAIN_SL stuck at entry ST.
-        """
-        bar_sec = self._tf_bar_seconds(timeframe)
-        if bar_sec <= 0:
-            return None
-        as_of = pd.Timestamp(as_of_utc)
-        if as_of.tzinfo is None:
-            as_of = as_of.tz_localize("UTC")
-        else:
-            as_of = as_of.tz_convert("UTC")
-        try:
-            rows = ind_hist.load_indicator_history_rows(
-                "BTCUSD", timeframe, max_rows=80
-            )
-        except Exception as exc:
-            logger.debug(
-                "%s indicator history read failed tf=%s: %s",
-                self.name,
-                timeframe,
-                exc,
-            )
-            return None
-        best: Optional[Tuple[int, float, pd.Timestamp]] = None
-        for row in rows or []:
-            ts = row.get("timestamp")
-            if ts is None:
-                continue
-            bar_open = pd.Timestamp(ts)
-            if bar_open.tzinfo is None:
-                bar_open = bar_open.tz_localize("UTC")
-            else:
-                bar_open = bar_open.tz_convert("UTC")
-            close_at = bar_open + pd.Timedelta(seconds=bar_sec)
-            if close_at > as_of:
-                continue
-            ind = row.get("indicators") if isinstance(row.get("indicators"), dict) else {}
-            direction = self._normal_direction(
-                ind.get("supertrend_direction")
-                if ind
-                else row.get("supertrend_direction")
-            )
-            try:
-                st = float(
-                    (ind.get("supertrend") if ind else None)
-                    or row.get("supertrend")
-                    or 0
-                )
-            except (TypeError, ValueError):
-                continue
-            if direction is None or pd.isna(st) or st <= 0:
-                continue
-            best = (int(direction), float(st), bar_open)
-        return best
-
-    def _htf_supertrend(
-        self, ctx: Any, timeframe: str, candle: dict
-    ) -> Optional[Tuple[int, float, pd.Timestamp]]:
-        """Cached last-closed SuperTrend for ``timeframe`` (4h / 1d)."""
-        as_of = self._as_of_utc(candle)
-        cached = self._htf_st_cache.get(timeframe)
-        bar_sec = self._tf_bar_seconds(timeframe)
-        # Prefer live indicator history (updated on 4h/1d close) over REST.
-        hist = self._latest_closed_st_from_indicator_history(timeframe, as_of)
-        if hist is not None:
-            if cached is None or hist[2] > cached[2] or abs(hist[1] - cached[1]) > 1e-6:
-                self._htf_st_cache[timeframe] = hist
-            return self._htf_st_cache[timeframe]
-        if cached is not None and bar_sec > 0:
-            _dir, _st, bar_open = cached
-            next_close = bar_open + pd.Timedelta(seconds=bar_sec)
-            # Still on the same closed HTF bar — reuse cache.
-            if as_of < next_close + pd.Timedelta(seconds=bar_sec):
-                return cached
-        df = self._fetch_htf_ohlc(ctx, timeframe, as_of)
-        snap = self._latest_closed_st_from_df(df, timeframe=timeframe, as_of_utc=as_of)
-        if snap is not None:
-            self._htf_st_cache[timeframe] = snap
-        return snap
-
-    def _htf_snapshot(
-        self, ctx: Any, candle: dict
-    ) -> Optional[Dict[str, Tuple[int, float]]]:
-        """
-        Return ``{"4h": (dir, st), "1d": (dir, st)}`` when both HTFs are available.
-        """
-        out: Dict[str, Tuple[int, float]] = {}
-        for tf in HTF_TIMEFRAMES:
-            snap = self._htf_supertrend(ctx, tf, candle)
-            if snap is None:
-                return None
-            direction, st, _bar = snap
-            out[tf] = (int(direction), float(st))
-        return out
-
-    def _htf_entry_allowed(
-        self, direction: int, ctx: Any, candle: dict
-    ) -> bool:
-        """Backward-compatible alias: weekly-style 1D+4H alignment."""
-        return self._weekly_htf_aligned(direction, ctx, candle)
-
-    def _stamp_htf_on_candle(
-        self, candle: dict, snap: Dict[str, Tuple[int, float]]
-    ) -> None:
-        d4, st4 = snap["4h"]
-        d1d, st1d = snap["1d"]
-        candle["supertrend_4h"] = st4
-        candle["supertrend_4h_direction"] = d4
-        candle["supertrend_1d"] = st1d
-        candle["supertrend_1d_direction"] = d1d
-
-    def _weekly_htf_aligned(
-        self, direction: int, ctx: Any, candle: dict
-    ) -> bool:
-        """Weekly sleeve: 1D and 4H SuperTrend must both match direction."""
-        want = self._normal_direction(direction)
-        if want is None:
-            return False
-        snap = self._htf_snapshot(ctx, candle)
-        if snap is None:
-            logger.info(
-                "%s weekly entry blocked: missing 1D/4H SuperTrend",
-                self.name,
-            )
-            return False
-        self._stamp_htf_on_candle(candle, snap)
-        d4, st4 = snap["4h"]
-        d1d, st1d = snap["1d"]
-        if d4 != want or d1d != want:
-            logger.info(
-                "%s weekly entry blocked: want=%s 4h=%s (%.2f) 1d=%s (%.2f)",
-                self.name,
-                want,
-                d4,
-                st4,
-                d1d,
-                st1d,
-            )
-            return False
-        logger.info(
-            "%s weekly HTF aligned direction=%s 4h_ST=%.2f 1d_ST=%.2f",
-            self.name,
-            want,
-            st4,
-            st1d,
-        )
-        return True
-
-    def _daily_htf_aligned(
-        self, direction: int, ctx: Any, candle: dict
-    ) -> bool:
-        """
-        Daily sleeve filter: long only if 1D+4H green; short only if 1D+4H red.
-        Entry/exit timing itself is driven by the 1H SuperTrend.
-        """
-        want = self._normal_direction(direction)
-        if want is None:
-            return False
-        snap = self._htf_snapshot(ctx, candle)
-        if snap is None:
-            logger.info(
-                "%s daily entry blocked: missing 1D/4H SuperTrend",
-                self.name,
-            )
-            return False
-        self._stamp_htf_on_candle(candle, snap)
-        d4, st4 = snap["4h"]
-        d1d, st1d = snap["1d"]
-        if d4 != want or d1d != want:
-            logger.info(
-                "%s daily entry blocked: 1H want=%s needs 4h+1d same; "
-                "4h=%s (%.2f) 1d=%s (%.2f)",
-                self.name,
-                want,
-                d4,
-                st4,
-                d1d,
-                st1d,
-            )
-            return False
-        logger.info(
-            "%s daily HTF aligned with 1H direction=%s 4h_ST=%.2f 1d_ST=%.2f",
-            self.name,
-            want,
-            st4,
-            st1d,
-        )
-        return True
-
-    def _refresh_htf_state(
-        self, ctx: Any, candle: dict
-    ) -> Optional[Dict[str, Tuple[int, float]]]:
-        """Update cached 1D/4H directions. Returns snapshot or None."""
-        snap = self._htf_snapshot(ctx, candle)
-        if snap is None:
-            return None
-        self._stamp_htf_on_candle(candle, snap)
-        d4, st4 = snap["4h"]
-        d1d, _st1d = snap["1d"]
-        self._current_4h_supertrend = float(st4)
-        bar_open = None
-        cached = self._htf_st_cache.get("4h")
-        if cached is not None:
-            bar_open = cached[2]
-        if bar_open is not None:
-            self._last_seen_4h_bar_open = bar_open
-        self._confirmed_4h_direction = int(d4)
-        self._confirmed_1d_direction = int(d1d)
-        return snap
-
     def _weekly_expiry_for_entry(self, candle: dict, ctx: Any) -> str:
         """
         Friday weekly expiry code. If DTE <= 2, shift to the next weekly Friday.
@@ -489,23 +179,6 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     @staticmethod
     def _option_type(direction: int) -> str:
         return "PE" if direction > 0 else "CE"
-
-    @staticmethod
-    def _trail_sl_level(direction: int, supertrend: float) -> float:
-        """Broker SL level. Bullish: ST - 100. Bearish: ST + 100."""
-        st = float(supertrend)
-        if direction > 0:
-            return st - TRAIL_SL_POINTS
-        return st + TRAIL_SL_POINTS
-
-    @staticmethod
-    def _force_exit_level(direction: int, supertrend: float) -> float:
-        """Strategy emergency exit level. Bullish: ST - 300. Bearish: ST + 300."""
-        st = float(supertrend)
-        if direction > 0:
-            return st - FORCE_EXIT_POINTS
-        return st + FORCE_EXIT_POINTS
-
     @staticmethod
     def _spot_hits_level(
         *,
@@ -1620,300 +1293,6 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 "exit_reason": "broker_main_sl",
             },
         )
-
-    def _find_main_sl_record(self, ctx: Any, structure_id: str) -> Optional[dict]:
-        intent_store = getattr(ctx, "intent_store", None)
-        if intent_store is None or not callable(getattr(intent_store, "list_by_status", None)):
-            return None
-        from core.orderExecution.intent_store import IntentStatus
-
-        pending = []
-        for status in (
-            IntentStatus.SENT,
-            IntentStatus.ACKED,
-            IntentStatus.VALIDATED,
-        ):
-            pending.extend(intent_store.list_by_status(status) or [])
-        for rec in pending:
-            payload = rec.get("payload") or {}
-            if str(payload.get("structure_id") or rec.get("structure_id") or "") != str(
-                structure_id
-            ):
-                continue
-            if str(payload.get("tag") or rec.get("tag") or "").upper() != "MAIN_SL":
-                continue
-            if str(payload.get("strategy") or rec.get("strategy") or "") not in {
-                "",
-                self.name,
-            }:
-                if str(payload.get("strategy_id") or "") != self.name:
-                    continue
-            return rec
-        return None
-
-    def _modify_broker_trail_sl(
-        self, ctx: Any, position: Any, *, direction: int, supertrend: float
-    ) -> bool:
-        """Update resting broker MAIN_SL stop_price to the latest SuperTrend trail level.
-
-        Retries a few times immediately. Callers must treat False as stale SL and
-        queue ``_pending_trail_retries`` so later candles/quotes keep trying.
-        """
-        level = self._trail_sl_level(direction, supertrend)
-        router = getattr(ctx, "order_router", None)
-        broker = getattr(router, "broker", None) if router is not None else None
-        if broker is None:
-            logger.error(
-                "%s TRAIL_SL_STALE broker missing sid=%s desired_sl=%.2f ST=%.2f",
-                self.name,
-                getattr(position, "structure_id", None),
-                level,
-                float(supertrend),
-            )
-            return False
-        sid = str(getattr(position, "structure_id", "") or "")
-        qty = abs(int(getattr(position, "net_qty", 0) or 0)) or 1
-        inst = getattr(position, "instrument", None)
-        trading_symbol = str(getattr(inst, "trading_symbol", "") or "")
-
-        # Simulated / paper: update pending SL book directly when available.
-        update_pending = getattr(broker, "update_pending_sl_trigger", None)
-        if callable(update_pending) and sid:
-            if update_pending(sid, level):
-                logger.info(
-                    "%s broker trail SL updated sid=%s level=%.2f (sim)",
-                    self.name,
-                    sid,
-                    level,
-                )
-                return True
-
-        order_id = None
-        product_id = getattr(inst, "product_id", None) if inst is not None else None
-        find_oid = getattr(broker, "find_bracket_leg_order_id", None)
-        if callable(find_oid) and trading_symbol:
-            order_id = find_oid(trading_symbol, "MAIN_SL")
-        rec = self._find_main_sl_record(ctx, sid)
-        if not order_id and rec is not None:
-            order_id = rec.get("broker_order_id")
-        if product_id is None and trading_symbol:
-            api = getattr(broker, "api", None)
-            pid_fn = getattr(api, "product_id_for_symbol", None) if api is not None else None
-            if callable(pid_fn):
-                product_id = pid_fn(trading_symbol)
-        update_fn = getattr(broker, "update_order_stop_price", None)
-        if not callable(update_fn) or not order_id or product_id is None:
-            logger.error(
-                "%s TRAIL_SL_STALE sid=%s order_id=%s product_id=%s "
-                "desired_sl=%.2f ST=%.2f (missing broker update path) — will retry",
-                self.name,
-                sid,
-                order_id,
-                product_id,
-                level,
-                float(supertrend),
-            )
-            return False
-
-        attempts = max(1, int(TRAIL_SL_MODIFY_ATTEMPTS))
-        last_ok = False
-        for attempt in range(1, attempts + 1):
-            try:
-                last_ok = bool(
-                    update_fn(
-                        product_id=int(product_id),
-                        order_id=str(order_id),
-                        new_stop_price=float(level),
-                        size=int(qty),
-                    )
-                )
-            except Exception as exc:
-                last_ok = False
-                logger.error(
-                    "%s TRAIL_SL_MODIFY_ERROR sid=%s order=%s desired_sl=%.2f "
-                    "ST=%.2f attempt=%s/%s err=%s",
-                    self.name,
-                    sid,
-                    order_id,
-                    level,
-                    float(supertrend),
-                    attempt,
-                    attempts,
-                    exc,
-                )
-            if last_ok:
-                break
-            logger.error(
-                "%s TRAIL_SL_STALE sid=%s order=%s desired_sl=%.2f ST=%.2f "
-                "attempt=%s/%s broker_modify_failed",
-                self.name,
-                sid,
-                order_id,
-                level,
-                float(supertrend),
-                attempt,
-                attempts,
-            )
-            if attempt < attempts and RUN_MODE != RunMode.BACKTEST:
-                time_mod.sleep(float(TRAIL_SL_IMMEDIATE_RETRY_SLEEP_SEC))
-
-        if last_ok:
-            logger.info(
-                "%s broker trail SL updated sid=%s order=%s level=%.2f ST=%.2f",
-                self.name,
-                sid,
-                order_id,
-                level,
-                float(supertrend),
-            )
-            if rec is not None:
-                payload = rec.get("payload") or {}
-                payload["trigger_price"] = float(level)
-                payload["price"] = float(level)
-                meta = dict(payload.get("strategy_meta") or {})
-                meta["trail_sl_level"] = float(level)
-                meta["supertrend"] = float(supertrend)
-                payload["strategy_meta"] = meta
-                rec["payload"] = payload
-            return True
-
-        logger.error(
-            "%s TRAIL_SL_STALE FINAL sid=%s order=%s desired_sl=%.2f ST=%.2f "
-            "after %s attempts — SL not moved; queued for retry",
-            self.name,
-            sid,
-            order_id,
-            level,
-            float(supertrend),
-            attempts,
-        )
-        return False
-
-    def _queue_trail_sl_retry(
-        self,
-        *,
-        structure_id: str,
-        direction: int,
-        target_supertrend: float,
-        sleeve: str,
-        prev_ref: Optional[float],
-    ) -> None:
-        sid = str(structure_id or "").strip()
-        if not sid:
-            return
-        desired = self._trail_sl_level(int(direction), float(target_supertrend))
-        stale = (
-            self._trail_sl_level(int(direction), float(prev_ref))
-            if prev_ref is not None
-            else None
-        )
-        existing = self._pending_trail_retries.get(sid)
-        attempts = int(existing.attempts) if existing is not None else 0
-        self._pending_trail_retries[sid] = _PendingTrailRetry(
-            structure_id=sid,
-            direction=int(direction),
-            target_supertrend=float(target_supertrend),
-            sleeve=str(sleeve or SLEEVE_DAILY),
-            attempts=attempts,
-            last_attempt_mono=time_mod.monotonic(),
-        )
-        logger.error(
-            "%s TRAIL_SL_RETRY_QUEUED sid=%s sleeve=%s ST %.2f -> %.2f "
-            "broker_sl %.2f -> %.2f (meta not advanced until modify succeeds)",
-            self.name,
-            sid,
-            sleeve,
-            float(prev_ref) if prev_ref is not None else float("nan"),
-            float(target_supertrend),
-            float(stale) if stale is not None else float("nan"),
-            float(desired),
-        )
-
-    def _clear_trail_sl_retry(self, structure_id: Any) -> None:
-        sid = str(structure_id or "").strip()
-        if sid:
-            self._pending_trail_retries.pop(sid, None)
-
-    def _apply_trail_sl_update(
-        self,
-        ctx: Any,
-        position: Any,
-        *,
-        direction: int,
-        ref_st: float,
-        sleeve: str,
-        prev_ref: Optional[float],
-    ) -> bool:
-        """Modify broker SL to ``ref_st`` trail; update meta only on success."""
-        sid = str(getattr(position, "structure_id", "") or "")
-        updated = self._modify_broker_trail_sl(
-            ctx,
-            position,
-            direction=int(direction),
-            supertrend=float(ref_st),
-        )
-        meta = self._meta_by_structure_id.get(sid) if sid else None
-        if updated:
-            self._clear_trail_sl_retry(sid)
-            if meta is not None and sid:
-                self._meta_by_structure_id[sid] = replace(
-                    meta, supertrend=float(ref_st)
-                )
-            return True
-        self._queue_trail_sl_retry(
-            structure_id=sid,
-            direction=int(direction),
-            target_supertrend=float(ref_st),
-            sleeve=str(sleeve or SLEEVE_DAILY),
-            prev_ref=float(prev_ref) if prev_ref is not None else None,
-        )
-        return False
-
-    def _retry_pending_trail_sl(self, ctx: Any) -> None:
-        """Re-attempt broker trail modifies that failed after an ST move."""
-        if not self._pending_trail_retries:
-            return
-        now = time_mod.monotonic()
-        gap = float(TRAIL_SL_PENDING_RETRY_GAP_SEC)
-        open_by_sid = {
-            str(getattr(p, "structure_id", "") or ""): p
-            for p in self._open_main_positions(ctx)
-        }
-        for sid, pending in list(self._pending_trail_retries.items()):
-            position = open_by_sid.get(sid)
-            if position is None or sid in self._pending_exit_structure_ids:
-                self._clear_trail_sl_retry(sid)
-                continue
-            if (now - float(pending.last_attempt_mono or 0.0)) < gap:
-                continue
-            meta = self._ensure_meta(position, ctx)
-            prev_ref = float(meta.supertrend) if meta is not None else None
-            target = float(pending.target_supertrend)
-            if prev_ref is not None and abs(target - prev_ref) <= 1e-9:
-                # Meta already matches target (e.g. restored); still push broker.
-                pass
-            pending.attempts = int(pending.attempts or 0) + 1
-            pending.last_attempt_mono = now
-            logger.error(
-                "%s TRAIL_SL_RETRY sid=%s sleeve=%s attempt=%s desired_ST=%.2f "
-                "desired_sl=%.2f meta_ST=%s",
-                self.name,
-                sid,
-                pending.sleeve,
-                pending.attempts,
-                target,
-                self._trail_sl_level(int(pending.direction), target),
-                f"{prev_ref:.2f}" if prev_ref is not None else "None",
-            )
-            self._apply_trail_sl_update(
-                ctx,
-                position,
-                direction=int(pending.direction),
-                ref_st=target,
-                sleeve=str(pending.sleeve or SLEEVE_DAILY),
-                prev_ref=prev_ref,
-            )
-
     def _broker_still_has_position(self, ctx: Any, position: Any) -> bool:
         """True when local MAIN is open; prefer live broker position check when available."""
         if int(getattr(position, "net_qty", 0) or 0) == 0:

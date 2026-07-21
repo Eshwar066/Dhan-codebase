@@ -807,7 +807,7 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             },
         ]
         with patch(
-            "core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling.ind_hist.load_indicator_history_rows",
+            "core.strategies.crypto.DirectionalOptionSelling.htf.ind_hist.load_indicator_history_rows",
             return_value=rows,
         ):
             # 4h bars: 00:00 closes 04:00, 04:00 closes 08:00, 12:00 closes 16:00
