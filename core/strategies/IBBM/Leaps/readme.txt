@@ -123,7 +123,8 @@ IndiaMktMixins.on_candle_rollover — wired in LiveEngine._run_exits_and_rollove
 
 Window: calendar days 15–18 of month.
 Roll when: current date >= adjusted 18th (weekends + NSE holidays → prior session).
-Action: HEDGE_EXIT (sell old hedge) + new HEDGE ENTRY.
+Action: new HEDGE ENTRY (next month) first, then HEDGE_EXIT (sell old).
+  Buying first avoids a margin spike from briefly unhedged MAIN.
 Deduped: one roll per structure per calendar day (rolled_hedges set).
 
 ==========================================================================================
@@ -134,6 +135,19 @@ EXECUTION (LIVE)
 - Hedge auto-retry with refreshed bid/ask (LEAPS_RSI only, up to 3 attempts)
 - LIMIT prices from live depth (engine price_map → OrderRouter)
 - Hedge exit / MAIN exit: depth-based limit at eval bar
+
+==========================================================================================
+EMERGENCY HEDGE ROLLOVER (manual, after market open)
+==========================================================================================
+
+Stop dhan-leaps-rsi.service first, then:
+
+  .venv/bin/python -m core.strategies.IBBM.Leaps.emergency.roll_leaps_hedge --dry-run
+  .venv/bin/python -m core.strategies.IBBM.Leaps.emergency.roll_leaps_hedge
+
+Order: BUY next-month hedge → wait fill → EXIT current-month hedge.
+Default target expiry = next month (last Tuesday). Use --use-calendar for 15th cutoff.
+Optional: --structure-id <sid> (repeatable).
 
 ==========================================================================================
 EXIT RULES

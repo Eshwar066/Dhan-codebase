@@ -737,14 +737,21 @@ class NiftySMA9Weekly(IndiaMktMixins, BaseStrategy):
             # Force next weekly expiry for the replacement hedge.
             wd = int(getattr(self, "weekly_expiry_weekday", 1) or 1) % 7
             next_exp = ExpiryResolver.next_weekly_expiry(ts.date(), weekday=wd)
+            # Buy next-week hedge first, then exit current hedge (margin).
             self._force_hedge_expiry = next_exp
             try:
+                new_hedge = self.create_hedge_intent(parent, candle, ctx)
+                if not new_hedge:
+                    logger.warning(
+                        "NiftySMA9Weekly hedge rollover skipped (no new hedge) "
+                        "structure=%s",
+                        hedge.structure_id,
+                    )
+                    continue
+                intents.append(new_hedge)
                 hedge_exit = self.create_hedge_exit_intent(parent, candle, ctx)
                 if hedge_exit:
                     intents.append(hedge_exit)
-                new_hedge = self.create_hedge_intent(parent, candle, ctx)
-                if new_hedge:
-                    intents.append(new_hedge)
             finally:
                 self._force_hedge_expiry = None
 

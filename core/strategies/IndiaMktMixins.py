@@ -1773,13 +1773,21 @@ class IndiaMktMixins:
             if roll_key in self.rolled_hedges:
                 continue
 
+            # Buy next-month hedge first, then exit current-month hedge.
+            # Exiting first can spike margin (short MAIN briefly unhedged).
+            new_hedge = self.create_hedge_intent(parent, candle, ctx)
+            if not new_hedge:
+                logger.warning(
+                    "Hedge rollover skipped (no new hedge) structure=%s ts=%s",
+                    hedge.structure_id,
+                    ts,
+                )
+                continue
+
+            intents.append(new_hedge)
             hedge_exit = self.create_hedge_exit_intent(parent, candle, ctx)
             if hedge_exit:
                 intents.append(hedge_exit)
-
-            new_hedge = self.create_hedge_intent(parent, candle, ctx)
-            if new_hedge:
-                intents.append(new_hedge)
 
             self.rolled_hedges.add(roll_key)
 
