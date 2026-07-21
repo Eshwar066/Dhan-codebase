@@ -2,11 +2,14 @@
 """
 Refresh shared crypto indicator history from Delta Exchange REST.
 
-Default outputs (schema v2 JSONL, preserves ``live_append`` rows)::
+Default outputs (schema v2 JSONL)::
 
     logs/indicators/BTCUSD/60/indicator_history.jsonl — 1h SuperTrend (DirectionalOptionSelling)
     logs/indicators/BTCUSD/4h/indicator_history.jsonl — 4h SuperTrend
     logs/indicators/BTCUSD/1d/indicator_history.jsonl — 1d SuperTrend
+
+``delta_refresh`` overwrites same-timestamp ``live_append`` rows (exchange OHLC/ST
+are authoritative). Live-only bars beyond the refresh window are preserved.
 
 Also supports structure TFs used by RSIBreadAndButter::
 
@@ -17,6 +20,8 @@ Usage (from repo root)::
 
     python utils/delta/refresh_crypto_indicator_history.py
     python utils/delta/refresh_crypto_indicator_history.py --dry-run
+    
+    python utils/delta/refresh_crypto_indicator_history.py --only 60 --no-cache
     python utils/delta/refresh_crypto_indicator_history.py --only 60,4h,1d
     python utils/delta/refresh_crypto_indicator_history.py --only 4h --days 90
     python utils/delta/refresh_crypto_indicator_history.py --structure
@@ -162,12 +167,20 @@ def _merge_history(
     other: List[dict],
     refreshed: Dict[str, dict],
 ) -> List[dict]:
+    """
+    Merge disk history with a fresh Delta REST SuperTrend series.
+
+    ``delta_refresh`` wins over ``live_append`` for the same bar — live OHLC/ST
+    can drift (aggregator wicks / sanitizer); REST matches the exchange chart.
+    Live-only bars past the refresh window are still kept.
+    """
     if not refreshed:
         return sorted(
             list(live.values()) + other,
             key=lambda r: normalize_ist_bar_key(r.get("candle_timestamp_ist", "")),
         )
     refresh_min = min(refreshed.keys())
+    refresh_max = max(refreshed.keys())
     preserved: List[dict] = []
     for row in other:
         key = normalize_ist_bar_key(row.get("candle_timestamp_ist"))
@@ -180,10 +193,14 @@ def _merge_history(
     for row in preserved:
         merged[normalize_ist_bar_key(row.get("candle_timestamp_ist"))] = row
     for key, row in refreshed.items():
-        if key in live:
-            continue
         merged[key] = row
     for key, row in live.items():
+        if key in merged:
+            continue
+        # Inside the REST window but missing from exchange → usually a bad
+        # aggregator bucket (wrong OHLC / false hour). Do not keep it.
+        if refresh_min <= key <= refresh_max:
+            continue
         merged[key] = row
     return [merged[k] for k in sorted(merged.keys())]
 

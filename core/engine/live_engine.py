@@ -2576,18 +2576,41 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     timeframe=None,
                 )
 
+    @staticmethod
+    def _strategy_owns_timeframe(strategy: Any, timeframe: str) -> bool:
+        tf_s = str(timeframe or "").strip()
+        if not tf_s or strategy is None:
+            return False
+        if str(getattr(strategy, "timeframe", "") or "").strip() == tf_s:
+            return True
+        for extra in getattr(strategy, "extra_timeframes", None) or []:
+            if str(extra or "").strip() == tf_s:
+                return True
+        return False
+
     def _candle_strategy_for(self, symbol: str, timeframe: str) -> Any:
-        """Live-feed strategy whose ``timeframe`` matches the closed bar."""
+        """Live-feed strategy that owns the closed bar (primary TF or extra_timeframes)."""
         tf_s = str(timeframe or "").strip()
         sym_u = str(symbol or "").strip().upper()
+        primary_match = None
+        extra_match = None
         for strategy in self.strategies:
             if self._is_scheduled_strategy(strategy, self.strategy_eval_modes):
                 continue
-            if str(getattr(strategy, "timeframe", "") or "").strip() != tf_s:
-                continue
             if sym_u and not strategy.applies_to_symbol(sym_u):
                 continue
-            return strategy
+            if str(getattr(strategy, "timeframe", "") or "").strip() == tf_s:
+                primary_match = strategy
+                break
+            if extra_match is None and self._strategy_owns_timeframe(strategy, tf_s):
+                extra_match = strategy
+        if primary_match is not None:
+            return primary_match
+        if extra_match is not None:
+            return extra_match
+        # Avoid attributing an unmatched HTF bar to the primary strategy stream.
+        if self._strategy_owns_timeframe(self.strategy, tf_s):
+            return self.strategy
         return self.strategy
 
     def _enrich_candle_for_strategy(
@@ -2596,6 +2619,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         candle: Dict[str, Any],
         out_meta: Optional[Dict[str, Any]] = None,
         allow_live_persist: bool = True,
+        timeframe: Optional[str] = None,
     ) -> Dict[str, Any]:
         return self.indicator_manager.enrich_candle_for_strategy(
             strategy=strategy,
@@ -2603,6 +2627,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             candle_bucket_fn=self._candle_bucket_start_unix,
             out_meta=out_meta,
             allow_live_persist=allow_live_persist,
+            timeframe=timeframe,
         )
 
     def _recent_candles_for_strategy(
@@ -3302,11 +3327,14 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         )
                     enrich_meta: Dict[str, Any] = {}
                     candle_strategy = self._candle_strategy_for(symbol, str(tf))
+                    # Persist live_append under the closed bar TF (primary or extra_timeframes).
+                    candle["timeframe"] = str(tf)
                     enriched_candle = self._enrich_candle_for_strategy(
                         candle_strategy,
                         candle,
                         out_meta=enrich_meta,
                         allow_live_persist=True,
+                        timeframe=str(tf),
                     )
                     if self.engine_logger and enrich_meta.get("bar_closed_for_append"):
                         if self._should_log_closed_candle(symbol, tf, candle):

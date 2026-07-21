@@ -74,6 +74,20 @@ class IndicatorManager:
         return f"{strategy_id}|{symbol}|{tf}"
 
     @staticmethod
+    def _should_sanitize_delta_ohlc(timeframe: Optional[str] = None) -> bool:
+        """
+        Wick clamping is only for fine crypto bars (1m/5m tick noise).
+
+        Applying it to 60 / 4h / 1d truncates real range and drifts ATR / SuperTrend
+        away from Delta REST / TradingView (delta_refresh path).
+        """
+        raw = str(timeframe or "").strip().lower()
+        if not raw:
+            # Unknown TF: keep legacy clamp only when caller omits TF on 1m-style paths.
+            return True
+        return raw in {"1", "1m", "5", "5m"}
+
+    @staticmethod
     def _sanitize_delta_ohlc_row(
         row: Dict[str, Any],
         *,
@@ -108,10 +122,14 @@ class IndicatorManager:
         out["open"], out["high"], out["low"], out["close"] = o, h, l, c
         return out
 
-    def _sanitize_delta_ohlc_df(self, df: Any) -> Any:
+    def _sanitize_delta_ohlc_df(
+        self, df: Any, *, timeframe: Optional[str] = None
+    ) -> Any:
         if df is None or len(df) == 0:
             return df
         if str(self._live_exchange or "").upper() != "DELTA":
+            return df
+        if not self._should_sanitize_delta_ohlc(timeframe):
             return df
         out = df.copy()
         for col in ("open", "high", "low", "close"):
@@ -384,6 +402,13 @@ class IndicatorManager:
         if not raw:
             return 60
         try:
+            from core.data.candle_aggregator import TIMEFRAME_SECONDS
+
+            if raw in TIMEFRAME_SECONDS:
+                return int(TIMEFRAME_SECONDS[raw])
+        except Exception:
+            pass
+        try:
             return max(60, int(raw) * 60)
         except Exception:
             pass
@@ -397,7 +422,42 @@ class IndicatorManager:
                 return max(60, int(raw[:-1]) * 3600)
             except Exception:
                 return 3600
+        if raw.endswith("d"):
+            try:
+                days = int(raw[:-1] or "1")
+            except Exception:
+                days = 1
+            return max(86400, days * 86400)
+        if raw in ("day", "1day"):
+            return 86400
         return 60
+
+    @staticmethod
+    def _strategy_owns_timeframe(strategy: Any, timeframe: str) -> bool:
+        """True when ``timeframe`` is the strategy primary TF or an ``extra_timeframes`` entry."""
+        tf_s = str(timeframe or "").strip()
+        if not tf_s or strategy is None:
+            return False
+        if str(getattr(strategy, "timeframe", "") or "").strip() == tf_s:
+            return True
+        for extra in getattr(strategy, "extra_timeframes", None) or []:
+            if str(extra or "").strip() == tf_s:
+                return True
+        return False
+
+    @classmethod
+    def _resolve_enrich_timeframe(
+        cls, strategy: Any, candle: Dict[str, Any], timeframe: Optional[str] = None
+    ) -> str:
+        """
+        Prefer the closed-bar TF when the strategy owns it (primary or extra_timeframes).
+        This lets live_append write 4h/1d history for strategies whose primary TF is 60.
+        """
+        primary = str(getattr(strategy, "timeframe", "") or "").strip()
+        bar_tf = str(timeframe or candle.get("timeframe") or "").strip()
+        if bar_tf and cls._strategy_owns_timeframe(strategy, bar_tf):
+            return bar_tf
+        return primary
 
     @staticmethod
     def _shared_indicator_signature(strategy: Any) -> str:
@@ -634,7 +694,7 @@ class IndicatorManager:
         merged = pd.concat([hdf, base], ignore_index=True)
         merged = merged.sort_values("timestamp")
         if str(self._live_exchange or "").upper() == "DELTA":
-            merged = self._sanitize_delta_ohlc_df(merged)
+            merged = self._sanitize_delta_ohlc_df(merged, timeframe=tf)
             # Prefer seeded history OHLC over live-appended rows for the same bar.
             merged = merged.drop_duplicates(subset=["timestamp"], keep="first")
         else:
@@ -1002,19 +1062,24 @@ class IndicatorManager:
         merged = merged.reset_index().sort_values("timestamp")
         merged = merged.drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
         if str(self._live_exchange or "").upper() == "DELTA":
-            merged = self._sanitize_delta_ohlc_df(merged)
+            merged = self._sanitize_delta_ohlc_df(merged, timeframe=tf)
         return merged
 
-    def _finalize_delta_base_df(self, base_state: Dict[str, Any]) -> None:
-        """Re-sanitize rolling OHLC and invalidate indicator cache after bar append."""
+    def _finalize_delta_base_df(
+        self, base_state: Dict[str, Any], *, timeframe: Optional[str] = None
+    ) -> None:
+        """Re-sanitize rolling OHLC (1m/5m only) and bump update_seq after bar append."""
         if str(self._live_exchange or "").upper() != "DELTA":
             return
         df = base_state.get("df")
         if df is None or len(df) == 0:
             return
-        cleaned = self._sanitize_delta_ohlc_df(df)
+        tf = timeframe or base_state.get("timeframe")
+        cleaned = self._sanitize_delta_ohlc_df(df, timeframe=tf)
         base_state["df"] = cleaned
         base_state["update_seq"] = int(base_state.get("update_seq", 0)) + 1
+        if tf:
+            base_state["timeframe"] = str(tf)
 
     @staticmethod
     def _strip_same_day_bars(df: Any) -> Any:
@@ -1171,7 +1236,7 @@ class IndicatorManager:
             df["exchange"] = exchange
         if len(df) > window:
             df = df.iloc[-window:].reset_index(drop=True)
-        df = self._sanitize_delta_ohlc_df(df)
+        df = self._sanitize_delta_ohlc_df(df, timeframe=tf)
 
         boot_ist = dt.datetime.now(IST).isoformat()
         prev_state = self._base_candle_state.get(key) or {}
@@ -1182,6 +1247,7 @@ class IndicatorManager:
             "df": df,
             "last_bucket": prev_state.get("last_bucket") if prev_live else None,
             "window": window,
+            "timeframe": str(tf),
             "bootstrap_source": source,
             "bootstrap_at_ist": boot_ist,
             "update_seq": int(prev_state.get("update_seq", 0)) if prev_live else 0,
@@ -1216,10 +1282,19 @@ class IndicatorManager:
         candle_bucket_fn: Any,
         out_meta: Optional[Dict[str, Any]] = None,
         allow_live_persist: bool = True,
+        timeframe: Optional[str] = None,
     ) -> Dict[str, Any]:
         import pandas as pd
 
-        tf = str(getattr(strategy, "timeframe", "") or "")
+        # Engine passes the closed-bar TF. If this strategy does not own it
+        # (primary or extra_timeframes), skip — never fold HTF OHLC into the
+        # primary stream (e.g. 4h into 60).
+        if timeframe is not None:
+            bar_tf = str(timeframe or "").strip()
+            if bar_tf and not self._strategy_owns_timeframe(strategy, bar_tf):
+                return dict(candle)
+
+        tf = self._resolve_enrich_timeframe(strategy, candle, timeframe)
         if not tf:
             return dict(candle)
 
@@ -1241,7 +1316,7 @@ class IndicatorManager:
             return dict(candle)
 
         if str(exchange).upper() == "DELTA" and not base_state.get("delta_resanitized"):
-            self._finalize_delta_base_df(base_state)
+            self._finalize_delta_base_df(base_state, timeframe=tf)
             base_state["delta_resanitized"] = True
             base_df = base_state.get("df")
 
@@ -1267,7 +1342,7 @@ class IndicatorManager:
                 "symbol": symbol,
                 "exchange": exchange,
             }
-            if str(exchange).upper() == "DELTA":
+            if str(exchange).upper() == "DELTA" and self._should_sanitize_delta_ohlc(tf):
                 ref_close = None
                 if len(base_df) > 0:
                     try:
@@ -1382,7 +1457,7 @@ class IndicatorManager:
                     out_meta["bar_closed_for_append"] = True
 
             if str(exchange).upper() == "DELTA":
-                self._finalize_delta_base_df(base_state)
+                self._finalize_delta_base_df(base_state, timeframe=tf)
                 base_df = base_state.get("df")
 
         strategy_key = self._key_strategy_symbol_tf(strategy, symbol, tf)
@@ -1419,7 +1494,7 @@ class IndicatorManager:
 
             if not cache_hit:
                 compute_start = time.time()
-                work_df = self._sanitize_delta_ohlc_df(df.copy())
+                work_df = self._sanitize_delta_ohlc_df(df.copy(), timeframe=tf)
                 merge_cap = max(400, int(window or 0))
                 if self._strategy_uses_indicator_history(strategy):
                     work_df = self._merge_rsi_history_into_base_df(
