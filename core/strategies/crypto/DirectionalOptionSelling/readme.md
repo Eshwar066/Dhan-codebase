@@ -158,7 +158,7 @@ For both sleeves:
 2. Strike on the **outer side of SuperTrend** (CE &gt; ST, PE &lt; ST).
 3. Nearest eligible strike to the sleeve’s SuperTrend reference.
 4. Sell premium (best bid / mark) **≥ $120**.
-5. Qty = **2 lots** (`ORDER_QTY_LOTS`).
+5. Qty = sleeve lots (`ORDER_QTY_LOTS_WEEKLY` / `ORDER_QTY_LOTS_DAILY`).
 
 ---
 
@@ -210,7 +210,8 @@ After any SL / force / external full close: wait for the **next closed 1H bar**,
 | `STRIKE_PROXIMITY_EXIT_POINTS` | 50 | Exit if spot near strike |
 | `ROLLOVER_TIME` | 17:25 IST | Daily expiry rollover |
 | `ROLLOVER_MIN_STRIKE_DISTANCE` | 200 | Min distance on rollover strike |
-| `ORDER_QTY_LOTS` | 2 | Order size |
+| `ORDER_QTY_LOTS_WEEKLY` | 2 | Weekly (4H) entry lots |
+| `ORDER_QTY_LOTS_DAILY` | 2 | Daily (1H) entry lots |
 | `WEEKLY_MIN_DTE` | 3 | Weekly Friday must be ≥ 3 DTE |
 | `HTF_TIMEFRAMES` | `4h`, `1d` | Higher-TF SuperTrend sources |
 

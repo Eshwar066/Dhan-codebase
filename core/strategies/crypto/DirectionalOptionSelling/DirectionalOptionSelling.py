@@ -22,6 +22,8 @@ from .constants import (
     META_KEY,
     MIN_PREMIUM_USD,
     ORDER_QTY_LOTS,
+    ORDER_QTY_LOTS_DAILY,
+    ORDER_QTY_LOTS_WEEKLY,
     ROLLOVER_MIN_STRIKE_DISTANCE,
     ROLLOVER_TIME,
     SLEEVE_DAILY,
@@ -97,9 +99,18 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
     api = "DELTA"
     expiryType = "Daily"
     order_qty_lots = ORDER_QTY_LOTS
+    order_qty_lots_weekly = ORDER_QTY_LOTS_WEEKLY
+    order_qty_lots_daily = ORDER_QTY_LOTS_DAILY
     supertrend_length = SUPER_TREND_LENGTH
     supertrend_factor = SUPER_TREND_FACTOR
     bracket_leg_tags = ["MAIN_SL"]
+
+    def _entry_qty_lots(self, sleeve: str) -> int:
+        """Lots for a new ENTRY: weekly (4H) vs daily (1H)."""
+        sleeve_u = str(sleeve or SLEEVE_DAILY).strip().lower()
+        if sleeve_u == SLEEVE_WEEKLY:
+            return max(1, int(getattr(self, "order_qty_lots_weekly", ORDER_QTY_LOTS_WEEKLY) or 1))
+        return max(1, int(getattr(self, "order_qty_lots_daily", ORDER_QTY_LOTS_DAILY) or 1))
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -1120,11 +1131,12 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             action="ENTRY",
             metadata_extras=self._strategy_meta(meta),
         )
-        intent = replace(intent, qty=ORDER_QTY_LOTS)
+        qty_lots = self._entry_qty_lots(sleeve_u)
+        intent = replace(intent, qty=qty_lots)
         self._meta_by_structure_id[structure_id] = meta
         logger.info(
             "%s ENTRY signaled reason=%s sleeve=%s direction=%s opt=%s strike=%.2f "
-            "expiry=%s premium=%.2f ST=%.2f ST_4h=%s ST_1d=%s sid=%s",
+            "expiry=%s premium=%.2f qty=%s ST=%.2f ST_4h=%s ST_1d=%s sid=%s",
             self.name,
             reason,
             sleeve_u,
@@ -1133,6 +1145,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             strike,
             expiry,
             premium,
+            qty_lots,
             supertrend,
             candle.get("supertrend_4h"),
             candle.get("supertrend_1d"),
@@ -2116,6 +2129,10 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             return []
         entry_reason = meta.entry_reason if meta is not None else "unknown"
         inst_sym = getattr(instrument, "trading_symbol", None)
+        default_qty = self._entry_qty_lots(
+            meta.sleeve if meta is not None else SLEEVE_DAILY
+        )
+        fill_qty = int(qty or default_qty)
         logger.info(
             "%s ENTRY filled reason=%s direction=%s symbol=%s sid=%s qty=%s ST=%.2f",
             self.name,
@@ -2123,7 +2140,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             direction,
             inst_sym,
             sid,
-            int(qty or ORDER_QTY_LOTS),
+            fill_qty,
             float(supertrend),
         )
         # Option LIMIT (never market): prefer live ask; fall back to entry premium.
@@ -2142,7 +2159,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 option_limit = 0.0
         intent = self._build_main_sl_intent(
             instrument=instrument,
-            qty=int(qty or ORDER_QTY_LOTS),
+            qty=fill_qty,
             structure_id=sid,
             parent_intent_id=str(parent_intent_id) if parent_intent_id else None,
             candle_ts=candle_ts or datetime.now(),

@@ -13,7 +13,11 @@ FORCE_EXIT_POINTS = 300.0
 STRIKE_PROXIMITY_EXIT_POINTS = 50.0
 ROLLOVER_TIME = time(17, 25)
 ROLLOVER_MIN_STRIKE_DISTANCE = 200.0
-ORDER_QTY_LOTS = 2
+# Sleeve-specific entry size (lots). Weekly = 4H HTF entry; daily = 1H flip entry.
+ORDER_QTY_LOTS_WEEKLY = 10
+ORDER_QTY_LOTS_DAILY = 10
+# Backward-compatible alias (daily sleeve).
+ORDER_QTY_LOTS = ORDER_QTY_LOTS_DAILY
 META_KEY = "directional_option_selling"
 # Higher-TF SuperTrend: weekly on 1D+4H align; daily on 1H with 1D+4H filter.
 HTF_TIMEFRAMES = ("4h", "1d")

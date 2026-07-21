@@ -1567,6 +1567,15 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         # Must not remain stuck at entry meta ST.
         self.assertNotAlmostEqual(s._current_4h_supertrend, 64497.31)
 
+    def test_entry_qty_lots_differs_by_sleeve(self):
+        s = DirectionalOptionSelling()
+        s.order_qty_lots_weekly = 5
+        s.order_qty_lots_daily = 2
+        self.assertEqual(s._entry_qty_lots("weekly"), 5)
+        self.assertEqual(s._entry_qty_lots("daily"), 2)
+        self.assertEqual(s._entry_qty_lots(""), 2)
+        self.assertEqual(s._entry_qty_lots("WEEKLY"), 5)
+
 
 if __name__ == "__main__":
     unittest.main()
