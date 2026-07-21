@@ -1267,6 +1267,41 @@ class PositionManager:
                     )
                 self.positions.pop(sym, None)
 
+    def sync_symbol_flat_at_broker(
+        self, trading_symbol: str, *, reason: str = ""
+    ) -> bool:
+        """
+        Broker confirms no open position (e.g. Delta no_open_position on bracket).
+        Drop local qty tracking but retain ownership metadata until fill CLOSE.
+        """
+        sym = str(trading_symbol or "").strip()
+        if not sym:
+            return False
+        with self._lock:
+            pos = self.positions.get(sym)
+            if pos is None or int(getattr(pos, "net_qty", 0) or 0) == 0:
+                return False
+            self._merge_position_metadata(
+                sym,
+                strategy=getattr(pos, "strategy", None),
+                structure_id=getattr(pos, "structure_id", None),
+                tag=getattr(pos, "tag", None),
+                intent_id=getattr(pos, "intent_id", None),
+            )
+            logger.warning(
+                "Reconcile: broker flat for %s (was qty=%s); "
+                "removing local position but retaining ownership metadata%s",
+                sym,
+                pos.net_qty,
+                f" ({reason})" if reason else "",
+            )
+            strategy = getattr(pos, "strategy", None)
+            self.positions.pop(sym, None)
+            self._structure_slices.pop(sym, None)
+            if strategy:
+                self.strategy_pos[strategy][sym] = 0
+            return True
+
     # ---------------------
     # POSITION CHECKS
     # ---------------------

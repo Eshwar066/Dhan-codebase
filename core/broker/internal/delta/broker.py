@@ -915,13 +915,18 @@ class DeltaBroker(BaseBroker):
                         }
                 self._last_place_order_failure = {
                     "message": last_err,
+                    "error_code": "no_open_position"
+                    if "no_open_position" in err_txt
+                    else None,
                     "retryable": "no_open_position" in err_txt,
                 }
                 return {
                     "ok": False,
                     "sl_order_id": None,
                     "tp_order_id": None,
-                    "reason": "broker_error",
+                    "reason": "no_open_position"
+                    if "no_open_position" in err_txt
+                    else "broker_error",
                     "message": last_err,
                 }
 
@@ -939,15 +944,21 @@ class DeltaBroker(BaseBroker):
                 continue
             break
 
+        err_txt = str(last_err or "").lower()
         self._last_place_order_failure = {
             "message": last_err or "combined bracket failed",
+            "error_code": "no_open_position"
+            if "no_open_position" in err_txt
+            else None,
             "retryable": False,
         }
         return {
             "ok": False,
             "sl_order_id": None,
             "tp_order_id": None,
-            "reason": "no_order_id",
+            "reason": "no_open_position"
+            if "no_open_position" in err_txt
+            else "no_order_id",
             "message": last_err or "combined bracket failed",
         }
 

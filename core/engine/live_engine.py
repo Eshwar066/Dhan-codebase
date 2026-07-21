@@ -142,6 +142,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self.candle_service = candle_service
         self.order_router = order_router
         self.order_router.bundle_price_refresher = self._refresh_bundle_entry_prices
+        self.order_router.on_broker_no_open_position = self._on_broker_no_open_position
         self.position_manager = position_manager
         self.position_manager.on_structure_exit = getattr(
             strategy, "on_structure_exit", None
@@ -1268,6 +1269,64 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     sid,
                     exc,
                 )
+
+    def _on_broker_no_open_position(
+        self,
+        *,
+        trading_symbol: Optional[str] = None,
+        structure_id: Optional[str] = None,
+        strategy_id: Optional[str] = None,
+        message: str = "",
+        **kwargs: Any,
+    ) -> None:
+        """Broker says no open position while placing bracket/SL — sync local state."""
+        sym = str(trading_symbol or "").strip()
+        sid = str(structure_id or "").strip()
+        strat = str(strategy_id or "").strip()
+
+        synced = False
+        pm = self.position_manager
+        if sym and hasattr(pm, "sync_symbol_flat_at_broker"):
+            synced = bool(
+                pm.sync_symbol_flat_at_broker(sym, reason="no_open_position")
+            )
+
+        if sid:
+            self._delta_main_sl_retry.pop(sid, None)
+
+        book = getattr(self.order_router, "reentry_at_cost_book", None)
+        if book is not None:
+            try:
+                book.stop_for_trading_symbol(
+                    trading_symbol=sym or None,
+                    strategy_id=strat or None,
+                    structure_id=sid or None,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "reentry_at_cost stop_for_trading_symbol failed symbol=%s: %s",
+                    sym,
+                    exc,
+                )
+
+        if self.engine_logger and synced:
+            self.engine_logger.log(
+                "reconciliation",
+                (
+                    f"PM synced flat trading_symbol={sym} structure_id={sid} "
+                    f"strategy_id={strat} reason=no_open_position"
+                ),
+                symbol=sym or None,
+                structure_id=sid or None,
+                strategy_id=strat or None,
+            )
+        elif synced:
+            logger.warning(
+                "Broker flat sync: PM zeroed trading_symbol=%s structure_id=%s (%s)",
+                sym,
+                sid,
+                message,
+            )
 
         for stale_sid in list(self._delta_main_sl_retry.keys()):
             if stale_sid not in active_sids:

@@ -398,6 +398,37 @@ class ReentryAtCostBook:
         if removed is not None:
             self._save()
 
+    def stop_for_trading_symbol(
+        self,
+        *,
+        trading_symbol: Optional[str] = None,
+        strategy_id: Optional[str] = None,
+        structure_id: Optional[str] = None,
+    ) -> None:
+        """Cancel reentry-at-cost watches when broker confirms flat (manual exit / sync)."""
+        ts = str(trading_symbol or "").strip()
+        sid = str(structure_id or "").strip()
+        drop: List[str] = []
+        with self._lock:
+            if sid and sid in self._watches:
+                drop.append(sid)
+            for wid, w in self._watches.items():
+                if wid in drop:
+                    continue
+                if strategy_id and w.strategy_id != str(strategy_id):
+                    continue
+                if ts and w.trading_symbol == ts:
+                    drop.append(wid)
+            for wid in drop:
+                self._watches.pop(wid, None)
+        if drop:
+            self._save()
+            self._log(
+                "reentry_at_cost_stopped",
+                f"broker_flat_sync trading_symbol={ts} structure_id={sid} dropped={drop}",
+                strategy=str(strategy_id or ""),
+            )
+
     # ---------- poll / place ----------
 
     def tick(self) -> int:

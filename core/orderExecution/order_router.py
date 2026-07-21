@@ -141,6 +141,10 @@ class OrderRouter:
         self.bundle_price_refresher: Optional[
             Callable[[Dict[str, Any], List[Any], Dict[str, float]], None]
         ] = None
+        # Optional: broker reports no_open_position on bracket/SL placement (manual exit sync).
+        self.on_broker_no_open_position: Optional[
+            Callable[..., None]
+        ] = None
 
     def reset_oms_session_boundary(self) -> None:
         """Call when starting a new trading session (same process) to tighten orphan fill acceptance."""
@@ -1162,6 +1166,93 @@ class OrderRouter:
         }
 
     @staticmethod
+    def _failure_is_no_open_position(
+        fail: Optional[Dict[str, Any]], message: str = ""
+    ) -> bool:
+        parts = [
+            str((fail or {}).get("error_code") or ""),
+            str((fail or {}).get("reason") or ""),
+            str((fail or {}).get("message") or ""),
+            message,
+        ]
+        return "no_open_position" in " ".join(parts).lower()
+
+    @staticmethod
+    def _intent_trading_symbol(intent: Any) -> str:
+        inst = getattr(intent, "instrument", None)
+        return str(getattr(inst, "trading_symbol", None) or "").strip()
+
+    def _intent_is_broker_flat_sync_candidate(self, intent: Any) -> bool:
+        action_u = str(getattr(intent, "action", "") or "").upper()
+        tag_u = str(getattr(intent, "tag", "") or "").upper()
+        return action_u in ("FORCE_EXIT", "EXIT") or tag_u in (
+            "MAIN_SL",
+            "MAIN_TARGET",
+        )
+
+    def _handle_broker_no_open_position(
+        self,
+        intents: List[Any],
+        *,
+        message: str,
+        bundle_item: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Position already flat at broker; sync PM and stop bracket/reentry retries."""
+        primary = intents[0] if intents else None
+        trading_sym = self._intent_trading_symbol(primary) if primary else ""
+        structure_id = getattr(primary, "structure_id", None) if primary else None
+        strategy_id = (
+            getattr(primary, "strategy_id", None)
+            or (bundle_item or {}).get("strategy_id")
+            or self.strategy_id
+        )
+        for intent in intents:
+            self.intent_store.update(
+                intent.intent_id,
+                IntentStatus.CANCELLED,
+                order_state=OrderState.CANCELLED,
+            )
+            self._set_order_state(
+                intent.intent_id,
+                OrderState.CANCELLED,
+                action="broker_flat_sync",
+                message=message,
+            )
+        handler = self.on_broker_no_open_position
+        if callable(handler):
+            try:
+                handler(
+                    trading_symbol=trading_sym,
+                    structure_id=structure_id,
+                    strategy_id=strategy_id,
+                    message=message,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "on_broker_no_open_position failed symbol=%s sid=%s: %s",
+                    trading_sym,
+                    structure_id,
+                    exc,
+                )
+        if self.engine_logger:
+            self.engine_logger.log(
+                "reconciliation",
+                (
+                    f"BROKER_FLAT_SYNC trading_symbol={trading_sym} "
+                    f"structure_id={structure_id} reason=no_open_position "
+                    f"detail={message}"
+                ),
+                symbol=trading_sym or None,
+                structure_id=structure_id,
+                strategy_id=strategy_id,
+            )
+        return {
+            "ok": True,
+            "retryable": False,
+            "reason": "broker_flat_synced",
+        }
+
+    @staticmethod
     def _coerce_positive_exec_price(price: Any) -> Optional[float]:
         if price is None:
             return None
@@ -1645,6 +1736,13 @@ class OrderRouter:
             if fail_payload:
                 fail_msg = f"{fail_msg} | payload={fail_payload}"
             retryable = bool(fail_fields.get("retryable", True))
+            if self._failure_is_no_open_position(
+                broker_fail, fail_msg
+            ) and self._intent_is_broker_flat_sync_candidate(intent):
+                return self._handle_broker_no_open_position(
+                    [intent],
+                    message=fail_msg,
+                )
             self._log_oms_step(
                 "place_order",
                 intent,
@@ -2846,7 +2944,18 @@ class OrderRouter:
             target_execution_price=tgt_price,
         )
         if not combo.get("ok"):
-            fail_msg = str(combo.get("message") or combo.get("reason") or "combined bracket failed")
+            fail_msg = str(
+                combo.get("message") or combo.get("reason") or "combined bracket failed"
+            )
+            broker_fail = getattr(broker, "_last_place_order_failure", None) or {}
+            if self._failure_is_no_open_position(combo, fail_msg) or self._failure_is_no_open_position(
+                broker_fail, fail_msg
+            ):
+                return self._handle_broker_no_open_position(
+                    [i for i, _ in resolved],
+                    message=fail_msg,
+                    bundle_item=bundle_item,
+                )
             for intent, _ in resolved:
                 self.intent_store.update(
                     intent.intent_id,
