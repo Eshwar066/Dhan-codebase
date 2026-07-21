@@ -997,7 +997,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             list(intent_store.list_by_status(IntentStatus.SENT))
             + list(intent_store.list_by_status(IntentStatus.VALIDATED))
             + list(intent_store.list_by_status(IntentStatus.CREATED))
-            + list(intent_store.list_by_status(IntentStatus.REJECTED))
+            # Do not adopt REJECTED intents (REJECTED -> SENT is illegal and
+            # crashed the engine when a failed MAIN_SL shared the structure).
         )
         for rec in pending:
             payload = rec.get("payload") or {}

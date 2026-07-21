@@ -1101,6 +1101,147 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             self.assertTrue(s._daily_htf_aligned(1, ctx, candle))
             self.assertFalse(s._daily_htf_aligned(-1, ctx, candle))
 
+    def test_sleeve_inferred_from_structure_id(self):
+        s = DirectionalOptionSelling()
+        self.assertEqual(
+            s._sleeve_from_structure_id(
+                "DirectionalOptionSelling:BTCUSD:weekly:2026-07-21:PE:dc7343a8"
+            ),
+            "weekly",
+        )
+        self.assertEqual(
+            s._normalize_sleeve("daily", "DirectionalOptionSelling:BTCUSD:weekly:x:PE:abc"),
+            "weekly",
+        )
+
+    def test_fallback_meta_uses_symbol_and_structure_id(self):
+        s = DirectionalOptionSelling()
+        s._current_4h_supertrend = 64497.31
+        s._current_supertrend = 65059.55
+        inst = SimpleNamespace(
+            trading_symbol="P-BTC-64000-240726",
+            option_type="",  # missing after reconcile
+            strike=0,
+            expiry="",
+        )
+        pos = SimpleNamespace(
+            structure_id="DirectionalOptionSelling:BTCUSD:weekly:2026-07-21:PE:dc7343a8",
+            instrument=inst,
+            avg_price=384.0,
+            tag="MAIN",
+            net_qty=-2,
+            strategy="DirectionalOptionSelling",
+        )
+        meta = s._fallback_meta_from_position(pos)
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta.sleeve, "weekly")
+        self.assertEqual(meta.direction, 1)
+        self.assertEqual(meta.option_type, "PE")
+        self.assertEqual(meta.strike, 64000.0)
+        self.assertEqual(meta.expiry, "240726")
+        self.assertAlmostEqual(meta.supertrend, 64497.31)
+
+    def test_restore_state_without_strategy_meta(self):
+        s = DirectionalOptionSelling()
+        s._current_4h_supertrend = 64497.31
+        inst = SimpleNamespace(
+            trading_symbol="P-BTC-64000-240726",
+            option_type="",
+            strike=64000.0,
+            expiry="240726",
+        )
+        pos = SimpleNamespace(
+            structure_id="DirectionalOptionSelling:BTCUSD:weekly:2026-07-21:PE:dc7343a8",
+            instrument=inst,
+            avg_price=384.0,
+            tag="MAIN",
+            net_qty=-2,
+            strategy="DirectionalOptionSelling",
+        )
+        pm = SimpleNamespace(
+            positions={"P-BTC-64000-240726": pos},
+            get_position_metadata=lambda _sym: {},
+        )
+        s.restore_state_on_startup(pm)
+        meta = s._meta_by_structure_id[pos.structure_id]
+        self.assertEqual(meta.sleeve, "weekly")
+        self.assertEqual(meta.direction, 1)
+        self.assertEqual(s._confirmed_direction, 1)
+
+    def test_build_entry_skips_duplicate_trading_symbol(self):
+        s = DirectionalOptionSelling()
+        # Mis-tagged as daily after restart, but same Friday contract still open.
+        open_pos = SimpleNamespace(
+            tag="MAIN",
+            net_qty=-2,
+            structure_id="DirectionalOptionSelling:BTCUSD:daily:2026-07-21:PE:old",
+            instrument=SimpleNamespace(
+                trading_symbol="P-BTC-64000-240726",
+                option_type="PE",
+                strike=64000.0,
+                expiry="240726",
+            ),
+            avg_price=384.0,
+            strategy="DirectionalOptionSelling",
+        )
+        ctx = SimpleNamespace(
+            position_store=_PositionStore([open_pos]),
+            exchange="DELTA",
+            instrument_store=SimpleNamespace(
+                intent_creation_details=lambda *a, **k: SimpleNamespace()
+            ),
+        )
+        candle = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 21, 5, 0, tzinfo=timezone.utc),
+            "close": 65500,
+            "supertrend": 65000,
+            "supertrend_4h": 64497.31,
+        }
+        with patch.object(s, "_weekly_htf_aligned", return_value=True):
+            with patch.object(s, "_weekly_expiry_for_entry", return_value="240726"):
+                with patch.object(
+                    s,
+                    "_select_contract",
+                    return_value=(
+                        64000.0,
+                        303.0,
+                        pd.Series({"symbol": "P-BTC-64000-240726"}),
+                        "240726",
+                    ),
+                ):
+                    intent = s._build_entry(
+                        candle,
+                        ctx,
+                        1,
+                        reason="weekly_htf_aligned",
+                        sleeve="weekly",
+                    )
+        self.assertIsNone(intent)
+
+    def test_ensure_meta_reasserts_weekly_sleeve_from_sid(self):
+        from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (
+            _PositionMeta,
+        )
+
+        s = DirectionalOptionSelling()
+        sid = "DirectionalOptionSelling:BTCUSD:weekly:2026-07-21:PE:dc7343a8"
+        # Simulate previously mis-tagged daily fallback already cached.
+        s._meta_by_structure_id[sid] = _PositionMeta(
+            symbol="BTCUSD",
+            direction=-1,
+            option_type="CE",
+            supertrend=65059.55,
+            strike=64000.0,
+            expiry="240726",
+            entry_premium=384.0,
+            entry_reason="restored",
+            sleeve="daily",
+        )
+        pos = SimpleNamespace(structure_id=sid, instrument=None, intent_id=None)
+        meta = s._ensure_meta(pos, SimpleNamespace(intent_store=None))
+        self.assertEqual(meta.sleeve, "weekly")
+
 
 if __name__ == "__main__":
     unittest.main()

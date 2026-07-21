@@ -665,6 +665,46 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             },
         )
 
+    @staticmethod
+    def _sleeve_from_structure_id(structure_id: str) -> Optional[str]:
+        """Parse sleeve from sid like DirectionalOptionSelling:BTCUSD:weekly:..."""
+        parts = [p.strip().lower() for p in str(structure_id or "").split(":")]
+        for part in parts:
+            if part in (SLEEVE_WEEKLY, SLEEVE_DAILY):
+                return part
+        return None
+
+    @staticmethod
+    def _option_side_from_instrument(inst: Any, trading_symbol: str = "") -> tuple[str, int]:
+        """
+        Resolve PE/CE and direction from instrument fields or Delta symbol (P-/C-).
+        Missing option_type previously defaulted to CE/direction=-1 and caused false
+        bearish force-exits on restored puts.
+        """
+        raw_ot = str(getattr(inst, "option_type", "") or "").strip().upper()
+        sym = str(
+            trading_symbol
+            or getattr(inst, "trading_symbol", "")
+            or ""
+        ).strip().upper()
+        if raw_ot.startswith("P") or sym.startswith("P-"):
+            return "PE", 1
+        if raw_ot.startswith("C") or sym.startswith("C-"):
+            return "CE", -1
+        # Last resort: strike/expiry-only restore — treat as unknown put-safe no-op
+        # only if symbol encoding is absent; prefer PE when structure_id says PE.
+        return "CE", -1
+
+    def _normalize_sleeve(self, sleeve: Any, structure_id: str = "") -> str:
+        sleeve_u = str(sleeve or "").strip().lower()
+        if sleeve_u not in (SLEEVE_WEEKLY, SLEEVE_DAILY):
+            sleeve_u = ""
+        sid_sleeve = self._sleeve_from_structure_id(structure_id)
+        # Structure id is authoritative when present (survives meta loss on restart).
+        if sid_sleeve:
+            return sid_sleeve
+        return sleeve_u or SLEEVE_DAILY
+
     def _restore_meta(self, structure_id: str, raw: Any) -> bool:
         if structure_id in self._meta_by_structure_id:
             return True
@@ -676,9 +716,7 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         if not isinstance(raw, dict):
             return False
         try:
-            sleeve = str(raw.get("sleeve") or SLEEVE_DAILY).strip().lower()
-            if sleeve not in (SLEEVE_WEEKLY, SLEEVE_DAILY):
-                sleeve = SLEEVE_DAILY
+            sleeve = self._normalize_sleeve(raw.get("sleeve"), structure_id)
             meta = _PositionMeta(
                 symbol=str(raw["symbol"]).upper(),
                 direction=int(raw["direction"]),
@@ -695,10 +733,63 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         self._meta_by_structure_id[structure_id] = meta
         return True
 
+    def _fallback_meta_from_position(self, position: Any) -> Optional[_PositionMeta]:
+        """Build meta when CSV/intent strategy_meta is missing after restart."""
+        sid = str(getattr(position, "structure_id", "") or "")
+        inst = getattr(position, "instrument", None)
+        trading_symbol = str(getattr(inst, "trading_symbol", "") or "")
+        option_type, direction = self._option_side_from_instrument(
+            inst, trading_symbol
+        )
+        # Prefer PE token embedded in structure_id when instrument fields are empty.
+        sid_u = sid.upper()
+        if ":PE:" in sid_u or sid_u.endswith(":PE"):
+            option_type, direction = "PE", 1
+        elif ":CE:" in sid_u or sid_u.endswith(":CE"):
+            option_type, direction = "CE", -1
+        sleeve = self._normalize_sleeve(None, sid)
+        try:
+            strike = float(getattr(inst, "strike", 0) or 0)
+            expiry = str(getattr(inst, "expiry", "") or "")
+            if (strike <= 0 or not expiry) and trading_symbol:
+                parts = trading_symbol.split("-")
+                if len(parts) >= 4:
+                    if strike <= 0:
+                        strike = float(parts[2])
+                    if not expiry:
+                        expiry = str(parts[3])
+            # Weekly sleeve trails 4H ST; daily trails 1H ST.
+            if sleeve == SLEEVE_WEEKLY:
+                st = float(
+                    self._current_4h_supertrend
+                    or self._current_supertrend
+                    or 0
+                )
+            else:
+                st = float(self._current_supertrend or 0)
+            return _PositionMeta(
+                symbol="BTCUSD",
+                direction=direction,
+                option_type=option_type,
+                supertrend=st,
+                strike=strike,
+                expiry=expiry,
+                entry_premium=float(getattr(position, "avg_price", 0) or 0),
+                entry_reason="restored",
+                sleeve=sleeve,
+            )
+        except (TypeError, ValueError):
+            return None
+
     def _ensure_meta(self, position: Any, ctx: Any) -> Optional[_PositionMeta]:
         sid = str(getattr(position, "structure_id", "") or "")
         meta = self._meta_by_structure_id.get(sid)
         if meta is not None:
+            # Re-assert sleeve from structure_id if it was mis-tagged previously.
+            sid_sleeve = self._sleeve_from_structure_id(sid)
+            if sid_sleeve and meta.sleeve != sid_sleeve:
+                meta = replace(meta, sleeve=sid_sleeve)
+                self._meta_by_structure_id[sid] = meta
             return meta
         intent_store = getattr(ctx, "intent_store", None)
         intent_id = getattr(position, "intent_id", None)
@@ -708,24 +799,25 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             strategy_meta = payload.get("strategy_meta") or payload.get("metadata_extras") or {}
             if self._restore_meta(sid, strategy_meta):
                 return self._meta_by_structure_id.get(sid)
-        inst = getattr(position, "instrument", None)
-        option_type = str(getattr(inst, "option_type", "") or "").upper()
-        direction = 1 if option_type.startswith("P") else -1
-        try:
-            fallback = _PositionMeta(
-                symbol="BTCUSD",
-                direction=direction,
-                option_type="PE" if direction > 0 else "CE",
-                supertrend=float(self._current_supertrend or 0),
-                strike=float(getattr(inst, "strike", 0) or 0),
-                expiry=str(getattr(inst, "expiry", "") or ""),
-                entry_premium=float(getattr(position, "avg_price", 0) or 0),
-                entry_reason="restored",
-                sleeve=SLEEVE_DAILY,
-            )
-        except (TypeError, ValueError):
+        # Position-manager metadata (survives multi-strategy CSV merge).
+        if ctx is not None:
+            pm = getattr(ctx, "position_store", None)
+            inst = getattr(position, "instrument", None)
+            trading_symbol = str(getattr(inst, "trading_symbol", "") or "")
+            if (
+                trading_symbol
+                and pm is not None
+                and callable(getattr(pm, "get_position_metadata", None))
+            ):
+                stored = pm.get_position_metadata(trading_symbol) or {}
+                raw = stored.get("strategy_meta") if isinstance(stored, dict) else None
+                if self._restore_meta(sid, raw):
+                    return self._meta_by_structure_id.get(sid)
+        fallback = self._fallback_meta_from_position(position)
+        if fallback is None:
             return None
-        self._meta_by_structure_id[sid] = fallback
+        if sid:
+            self._meta_by_structure_id[sid] = fallback
         return fallback
 
     def restore_state_on_startup(
@@ -757,9 +849,28 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 intent_id = getattr(position, "intent_id", None)
                 record = intent_store.get(intent_id) if intent_id else None
                 raw = (record or {}).get("payload", {}).get("strategy_meta")
-            if sid and self._restore_meta(sid, raw):
+            restored = bool(sid and self._restore_meta(sid, raw))
+            if not restored:
+                # CSV/intent meta missing (common when engine restores from another
+                # strategy's open-positions file) — infer from structure_id + symbol.
+                fallback = self._fallback_meta_from_position(position)
+                if fallback is not None and sid:
+                    self._meta_by_structure_id[sid] = fallback
+                    restored = True
+                    logger.info(
+                        "%s restored MAIN meta from structure_id/symbol "
+                        "sid=%s sleeve=%s direction=%s symbol=%s",
+                        self.name,
+                        sid,
+                        fallback.sleeve,
+                        fallback.direction,
+                        trading_symbol,
+                    )
+            if restored:
                 meta = self._meta_by_structure_id[sid]
                 self._confirmed_direction = meta.direction
+                if meta.sleeve == SLEEVE_WEEKLY:
+                    self._current_4h_supertrend = meta.supertrend
                 self._current_supertrend = meta.supertrend
 
     def _open_main_positions(
@@ -782,6 +893,35 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                     continue
             out.append(position)
         return out
+
+    def _main_trading_symbol(self, position: Any) -> str:
+        inst = getattr(position, "instrument", None)
+        return str(getattr(inst, "trading_symbol", "") or "").strip().upper()
+
+    def _open_main_trading_symbols(self, ctx: Any) -> set[str]:
+        """All open DOS MAIN symbols (any sleeve) — used to block duplicate entries."""
+        out: set[str] = set()
+        for position in self._open_main_positions(ctx):
+            sym = self._main_trading_symbol(position)
+            if sym:
+                out.add(sym)
+        return out
+
+    def _open_main_has_expiry(self, ctx: Any, expiry: str) -> bool:
+        want = str(expiry or "").strip()
+        if not want:
+            return False
+        for position in self._open_main_positions(ctx):
+            meta = self._ensure_meta(position, ctx)
+            if meta is not None and str(meta.expiry) == want:
+                return True
+            inst = getattr(position, "instrument", None)
+            if str(getattr(inst, "expiry", "") or "") == want:
+                return True
+            sym = self._main_trading_symbol(position)
+            if sym.endswith(f"-{want}"):
+                return True
+        return False
 
     @staticmethod
     def _expiry_date(value: Any) -> Optional[date]:
@@ -1101,6 +1241,15 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         if sleeve_u == SLEEVE_WEEKLY:
             target_expiry = self._weekly_expiry_for_entry(candle, ctx)
             entry_min_dte = WEEKLY_MIN_DTE
+            # Even if sleeve meta was lost and the open leg looks "daily", never
+            # stack another weekly MAIN on the same Friday expiry.
+            if target_expiry and self._open_main_has_expiry(ctx, target_expiry):
+                logger.info(
+                    "%s skip weekly ENTRY: already open on expiry=%s",
+                    self.name,
+                    target_expiry,
+                )
+                return None
         selected = self._select_contract(
             candle,
             ctx,
@@ -1125,6 +1274,15 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         trading_symbol = self.delta_option_trading_symbol(
             row, strike, option_type, expiry
         )
+        open_syms = self._open_main_trading_symbols(ctx)
+        if str(trading_symbol or "").strip().upper() in open_syms:
+            logger.info(
+                "%s skip %s ENTRY: already open on %s",
+                self.name,
+                sleeve_u,
+                trading_symbol,
+            )
+            return None
         ctx.selected_expiry = expiry
         inst = ctx.instrument_store.intent_creation_details(
             trading_symbol, ctx.exchange, expiry, option_type, strike
