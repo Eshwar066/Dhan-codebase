@@ -568,6 +568,103 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertEqual(result, [marker])
         self.assertEqual(self.strategy._sl_reentry_direction, 1)
 
+    def test_weekly_force_exit_ignores_1h_supertrend(self):
+        """Regression: weekly ST±300 must use 4H ST, not flipped 1H ST."""
+        from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (
+            _PositionMeta,
+        )
+
+        instrument = SimpleNamespace(
+            option_type="PE",
+            expiry="240726",
+            strike=64000,
+            trading_symbol="P-BTC-64000-240726",
+        )
+        sid = "DirectionalOptionSelling:BTCUSD:weekly:2026-07-21:PE:f4fa3a09"
+        position = SimpleNamespace(
+            tag="MAIN",
+            net_qty=-2,
+            structure_id=sid,
+            instrument=instrument,
+            intent_id="e1",
+            avg_price=303,
+        )
+        ctx = SimpleNamespace(
+            position_store=_PositionStore([position]),
+            intent_store=None,
+            order_router=None,
+        )
+        self.strategy._meta_by_structure_id[sid] = _PositionMeta(
+            symbol="BTCUSD",
+            direction=1,
+            option_type="PE",
+            supertrend=65659.07,
+            strike=64000,
+            expiry="240726",
+            entry_premium=303,
+            entry_reason="weekly_htf_aligned",
+            sleeve="weekly",
+        )
+        # 1H flipped bearish with high ST (the bug path); live 4H still bullish.
+        self.strategy._current_supertrend = 66827.33
+        self.strategy._confirmed_direction = -1
+        self.strategy._current_4h_supertrend = 65659.07
+        self.strategy._confirmed_4h_direction = 1
+
+        # Spot below bogus 1H force (66827-300=66527) but above real 4H force (65359).
+        candle = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 21, 19, 0, tzinfo=timezone.utc),
+            "open": 66300,
+            "high": 66400,
+            "low": 66065,
+            "close": 66188,
+        }
+        self.assertFalse(self.strategy.should_exit(position, candle, ctx))
+
+        quote = {
+            "symbol": "BTCUSD",
+            "ltp": 66065,
+            "ts": datetime(2026, 7, 21, 19, 0, tzinfo=timezone.utc).timestamp(),
+        }
+        self.assertIsNone(self.strategy.on_quote(quote, ctx))
+
+        # Only when spot breaches 4H ST-300 should weekly force-exit.
+        quote_hit = {
+            "symbol": "BTCUSD",
+            "ltp": 65359.07,
+            "ts": datetime(2026, 7, 21, 19, 1, tzinfo=timezone.utc).timestamp(),
+        }
+        marker = object()
+        with patch.object(self.strategy, "_exit_intent", return_value=marker):
+            result = self.strategy.on_quote(quote_hit, ctx)
+        self.assertEqual(result, [marker])
+
+    def test_risk_supertrend_weekly_never_falls_back_to_1h(self):
+        s = DirectionalOptionSelling()
+        s._current_supertrend = 66827.33
+        s._current_4h_supertrend = None
+        from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (
+            _PositionMeta,
+        )
+
+        meta = _PositionMeta(
+            symbol="BTCUSD",
+            direction=1,
+            option_type="PE",
+            supertrend=65659.07,
+            strike=64000,
+            expiry="240726",
+            entry_premium=303,
+            entry_reason="weekly_htf_aligned",
+            sleeve="weekly",
+        )
+        self.assertAlmostEqual(s._risk_supertrend_for_sleeve("weekly", meta), 65659.07)
+        s._current_4h_supertrend = 65659.07
+        self.assertAlmostEqual(s._risk_supertrend_for_sleeve("weekly", meta), 65659.07)
+        # Daily still uses 1H.
+        self.assertAlmostEqual(s._risk_supertrend_for_sleeve("daily", meta), 66827.33)
+
     def test_same_direction_supertrend_modifies_broker_sl(self):
         from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (
             _PositionMeta,

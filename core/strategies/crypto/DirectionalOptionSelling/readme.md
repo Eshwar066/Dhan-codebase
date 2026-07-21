@@ -206,7 +206,7 @@ After any SL / force / external full close: wait for the **next closed 1H bar**,
 | `SUPER_TREND_FACTOR` | 1.5 | ATR multiplier |
 | `MIN_PREMIUM_USD` | 120 | Min sell premium |
 | `TRAIL_SL_POINTS` | 100 | Broker trail vs ST |
-| `FORCE_EXIT_POINTS` | 300 | Strategy emergency vs ST |
+| `FORCE_EXIT_POINTS` | 300 | Strategy emergency vs sleeve ST (weekly=4H, daily=1H) |
 | `STRIKE_PROXIMITY_EXIT_POINTS` | 50 | Exit if spot near strike |
 | `ROLLOVER_TIME` | 17:25 IST | Daily expiry rollover |
 | `ROLLOVER_MIN_STRIKE_DISTANCE` | 200 | Min distance on rollover strike |

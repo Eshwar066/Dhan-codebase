@@ -205,6 +205,41 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         check = float(high if high is not None else spot)
         return check >= float(level)
 
+    def _risk_supertrend_for_sleeve(
+        self,
+        sleeve: str,
+        meta: Optional[_PositionMeta] = None,
+    ) -> Optional[float]:
+        """
+        SuperTrend used for ST±300 force-exit / should_exit.
+
+        Weekly sleeve must use 4H ST only (never 1H). Daily uses 1H.
+        """
+        sleeve_u = str(sleeve or SLEEVE_DAILY).strip().lower()
+        if sleeve_u == SLEEVE_WEEKLY:
+            for candidate in (
+                self._current_4h_supertrend,
+                meta.supertrend if meta is not None else None,
+            ):
+                try:
+                    st = float(candidate) if candidate is not None else 0.0
+                except (TypeError, ValueError):
+                    continue
+                if st > 0:
+                    return st
+            return None
+        for candidate in (
+            self._current_supertrend,
+            meta.supertrend if meta is not None else None,
+        ):
+            try:
+                st = float(candidate) if candidate is not None else 0.0
+            except (TypeError, ValueError):
+                continue
+            if st > 0:
+                return st
+        return None
+
     @staticmethod
     def _timestamp_ist(value: Any) -> pd.Timestamp:
         """
@@ -1999,19 +2034,15 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                         position, candle, ctx, "strategy_strike_proximity_exit"
                     )
                 ]
-            trail_st = float(
-                (meta.supertrend if meta is not None else 0)
-                or self._current_4h_supertrend
-                or self._current_supertrend
-                or 0
-            )
-            if trail_st <= 0 or self._confirmed_direction is None:
-                continue
+            # Weekly force-exit ST = 4H only; daily = 1H. Never mix TFs.
+            trail_st = self._risk_supertrend_for_sleeve(sleeve, meta)
             position_direction = (
                 meta.direction if meta is not None else self._confirmed_direction
             )
+            if trail_st is None or trail_st <= 0 or position_direction is None:
+                continue
             force_level = self._force_exit_level(
-                int(position_direction), trail_st
+                int(position_direction), float(trail_st)
             )
             if not self._spot_hits_level(
                 direction=int(position_direction),
@@ -2031,7 +2062,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 self.name,
                 sleeve,
                 spot,
-                trail_st,
+                float(trail_st),
                 force_level,
                 position_direction,
             )
@@ -2044,6 +2075,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         if ctx is None or getattr(position, "tag", None) != "MAIN":
             return False
         meta = self._ensure_meta(position, ctx)
+        sleeve = str(meta.sleeve) if meta is not None else SLEEVE_DAILY
         pos_strike = self._position_strike(position, meta)
         spot = float(candle.get("close") or 0)
         low = float(candle.get("low") or spot or 0)
@@ -2052,11 +2084,18 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             spot=spot, strike=pos_strike, low=low, high=high
         ):
             return True
-        direction = self._confirmed_direction
-        supertrend = self._current_supertrend
-        if direction is None or supertrend is None:
+        supertrend = self._risk_supertrend_for_sleeve(sleeve, meta)
+        position_direction = (
+            meta.direction
+            if meta is not None
+            else (
+                self._confirmed_4h_direction
+                if sleeve == SLEEVE_WEEKLY
+                else self._confirmed_direction
+            )
+        )
+        if position_direction is None or supertrend is None:
             return False
-        position_direction = meta.direction if meta is not None else direction
         force_level = self._force_exit_level(int(position_direction), float(supertrend))
         return self._spot_hits_level(
             direction=int(position_direction),
