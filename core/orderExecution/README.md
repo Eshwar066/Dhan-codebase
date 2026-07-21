@@ -21,6 +21,7 @@ Strategy.on_candle(candle, ctx)
 |------|------|
 | `order_router.py` | Risk, placement, trade-led sync, bundles, GTT sync |
 | `gtt_fallback_book.py` | **HYBRID_GTT**: Forever order + engine ask watch + LIMIT fallback |
+| `reentry_at_cost_book.py` | **reentry_at_cost**: after MAIN_SL, poll premium ≤ cost and re-enter same contract |
 | `bracket_orders.py` | MAIN_SL / MAIN_TARGET sibling registry (OCO-style cancel) |
 | `risk_manager.py` | `allow_intent`, kill switch, daily loss |
 | `intent_store.py` | Intent lifecycle, idempotency, pending queries |
@@ -35,6 +36,26 @@ Strategy.on_candle(candle, ctx)
 | *(default)* | Regular Dhan LIMIT / SL-M via `place_order` |
 | `GTT` | Dhan Forever order; fill polled via `_sync_gtt_pending_fills` |
 | `HYBRID_GTT` | GTT + `GttFallbackBook` watches bid/ask; cancels GTT and places resting LIMIT when trigger fires |
+
+## Re-entry at cost (`reentry_at_cost`)
+
+Strategies opt in via class attr and/or MAIN ENTRY `metadata_extras`:
+
+```python
+reentry_at_cost = {
+    "enabled": True,
+    "max_reentries": 1,
+    "poll_interval_sec": 300,
+    "min_premium": 0.1,
+    "until_expiry": True,
+}
+```
+
+OMS flow (Delta / LiveEngine):
+1. `MAIN_SL` fill → `ReentryAtCostBook.maybe_arm_from_main_sl` (cost = entry premium)
+2. Engine tick polls book; when premium ≤ cost, places same-contract MAIN ENTRY (`:R{n}`)
+3. Stops when MAIN opens on that contract, max reentries hit, or expiry day ends
+4. Persists under `logs/oms/reentry_at_cost.json`
 
 Opt-in fallback spec (`gtt_fallback` in strategy_meta):
 ```python

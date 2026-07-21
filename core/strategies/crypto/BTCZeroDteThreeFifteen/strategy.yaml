@@ -51,30 +51,22 @@ documentation:
   title: BTC/ETH Zero DTE
   overview: >
     Three independently configurable Delta entries: BTC premium-band and BTC OTM2
-    at 15:15, then ETH OTM2 at 15:30. Each leg has a 100% stop, one same-contract
-    re-entry at cost, and a 17:15 exit.
+    at 15:15, then ETH OTM2 at 15:30. Each leg has a 100% stop. SL re-entry at cost
+    is declared via reentry_at_cost and executed by OMS ReentryAtCostBook.
   rules: |
     - 15:15 IST: BTC premium-band CE + PE (target ~$100)
     - 15:15 IST: BTC OTM2 CE + PE
     - 15:30 IST: ETH OTM2 CE + PE
-    - Each family has an enable switch and independent quantity
     - After MAIN fill: broker SL at 2x entry premium (100% stop)
-    - After SL, wait for that same contract and strike to return to entry cost
-      (checked continuously on underlying quotes; not only at scheduled slots)
+    - Declare reentry_at_cost on entry meta; OMS polls every 5m until expiry
+    - Once that strike is open again, OMS stops the retry
     - One same-contract re-entry per leg
-    - Manage remaining leg independently
-    - 17:15 IST: exit all remaining MAIN positions (pending re-entries cancelled)
-    - Scheduled slots for entry/EOD; quote ticks drive SL re-entry-at-cost
+    - 17:15 IST: exit all remaining MAIN positions
   run_command: python -m run.main --engine-id delta_engine_one
   generate_readme: false
 subscriptions:
   BarClosed: false
   ScheduledSlot:
-    enabled: true
-    symbols:
-    - BTCUSD
-    - ETHUSD
-  QuoteUpdated:
     enabled: true
     symbols:
     - BTCUSD

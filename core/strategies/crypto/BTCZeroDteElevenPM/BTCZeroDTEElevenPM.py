@@ -2,16 +2,13 @@
 BTC overnight OTM10 + OTM15 short strangles (Delta).
 
 Rules
-- 23:00 IST: sell 10 OTM10 Call lots + 10 OTM10 Put lots (Daily expiry).
-- If OTM10 is missing for a leg, use the farthest listed ATM+OTM strike available.
-- Also sell OTM15 Call and Put using a separately configurable lot size.
-- OTM15 is strict per leg: place CE or PE independently and skip a missing leg.
-- Hold overnight; after each MAIN fill place 100% premium stop (SL-M BUY cover).
-- Up to 2 re-entries per leg at the same OTM target after SL (re-entry at cost).
-- Manage remaining leg independently.
-- 17:15 IST (next session): exit all remaining MAIN positions.
+- 23:15 IST: sell OTM10 / OTM15 CE+PE (Daily expiry).
+- After MAIN fill place 100% premium stop.
+- After MAIN_SL: OMS reentry-at-cost (declare ``reentry_at_cost``; poll/persist in OMS).
+- Up to 2 successful re-entries per leg; OMS stops once strike is open again.
+- 17:15 IST: exit remaining MAIN positions.
 
-Eval style: scheduled slots. ``backtest_timeframe="5"`` so bar clocks hit 23:00 / 17:15.
+Eval style: scheduled slots. OMS owns SL re-entry-at-cost.
 
 Run: ``python -m run.main --engine-id delta_engine_one``
 """
@@ -50,8 +47,9 @@ SECOND_ENTRY_OTM_STEPS = 15
 SECOND_ENTRY_LOTS = 10
 # Backward-compatible alias for the original entry.
 OTM_STEPS = FIRST_ENTRY_OTM_STEPS
-# Hard floor for every entry / re-entry.
+# Hard floor for every *initial* entry.
 MIN_ENTRY_PREMIUM = 5.0
+MIN_REENTRY_PREMIUM = 0.1
 # Premium SL at 2x entry = 100% stop on short premium.
 SL_PREM_MULT = 2.0
 TP_TRIGGER_PRICE = 0.1
@@ -74,12 +72,6 @@ class _LegMeta:
     qty_lots: int
 
 
-@dataclass(frozen=True)
-class _PendingSLReentry:
-    meta: _LegMeta
-    instrument: Any
-    previous_structure_id: str
-
 
 class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     """Delta BTC OTM10 + OTM15 entries with independent leg management."""
@@ -96,6 +88,13 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     order_qty_lots = FIRST_ENTRY_LOTS
     otm_strike_step = 200
     otm_strike_count = SECOND_ENTRY_OTM_STEPS + 1
+    reentry_at_cost = {
+        "enabled": True,
+        "max_reentries": MAX_REENTRIES_PER_LEG,
+        "poll_interval_sec": 300,
+        "min_premium": MIN_REENTRY_PREMIUM,
+        "until_expiry": True,
+    }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -104,7 +103,6 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         self._entry_signaled_keys: set[str] = set()
         self._pending_exit_structure_ids: set[str] = set()
         self._snapshot_logged_slots: set[str] = set()
-        self._pending_sl_reentry_by_structure_id: Dict[str, _PendingSLReentry] = {}
 
     def get_warmup_period(self):
         return 0
@@ -114,6 +112,17 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         if str(entry_group).upper() == "E2":
             return ENABLE_SECOND_ENTRY
         return ENABLE_FIRST_ENTRY
+
+    def reentry_at_cost_allowed(self, metadata_extras: Any) -> bool:
+        from core.strategies.meta import unpack_strategy_meta
+
+        payload = unpack_strategy_meta(metadata_extras) or {}
+        if isinstance(metadata_extras, dict) and META_KEY in metadata_extras:
+            raw = metadata_extras.get(META_KEY)
+            if isinstance(raw, dict):
+                payload = raw
+        group = str(payload.get("entry_group", "E1") or "E1")
+        return self._entry_group_enabled(group)
 
     # ---------- time / slots ----------
 
@@ -205,9 +214,11 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             "entry_group": meta.entry_group,
             "otm_steps": meta.otm_steps,
             "qty_lots": meta.qty_lots,
+            "reentry_at_cost": dict(self.reentry_at_cost),
         }
         out = pack_strategy_meta(REGISTRY_KEY, payload)
         out[META_KEY] = payload
+        out["reentry_at_cost"] = dict(self.reentry_at_cost)
         return out
 
     def _try_merge_meta_from_raw(self, structure_id: str, raw: dict) -> bool:
@@ -805,117 +816,9 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             intents.append(self._exit_intent_for_position(pos, candle, ctx))
         return intents
 
-    def _build_same_contract_reentry(
-        self,
-        pending: _PendingSLReentry,
-        candle: dict,
-        ctx: Any,
-    ) -> Optional[Any]:
-        """Re-enter the stopped contract only after its premium returns to cost."""
-        meta = pending.meta
-        if meta.reentry_count >= MAX_REENTRIES_PER_LEG:
-            return None
-        if ctx is None:
-            return None
-
-        inst = pending.instrument
-        trading_symbol = str(getattr(inst, "trading_symbol", "") or "")
-        if not trading_symbol:
-            return None
-        current_premium = self.get_option_price_at_candle(
-            candle,
-            ctx,
-            getattr(inst, "strike", None),
-            getattr(inst, "option_type", None),
-            getattr(inst, "expiry", None),
-            trading_symbol=trading_symbol,
-        )
-        if current_premium is None or float(current_premium) <= MIN_ENTRY_PREMIUM:
-            return None
-        current_premium = float(current_premium)
-        if current_premium > float(meta.entry_premium):
-            return None
-
-        reentry_count = meta.reentry_count + 1
-        structure_id = self._structure_id(
-            meta.symbol,
-            meta.entry_date,
-            meta.option_type,
-            entry_group=meta.entry_group,
-            reentry=reentry_count,
-        )
-        if ctx.position_store.has_open_structure(
-            strategy=self.name, structure_id=structure_id, tag="MAIN"
-        ):
-            return None
-        intent_store = getattr(ctx, "intent_store", None)
-        if intent_store is not None and intent_store.has_pending_intent(
-            strategy=self.name,
-            structure_id=structure_id,
-            tags=["MAIN"],
-            actions=["ENTRY"],
-        ):
-            return None
-
-        new_meta = _LegMeta(
-            symbol=meta.symbol,
-            entry_date=meta.entry_date,
-            option_type=meta.option_type,
-            entry_premium=current_premium,
-            reentry_count=reentry_count,
-            entry_group=meta.entry_group,
-            otm_steps=meta.otm_steps,
-            qty_lots=meta.qty_lots,
-        )
-        row = pd.Series(
-            {
-                "symbol": trading_symbol,
-                "price": current_premium,
-                "close": current_premium,
-                "strike": getattr(inst, "strike", None),
-                "expiry": getattr(inst, "expiry", None),
-            }
-        )
-        intent = self.map_instrument_to_intent(
-            inst=inst,
-            strike_row=row,
-            strategy=self.name,
-            side="SELL",
-            structure_id=structure_id,
-            candle_ts=candle["timestamp"],
-            tag="MAIN",
-            symbol=meta.symbol,
-            action="ENTRY",
-            metadata_extras=self._strategy_meta_dict(new_meta),
-        )
-        intent = replace(intent, qty=meta.qty_lots)
-        self._meta_by_structure_id[structure_id] = new_meta
-        logger.info(
-            "BTCZeroDTEElevenPM same-contract SL re-entry %s contract=%s "
-            "premium=%.4f cost=%.4f reentry=%s",
-            structure_id,
-            trading_symbol,
-            current_premium,
-            meta.entry_premium,
-            reentry_count,
-        )
-        return intent
-
-    def _pending_sl_reentry_intents(self, candle: dict, ctx: Any) -> List[Any]:
-        intents: List[Any] = []
-        for sid, pending in list(self._pending_sl_reentry_by_structure_id.items()):
-            intent = self._build_same_contract_reentry(pending, candle, ctx)
-            if intent is None:
-                continue
-            self._pending_sl_reentry_by_structure_id.pop(sid, None)
-            intents.append(intent)
-        return intents
-
     # ---------- engine hooks ----------
 
     def should_evaluate(self, candle) -> bool:
-        if self._pending_sl_reentry_by_structure_id:
-            return True
         slot = self._active_slot(candle)
         if slot not in (ENTRY_TIME, EXIT_TIME):
             return False
@@ -929,14 +832,13 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     def on_candle(self, candle, ctx):
         slot = self._active_slot(candle)
         if slot == EXIT_TIME:
-            self._pending_sl_reentry_by_structure_id.clear()
             intents = self._eod_exit_intents(candle, ctx)
             return intents or None
 
-        intents: List[Any] = self._pending_sl_reentry_intents(candle, ctx)
         if slot != ENTRY_TIME:
-            return intents or None
+            return None
 
+        intents: List[Any] = []
         trade_dt = self._trade_date(candle)
         entry_specs = (
             (
@@ -969,8 +871,6 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                     allow_fallback=allow_fallback,
                     reentry_count=0,
                 )
-                # Each OTM15 leg is independent: an unavailable PE does not
-                # suppress a valid CE (and vice versa).
                 if leg is not None:
                     intents.append(leg)
         return intents or None
@@ -1054,34 +954,10 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         ]
 
     def on_main_exit_filled(self, **kwargs: Any) -> List[Tuple[Any, dict]]:
+        # OMS ReentryAtCostBook arms from metadata_extras.reentry_at_cost on MAIN_SL.
         structure_id = kwargs.get("structure_id")
-        if not structure_id:
-            return []
-        sid = str(structure_id)
-        self._pending_exit_structure_ids.discard(sid)
-        meta = self._meta_by_structure_id.get(sid)
-        tag_u = str(kwargs.get("tag") or "").upper()
-        if tag_u != "MAIN_SL":
-            self._pending_sl_reentry_by_structure_id.pop(sid, None)
-            return []
-        instrument = kwargs.get("instrument")
-        if meta is None or instrument is None:
-            return []
-        if meta.reentry_count >= MAX_REENTRIES_PER_LEG:
-            return []
-        self._pending_sl_reentry_by_structure_id[sid] = _PendingSLReentry(
-            meta=meta,
-            instrument=instrument,
-            previous_structure_id=sid,
-        )
-        logger.info(
-            "BTCZeroDTEElevenPM SL re-entry waiting sid=%s contract=%s cost=%.4f "
-            "next_reentry=%s",
-            sid,
-            getattr(instrument, "trading_symbol", ""),
-            meta.entry_premium,
-            meta.reentry_count + 1,
-        )
+        if structure_id:
+            self._pending_exit_structure_ids.discard(str(structure_id))
         return []
 
     def on_forced_exit(self, **kwargs: Any):

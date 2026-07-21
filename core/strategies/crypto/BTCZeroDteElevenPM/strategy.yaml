@@ -21,7 +21,7 @@ timeframe: null
 schedule:
   eval_mode: scheduled
   times:
-  - '23:00'
+  - '23:15'
   - '17:15'
 backtest_timeframe: '5'
 data:
@@ -48,19 +48,14 @@ dependencies:
 documentation:
   title: BTC OTM10 + OTM15 Overnight (11PM)
   overview: >
-    Delta BTC OTM10 and OTM15 short strangles on Daily expiry. Both enter at
-    23:00 IST with separate lot sizes, independent leg management, 100% stop-loss,
-    up to two re-entries after SL, and a 17:15 IST exit.
+    Delta BTC OTM10 and OTM15 short strangles on Daily expiry at 23:15 IST.
+    SL re-entry at cost is declared via reentry_at_cost and executed by OMS.
   rules: |
-    - 23:00 IST: sell 10 OTM10 Call lots + 10 OTM10 Put lots (Daily expiry)
-    - If OTM10 missing for CE/PE: use last available OTM strike for that leg
-    - Also enter strict OTM15 CE and PE with separately configurable lots
-    - If either OTM15 leg is unavailable, skip only that leg
-    - After MAIN fill: broker SL at 2x entry premium (100% stop)
-    - Up to 2 re-entries per leg after SL
-    - Manage remaining leg independently
-    - 17:15 IST: exit all remaining MAIN positions (overnight hold)
-    - Scheduled slots; backtest uses 5m bars for clock alignment
+    - 23:15 IST: sell OTM10 and OTM15 CE/PE
+    - After MAIN fill: broker SL at 2x entry premium
+    - Declare reentry_at_cost; OMS polls every 5m until expiry (up to 2 re-entries)
+    - Once that strike is open again, OMS stops the retry
+    - 17:15 IST: exit remaining MAIN positions
   run_command: python -m run.main --engine-id delta_engine_one
   generate_readme: false
 subscriptions:

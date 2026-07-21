@@ -149,6 +149,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self.position_manager.on_forced_exit = getattr(strategy, "on_forced_exit", None)
         self.position_manager.on_main_entry_fill = self._on_pm_main_entry_fill
         self.position_manager.on_main_exit_fill = self._on_pm_main_exit_fill
+        self._configure_reentry_at_cost_book()
         self.realtime_feed = realtime_feed
         self.tick_queue = tick_queue
         self.candle_queue = candle_queue
@@ -537,6 +538,16 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         }
         kwargs.pop("ctx", None)
         ctx = self.build_context_only(candle)
+        # OMS: stop any reentry-at-cost wait for this contract once MAIN is open.
+        book = getattr(self.order_router, "reentry_at_cost_book", None)
+        if book is not None:
+            try:
+                book.on_position_opened(
+                    instrument=kwargs.get("instrument"),
+                    strategy_id=str(getattr(strategy_obj, "name", "") or ""),
+                )
+            except Exception as exc:
+                logger.warning("reentry_at_cost on_position_opened failed: %s", exc)
         intents = fn(ctx=ctx, **kwargs) or []
         risk_manager = getattr(self.order_router, "risk", None)
         bracket_tags = {"MAIN_SL", "MAIN_TARGET"}
@@ -617,6 +628,27 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         }
         kwargs.pop("ctx", None)
         ctx = self.build_context_only(candle_stub) if sym else None
+        # OMS: arm reentry-at-cost wait when strategy opted in via metadata/attr.
+        tag_u = str(kwargs.get("tag") or "").upper()
+        book = getattr(self.order_router, "reentry_at_cost_book", None)
+        if book is not None and tag_u == "MAIN_SL":
+            try:
+                book.maybe_arm_from_main_sl(
+                    strategy=strategy_obj,
+                    instrument=kwargs.get("instrument"),
+                    structure_id=kwargs.get("structure_id"),
+                    metadata_extras=meta_ex,
+                    qty=kwargs.get("qty"),
+                    side=kwargs.get("side"),
+                    price=kwargs.get("price"),
+                )
+            except Exception as exc:
+                logger.warning("reentry_at_cost arm failed: %s", exc)
+        elif book is not None and tag_u in ("MAIN_EXIT", "MAIN_TARGET"):
+            try:
+                book.cancel_for_structure(str(kwargs.get("structure_id") or ""))
+            except Exception:
+                pass
         pairs = fn(ctx=ctx, **kwargs) or []
         risk_manager = getattr(self.order_router, "risk", None)
         for intent, candle in pairs:
@@ -2576,6 +2608,80 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     timeframe=None,
                 )
 
+    def _configure_reentry_at_cost_book(self) -> None:
+        book = getattr(self.order_router, "reentry_at_cost_book", None)
+        if book is None:
+            return
+        book.set_strategy_resolver(self._strategy_obj_for_name)
+
+        def _premium(
+            trading_symbol: str,
+            *,
+            side: str = "SELL",
+            strike: Any = None,
+            option_type: Any = None,
+            expiry: Any = None,
+        ) -> Optional[float]:
+            sym = str(trading_symbol or "").strip()
+            if not sym:
+                return None
+            # Prefer live option ticker (bid for short re-entry).
+            feed = self.realtime_feed
+            if feed is not None and feed.is_connected():
+                get_bid = getattr(feed, "get_best_bid", None)
+                get_ask = getattr(feed, "get_best_ask", None)
+                if str(side).upper() == "SELL" and callable(get_bid):
+                    bid = get_bid(sym)
+                    if bid is not None and float(bid) > 0:
+                        return float(bid)
+                if str(side).upper() == "BUY" and callable(get_ask):
+                    ask = get_ask(sym)
+                    if ask is not None and float(ask) > 0:
+                        return float(ask)
+                ticker_fn = getattr(feed, "get_last_ticker", None)
+                if callable(ticker_fn):
+                    tick = ticker_fn(sym)
+                    if isinstance(tick, dict):
+                        px = tick.get("close") or tick.get("last_price")
+                        if px is not None and float(px) > 0:
+                            return float(px)
+            broker = getattr(self.order_router, "broker", None)
+            get_ticker = getattr(broker, "get_ticker", None) if broker else None
+            if not callable(get_ticker):
+                source = getattr(self, "data", None)
+                get_ticker = getattr(source, "get_ticker", None) if source else None
+            if callable(get_ticker):
+                try:
+                    ticker = get_ticker(sym)
+                except Exception:
+                    ticker = None
+                if isinstance(ticker, dict):
+                    quotes = ticker.get("quotes") or {}
+                    if str(side).upper() == "SELL":
+                        bid = quotes.get("best_bid")
+                        if bid is not None and float(bid) > 0:
+                            return float(bid)
+                    else:
+                        ask = quotes.get("best_ask")
+                        if ask is not None and float(ask) > 0:
+                            return float(ask)
+                    mark = ticker.get("mark_price") or ticker.get("close")
+                    if mark is not None and float(mark) > 0:
+                        return float(mark)
+            return None
+
+        book.set_premium_fn(_premium)
+
+    def _maybe_tick_reentry_at_cost(self) -> None:
+        """OMS poll: place same-contract re-entries when premium returns to cost."""
+        book = getattr(self.order_router, "reentry_at_cost_book", None)
+        if book is None or not book.has_pending():
+            return
+        try:
+            book.tick()
+        except Exception as exc:
+            logger.warning("reentry_at_cost tick failed: %s", exc)
+
     @staticmethod
     def _strategy_owns_timeframe(strategy: Any, timeframe: str) -> bool:
         tf_s = str(timeframe or "").strip()
@@ -2674,12 +2780,19 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         timeframe: Optional[str] = None,
         scheduled: bool = False,
         already_enriched: bool = False,
+        only_strategy_names: Optional[set] = None,
     ) -> List[Dict[str, Any]]:
         response_q: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         expected = 0
         tf_filter = str(timeframe or "").strip() if timeframe is not None else ""
         candle_symbol = str(candle.get("symbol") or "").strip().upper()
+        only_names = None
+        if only_strategy_names:
+            only_names = {str(n) for n in only_strategy_names}
         for strategy in self.strategies:
+            strategy_id = str(getattr(strategy, "name", "unknown_strategy"))
+            if only_names is not None and strategy_id not in only_names:
+                continue
             if scheduled:
                 if not self._is_scheduled_strategy(strategy, self.strategy_eval_modes):
                     continue
@@ -2705,7 +2818,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 except Exception:
                     sig_msg = None
                 if sig_msg:
-                    strategy_id = str(getattr(strategy, "name", "unknown_strategy"))
                     sig_symbol = str(
                         strategy_candle.get("symbol") or candle.get("symbol") or ""
                     )
@@ -2717,7 +2829,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         timeframe=str(getattr(strategy, "timeframe", "") or ""),
                     )
             self._ensure_strategy_worker(strategy)
-            strategy_id = str(getattr(strategy, "name", "unknown_strategy"))
             recent_candles = self._recent_candles_for_strategy(
                 strategy, strategy_candle
             )
@@ -3005,6 +3116,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             self._run_gtt_fallback_tick()
             self._maybe_retry_delta_missing_main_sl()
             self._maybe_run_scheduled_evaluations(exchange)
+            self._maybe_tick_reentry_at_cost()
 
             # Export eod report funtion
             if loop_count % 60 == 0:

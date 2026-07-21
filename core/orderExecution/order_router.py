@@ -21,6 +21,7 @@ except ImportError:
 from core.broker.internal.dhan.mappings import dhan_correlation_id, format_broker_failure_for_log
 from core.orderExecution.bracket_orders import BRACKET_TAGS, BracketLegRegistry
 from core.orderExecution.gtt_fallback_book import GttFallbackBook, GttFallbackWatch
+from core.orderExecution.reentry_at_cost_book import ReentryAtCostBook
 from core.orderExecution.intent_store import IntentStatus, IntentStore
 from core.models.order_intent import OrderIntent
 
@@ -127,6 +128,11 @@ class OrderRouter:
         self._oms_session_start_unix = time.time()
         self.bracket_registry = BracketLegRegistry()
         self.gtt_fallback_book = GttFallbackBook(
+            self,
+            instrument_store=instrument_store,
+            engine_logger=engine_logger,
+        )
+        self.reentry_at_cost_book = ReentryAtCostBook(
             self,
             instrument_store=instrument_store,
             engine_logger=engine_logger,
