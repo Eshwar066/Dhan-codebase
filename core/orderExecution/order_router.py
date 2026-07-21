@@ -4328,6 +4328,8 @@ class OrderRouter:
             realized_pnl=realized_pnl,
             structure_id=structure_id,
             tag=tag,
+            action=action,
+            metadata_extras=metadata_extras,
         )
 
     def _emit_bus_fill_events(
@@ -4343,6 +4345,8 @@ class OrderRouter:
         realized_pnl: Any,
         structure_id: Any,
         tag: Any,
+        action: Any = None,
+        metadata_extras: Any = None,
     ) -> None:
         bus = getattr(self, "event_bus", None)
         if bus is None:
@@ -4363,6 +4367,9 @@ class OrderRouter:
                     "price": price,
                     "structure_id": structure_id,
                     "tag": tag,
+                    "action": action,
+                    "instrument": instrument,
+                    "metadata_extras": metadata_extras,
                 },
                 engine_id=engine_id,
             )

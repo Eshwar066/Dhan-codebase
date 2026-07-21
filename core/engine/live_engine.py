@@ -539,16 +539,15 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         }
         kwargs.pop("ctx", None)
         ctx = self.build_context_only(candle)
-        # OMS: stop any reentry-at-cost wait for this contract once MAIN is open.
-        book = getattr(self.order_router, "reentry_at_cost_book", None)
-        if book is not None:
-            try:
-                book.on_position_opened(
-                    instrument=kwargs.get("instrument"),
-                    strategy_id=str(getattr(strategy_obj, "name", "") or ""),
-                )
-            except Exception as exc:
-                logger.warning("reentry_at_cost on_position_opened failed: %s", exc)
+        # OMS reentry-at-cost: stop wait once MAIN is open (handler also listens
+        # to IntentFilled; helper is idempotent / safe if bus unwired).
+        from core.events.handlers.reentry_at_cost import stop_on_main_opened
+
+        stop_on_main_opened(
+            self,
+            strategy=strategy_obj,
+            instrument=kwargs.get("instrument"),
+        )
         intents = fn(ctx=ctx, **kwargs) or []
         risk_manager = getattr(self.order_router, "risk", None)
         bracket_tags = {"MAIN_SL", "MAIN_TARGET"}
@@ -629,27 +628,26 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         }
         kwargs.pop("ctx", None)
         ctx = self.build_context_only(candle_stub) if sym else None
-        # OMS: arm reentry-at-cost wait when strategy opted in via metadata/attr.
+        # OMS reentry-at-cost: arm/cancel via shared helpers (also wired on bus).
+        from core.events.handlers.reentry_at_cost import (
+            arm_from_main_sl,
+            cancel_for_structure,
+        )
+
         tag_u = str(kwargs.get("tag") or "").upper()
-        book = getattr(self.order_router, "reentry_at_cost_book", None)
-        if book is not None and tag_u == "MAIN_SL":
-            try:
-                book.maybe_arm_from_main_sl(
-                    strategy=strategy_obj,
-                    instrument=kwargs.get("instrument"),
-                    structure_id=kwargs.get("structure_id"),
-                    metadata_extras=meta_ex,
-                    qty=kwargs.get("qty"),
-                    side=kwargs.get("side"),
-                    price=kwargs.get("price"),
-                )
-            except Exception as exc:
-                logger.warning("reentry_at_cost arm failed: %s", exc)
-        elif book is not None and tag_u in ("MAIN_EXIT", "MAIN_TARGET"):
-            try:
-                book.cancel_for_structure(str(kwargs.get("structure_id") or ""))
-            except Exception:
-                pass
+        if tag_u == "MAIN_SL":
+            arm_from_main_sl(
+                self,
+                strategy=strategy_obj,
+                instrument=kwargs.get("instrument"),
+                structure_id=kwargs.get("structure_id"),
+                metadata_extras=meta_ex,
+                qty=kwargs.get("qty"),
+                side=kwargs.get("side"),
+                price=kwargs.get("price"),
+            )
+        elif tag_u in ("MAIN_EXIT", "MAIN_TARGET"):
+            cancel_for_structure(self, kwargs.get("structure_id"))
         pairs = fn(ctx=ctx, **kwargs) or []
         risk_manager = getattr(self.order_router, "risk", None)
         for intent, candle in pairs:
@@ -1270,6 +1268,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     exc,
                 )
 
+        for stale_sid in list(self._delta_main_sl_retry.keys()):
+            if stale_sid not in active_sids:
+                self._delta_main_sl_retry.pop(stale_sid, None)
+
     def _on_broker_no_open_position(
         self,
         *,
@@ -1294,20 +1296,14 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         if sid:
             self._delta_main_sl_retry.pop(sid, None)
 
-        book = getattr(self.order_router, "reentry_at_cost_book", None)
-        if book is not None:
-            try:
-                book.stop_for_trading_symbol(
-                    trading_symbol=sym or None,
-                    strategy_id=strat or None,
-                    structure_id=sid or None,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "reentry_at_cost stop_for_trading_symbol failed symbol=%s: %s",
-                    sym,
-                    exc,
-                )
+        from core.events.handlers.reentry_at_cost import stop_for_flat
+
+        stop_for_flat(
+            self,
+            trading_symbol=sym or None,
+            strategy_id=strat or None,
+            structure_id=sid or None,
+        )
 
         if self.engine_logger and synced:
             self.engine_logger.log(
@@ -1327,10 +1323,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 sid,
                 message,
             )
-
-        for stale_sid in list(self._delta_main_sl_retry.keys()):
-            if stale_sid not in active_sids:
-                self._delta_main_sl_retry.pop(stale_sid, None)
 
     def _force_close_position_missing_main_sl(
         self,
@@ -2734,13 +2726,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
 
     def _maybe_tick_reentry_at_cost(self) -> None:
         """OMS poll: place same-contract re-entries when premium returns to cost."""
-        book = getattr(self.order_router, "reentry_at_cost_book", None)
-        if book is None or not book.has_pending():
-            return
-        try:
-            book.tick()
-        except Exception as exc:
-            logger.warning("reentry_at_cost tick failed: %s", exc)
+        from core.events.handlers.reentry_at_cost import tick_book
+
+        tick_book(self)
 
     @staticmethod
     def _strategy_owns_timeframe(strategy: Any, timeframe: str) -> bool:

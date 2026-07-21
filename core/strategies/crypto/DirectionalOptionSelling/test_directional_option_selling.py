@@ -613,9 +613,11 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             "symbol": "BTCUSD",
             "timestamp": datetime(2026, 7, 17, 7, 0, tzinfo=timezone.utc),
             "close": 118500,
-            "supertrend": 118200,
+            "supertrend": 118050,
             "supertrend_direction": 1,
+            "supertrend_4h": 118200,
         }
+        self.strategy._current_4h_supertrend = 118200.0
         with patch.object(
             self.strategy,
             "_refresh_htf_state",
@@ -626,9 +628,111 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             ) as modify:
                 with patch.object(self.strategy, "_build_entry", return_value=None):
                     self.assertIsNone(self.strategy.on_candle(candle, ctx))
-        self.assertEqual(self.strategy._current_supertrend, 118200)
+        self.assertEqual(self.strategy._current_supertrend, 118050)
         self.assertEqual(modify.call_args.kwargs["supertrend"], 118200)
         self.assertEqual(modify.call_args.kwargs["direction"], 1)
+
+    def test_weekly_trail_does_not_fall_back_to_1h_st(self):
+        """Weekly sleeve must ignore 1H ST when 4H reference is missing."""
+        from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (
+            _PositionMeta,
+        )
+
+        instrument = SimpleNamespace(
+            option_type="PE",
+            expiry="240726",
+            strike=64000,
+            trading_symbol="P-BTC-64000-240726",
+            lot_size=1,
+            product_id=99,
+        )
+        position = SimpleNamespace(
+            tag="MAIN",
+            net_qty=-2,
+            structure_id="DirectionalOptionSelling:BTCUSD:weekly:2026-07-21:PE:f4fa3a09",
+            instrument=instrument,
+            intent_id="entry1",
+            avg_price=303,
+        )
+        ctx = SimpleNamespace(
+            position_store=_PositionStore([position]),
+            intent_store=None,
+            order_router=SimpleNamespace(broker=SimpleNamespace()),
+        )
+        self.strategy._confirmed_direction = 1
+        self.strategy._current_supertrend = 65059.55
+        self.strategy._current_4h_supertrend = None
+        self.strategy._meta_by_structure_id[position.structure_id] = _PositionMeta(
+            symbol="BTCUSD",
+            direction=1,
+            option_type="PE",
+            supertrend=64497.31,
+            strike=64000,
+            expiry="240726",
+            entry_premium=303,
+            entry_reason="weekly_htf_aligned",
+            sleeve="weekly",
+        )
+        candle = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 21, 8, 0, tzinfo=timezone.utc),
+            "close": 65500,
+            "supertrend": 65059.55,
+            "supertrend_direction": 1,
+        }
+        with patch.object(self.strategy, "_refresh_htf_state", return_value=None):
+            with patch.object(
+                self.strategy, "_modify_broker_trail_sl", return_value=True
+            ) as modify:
+                with patch.object(self.strategy, "_build_entry", return_value=None):
+                    self.strategy.on_candle(candle, ctx)
+        modify.assert_not_called()
+        self.assertAlmostEqual(
+            self.strategy._meta_by_structure_id[position.structure_id].supertrend,
+            64497.31,
+        )
+
+    def test_htf_prefers_indicator_history_over_rest(self):
+        from datetime import timezone as tz
+
+        s = DirectionalOptionSelling()
+        as_of = pd.Timestamp("2026-07-21 14:00:00", tz="UTC")
+        rows = [
+            {
+                "timestamp": datetime(2026, 7, 21, 0, 0, tzinfo=tz.utc),
+                "indicators": {
+                    "supertrend": 64497.31,
+                    "supertrend_direction": 1.0,
+                },
+            },
+            {
+                "timestamp": datetime(2026, 7, 21, 4, 0, tzinfo=tz.utc),
+                "indicators": {
+                    "supertrend": 64896.29,
+                    "supertrend_direction": 1.0,
+                },
+            },
+            # Forming bar (not yet closed at as_of=14:00 if bar_sec=4h from 08:00)
+            {
+                "timestamp": datetime(2026, 7, 21, 12, 0, tzinfo=tz.utc),
+                "indicators": {
+                    "supertrend": 65332.39,
+                    "supertrend_direction": 1.0,
+                },
+            },
+        ]
+        with patch(
+            "core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling.ind_hist.load_indicator_history_rows",
+            return_value=rows,
+        ):
+            # 4h bars: 00:00 closes 04:00, 04:00 closes 08:00, 12:00 closes 16:00
+            # as_of 14:00 → last closed is 04:00 bar (closed 08:00) wait
+            # bar open 04:00 + 4h = 08:00 <= 14:00 ✓
+            # bar open 12:00 + 4h = 16:00 > 14:00 ✗
+            snap = s._latest_closed_st_from_indicator_history("4h", as_of)
+        self.assertIsNotNone(snap)
+        self.assertEqual(snap[0], 1)
+        self.assertAlmostEqual(snap[1], 64896.29)
 
     def test_on_main_entry_filled_arms_spot_trail_sl(self):
         instrument = SimpleNamespace(

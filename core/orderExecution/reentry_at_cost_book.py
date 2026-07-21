@@ -14,13 +14,16 @@ Strategies opt in by declaring ``reentry_at_cost`` on the MAIN ENTRY intent
 
 Flow:
   1. MAIN_SL fill → OMS arms a persisted wait (cost = entry premium).
-  2. Engine polls the book every poll_interval_sec.
+  2. Engine / QuoteUpdated polls the book every poll_interval_sec.
   3. When option premium <= cost (and >= min_premium), OMS places MAIN ENTRY
      on the same contract with incremented reentry_count / structure_id :R{n}.
   4. Wait stops when: re-entry placed, MAIN opens on that contract, max
      reentries reached, or (if until_expiry) the option expiry day ends.
 
 Persistence: ``logs/oms/reentry_at_cost.json`` (survives restart).
+
+Event adapters (arm / tick / stop): ``core.events.handlers.reentry_at_cost``
+(wired like GTT via ``core.events.wiring``).
 """
 
 from __future__ import annotations

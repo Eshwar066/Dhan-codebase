@@ -37,12 +37,15 @@ def resolve_strategy_subscriptions(
     timeframe = getattr(strategy, "timeframe", None)
     symbols = list(getattr(strategy, "underlying_symbols", None) or [])
     has_gtt = bool(getattr(strategy, "gtt_fallback", None))
+    from core.events.handlers.reentry_at_cost import strategy_opts_into_reentry
+
+    has_reentry = strategy_opts_into_reentry(strategy)
     live_feed = eval_mode != "scheduled"
     tfs = [str(timeframe)] if timeframe else []
     return {
         "BarClosed": {"enabled": live_feed, "timeframes": tfs, "symbols": symbols},
         "ScheduledSlot": {"enabled": not live_feed, "symbols": symbols},
-        "QuoteUpdated": {"enabled": has_gtt, "symbols": symbols},
+        "QuoteUpdated": {"enabled": has_gtt or has_reentry, "symbols": symbols},
         "IntentCreated": {"enabled": True},
         "IntentFilled": {"enabled": True},
         "PositionClosed": {"enabled": True},

@@ -15,6 +15,10 @@ from core.events.handlers.gtt import register_gtt_quote_handler
 from core.events.handlers.logging import register_event_tap
 from core.events.handlers.market import register_bar_closed_handlers
 from core.events.handlers.quotes import register_strategy_quote_handler
+from core.events.handlers.reentry_at_cost import (
+    register_reentry_at_cost_handlers,
+    strategy_opts_into_reentry,
+)
 from core.events.handlers.scheduled import register_scheduled_slot_handler
 from core.events.services import attach_event_services
 from core.events.subscriptions import (
@@ -62,6 +66,15 @@ def resolve_engine_subscriptions(engine: object) -> Set[str]:
     book = getattr(getattr(engine, "order_router", None), "gtt_fallback_book", None)
     if book is not None:
         enabled.add("QuoteUpdated")
+    # Reentry-at-cost needs IntentFilled + QuoteUpdated when any strategy opts in.
+    reentry_book = getattr(
+        getattr(engine, "order_router", None), "reentry_at_cost_book", None
+    )
+    if reentry_book is not None and any(
+        strategy_opts_into_reentry(s) for s in strategies
+    ):
+        enabled.add("IntentFilled")
+        enabled.add("QuoteUpdated")
     return enabled
 
 
@@ -98,10 +111,13 @@ def wire_event_bus(engine: object, bus: EventBus | None = None) -> EventBus:
     if "QuoteUpdated" in enabled:
         register_strategy_quote_handler(ctx)
         register_gtt_quote_handler(ctx)
-    if "FeedDisconnected" in enabled or "FeedRecovered" in enabled:
-        register_feed_handlers(ctx)
     if "IntentFilled" in enabled or "PositionClosed" in enabled:
         register_fill_handlers(ctx)
+    # Reentry-at-cost: fill arm/stop + quote poll (needs book + opt-in strategy).
+    if any(strategy_opts_into_reentry(s) for s in strategies):
+        register_reentry_at_cost_handlers(ctx)
+    if "FeedDisconnected" in enabled or "FeedRecovered" in enabled:
+        register_feed_handlers(ctx)
 
     tap_enabled = str(os.getenv("ALGO_EVENT_TAP", "0")).strip().lower() not in (
         "0",

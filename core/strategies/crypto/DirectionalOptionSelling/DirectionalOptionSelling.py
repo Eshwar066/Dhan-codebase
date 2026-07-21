@@ -15,6 +15,7 @@ from core.strategies.base import BaseStrategy
 from core.strategies.IndiaMktMixins import IST, IndiaMktMixins
 from core.strategies.deltaMktMixins import DeltaMktMixins, _delta_source_from_ctx
 from core.strategies.meta import pack_strategy_meta, unpack_strategy_meta
+from core.utils import indicator_history as ind_hist
 from core.utils.structure.supertrend import add_supertrend, supertrend_column_names
 
 logger = logging.getLogger(__name__)
@@ -219,6 +220,67 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             )
             return None
 
+    def _latest_closed_st_from_indicator_history(
+        self, timeframe: str, as_of_utc: pd.Timestamp
+    ) -> Optional[Tuple[int, float, pd.Timestamp]]:
+        """
+        Last fully closed SuperTrend from live ``indicator_history.jsonl``.
+
+        Preferred over REST for trailing: live_append already has the new 4H ST
+        while get_intraday can lag and leave MAIN_SL stuck at entry ST.
+        """
+        bar_sec = self._tf_bar_seconds(timeframe)
+        if bar_sec <= 0:
+            return None
+        as_of = pd.Timestamp(as_of_utc)
+        if as_of.tzinfo is None:
+            as_of = as_of.tz_localize("UTC")
+        else:
+            as_of = as_of.tz_convert("UTC")
+        try:
+            rows = ind_hist.load_indicator_history_rows(
+                "BTCUSD", timeframe, max_rows=80
+            )
+        except Exception as exc:
+            logger.debug(
+                "%s indicator history read failed tf=%s: %s",
+                self.name,
+                timeframe,
+                exc,
+            )
+            return None
+        best: Optional[Tuple[int, float, pd.Timestamp]] = None
+        for row in rows or []:
+            ts = row.get("timestamp")
+            if ts is None:
+                continue
+            bar_open = pd.Timestamp(ts)
+            if bar_open.tzinfo is None:
+                bar_open = bar_open.tz_localize("UTC")
+            else:
+                bar_open = bar_open.tz_convert("UTC")
+            close_at = bar_open + pd.Timedelta(seconds=bar_sec)
+            if close_at > as_of:
+                continue
+            ind = row.get("indicators") if isinstance(row.get("indicators"), dict) else {}
+            direction = self._normal_direction(
+                ind.get("supertrend_direction")
+                if ind
+                else row.get("supertrend_direction")
+            )
+            try:
+                st = float(
+                    (ind.get("supertrend") if ind else None)
+                    or row.get("supertrend")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                continue
+            if direction is None or pd.isna(st) or st <= 0:
+                continue
+            best = (int(direction), float(st), bar_open)
+        return best
+
     def _htf_supertrend(
         self, ctx: Any, timeframe: str, candle: dict
     ) -> Optional[Tuple[int, float, pd.Timestamp]]:
@@ -226,6 +288,12 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         as_of = self._as_of_utc(candle)
         cached = self._htf_st_cache.get(timeframe)
         bar_sec = self._tf_bar_seconds(timeframe)
+        # Prefer live indicator history (updated on 4h/1d close) over REST.
+        hist = self._latest_closed_st_from_indicator_history(timeframe, as_of)
+        if hist is not None:
+            if cached is None or hist[2] > cached[2] or abs(hist[1] - cached[1]) > 1e-6:
+                self._htf_st_cache[timeframe] = hist
+            return self._htf_st_cache[timeframe]
         if cached is not None and bar_sec > 0:
             _dir, _st, bar_open = cached
             next_close = bar_open + pd.Timedelta(seconds=bar_sec)
@@ -1605,6 +1673,16 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 product_id = pid_fn(trading_symbol)
         update_fn = getattr(broker, "update_order_stop_price", None)
         if not callable(update_fn) or not order_id or product_id is None:
+            logger.warning(
+                "%s broker trail SL skipped sid=%s order_id=%s product_id=%s "
+                "level=%.2f ST=%.2f (missing broker update path)",
+                self.name,
+                sid,
+                order_id,
+                product_id,
+                level,
+                float(supertrend),
+            )
             return False
         ok = bool(
             update_fn(
@@ -1632,6 +1710,15 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 meta["supertrend"] = float(supertrend)
                 payload["strategy_meta"] = meta
                 rec["payload"] = payload
+        else:
+            logger.warning(
+                "%s broker trail SL update FAILED sid=%s order=%s level=%.2f ST=%.2f",
+                self.name,
+                sid,
+                order_id,
+                level,
+                float(supertrend),
+            )
         return ok
 
     def _broker_still_has_position(self, ctx: Any, position: Any) -> bool:
@@ -1974,27 +2061,41 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                 str(meta.sleeve) if meta is not None else SLEEVE_DAILY
             )
             if sleeve == SLEEVE_WEEKLY:
+                # Weekly must trail 4H only — never fall back to 1H ST
+                # (that wrongly yanked SL to ~1H levels after restart).
                 ref_st = float(
                     candle.get("supertrend_4h")
                     or self._current_4h_supertrend
-                    or supertrend
+                    or 0
                 )
             else:
                 ref_st = float(supertrend)
+            if ref_st <= 0:
+                continue
             prev_ref = float(meta.supertrend) if meta is not None else previous_st
             if prev_ref is not None and abs(ref_st - float(prev_ref)) > 1e-9:
-                self._modify_broker_trail_sl(
+                updated = self._modify_broker_trail_sl(
                     ctx,
                     position,
                     direction=pos_dir,
                     supertrend=ref_st,
                 )
-                if meta is not None:
+                if meta is not None and updated:
                     sid = str(getattr(position, "structure_id", "") or "")
                     if sid:
                         self._meta_by_structure_id[sid] = replace(
                             meta, supertrend=ref_st
                         )
+                elif meta is not None and not updated:
+                    logger.warning(
+                        "%s weekly/daily trail ST moved %.2f -> %.2f but broker "
+                        "MAIN_SL was not updated sid=%s sleeve=%s",
+                        self.name,
+                        float(prev_ref),
+                        ref_st,
+                        getattr(position, "structure_id", None),
+                        sleeve,
+                    )
 
         deferred = self._consume_pending_closed_entry(candle, ctx, direction)
         if deferred is not None:
