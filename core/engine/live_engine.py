@@ -872,15 +872,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 merge_own(engine_id=self.engine_id)
             except Exception:
                 pass
-        restore_fn = getattr(self.strategy, "restore_state_on_startup", None)
-        if callable(restore_fn):
-            try:
-                restore_fn(self.position_manager, intent_store)
-            except Exception as exc:
-                if self.engine_logger:
-                    self.engine_logger.reconciliation(
-                        f"restore_state_on_startup failed: {exc}"
-                    )
+        self._restore_strategies_after_reconcile(intent_store)
         self._ensure_bracket_legs_after_reconcile()
         if self._open_positions_logger is not None and self.run_mode == RunMode.LIVE:
             self._open_positions_logger.record_broker_reconcile_snapshot(
@@ -901,6 +893,43 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 },
             )
         return True
+
+    def _restore_strategies_after_reconcile(self, intent_store: Any = None) -> None:
+        """Call each strategy's restore_state_on_startup (not only self.strategy)."""
+        from types import SimpleNamespace
+
+        restore_ctx = SimpleNamespace(
+            position_store=self.position_manager,
+            intent_store=intent_store,
+            order_router=self.order_router,
+        )
+        for strategy_obj in self.strategies:
+            restore_fn = getattr(strategy_obj, "restore_state_on_startup", None)
+            if not callable(restore_fn):
+                continue
+            strategy_name = str(
+                getattr(strategy_obj, "name", type(strategy_obj).__name__)
+            )
+            try:
+                restore_fn(
+                    self.position_manager,
+                    intent_store,
+                    ctx=restore_ctx,
+                )
+            except TypeError:
+                # Older strategies: restore_state_on_startup(pm, intent_store)
+                try:
+                    restore_fn(self.position_manager, intent_store)
+                except Exception as exc:
+                    if self.engine_logger:
+                        self.engine_logger.reconciliation(
+                            f"restore_state_on_startup failed strategy={strategy_name}: {exc}"
+                        )
+            except Exception as exc:
+                if self.engine_logger:
+                    self.engine_logger.reconciliation(
+                        f"restore_state_on_startup failed strategy={strategy_name}: {exc}"
+                    )
 
     def _resolve_position_ownership_from_intent_store(
         self, sym: str, pos: Any, intent_store: Any
@@ -2873,11 +2902,18 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             else:
                 if self._is_scheduled_strategy(strategy, self.strategy_eval_modes):
                     continue
-                if tf_filter and str(getattr(strategy, "timeframe", "") or "").strip() != tf_filter:
-                    continue
+                if tf_filter:
+                    primary_tf = str(getattr(strategy, "timeframe", "") or "").strip()
+                    if primary_tf != tf_filter and not self._strategy_owns_timeframe(
+                        strategy, tf_filter
+                    ):
+                        continue
             if candle_symbol and not strategy.applies_to_symbol(candle_symbol):
                 continue
-            if already_enriched and str(getattr(strategy, "timeframe", "") or "").strip() == tf_filter:
+            if already_enriched and (
+                str(getattr(strategy, "timeframe", "") or "").strip() == tf_filter
+                or self._strategy_owns_timeframe(strategy, tf_filter)
+            ):
                 strategy_candle = dict(candle)
             else:
                 strategy_candle = self._enrich_candle_for_strategy(

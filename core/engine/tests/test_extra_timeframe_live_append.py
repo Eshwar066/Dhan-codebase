@@ -66,6 +66,39 @@ class TestExtraTimeframeLiveAppend(unittest.TestCase):
         self.assertIs(eng._candle_strategy_for("BTCUSD", "1d"), dos)
         self.assertIs(eng._candle_strategy_for("BTCUSD", "5"), other)
 
+    def test_evaluate_parallel_includes_extra_timeframe_owner(self):
+        """4h BarClosed must evaluate DOS (extra_timeframes), not only primary TF==4h."""
+        eng = LiveEngine.__new__(LiveEngine)
+        dos = SimpleNamespace(
+            name="DirectionalOptionSelling",
+            timeframe="60",
+            extra_timeframes=["4h", "1d"],
+            applies_to_symbol=lambda s: s == "BTCUSD",
+            should_evaluate=lambda _c: True,
+            eval_signal_log_message=None,
+            get_warmup_period=lambda: 5,
+        )
+        eng.strategies = [dos]
+        eng.strategy = dos
+        eng.strategy_eval_modes = {}
+        eng.strategy_timeout_seconds = 0.2
+        eng.engine_logger = None
+        eng._is_scheduled_strategy = lambda *_a, **_k: False
+        eng._strategy_task_queues = {"DirectionalOptionSelling": MagicMock()}
+        eng._ensure_strategy_worker = MagicMock()
+        eng._recent_candles_for_strategy = MagicMock(return_value=[])
+        eng._safe_queue_put = MagicMock(return_value=False)
+        eng._enrich_candle_for_strategy = MagicMock(side_effect=lambda s, c, **k: dict(c))
+
+        results = eng._evaluate_strategies_parallel(
+            {"symbol": "BTCUSD", "timeframe": "4h", "close": 1},
+            timeframe="4h",
+            already_enriched=True,
+        )
+        eng._ensure_strategy_worker.assert_called_once_with(dos)
+        eng._safe_queue_put.assert_called_once()
+        self.assertEqual(results, [])
+
     def test_enrich_skips_unowned_explicit_timeframe(self):
         mgr = IndicatorManager(MagicMock())
         strategy = SimpleNamespace(timeframe="60", extra_timeframes=[], name="X")
@@ -150,6 +183,33 @@ class TestExtraTimeframeLiveAppend(unittest.TestCase):
             )
             self.assertTrue(append_mock.called)
             self.assertEqual(append_mock.call_args.kwargs["tf"], "4h")
+
+    def test_restore_strategies_after_reconcile_all_strategies(self):
+        """Non-primary strategies (e.g. DOS) must receive restore + ctx."""
+        eng = LiveEngine.__new__(LiveEngine)
+        primary = SimpleNamespace(name="BTCZeroDTE")
+        dos_calls = []
+
+        def dos_restore(pm, intent_store=None, ctx=None):
+            dos_calls.append({"pm": pm, "intent_store": intent_store, "ctx": ctx})
+
+        dos = SimpleNamespace(
+            name="DirectionalOptionSelling",
+            restore_state_on_startup=dos_restore,
+        )
+        eng.strategies = [primary, dos]
+        eng.strategy = primary
+        eng.position_manager = SimpleNamespace(positions={})
+        eng.order_router = object()
+        eng.engine_logger = None
+
+        intent_store = object()
+        eng._restore_strategies_after_reconcile(intent_store)
+
+        self.assertEqual(len(dos_calls), 1)
+        self.assertIs(dos_calls[0]["ctx"].order_router, eng.order_router)
+        self.assertIs(dos_calls[0]["pm"], eng.position_manager)
+        self.assertIs(dos_calls[0]["intent_store"], intent_store)
 
 
 if __name__ == "__main__":

@@ -683,10 +683,18 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         }
         with patch.object(self.strategy, "_refresh_htf_state", return_value=None):
             with patch.object(
-                self.strategy, "_modify_broker_trail_sl", return_value=True
-            ) as modify:
-                with patch.object(self.strategy, "_build_entry", return_value=None):
-                    self.strategy.on_candle(candle, ctx)
+                self.strategy, "_hydrate_4h_from_history", return_value=None
+            ):
+                with patch.object(
+                    self.strategy, "_htf_supertrend", return_value=None
+                ):
+                    with patch.object(
+                        self.strategy, "_modify_broker_trail_sl", return_value=True
+                    ) as modify:
+                        with patch.object(
+                            self.strategy, "_build_entry", return_value=None
+                        ):
+                            self.strategy.on_candle(candle, ctx)
         modify.assert_not_called()
         self.assertAlmostEqual(
             self.strategy._meta_by_structure_id[position.structure_id].supertrend,
@@ -1430,6 +1438,134 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         pos = SimpleNamespace(structure_id=sid, instrument=None, intent_id=None)
         meta = s._ensure_meta(pos, SimpleNamespace(intent_store=None))
         self.assertEqual(meta.sleeve, "weekly")
+
+    def test_4h_bar_trails_weekly_without_1h_entry(self):
+        """Closed 4H BarClosed must trail weekly SL and must not run 1H entry logic."""
+        from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (
+            _PositionMeta,
+        )
+
+        instrument = SimpleNamespace(
+            option_type="PE",
+            expiry="240726",
+            strike=64000,
+            trading_symbol="P-BTC-64000-240726",
+            product_id=99,
+        )
+        position = SimpleNamespace(
+            tag="MAIN",
+            net_qty=-2,
+            structure_id="DirectionalOptionSelling:BTCUSD:weekly:trail-4h",
+            instrument=instrument,
+            intent_id="e1",
+            avg_price=303,
+        )
+        ctx = SimpleNamespace(
+            position_store=_PositionStore([position]),
+            intent_store=None,
+            order_router=SimpleNamespace(broker=SimpleNamespace()),
+        )
+        sid = position.structure_id
+        self.strategy._meta_by_structure_id[sid] = _PositionMeta(
+            symbol="BTCUSD",
+            direction=1,
+            option_type="PE",
+            supertrend=64497.31,
+            strike=64000,
+            expiry="240726",
+            entry_premium=303,
+            entry_reason="weekly_htf_aligned",
+            sleeve="weekly",
+        )
+        # Stale seed that previously blocked trail after restart.
+        self.strategy._current_4h_supertrend = 64497.31
+        self.strategy._confirmed_direction = 1
+        self.strategy._current_supertrend = 66257.55
+        candle = {
+            "symbol": "BTCUSD",
+            "timeframe": "4h",
+            "timestamp": datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc),
+            "close": 66655.0,
+            "supertrend": 65659.07,
+            "supertrend_direction": 1,
+            "supertrend_4h": 65659.07,
+        }
+        with patch.object(
+            self.strategy, "_bar_is_fully_closed", return_value=True
+        ):
+            with patch.object(
+                self.strategy,
+                "_resolve_weekly_trail_st",
+                return_value=65659.07,
+            ):
+                with patch.object(
+                    self.strategy, "_modify_broker_trail_sl", return_value=True
+                ) as modify:
+                    with patch.object(
+                        self.strategy, "_build_entry", return_value=object()
+                    ) as build:
+                        result = self.strategy.on_candle(candle, ctx)
+        self.assertIsNone(result)
+        build.assert_not_called()
+        modify.assert_called_once()
+        self.assertAlmostEqual(modify.call_args.kwargs["supertrend"], 65659.07)
+        self.assertAlmostEqual(
+            self.strategy._meta_by_structure_id[sid].supertrend, 65659.07
+        )
+        # 1H ST must stay untouched by the 4H trail-only path.
+        self.assertAlmostEqual(self.strategy._current_supertrend, 66257.55)
+
+    def test_restore_does_not_seed_stale_4h_from_meta(self):
+        from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (
+            _PositionMeta,
+        )
+
+        s = DirectionalOptionSelling()
+        sid = "DirectionalOptionSelling:BTCUSD:weekly:2026-07-21:PE:f4fa3a09"
+        s._meta_by_structure_id[sid] = _PositionMeta(
+            symbol="BTCUSD",
+            direction=1,
+            option_type="PE",
+            supertrend=64497.31,
+            strike=64000,
+            expiry="240726",
+            entry_premium=303,
+            entry_reason="weekly_htf_aligned",
+            sleeve="weekly",
+        )
+        pos = SimpleNamespace(
+            net_qty=-2,
+            strategy="DirectionalOptionSelling",
+            tag="MAIN",
+            structure_id=sid,
+            instrument=SimpleNamespace(trading_symbol="P-BTC-64000-240726"),
+            intent_id=None,
+        )
+        pm = SimpleNamespace(
+            positions={"P-BTC-64000-240726": pos},
+            get_position_metadata=lambda _s: {
+                "strategy_meta": {
+                    "symbol": "BTCUSD",
+                    "direction": 1,
+                    "option_type": "PE",
+                    "supertrend": 64497.31,
+                    "strike": 64000,
+                    "expiry": "240726",
+                    "entry_premium": 303,
+                    "entry_reason": "weekly_htf_aligned",
+                    "sleeve": "weekly",
+                }
+            },
+        )
+        with patch.object(s, "_hydrate_4h_from_history") as hyd:
+            hyd.side_effect = lambda *_a, **_k: (
+                setattr(s, "_current_4h_supertrend", 65659.07) or 65659.07
+            )
+            s.restore_state_on_startup(pm, intent_store=None)
+        hyd.assert_called()
+        self.assertAlmostEqual(s._current_4h_supertrend, 65659.07)
+        # Must not remain stuck at entry meta ST.
+        self.assertNotAlmostEqual(s._current_4h_supertrend, 64497.31)
 
 
 if __name__ == "__main__":

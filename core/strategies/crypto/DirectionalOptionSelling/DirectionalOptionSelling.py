@@ -206,19 +206,23 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         return ts.tz_convert(IST)
 
     def _closed_bar_time_ist(self, candle: dict) -> pd.Timestamp:
-        """Hourly candle timestamps are bucket starts; return confirmed close time."""
+        """Candle timestamps are bucket starts; return confirmed close time for TF."""
+        tf = self._candle_timeframe(candle)
+        bar_sec = self._tf_bar_seconds(tf)
+        if bar_sec <= 0:
+            bar_sec = 3600
         bt = candle.get("bucket_ts")
         if bt is not None:
             try:
                 open_utc = pd.Timestamp(int(float(bt)), unit="s", tz="UTC")
-                return open_utc.tz_convert(IST) + pd.Timedelta(minutes=60)
+                return open_utc.tz_convert(IST) + pd.Timedelta(seconds=bar_sec)
             except (TypeError, ValueError, OverflowError):
                 pass
-        return self._timestamp_ist(candle["timestamp"]) + pd.Timedelta(minutes=60)
+        return self._timestamp_ist(candle["timestamp"]) + pd.Timedelta(seconds=bar_sec)
 
     def _bar_is_fully_closed(self, candle: dict, now: Optional[Any] = None) -> bool:
         """
-        True only after the 60m bar close (e.g. 14:30 bar → evaluate at/after 15:30).
+        True only after the bar close for this candle's timeframe.
         Quote ticks never count as closed bars. A 2s buffer avoids race-at-close.
         """
         if candle.get("quote_tick"):
@@ -229,7 +233,6 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         else:
             now_ist = self._timestamp_ist(now)
         return now_ist >= (close_ist + pd.Timedelta(seconds=2))
-
     @staticmethod
     def _close_confirms_direction(
         direction: int, close: float, supertrend: float
@@ -315,14 +318,16 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
 
     def _bar_key(self, candle: dict) -> str:
         symbol = str(candle.get("symbol") or "").strip().upper()
+        tf = self._candle_timeframe(candle)
         bt = candle.get("bucket_ts")
         if bt is not None:
             try:
-                return f"{symbol}|{int(float(bt))}"
+                return f"{symbol}|{tf}|{int(float(bt))}"
             except (TypeError, ValueError):
                 pass
-        return f"{symbol}|{self._timestamp_ist(candle['timestamp']).isoformat()}"
-
+        return (
+            f"{symbol}|{tf}|{self._timestamp_ist(candle['timestamp']).isoformat()}"
+        )
     def should_evaluate(self, candle: dict) -> bool:
         if str(candle.get("symbol") or "").strip().upper() != "BTCUSD":
             return False
@@ -581,7 +586,10 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         return fallback
 
     def restore_state_on_startup(
-        self, position_manager: Any, intent_store: Any = None
+        self,
+        position_manager: Any,
+        intent_store: Any = None,
+        ctx: Any = None,
     ) -> None:
         """Restore open MAIN metadata so quote risk works before the next hourly bar."""
         if position_manager is None:
@@ -629,10 +637,45 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             if restored:
                 meta = self._meta_by_structure_id[sid]
                 self._confirmed_direction = meta.direction
-                if meta.sleeve == SLEEVE_WEEKLY:
-                    self._current_4h_supertrend = meta.supertrend
+                # Do NOT seed _current_4h_supertrend from entry meta — that froze
+                # weekly trail at entry ST after restart. Hydrate live 4H below.
                 self._current_supertrend = meta.supertrend
-
+        # After restore, load live last-closed 4H ST so weekly trail can catch up.
+        live_4h = self._hydrate_4h_from_history()
+        if live_4h is not None:
+            logger.info(
+                "%s hydrated live 4H SuperTrend=%.2f after startup restore",
+                self.name,
+                live_4h,
+            )
+        else:
+            logger.warning(
+                "%s could not hydrate live 4H SuperTrend after startup restore "
+                "(weekly trail catch-up deferred until next closed 4h/1h bar)",
+                self.name,
+            )
+        # Catch up broker MAIN_SL immediately when engine provides a ctx
+        # (otherwise wait for the next 60m/4h BarClosed).
+        if ctx is not None and live_4h is not None:
+            try:
+                candle = {
+                    "symbol": "BTCUSD",
+                    "timestamp": pd.Timestamp.now(tz="UTC"),
+                    "timeframe": "4h",
+                    "close": float(live_4h),
+                    "supertrend_4h": float(live_4h),
+                }
+                self._trail_open_sleeves(
+                    ctx,
+                    candle,
+                    one_h_st=self._current_supertrend,
+                    previous_st=self._current_supertrend,
+                    source="startup_catchup",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "%s startup trail catch-up failed: %s", self.name, exc
+                )
     def _open_main_positions(
         self, ctx: Any, *, sleeve: Optional[str] = None
     ) -> List[Any]:
@@ -1574,8 +1617,118 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             )
         return intent
 
+    def _trail_open_sleeves(
+        self,
+        ctx: Any,
+        candle: dict,
+        *,
+        one_h_st: Optional[float],
+        previous_st: Optional[float],
+        source: str = "on_candle",
+    ) -> None:
+        """Trail broker MAIN_SL: weekly on live 4H ST, daily on 1H ST."""
+        positions = self._open_main_positions(ctx)
+        if not positions:
+            logger.debug(
+                "%s trail skip source=%s reason=no_open_main",
+                self.name,
+                source,
+            )
+            return
+        weekly_st = self._resolve_weekly_trail_st(ctx, candle)
+        for position in positions:
+            meta = self._ensure_meta(position, ctx)
+            pos_dir = (
+                int(meta.direction)
+                if meta is not None
+                else int(self._confirmed_direction or 0)
+            )
+            if not pos_dir:
+                continue
+            sleeve = str(meta.sleeve) if meta is not None else SLEEVE_DAILY
+            sid = str(getattr(position, "structure_id", "") or "")
+            if sleeve == SLEEVE_WEEKLY:
+                ref_st = float(weekly_st) if weekly_st is not None else 0.0
+                if ref_st <= 0:
+                    logger.error(
+                        "%s TRAIL_SKIP_WEEKLY sid=%s source=%s reason=no_live_4h_st "
+                        "meta_ST=%s (will not fall back to 1H/entry ST)",
+                        self.name,
+                        sid,
+                        source,
+                        f"{float(meta.supertrend):.2f}" if meta is not None else "None",
+                    )
+                    continue
+            else:
+                try:
+                    ref_st = float(one_h_st) if one_h_st is not None else 0.0
+                except (TypeError, ValueError):
+                    ref_st = 0.0
+                if ref_st <= 0:
+                    logger.warning(
+                        "%s TRAIL_SKIP_DAILY sid=%s source=%s reason=no_1h_st",
+                        self.name,
+                        sid,
+                        source,
+                    )
+                    continue
+            prev_ref = float(meta.supertrend) if meta is not None else previous_st
+            if prev_ref is None:
+                self._apply_trail_sl_update(
+                    ctx,
+                    position,
+                    direction=pos_dir,
+                    ref_st=ref_st,
+                    sleeve=sleeve,
+                    prev_ref=None,
+                )
+                continue
+            if abs(ref_st - float(prev_ref)) <= 1e-9:
+                logger.debug(
+                    "%s trail unchanged sid=%s sleeve=%s ST=%.2f source=%s",
+                    self.name,
+                    sid,
+                    sleeve,
+                    ref_st,
+                    source,
+                )
+                continue
+            logger.info(
+                "%s trail ST moved sid=%s sleeve=%s %.2f -> %.2f desired_sl=%.2f "
+                "source=%s",
+                self.name,
+                sid,
+                sleeve,
+                float(prev_ref),
+                ref_st,
+                self._trail_sl_level(pos_dir, ref_st),
+                source,
+            )
+            self._apply_trail_sl_update(
+                ctx,
+                position,
+                direction=pos_dir,
+                ref_st=ref_st,
+                sleeve=sleeve,
+                prev_ref=float(prev_ref),
+            )
+        self._retry_pending_trail_sl(ctx)
+
     def on_candle(self, candle: dict, ctx: Any) -> Optional[List[Any]]:
         if str(candle.get("symbol") or "").strip().upper() != "BTCUSD":
+            return None
+        tf = self._candle_timeframe(candle)
+        # 4H/1D closed bars: trail weekly SL only — do not treat HTF ST as 1H signal.
+        if tf.lower() in ("4h", "4", "240", "1d", "d"):
+            if RUN_MODE != RunMode.BACKTEST and not self._bar_is_fully_closed(candle):
+                return None
+            self._trail_open_sleeves(
+                ctx,
+                candle,
+                one_h_st=self._current_supertrend,
+                previous_st=self._current_supertrend,
+                source=f"htf_bar:{tf}",
+            )
             return None
         # Live only: never confirm flips / entries on a forming hour bar.
         # Mid-bar risk = broker MAIN_SL (+ quote proximity / ST±300). ST reverse only at close.
@@ -1625,37 +1778,13 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         one_h_signal = previous is not None and direction != previous
         intents: List[Any] = []
 
-        # Trail broker SL: weekly on 4H ST, daily on 1H ST.
-        for position in self._open_main_positions(ctx):
-            meta = self._ensure_meta(position, ctx)
-            pos_dir = int(meta.direction) if meta is not None else int(direction)
-            sleeve = (
-                str(meta.sleeve) if meta is not None else SLEEVE_DAILY
-            )
-            if sleeve == SLEEVE_WEEKLY:
-                # Weekly must trail 4H only — never fall back to 1H ST
-                # (that wrongly yanked SL to ~1H levels after restart).
-                ref_st = float(
-                    candle.get("supertrend_4h")
-                    or self._current_4h_supertrend
-                    or 0
-                )
-            else:
-                ref_st = float(supertrend)
-            if ref_st <= 0:
-                continue
-            prev_ref = float(meta.supertrend) if meta is not None else previous_st
-            if prev_ref is not None and abs(ref_st - float(prev_ref)) > 1e-9:
-                self._apply_trail_sl_update(
-                    ctx,
-                    position,
-                    direction=pos_dir,
-                    ref_st=ref_st,
-                    sleeve=sleeve,
-                    prev_ref=float(prev_ref),
-                )
-        # Keep retrying any prior ST-move where broker MAIN_SL stayed stale.
-        self._retry_pending_trail_sl(ctx)
+        self._trail_open_sleeves(
+            ctx,
+            candle,
+            one_h_st=supertrend,
+            previous_st=previous_st,
+            source="1h_bar",
+        )
 
         deferred = self._consume_pending_closed_entry(candle, ctx, direction)
         if deferred is not None:

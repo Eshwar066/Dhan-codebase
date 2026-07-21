@@ -43,6 +43,7 @@ subscriptions:
     enabled: true
     timeframes:
     - '60'
+    - 4h
     symbols:
     - BTCUSD
   ScheduledSlot:

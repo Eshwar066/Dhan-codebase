@@ -308,3 +308,60 @@ class DosHtfMixin:
         self._confirmed_4h_direction = int(d4)
         self._confirmed_1d_direction = int(d1d)
         return snap
+
+    def _candle_timeframe(self, candle: dict) -> str:
+        tf = str(candle.get("timeframe") or "").strip()
+        if tf:
+            return tf
+        return str(getattr(self, "timeframe", "") or "60").strip() or "60"
+
+    def _hydrate_4h_from_history(self, candle: Optional[dict] = None) -> Optional[float]:
+        """
+        Load last fully closed 4H SuperTrend from indicator history into cache.
+
+        Used after restart and for weekly trail so we never rely on entry-meta ST
+        as if it were the live 4H line.
+        """
+        if candle is None:
+            candle = {
+                "symbol": "BTCUSD",
+                "timestamp": pd.Timestamp.now(tz="UTC"),
+                "timeframe": "4h",
+            }
+        as_of = self._as_of_utc(candle)
+        hist = self._latest_closed_st_from_indicator_history("4h", as_of)
+        if hist is None:
+            return None
+        direction, st, bar_open = hist
+        self._htf_st_cache["4h"] = hist
+        self._current_4h_supertrend = float(st)
+        self._confirmed_4h_direction = int(direction)
+        self._last_seen_4h_bar_open = bar_open
+        return float(st)
+
+    def _resolve_weekly_trail_st(self, ctx: Any, candle: dict) -> Optional[float]:
+        """
+        Live 4H SuperTrend for weekly MAIN_SL trail.
+
+        Prefer indicator history / HTF refresh. Never return the entry-meta seed
+        alone (that caused silent no-ops after restart when 4H had already moved).
+        """
+        # Full HTF refresh stamps candle + updates _current_4h_supertrend.
+        self._refresh_htf_state(ctx, candle)
+        stamped = candle.get("supertrend_4h")
+        try:
+            if stamped is not None and float(stamped) > 0:
+                return float(stamped)
+        except (TypeError, ValueError):
+            pass
+        hydrated = self._hydrate_4h_from_history(candle)
+        if hydrated is not None and hydrated > 0:
+            candle["supertrend_4h"] = float(hydrated)
+            return float(hydrated)
+        snap = self._htf_supertrend(ctx, "4h", candle)
+        if snap is not None:
+            _d, st, _bar = snap
+            self._current_4h_supertrend = float(st)
+            candle["supertrend_4h"] = float(st)
+            return float(st)
+        return None

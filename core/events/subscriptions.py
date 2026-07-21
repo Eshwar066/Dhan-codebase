@@ -42,6 +42,10 @@ def resolve_strategy_subscriptions(
     has_reentry = strategy_opts_into_reentry(strategy)
     live_feed = eval_mode != "scheduled"
     tfs = [str(timeframe)] if timeframe else []
+    for extra in getattr(strategy, "extra_timeframes", None) or []:
+        e = str(extra or "").strip()
+        if e and e not in tfs:
+            tfs.append(e)
     return {
         "BarClosed": {"enabled": live_feed, "timeframes": tfs, "symbols": symbols},
         "ScheduledSlot": {"enabled": not live_feed, "symbols": symbols},
