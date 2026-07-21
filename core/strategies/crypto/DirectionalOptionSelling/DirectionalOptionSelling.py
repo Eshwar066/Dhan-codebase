@@ -82,8 +82,9 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
 
     - Weekly: when 1D and 4H SuperTrend agree, sell near 4H SuperTrend on the
       weekly Friday (skip to next week if DTE <= 2).
-    - Daily (0DTE/1DTE): 1H SuperTrend signals, only when 1D and 4H agree with
-      that 1H direction; sell near 1H SuperTrend (0DTE before 17:25 IST, else 1DTE).
+    - Daily (0DTE/1DTE): only on a confirmed 1H SuperTrend flip (no mid-regime
+      catch-up), and only when 1D and 4H agree with that 1H direction; sell near
+      1H SuperTrend (0DTE before 17:25 IST, else 1DTE).
 
     Both sleeves may be open together. Broker MAIN_SL trails at ST±100.
     """
@@ -1945,33 +1946,24 @@ class DirectionalOptionSelling(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
                     intents.append(intent)
                     entered_sleeves.add(SLEEVE_WEEKLY)
 
-        # Daily 0DTE/1DTE: 1H signal (or flat catch-up) only when 1D+4H match 1H.
+        # Daily 0DTE/1DTE: only on a confirmed 1H ST flip (no mid-regime entries).
+        # HTF filter (1D+4H must match 1H) is enforced inside _build_entry.
         if (
             SLEEVE_DAILY not in entered_sleeves
+            and one_h_signal
             and not self._open_main_positions(ctx, sleeve=SLEEVE_DAILY)
         ):
-            daily_reason = None
-            if one_h_signal:
-                daily_reason = "one_h_signal"
-            elif previous is not None and htf is not None:
-                # Flat catch-up: 1H already on side and HTF agrees.
-                if (
-                    htf["4h"][0] == direction
-                    and htf["1d"][0] == direction
-                ):
-                    daily_reason = "one_h_htf_aligned"
-            if daily_reason is not None:
-                intent = self._build_entry(
-                    candle,
-                    ctx,
-                    int(direction),
-                    reason=daily_reason,
-                    min_dte=self._min_dte_for_candle(candle),
-                    sleeve=SLEEVE_DAILY,
-                )
-                if intent is not None:
-                    intents.append(intent)
-                    entered_sleeves.add(SLEEVE_DAILY)
+            intent = self._build_entry(
+                candle,
+                ctx,
+                int(direction),
+                reason="one_h_signal",
+                min_dte=self._min_dte_for_candle(candle),
+                sleeve=SLEEVE_DAILY,
+            )
+            if intent is not None:
+                intents.append(intent)
+                entered_sleeves.add(SLEEVE_DAILY)
 
         rollover = self._rollover_intent_if_due(candle, ctx, closed_bar=True)
         if rollover is not None:

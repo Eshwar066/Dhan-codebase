@@ -44,8 +44,8 @@ def _ticker(bid):
 class DirectionalOptionSellingTests(unittest.TestCase):
     def setUp(self):
         self.strategy = DirectionalOptionSelling()
-        # Default: allow entries in _build_entry; keep snapshot empty so the
-        # flat ``htf_aligned`` path does not auto-fire in unrelated tests.
+        # Default: allow entries in _build_entry; keep snapshot empty so HTF
+        # filter stubs do not auto-fire in unrelated tests.
         self._htf_allow = patch.object(
             self.strategy, "_htf_entry_allowed", return_value=True
         )
@@ -959,7 +959,8 @@ class DirectionalOptionSellingTests(unittest.TestCase):
                 )
                 select.assert_not_called()
 
-    def test_flat_htf_aligned_enters_without_1h_flip(self):
+    def test_flat_htf_aligned_does_not_enter_daily_without_1h_flip(self):
+        """Weekly may enter on HTF align; daily must wait for a 1H ST flip."""
         self.strategy._confirmed_direction = 1
         self.strategy._current_supertrend = 64000.0
         candle = {
@@ -986,8 +987,12 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         weekly_calls = [
             c for c in build.call_args_list if c.kwargs.get("sleeve") == "weekly"
         ]
+        daily_calls = [
+            c for c in build.call_args_list if c.kwargs.get("sleeve") == "daily"
+        ]
         self.assertTrue(weekly_calls)
         self.assertEqual(weekly_calls[0].kwargs["reason"], "weekly_htf_aligned")
+        self.assertFalse(daily_calls)
         self.assertIn(marker, result or [])
 
     def test_weekly_expiry_shifts_when_dte_le_2(self):
@@ -1004,8 +1009,9 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertEqual(ctx.selected_expiry, "240726")
 
     def test_dual_sleeve_weekly_and_daily_can_both_enter(self):
+        """On a confirmed 1H flip with HTF aligned, weekly + daily may both enter."""
         ctx = SimpleNamespace(position_store=_PositionStore())
-        self.strategy._confirmed_direction = 1
+        self.strategy._confirmed_direction = -1
         self.strategy._current_supertrend = 64000.0
         candle = {
             "symbol": "BTCUSD",
@@ -1037,9 +1043,7 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertEqual(result, [weekly_marker, daily_marker])
         sleeves = [c.kwargs.get("sleeve") for c in build.call_args_list]
         self.assertEqual(sleeves, ["weekly", "daily"])
-        self.assertEqual(
-            build.call_args_list[1].kwargs["reason"], "one_h_htf_aligned"
-        )
+        self.assertEqual(build.call_args_list[1].kwargs["reason"], "one_h_signal")
 
     def test_latest_closed_st_from_df(self):
         s = DirectionalOptionSelling()

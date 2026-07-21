@@ -81,7 +81,7 @@ flowchart TD
 
 ### Entry
 
-1. Driven by **1H SuperTrend** (flip signal, or flat catch-up while 1H side is already set).
+1. Driven by a confirmed **1H SuperTrend flip only** (no mid-regime / flat catch-up entries).
 2. Filter: for a **long (green / sell PE)**, **1D and 4H must both be green**; for **short (red / sell CE)**, **both must be red**.
 3. Sell near **1H SuperTrend**.
 4. Expiry:
@@ -103,7 +103,7 @@ flowchart TD
     E -->|yes| F{1H flipped against position?}
     F -->|yes| G[EXIT daily]
     F -->|no| H[Keep / trail SL on 1H ST ± 100]
-    E -->|no| I{1H signal or HTF catch-up?}
+    E -->|no| I{Confirmed 1H ST flip?}
     I -->|no| J[Wait]
     I -->|yes| K[ENTRY daily near 1H ST]
     K --> L{Time ≥ 17:25 IST?}
@@ -214,7 +214,6 @@ After any SL / force / external full close: wait for the **next closed 1H bar**,
 | `weekly_htf_aligned` | weekly | 1D + 4H agree → weekly entry |
 | `weekly_htf_misaligned` | weekly | Exit: 1D/4H no longer agree |
 | `one_h_signal` | daily | Confirmed 1H flip + HTF filter pass |
-| `one_h_htf_aligned` | daily | Flat catch-up: 1H side + 1D/4H agree |
 | `one_h_reversal` | daily | Exit: 1H flipped against position |
 | `sl_reentry_same` / `sl_reentry_flip` | either | Post-SL reentry on hour close |
 | `expiry_rollover` | daily (today expiry) | 17:25 IST roll |

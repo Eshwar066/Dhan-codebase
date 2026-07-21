@@ -64,6 +64,7 @@ documentation:
     with at least $120 premium, preferring 0DTE and then the next daily expiry.
   rules: |
     - SuperTrend length 16, multiplier 1.5 on BTCUSD 60-minute closed candles
+    - Daily sleeve enters only on a confirmed 1H SuperTrend flip (no mid-regime catch-up)
     - Red to Green: sell one PE; Green to Red: sell one CE
     - Exit the old option before placing the opposite option
     - Broker MAIN_SL is a spot-triggered stop-LIMIT on the option (never market); open limits re-quote to best ask every 30s
