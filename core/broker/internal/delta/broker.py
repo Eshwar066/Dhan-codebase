@@ -473,18 +473,24 @@ class DeltaBroker(BaseBroker):
         }
         return self.place_order(intent, execution_price=float(px))
 
-    def _delta_symbol_limit_price(
-        self, trading_symbol: str, side: str
-    ) -> Optional[float]:
-        """Best-effort LTP/mark for LIMIT exits when caller omits a price."""
+    def get_ticker(self, trading_symbol: str) -> Optional[Dict[str, Any]]:
+        """REST ticker for OMS market snapshots (mark / bid / ask)."""
         source = getattr(self.api, "_source", None)
         if source is None or not hasattr(source, "get_ticker"):
             return None
         try:
-            ticker = source.get_ticker(trading_symbol) or {}
-        except Exception:
+            ticker = source.get_ticker(trading_symbol)
+        except Exception as exc:
+            logger.warning("Delta get_ticker failed for %s: %s", trading_symbol, exc)
             return None
-        if not isinstance(ticker, dict):
+        return ticker if isinstance(ticker, dict) else None
+
+    def _delta_symbol_limit_price(
+        self, trading_symbol: str, side: str
+    ) -> Optional[float]:
+        """Best-effort LTP/mark for LIMIT exits when caller omits a price."""
+        ticker = self.get_ticker(trading_symbol) or {}
+        if not ticker:
             return None
         side_u = str(side or "").upper()
         for key in (

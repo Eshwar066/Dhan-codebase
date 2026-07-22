@@ -101,6 +101,7 @@ ENGINE_JOBS = [
             "max_quote_age_sec": 30.0,
             "require_bid_ask": True,
             "require_mark": True,
+            "allow_mark_fallback_to_mid": True,
             "default_sl_premium_mult": 2.0,
             "infer_entry_sl_from_default_mult": False,
             "min_stop_mark_ratio": 1.0,

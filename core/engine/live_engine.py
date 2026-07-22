@@ -2726,6 +2726,20 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 enabled=enabled,
             )
 
+    @staticmethod
+    def _ticker_has_mark(ticker: Any) -> bool:
+        if not isinstance(ticker, dict):
+            return False
+        quotes = ticker.get("quotes") if isinstance(ticker.get("quotes"), dict) else {}
+        for key in ("mark_price", "mark"):
+            try:
+                val = float(ticker.get(key) or quotes.get(key) or 0)
+            except (TypeError, ValueError):
+                val = 0.0
+            if val > 0:
+                return True
+        return False
+
     def _market_snapshot_for_symbol(self, symbol: str):
         """Single snapshot from feed ticker + top of book (Delta)."""
         from core.orderExecution.execution_validator import snapshot_from_ticker
@@ -2756,10 +2770,16 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     ask = get_ask(sym)
                 except Exception:
                     ask = None
-        if ticker is None or (
-            (bid is None or ask is None)
-            and str(getattr(self, "venue", "") or "").upper() == "DELTA"
-        ):
+        venue_u = str(getattr(self, "venue", "") or "").upper()
+        # Feed often has L2 bid/ask without mark. REST-fill when ticker/mark/book
+        # is incomplete so ExecutionValidator does not reject on missing_mark.
+        need_rest = venue_u == "DELTA" and (
+            ticker is None
+            or bid is None
+            or ask is None
+            or not self._ticker_has_mark(ticker)
+        )
+        if need_rest:
             broker = getattr(self.order_router, "broker", None)
             get_ticker = getattr(broker, "get_ticker", None) if broker else None
             if callable(get_ticker):
@@ -2768,7 +2788,26 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 except Exception:
                     rest = None
                 if isinstance(rest, dict):
-                    ticker = rest if ticker is None else {**rest, **(ticker or {})}
+                    # Feed wins for overlapping keys, but keep REST mark when feed
+                    # has bid/ask without a usable mark_price.
+                    merged = {**rest, **(ticker or {})}
+                    if not self._ticker_has_mark(merged) and self._ticker_has_mark(rest):
+                        for key in ("mark_price", "mark"):
+                            if rest.get(key) is not None:
+                                merged[key] = rest[key]
+                        rest_quotes = (
+                            rest.get("quotes")
+                            if isinstance(rest.get("quotes"), dict)
+                            else {}
+                        )
+                        if rest_quotes:
+                            mq = dict(merged.get("quotes") or {})
+                            for key in ("mark_price", "mark"):
+                                if rest_quotes.get(key) is not None and key not in mq:
+                                    mq[key] = rest_quotes[key]
+                            if mq:
+                                merged["quotes"] = mq
+                    ticker = merged
                     source = "feed+rest" if source == "feed" else "rest"
                     quotes = (
                         rest.get("quotes")

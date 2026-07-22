@@ -163,6 +163,26 @@ class TestValidateEntry(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.reason, "missing_bid_ask")
 
+    def test_missing_mark_falls_back_to_mid(self):
+        intent = _intent(
+            metadata_extras={"stop_trigger_method": "spot_price"}
+        )
+        result = self.v.validate_entry(
+            intent, snapshot=self._snap(bid=1100.0, ask=1109.0, mark=None)
+        )
+        self.assertTrue(result.ok, result)
+        self.assertEqual(result.details.get("mark_source"), "mid_fallback")
+        self.assertAlmostEqual(result.details.get("mark"), 1104.5)
+
+    def test_missing_mark_hard_reject_when_fallback_disabled(self):
+        self.v.config.allow_mark_fallback_to_mid = False
+        intent = _intent()
+        result = self.v.validate_entry(
+            intent, snapshot=self._snap(bid=1100.0, ask=1109.0, mark=None)
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, "missing_mark")
+
 
 class TestValidateStop(unittest.TestCase):
     def setUp(self):

@@ -58,6 +58,9 @@ class ExecutionValidatorConfig:
     max_quote_age_sec: float = 30.0
     require_bid_ask: bool = True
     require_mark: bool = True
+    # When mark is absent but bid/ask exist, use mid as mark for risk gates.
+    # Avoids hard-failing ENTRY when feed L2 is live but mark_price is stale/missing.
+    allow_mark_fallback_to_mid: bool = True
     validate_entry: bool = True
     validate_stop: bool = True
     # Short-option buy-to-cover stop must sit above mark by this ratio (1.0 = strictly > mark).
@@ -393,6 +396,8 @@ class ExecutionValidator:
                 return ValidationResult.reject("stale_quote", **details)
 
         bid, ask = snapshot.bid, snapshot.ask
+        mark = snapshot.mark
+        mid = None
         if cfg.require_bid_ask and (bid is None or ask is None):
             return ValidationResult.reject("missing_bid_ask", **details)
 
@@ -413,7 +418,10 @@ class ExecutionValidator:
                 if snapshot.ask_size is not None and snapshot.ask_size < cfg.min_book_size:
                     return ValidationResult.reject("insufficient_ask_size", **details)
 
-            mark = snapshot.mark
+            if mark is None and cfg.allow_mark_fallback_to_mid and mid > 0:
+                mark = mid
+                details["mark"] = mark
+                details["mark_source"] = "mid_fallback"
             if mark is None and cfg.require_mark:
                 return ValidationResult.reject("missing_mark", **details)
             if mark is not None and mid > 0 and cfg.max_mark_mid_pct > 0:
@@ -421,8 +429,8 @@ class ExecutionValidator:
                 details["mark_mid_pct"] = diverg
                 if diverg > cfg.max_mark_mid_pct:
                     return ValidationResult.reject("mark_mid_divergence", **details)
-        elif cfg.require_bid_ask:
-            return ValidationResult.reject("missing_bid_ask", **details)
+        elif cfg.require_mark and mark is None:
+            return ValidationResult.reject("missing_mark", **details)
 
         # Planned premium SL vs mark (short option sell → buy-to-cover stop).
         # Skip when strategy uses underlying/spot stops (no premium SL to validate).
@@ -451,7 +459,6 @@ class ExecutionValidator:
         details["planned_sl_trigger"] = sl_trig
         details["entry_estimate"] = entry_px
 
-        mark = snapshot.mark
         if (
             side == "SELL"
             and sl_trig is not None
@@ -527,6 +534,14 @@ class ExecutionValidator:
             return ValidationResult.accept(**details)
 
         mark = snapshot.mark
+        if mark is None and cfg.allow_mark_fallback_to_mid:
+            bid, ask = snapshot.bid, snapshot.ask
+            if bid is not None and ask is not None and ask >= bid:
+                mid = (float(bid) + float(ask)) / 2.0
+                if mid > 0:
+                    mark = mid
+                    details["mark"] = mark
+                    details["mark_source"] = "mid_fallback"
         if mark is None and cfg.require_mark:
             return ValidationResult.reject("missing_mark", **details)
 
@@ -576,6 +591,7 @@ def config_from_mapping(raw: Optional[Dict[str, Any]]) -> ExecutionValidatorConf
         "max_quote_age_sec",
         "require_bid_ask",
         "require_mark",
+        "allow_mark_fallback_to_mid",
         "validate_entry",
         "validate_stop",
         "min_stop_mark_ratio",
