@@ -435,6 +435,16 @@ class GttFallbackBook:
                 and (trade_date is None or w.entry_date == trade_date)
             ]
         for w in targets:
+            store = getattr(self._router, "intent_store", None)
+            rec = store.get(w.gtt_intent_id) if store else None
+            if self._adopt_fill_from_broker(w, rec):
+                self.on_fill(w.gtt_intent_id)
+                self._log(
+                    "gtt_fallback_position_detected",
+                    f"adopted fill at strategy cutoff {w.trading_symbol}",
+                    intent_id=w.gtt_intent_id,
+                )
+                continue
             self._router.cancel_gtt_fallback_watch(w, reason="strategy_cutoff")
             self.cancel_watch(w.gtt_intent_id, reason="strategy_cutoff")
             n += 1
@@ -602,11 +612,24 @@ class GttFallbackBook:
                 return
 
         if self._structure_filled(watch):
+            # PM already has the leg (e.g. broker reconcile) — still adopt so
+            # MAIN_SL / metadata hooks run if the GTT intent is not FILLED yet.
+            if self._adopt_fill_from_broker(watch, rec):
+                self.on_fill(watch.gtt_intent_id)
+                return
             self.on_fill(watch.gtt_intent_id)
+            return
+
+        # Forever status often lags the actual fill. Periodically adopt from broker
+        # positions even when quotes are unavailable (instrument lookup failures).
+        if self._maybe_adopt_broker_open_fill(watch, rec, force=False):
             return
 
         slot_t = now_ist.time().replace(second=0, microsecond=0)
         if slot_t > watch.active_until and watch.entry_date == now_ist.date():
+            # Last-chance adopt before cutting off an already-filled Forever order.
+            if self._maybe_adopt_broker_open_fill(watch, rec, force=True):
+                return
             router.cancel_gtt_fallback_watch(watch, reason="active_until")
             self.cancel_watch(watch.gtt_intent_id, reason="active_until")
             return
@@ -626,7 +649,13 @@ class GttFallbackBook:
             if self._quote_provider is None:
                 return
             quote = self._quote_provider.get_quote(watch.trading_symbol)
-        if quote is None or not _trigger_met(watch, quote):
+        if quote is None:
+            # Quotes failed (common when place-order symbol ≠ engine symbol); still
+            # try broker position truth so SL is not stranded after a GTT fill.
+            self._maybe_adopt_broker_open_fill(watch, rec, force=False)
+            watch._trigger_hits = 0
+            return
+        if not _trigger_met(watch, quote):
             watch._trigger_hits = 0
             return
 
@@ -639,15 +668,28 @@ class GttFallbackBook:
         # a Forever fill can reach Dhan positions before its order/fill update reaches
         # the local PositionManager.
         if self._broker_position_open(watch):
-            self.on_fill(watch.gtt_intent_id)
+            if self._adopt_fill_from_broker(watch, rec):
+                self.on_fill(watch.gtt_intent_id)
+                self._log(
+                    "gtt_fallback_position_detected",
+                    f"adopted fill + skip LIMIT; broker position already open "
+                    f"{watch.trading_symbol}",
+                    intent_id=watch.gtt_intent_id,
+                )
+                return
             self._log(
                 "gtt_fallback_position_detected",
-                f"skip LIMIT; broker position already open {watch.trading_symbol}",
+                f"broker position open but adopt failed; keep watching "
+                f"{watch.trading_symbol}",
                 intent_id=watch.gtt_intent_id,
             )
             return
         if not self._gtt_still_unfilled(watch, rec):
-            self.on_fill(watch.gtt_intent_id)
+            if self._adopt_fill_from_broker(watch, rec):
+                self.on_fill(watch.gtt_intent_id)
+                return
+            # Forever reports filled/cancelled but adopt failed — keep watching
+            # briefly so a later broker-position poll can still arm SL.
             return
 
         # Re-poll Forever book once more before cancel (broker may have just triggered).
@@ -656,15 +698,25 @@ class GttFallbackBook:
                 self.on_fill(watch.gtt_intent_id)
                 return
         if not self._gtt_still_unfilled(watch, store.get(watch.gtt_intent_id) if store else None):
-            self.on_fill(watch.gtt_intent_id)
+            if self._adopt_fill_from_broker(watch, rec):
+                self.on_fill(watch.gtt_intent_id)
             return
         if self._broker_position_open(watch):
-            self.on_fill(watch.gtt_intent_id)
-            self._log(
-                "gtt_fallback_position_detected",
-                f"skip LIMIT; broker position already open {watch.trading_symbol}",
-                intent_id=watch.gtt_intent_id,
-            )
+            if self._adopt_fill_from_broker(watch, rec):
+                self.on_fill(watch.gtt_intent_id)
+                self._log(
+                    "gtt_fallback_position_detected",
+                    f"adopted fill + skip LIMIT; broker position already open "
+                    f"{watch.trading_symbol}",
+                    intent_id=watch.gtt_intent_id,
+                )
+            else:
+                self._log(
+                    "gtt_fallback_position_detected",
+                    f"broker position open but adopt failed; keep watching "
+                    f"{watch.trading_symbol}",
+                    intent_id=watch.gtt_intent_id,
+                )
             return
 
         if watch.phase == GttFallbackPhase.GTT:
@@ -737,6 +789,68 @@ class GttFallbackBook:
             if int(getattr(pos, "net_qty", 0) or 0) != 0:
                 return True
         return False
+
+    def _adopt_fill_from_broker(
+        self, watch: GttFallbackWatch, rec: Optional[Dict]
+    ) -> bool:
+        """Sync GTT ENTRY fill from Forever APIs or broker position so MAIN_SL arms."""
+        router = self._router
+        store = getattr(router, "intent_store", None)
+        if rec is None and store:
+            rec = store.get(watch.gtt_intent_id)
+        if not rec:
+            return False
+        if hasattr(router, "_try_sync_gtt_intent_fill"):
+            try:
+                if router._try_sync_gtt_intent_fill(rec):
+                    return True
+            except Exception as exc:
+                logger.warning(
+                    "GTT fill sync failed intent=%s: %s", watch.gtt_intent_id, exc
+                )
+        if hasattr(router, "adopt_gtt_intent_from_broker_positions"):
+            try:
+                return bool(router.adopt_gtt_intent_from_broker_positions(rec))
+            except Exception as exc:
+                logger.warning(
+                    "GTT broker-position adopt failed intent=%s: %s",
+                    watch.gtt_intent_id,
+                    exc,
+                )
+        return False
+
+    def _maybe_adopt_broker_open_fill(
+        self,
+        watch: GttFallbackWatch,
+        rec: Optional[Dict],
+        *,
+        force: bool = False,
+    ) -> bool:
+        """Throttled broker-position adopt for watches whose Forever status is stale."""
+        import time as _time
+
+        now = _time.monotonic()
+        last = float(getattr(watch, "_last_broker_pos_check", 0.0) or 0.0)
+        if not force and (now - last) < 15.0:
+            return False
+        watch._last_broker_pos_check = now
+        if not self._broker_position_open(watch):
+            return False
+        adopted = self._adopt_fill_from_broker(watch, rec)
+        if not adopted:
+            self._log(
+                "gtt_fallback_position_detected",
+                f"broker position open but adopt failed {watch.trading_symbol}",
+                intent_id=watch.gtt_intent_id,
+            )
+            return False
+        self.on_fill(watch.gtt_intent_id)
+        self._log(
+            "gtt_fallback_position_detected",
+            f"adopted fill; broker position already open {watch.trading_symbol}",
+            intent_id=watch.gtt_intent_id,
+        )
+        return True
 
     def _broker_position_open(self, watch: GttFallbackWatch) -> bool:
         """Check broker truth for this exact contract before placing fallback LIMIT."""

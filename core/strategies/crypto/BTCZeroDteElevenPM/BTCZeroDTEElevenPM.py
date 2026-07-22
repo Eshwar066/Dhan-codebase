@@ -11,6 +11,9 @@ Rules
 Eval style: scheduled slots. OMS owns SL re-entry-at-cost.
 
 Run: ``python -m run.main --engine-id delta_engine_one``
+
+Rejected:
+Basically spreads are wider so mostly wont trigger orders, according Delta OMS validation rules
 """
 
 from __future__ import annotations
