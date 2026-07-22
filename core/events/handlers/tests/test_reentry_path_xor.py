@@ -111,6 +111,7 @@ class TestBusOnlyWhenWired(unittest.TestCase):
                     "qty": 1,
                     "side": "BUY",
                     "price": 55,
+                    "position_closed": True,
                 },
                 engine_id="test_reentry_xor",
             )

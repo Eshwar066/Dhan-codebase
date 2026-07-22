@@ -110,6 +110,17 @@ def arm_from_main_sl(
     if strat is None:
         strat = resolve_strategy(engine, strategy_id)
     if strat is None or instrument is None:
+        logger.warning(
+            "reentry_at_cost arm skipped: strategy=%s instrument=%s sid=%s "
+            "(bus_wired=%s via_bus=%s)",
+            getattr(strat, "name", None) if strat is not None else strategy_id,
+            getattr(instrument, "trading_symbol", None)
+            if instrument is not None
+            else None,
+            sid,
+            reentry_driven_by_bus(engine),
+            via_bus,
+        )
         return False
     try:
         return bool(
@@ -272,6 +283,9 @@ class ReentryAtCostFillHandler:
         structure_id = payload.get("structure_id")
 
         if tag_u == "MAIN_SL":
+            # Partial MAIN_SL fills must not arm; wait until the structure is flat.
+            if payload.get("position_closed") is False:
+                return
             instrument = _instrument_from_payload(payload, engine)
             arm_from_main_sl(
                 engine,

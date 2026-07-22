@@ -4229,6 +4229,11 @@ class OrderRouter:
         _ir = self.intent_store.get(intent_id) if intent_id and self.intent_store else None
         if _ir:
             metadata_extras = (_ir.get("payload") or {}).get("strategy_meta")
+        if metadata_extras is None and self.position_manager:
+            sym_meta = self._instrument_trading_symbol(instrument)
+            if sym_meta:
+                pm_bucket = self.position_manager.position_metadata.get(sym_meta) or {}
+                metadata_extras = pm_bucket.get("strategy_meta")
         if self.position_manager and intent_id and _ir:
             pay_pf = _ir.get("payload") or {}
             act_pf = str(
@@ -4370,6 +4375,7 @@ class OrderRouter:
                     "action": action,
                     "instrument": instrument,
                     "metadata_extras": metadata_extras,
+                    "position_closed": bool(position_closed),
                 },
                 engine_id=engine_id,
             )
@@ -4438,8 +4444,11 @@ class OrderRouter:
         instrument = trade.get("instrument") or intent.get("instrument")
         if not instrument:
             return False
+        position_closed = False
+        realized_pnl = None
+        payload = intent.get("payload") or {}
+        meta_extras = payload.get("strategy_meta")
         if self.position_manager:
-            payload = intent.get("payload") or {}
             action_to_apply = intent.get("action") or payload.get("action") or trade.get("action")
             action_upper = str(action_to_apply or "").upper()
             sym = self._instrument_trading_symbol(instrument)
@@ -4551,8 +4560,11 @@ class OrderRouter:
                 return True
 
             execution_source = trade.get("execution_source") or "INTENT"
-            position_closed = False
-            realized_pnl = None
+            # SL/TARGET intents often omit strategy_meta; use open-position meta
+            # (entry_premium / qty_lots / reentry_at_cost) captured before close.
+            if meta_extras is None and sym:
+                pm_bucket = self.position_manager.position_metadata.get(sym) or {}
+                meta_extras = pm_bucket.get("strategy_meta")
             position_closed, realized_pnl = self.position_manager.on_fill(
                 instrument=instrument,
                 side=side,
@@ -4573,7 +4585,7 @@ class OrderRouter:
                 tag=intent.get("tag") or trade.get("tag"),
                 candle_ts=intent.get("candle_ts") or trade.get("candle_ts"),
                 action=intent.get("action") or payload.get("action") or trade.get("action"),
-                metadata_extras=payload.get("strategy_meta"),
+                metadata_extras=meta_extras,
                 execution_source=execution_source,
             )
             if position_closed and realized_pnl is not None:
@@ -4623,6 +4635,31 @@ class OrderRouter:
             self._processed_trade_ids = set(list(self._processed_trade_ids)[-self._processed_trade_ids_max // 2 :])
         if self.position_manager and sym:
             self.position_manager.note_trade_led_fill(sym)
+        # Same bus IntentFilled / PositionClosed as process_fill — required for
+        # reentry-at-cost when bus is wired (PM hooks are XOR-skipped).
+        emit_meta = payload_done.get("strategy_meta") or meta_extras
+        self._emit_bus_fill_events(
+            intent_id=intent_id,
+            strategy=(
+                intent.get("strategy")
+                or payload_done.get("strategy_id")
+                or trade.get("strategy")
+            ),
+            instrument=instrument,
+            side=side,
+            qty=int(size),
+            price=price,
+            position_closed=bool(position_closed),
+            realized_pnl=realized_pnl,
+            structure_id=(
+                intent.get("structure_id")
+                or payload_done.get("structure_id")
+                or trade.get("structure_id")
+            ),
+            tag=intent.get("tag") or payload_done.get("tag") or trade.get("tag"),
+            action=intent.get("action") or payload_done.get("action") or trade.get("action"),
+            metadata_extras=emit_meta,
+        )
         return True
 
     @staticmethod

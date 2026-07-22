@@ -729,6 +729,7 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         trigger_price: float,
         candle_ts: Any,
         symbol: str,
+        meta: Optional[_LegMeta] = None,
     ) -> Any:
         trig = float(trigger_price)
         return self.create_order_intent(
@@ -745,6 +746,7 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             action="FORCE_EXIT",
             parent_intent_id=entry_ref.intent_id,
             trigger_price=trig,
+            metadata_extras=self._strategy_meta_dict(meta) if meta is not None else None,
         )
 
     def _build_main_target_intent(
@@ -752,6 +754,7 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         entry_ref: Any,
         candle_ts: Any,
         symbol: str,
+        meta: Optional[_LegMeta] = None,
     ) -> Any:
         target = float(TP_TRIGGER_PRICE)
         return self.create_order_intent(
@@ -768,6 +771,7 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             action="FORCE_EXIT",
             parent_intent_id=entry_ref.intent_id,
             trigger_price=target,
+            metadata_extras=self._strategy_meta_dict(meta) if meta is not None else None,
         )
 
     def _exit_intent_for_position(self, position: Any, candle: dict, ctx: Any) -> Any:
@@ -949,8 +953,8 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
             qty=self._normalize_order_qty(instrument, kwargs.get("qty")),
         )
         return [
-            self._build_main_sl_intent(ref, sl_trigger, candle_ts, meta.symbol),
-            self._build_main_target_intent(ref, candle_ts, meta.symbol),
+            self._build_main_sl_intent(ref, sl_trigger, candle_ts, meta.symbol, meta),
+            self._build_main_target_intent(ref, candle_ts, meta.symbol, meta),
         ]
 
     def on_main_exit_filled(self, **kwargs: Any) -> List[Tuple[Any, dict]]:

@@ -109,11 +109,44 @@ class TestFillHandler(unittest.TestCase):
                 "qty": 1,
                 "side": "BUY",
                 "price": 55,
+                "position_closed": True,
             },
             engine_id="test",
         )
         handler(event)
         book.maybe_arm_from_main_sl.assert_called_once()
+
+    def test_main_sl_skips_partial_fill(self):
+        book = SimpleNamespace(
+            _watches={},
+            maybe_arm_from_main_sl=MagicMock(return_value=True),
+        )
+        engine = SimpleNamespace(
+            order_router=SimpleNamespace(
+                reentry_at_cost_book=book, intent_store=None
+            ),
+            _strategy_obj_for_name=lambda _n: SimpleNamespace(
+                name="ElevenPM", reentry_at_cost={"enabled": True}
+            ),
+            instrument_store=None,
+        )
+        handler = ReentryAtCostFillHandler(SimpleNamespace(engine=engine))
+        event = make_event(
+            EventType.INTENT_FILLED,
+            {
+                "tag": "MAIN_SL",
+                "strategy": "ElevenPM",
+                "structure_id": "sid-partial",
+                "instrument": SimpleNamespace(trading_symbol="P-BTC-1"),
+                "qty": 1,
+                "side": "BUY",
+                "price": 10.1,
+                "position_closed": False,
+            },
+            engine_id="test",
+        )
+        handler(event)
+        book.maybe_arm_from_main_sl.assert_not_called()
 
     def test_main_entry_stops(self):
         book = SimpleNamespace(

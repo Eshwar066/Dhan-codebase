@@ -262,7 +262,8 @@ class ReentryAtCostBook:
             entry_side = "SELL"
 
         try:
-            qty_i = max(1, int(qty or payload.get("qty_lots") or 1))
+            # Prefer original entry size over partial SL fill qty.
+            qty_i = max(1, int(payload.get("qty_lots") or qty or 1))
         except (TypeError, ValueError):
             qty_i = 1
 
