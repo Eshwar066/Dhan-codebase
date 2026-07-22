@@ -68,6 +68,10 @@ ENGINE_JOBS = [
             ),
             "chat_id": os.getenv("TELEGRAM_LEAPS_CHAT_ID", "1021479950"),
         },
+        # Factory default is 150ms; Dhan LIMIT round-trips are ~1s and were
+        # leaving entries paused all session after the morning spike.
+        "latency_critical_ms": 6000,
+        "latency_critical_cycles": 6,
 
     },
     {

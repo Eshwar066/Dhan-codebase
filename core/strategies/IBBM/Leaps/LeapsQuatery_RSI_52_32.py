@@ -1,7 +1,8 @@
 import logging
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import talib
@@ -25,6 +26,17 @@ LEG_SPECS: Tuple[Tuple[str, str, str], ...] = (
     ("mini_leaps_enabled", "LEAPS_ROLL", ""),
     ("quarterly_leaps_enabled", "QUARTERLY", ":QTR"),
 )
+
+
+@dataclass
+class _PendingRsiReversal:
+    """Prebuilt opposite-regime ENTRY after RSI flip; placed on MAIN_EXIT fill."""
+
+    option_type: str
+    regime: str
+    candle: dict
+    intents: List[Any]
+    exit_structure_id: str = ""
 
 
 class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
@@ -58,6 +70,8 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         self._entry_signaled_keys: set[str] = set()
         self._evaluated_signal_keys: set[str] = set()
         self._snapshot_expiry_pref: Optional[str] = None
+        # RSI flip: exit runs first while MAIN still open → defer reverse ENTRY.
+        self._pending_rsi_reversal: Optional[_PendingRsiReversal] = None
         self._load_legs_config_from_yaml()
 
     def _load_legs_config_from_yaml(self) -> None:
@@ -328,6 +342,7 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         structure_id: str,
         expiry_pref: str,
         leg_label: str,
+        ignore_open_main: bool = False,
     ) -> Optional[List[Any]]:
         signal_key = self._entry_signal_guard_key(candle, structure_id)
         if signal_key in self._entry_signaled_keys:
@@ -346,7 +361,7 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             blocked = ctx.position_store.has_open_structure(
                 strategy=self.name, structure_id=structure_id, tag="MAIN"
             )
-        if blocked:
+        if blocked and not ignore_open_main:
             logger.info(
                 "LEAPS %s entry skipped: open MAIN already present "
                 "structure=%s sym=%s",
@@ -501,6 +516,75 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             f" timeframe={getattr(self, 'timeframe', '')}"
         )
 
+    def _open_main_blocks_entry(self, candle: dict, ctx, structure_id: str) -> bool:
+        has_open_main = getattr(ctx.position_store, "has_open_main_leg", None)
+        if callable(has_open_main):
+            return bool(
+                has_open_main(
+                    self.name,
+                    underlying=str(candle.get("symbol") or ""),
+                    structure_id=structure_id,
+                )
+            )
+        return bool(
+            ctx.position_store.has_open_structure(
+                strategy=self.name, structure_id=structure_id, tag="MAIN"
+            )
+        )
+
+    def _arm_pending_rsi_reversal(
+        self,
+        candle: dict,
+        ctx,
+        *,
+        option_type: str,
+        regime: str,
+        base_structure_id: str,
+        exit_structure_id: str = "",
+    ) -> None:
+        """Prebuild reverse ENTRY while option chain is available; place on MAIN_EXIT fill."""
+        prebuilt: List[Any] = []
+        for flag_attr, expiry_pref, suffix in LEG_SPECS:
+            if not getattr(self, flag_attr, False):
+                continue
+            structure_id = f"{base_structure_id}{suffix}"
+            leg_label = "quarterly" if suffix else "mini"
+            legs = self._build_entry_intents(
+                candle,
+                ctx,
+                option_type,
+                structure_id=structure_id,
+                expiry_pref=expiry_pref,
+                leg_label=leg_label,
+                ignore_open_main=True,
+            )
+            if legs:
+                prebuilt.extend(legs)
+        if not prebuilt:
+            logger.warning(
+                "LEAPS RSI reversal defer failed: could not prebuild ENTRY "
+                "regime=%s opt=%s sym=%s",
+                regime,
+                option_type,
+                candle.get("symbol"),
+            )
+            return
+        self._pending_rsi_reversal = _PendingRsiReversal(
+            option_type=option_type,
+            regime=regime,
+            candle=dict(candle),
+            intents=list(prebuilt),
+            exit_structure_id=str(exit_structure_id or ""),
+        )
+        logger.info(
+            "LEAPS RSI reversal deferred until MAIN exit fill "
+            "regime=%s opt=%s intents=%s exit_sid=%s",
+            regime,
+            option_type,
+            len(prebuilt),
+            exit_structure_id or "(any)",
+        )
+
     def on_candle(self, candle, ctx):
         rsi = candle["rsi"]
         if rsi < 32:
@@ -518,12 +602,23 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
 
         base_structure_id = self.build_structure_id(candle, regime)
         all_intents: List[Any] = []
+        blocked_by_open = False
 
         for flag_attr, expiry_pref, suffix in LEG_SPECS:
             if not getattr(self, flag_attr, False):
                 continue
             structure_id = f"{base_structure_id}{suffix}"
             leg_label = "quarterly" if suffix else "mini"
+            if self._open_main_blocks_entry(candle, ctx, structure_id):
+                blocked_by_open = True
+                logger.info(
+                    "LEAPS %s entry skipped: open MAIN already present "
+                    "structure=%s sym=%s",
+                    leg_label,
+                    structure_id,
+                    candle.get("symbol"),
+                )
+                continue
             legs = self._build_entry_intents(
                 candle,
                 ctx,
@@ -535,7 +630,74 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             if legs:
                 all_intents.extend(legs)
 
-        return all_intents or None
+        if all_intents:
+            return all_intents
+
+        # Same-bar RSI flip: exits are enqueued but MAIN is still open → defer CALL/PUT.
+        if blocked_by_open:
+            open_mains = []
+            try:
+                open_mains = [
+                    p
+                    for p in (
+                        ctx.position_store.get_open_positions(
+                            underlying=str(candle.get("symbol") or ""),
+                            strategy=self.name,
+                        )
+                        or []
+                    )
+                    if str(getattr(p, "tag", "") or "").upper() == "MAIN"
+                    and int(getattr(p, "net_qty", 0) or 0) != 0
+                ]
+            except Exception:
+                open_mains = []
+            # Only defer when an open MAIN is on the opposite side of this signal.
+            want_call = option_type.upper() in ("CALL", "CE")
+            reversing = False
+            exit_sid = ""
+            for pos in open_mains:
+                opt = str(
+                    getattr(getattr(pos, "instrument", None), "option_type", "") or ""
+                ).upper()
+                if want_call and opt in ("PE", "PUT"):
+                    reversing = True
+                    exit_sid = str(getattr(pos, "structure_id", "") or "")
+                    break
+                if (not want_call) and opt in ("CE", "CALL"):
+                    reversing = True
+                    exit_sid = str(getattr(pos, "structure_id", "") or "")
+                    break
+            if reversing:
+                self._arm_pending_rsi_reversal(
+                    candle,
+                    ctx,
+                    option_type=option_type,
+                    regime=regime,
+                    base_structure_id=base_structure_id,
+                    exit_structure_id=exit_sid,
+                )
+        return None
+
+    def on_main_exit_filled(self, **kwargs: Any) -> List[Tuple[Any, dict]]:
+        """Place deferred RSI reverse ENTRY after MAIN_EXIT fill."""
+        pending = self._pending_rsi_reversal
+        if pending is None:
+            return []
+        tag_u = str(kwargs.get("tag") or "").upper()
+        if tag_u != "MAIN_EXIT":
+            return []
+        sid = str(kwargs.get("structure_id") or "")
+        if pending.exit_structure_id and sid and sid != pending.exit_structure_id:
+            return []
+        self._pending_rsi_reversal = None
+        candle = pending.candle
+        logger.info(
+            "LEAPS RSI reversal ENTRY on MAIN_EXIT fill regime=%s opt=%s intents=%s",
+            pending.regime,
+            pending.option_type,
+            len(pending.intents),
+        )
+        return [(intent, candle) for intent in pending.intents]
 
     def should_exit(self, position, candle, ctx=None):
         if position.tag != "MAIN":
