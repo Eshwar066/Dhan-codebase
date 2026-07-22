@@ -339,6 +339,31 @@ class DosHtfMixin:
         self._last_seen_4h_bar_open = bar_open
         return float(st)
 
+    def _hydrate_1h_from_history(self, candle: Optional[dict] = None) -> Optional[float]:
+        """
+        Seed 1H SuperTrend / direction from last closed 60m indicator history.
+
+        Must NOT use open-position meta direction (e.g. weekly PE = +1) — that
+        masks the real 1H state after restart and skips the next daily flip entry.
+        """
+        if candle is None:
+            candle = {
+                "symbol": "BTCUSD",
+                "timestamp": pd.Timestamp.now(tz="UTC"),
+                "timeframe": "60",
+            }
+        as_of = self._as_of_utc(candle)
+        # Primary TF key in indicator history is "60".
+        hist = self._latest_closed_st_from_indicator_history("60", as_of)
+        if hist is None:
+            hist = self._latest_closed_st_from_indicator_history("1h", as_of)
+        if hist is None:
+            return None
+        direction, st, _bar_open = hist
+        self._confirmed_direction = int(direction)
+        self._current_supertrend = float(st)
+        return float(st)
+
     def _resolve_weekly_trail_st(self, ctx: Any, candle: dict) -> Optional[float]:
         """
         Live 4H SuperTrend for weekly MAIN_SL trail.

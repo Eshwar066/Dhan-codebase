@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 # Sleeve entry switches (flip to False to stop new entries / SL re-entries for
 # that sleeve). Open positions still trail SL, force-exit, and roll as usual.
-ENABLE_WEEKLY_TRADES = False
+ENABLE_WEEKLY_TRADES = True
 ENABLE_INTRADAY_TRADES = True
 ENABLE_MORNING_TRADES = True
 
@@ -733,11 +733,24 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                         trading_symbol,
                     )
             if restored:
-                meta = self._meta_by_structure_id[sid]
-                self._confirmed_direction = meta.direction
-                # Do NOT seed _current_4h_supertrend from entry meta — that froze
-                # weekly trail at entry ST after restart. Hydrate live 4H below.
-                self._current_supertrend = meta.supertrend
+                # Meta restored for quote risk / trail; 1H signal state is hydrated
+                # from indicator history below (not from sleeve entry direction).
+                pass
+        # Seed 1H signal state from last closed 60m history (not position meta).
+        live_1h = self._hydrate_1h_from_history()
+        if live_1h is not None:
+            logger.info(
+                "%s hydrated live 1H SuperTrend=%.2f direction=%s after startup restore",
+                self.name,
+                live_1h,
+                self._confirmed_direction,
+            )
+        else:
+            logger.warning(
+                "%s could not hydrate live 1H SuperTrend after startup restore "
+                "(daily flip detection deferred until first closed 1H bar)",
+                self.name,
+            )
         # After restore, load live last-closed 4H ST so weekly trail can catch up.
         live_4h = self._hydrate_4h_from_history()
         if live_4h is not None:

@@ -1513,11 +1513,55 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             positions={"P-BTC-64000-240726": pos},
             get_position_metadata=lambda _sym: {},
         )
-        s.restore_state_on_startup(pm)
+
+        def _hydrate_1h(_candle=None):
+            s._confirmed_direction = -1
+            s._current_supertrend = 66202.19
+            return 66202.19
+
+        with patch.object(s, "_hydrate_1h_from_history", side_effect=_hydrate_1h):
+            with patch.object(s, "_hydrate_4h_from_history", return_value=65659.07):
+                s.restore_state_on_startup(pm)
         meta = s._meta_by_structure_id[pos.structure_id]
         self.assertEqual(meta.sleeve, "weekly")
         self.assertEqual(meta.direction, 1)
-        self.assertEqual(s._confirmed_direction, 1)
+        # 1H signal state from hydrate — not weekly meta (+1).
+        self.assertEqual(s._confirmed_direction, -1)
+        self.assertAlmostEqual(s._current_supertrend, 66202.19)
+
+    def test_restart_seeds_1h_not_weekly_meta_so_daily_flip_fires(self):
+        """Regression: weekly PE restore must not hide a later 1H -1→+1 daily entry."""
+        ctx = SimpleNamespace(position_store=_PositionStore())
+        # After restart hydrate: last closed 1H was still bearish.
+        self.strategy._confirmed_direction = -1
+        self.strategy._current_supertrend = 66202.19
+        candle = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 22, 16, 0, tzinfo=timezone.utc),  # 21:30 IST open
+            "bucket_ts": datetime(2026, 7, 22, 16, 0, tzinfo=timezone.utc).timestamp(),
+            "timeframe": "60",
+            "close": 66207.0,
+            "supertrend": 65625.87,
+            "supertrend_direction": 1,
+        }
+        marker = object()
+        with patch.object(self.strategy, "_bar_is_fully_closed", return_value=True):
+            with patch.object(
+                self.strategy,
+                "_refresh_htf_state",
+                return_value={"4h": (1, 65659.07), "1d": (1, 63278.86)},
+            ):
+                with patch.object(
+                    self.strategy, "_build_entry", return_value=marker
+                ) as build:
+                    result = self.strategy.on_candle(candle, ctx)
+        daily_calls = [
+            c for c in build.call_args_list if c.kwargs.get("sleeve") == "daily"
+        ]
+        self.assertEqual(len(daily_calls), 1)
+        self.assertEqual(daily_calls[0].kwargs["reason"], "one_h_signal")
+        self.assertEqual(daily_calls[0].args[2], 1)
+        self.assertIn(marker, result or [])
 
     def test_build_entry_skips_duplicate_trading_symbol(self):
         s = DirectionalOptionSelling()
