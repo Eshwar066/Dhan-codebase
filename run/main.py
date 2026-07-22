@@ -97,6 +97,7 @@ def job_to_engine_config(job: dict) -> EngineConfig:
         root_log_level=str(job.get("log_level") or DEFAULT_ROOT_LOG_LEVEL),
         library_log_level=str(job.get("library_log_level") or DEFAULT_LIBRARY_LOG_LEVEL),
         strategy_eval=job.get("strategy_eval"),
+        execution_validator=job.get("execution_validator"),
     )
 
 

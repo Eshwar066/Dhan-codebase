@@ -205,11 +205,14 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         return (trade_dt + timedelta(days=1)).strftime("%d%m%y")
 
     def _strategy_meta_dict(self, meta: _LegMeta) -> dict:
+        planned_sl = float(meta.entry_premium) * float(SL_PREM_MULT)
         payload = {
             "symbol": meta.symbol,
             "entry_date": meta.entry_date.isoformat(),
             "option_type": meta.option_type,
             "entry_premium": meta.entry_premium,
+            "sl_premium_mult": float(SL_PREM_MULT),
+            "planned_sl_trigger": planned_sl,
             "reentry_count": meta.reentry_count,
             "entry_group": meta.entry_group,
             "otm_steps": meta.otm_steps,
@@ -219,6 +222,9 @@ class BTCZeroDTEElevenPM(IndiaMktMixins, DeltaMktMixins, BaseStrategy):
         out = pack_strategy_meta(REGISTRY_KEY, payload)
         out[META_KEY] = payload
         out["reentry_at_cost"] = dict(self.reentry_at_cost)
+        out["sl_premium_mult"] = float(SL_PREM_MULT)
+        out["planned_sl_trigger"] = planned_sl
+        out["entry_premium"] = float(meta.entry_premium)
         return out
 
     def _try_merge_meta_from_raw(self, structure_id: str, raw: dict) -> bool:

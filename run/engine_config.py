@@ -151,6 +151,8 @@ class EngineConfig:
     max_active_account_symbol_keys: int = 200
     account_circuit_breaker_threshold: int = 5
     feed_stall_seconds: float = 60.0
+    # Delta OMS ExecutionValidator knobs (mark/mid/spread/stop gates). Optional dict.
+    execution_validator: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         if self.base_dir is None:

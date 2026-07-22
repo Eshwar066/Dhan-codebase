@@ -114,6 +114,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         max_active_account_symbol_keys: int = 200,
         account_circuit_breaker_threshold: int = 5,
         feed_stall_seconds: float = 60.0,
+        execution_validator: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             strategy,
@@ -159,8 +160,12 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self.event_bus = None
         self._feed_disconnect_event_sent = False
         self.venue = venue or ""
+        self._execution_validator_cfg = (
+            dict(execution_validator) if isinstance(execution_validator, dict) else None
+        )
         self.market_exchange = str(market_exchange or "").upper()
         self.engine_logger = engine_logger
+        self._configure_execution_validator()
         self.feed_stale_seconds = feed_stale_seconds
         self._last_tick_timestamp: Dict[str, float] = {}
         self._last_candle_timestamp: Dict[str, float] = {}
@@ -2689,6 +2694,208 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     strategy_time_ms=eval_result.get("strategy_time_ms"),
                     timeframe=None,
                 )
+
+    def _configure_execution_validator(self) -> None:
+        """Attach Delta OMS ExecutionValidator to OrderRouter (mark/mid/stop gates)."""
+        router = getattr(self, "order_router", None)
+        if router is None or not hasattr(router, "configure_execution_validator"):
+            return
+        raw = getattr(self, "_execution_validator_cfg", None)
+        venue = str(getattr(self, "venue", "") or "").upper()
+        # Default: enable for DELTA when job omits the block; DHAN stays off.
+        if raw is None and venue == "DELTA":
+            raw = {"enabled": True, "venue": "DELTA"}
+        elif raw is None:
+            return
+        if isinstance(raw, dict) and "venue" not in raw and venue:
+            raw = {**raw, "venue": venue}
+        router.configure_execution_validator(
+            venue=venue or None,
+            config=raw,
+            snapshot_provider=self._market_snapshot_for_symbol,
+            on_invalid_stop=self._on_invalid_stop,
+        )
+        if self.engine_logger:
+            enabled = True
+            if isinstance(raw, dict):
+                enabled = bool(raw.get("enabled", True))
+            self.engine_logger.log(
+                "oms",
+                f"ExecutionValidator configured venue={venue} enabled={enabled}",
+                venue=venue,
+                enabled=enabled,
+            )
+
+    def _market_snapshot_for_symbol(self, symbol: str):
+        """Single snapshot from feed ticker + top of book (Delta)."""
+        from core.orderExecution.execution_validator import snapshot_from_ticker
+
+        sym = str(symbol or "").strip()
+        if not sym:
+            return None
+        feed = self.realtime_feed
+        ticker = None
+        bid = ask = bid_size = ask_size = None
+        source = "feed"
+        if feed is not None:
+            get_ticker = getattr(feed, "get_last_ticker", None)
+            if callable(get_ticker):
+                try:
+                    ticker = get_ticker(sym)
+                except Exception:
+                    ticker = None
+            get_bid = getattr(feed, "get_best_bid", None)
+            get_ask = getattr(feed, "get_best_ask", None)
+            if callable(get_bid):
+                try:
+                    bid = get_bid(sym)
+                except Exception:
+                    bid = None
+            if callable(get_ask):
+                try:
+                    ask = get_ask(sym)
+                except Exception:
+                    ask = None
+        if ticker is None or (
+            (bid is None or ask is None)
+            and str(getattr(self, "venue", "") or "").upper() == "DELTA"
+        ):
+            broker = getattr(self.order_router, "broker", None)
+            get_ticker = getattr(broker, "get_ticker", None) if broker else None
+            if callable(get_ticker):
+                try:
+                    rest = get_ticker(sym)
+                except Exception:
+                    rest = None
+                if isinstance(rest, dict):
+                    ticker = rest if ticker is None else {**rest, **(ticker or {})}
+                    source = "feed+rest" if source == "feed" else "rest"
+                    quotes = (
+                        rest.get("quotes")
+                        if isinstance(rest.get("quotes"), dict)
+                        else {}
+                    )
+                    if bid is None:
+                        bid = (
+                            quotes.get("best_bid")
+                            or rest.get("bid")
+                            or rest.get("best_bid")
+                        )
+                    if ask is None:
+                        ask = (
+                            quotes.get("best_ask")
+                            or rest.get("ask")
+                            or rest.get("best_ask")
+                        )
+        snap = snapshot_from_ticker(
+            sym,
+            ticker if isinstance(ticker, dict) else None,
+            bid=bid,
+            ask=ask,
+            bid_size=bid_size,
+            ask_size=ask_size,
+            source=source,
+        )
+        # If ticker had no timestamp, stamp now so age checks stay meaningful.
+        if snap.ts is None:
+            snap.ts = time.time()
+        return snap
+
+    def _on_invalid_stop(self, intent: Any, result: Any) -> None:
+        """
+        Post-fill safety: MAIN_SL invalid vs mark → force-exit the open MAIN.
+        Pre-ENTRY rejects never reach here (no position yet).
+        """
+        reason = getattr(result, "reason", None) or "invalid_stop_vs_mark"
+        details = getattr(result, "details", None) or {}
+        sid = str(getattr(intent, "structure_id", None) or "").strip()
+        strategy_name = str(
+            getattr(intent, "strategy", None)
+            or getattr(intent, "strategy_id", None)
+            or ""
+        ).strip()
+        inst = getattr(intent, "instrument", None)
+        trading_sym = str(
+            getattr(inst, "trading_symbol", None)
+            or details.get("symbol")
+            or getattr(intent, "symbol", None)
+            or ""
+        ).strip()
+        underlying = str(getattr(intent, "symbol", None) or "").strip()
+
+        logger.error(
+            "ExecutionValidator invalid MAIN_SL → force exit "
+            "reason=%s sid=%s symbol=%s mark=%s trigger=%s",
+            reason,
+            sid,
+            trading_sym,
+            details.get("mark"),
+            details.get("trigger") or details.get("planned_sl_trigger"),
+        )
+        if self.engine_logger:
+            self.engine_logger.log(
+                "order_failed",
+                (
+                    f"invalid_stop_vs_mark force_exit sid={sid} "
+                    f"symbol={trading_sym} mark={details.get('mark')} "
+                    f"trigger={details.get('trigger')}"
+                ),
+                structure_id=sid or None,
+                symbol=trading_sym or None,
+                reason=str(reason),
+                mark=details.get("mark"),
+                trigger=details.get("trigger"),
+            )
+
+        if not sid and not trading_sym:
+            return
+
+        pos = None
+        symbol_key = underlying or trading_sym
+        for sym, candidate in list(self.position_manager.positions.items()):
+            if int(getattr(candidate, "net_qty", 0) or 0) == 0:
+                continue
+            c_sid = str(getattr(candidate, "structure_id", None) or "").strip()
+            c_tsym = str(
+                getattr(
+                    getattr(candidate, "instrument", None), "trading_symbol", None
+                )
+                or sym
+            ).strip()
+            if sid and c_sid == sid:
+                pos = candidate
+                symbol_key = sym
+                break
+            if trading_sym and c_tsym == trading_sym:
+                pos = candidate
+                symbol_key = sym
+        if pos is None:
+            logger.warning(
+                "invalid_stop force_exit skipped: no open MAIN sid=%s symbol=%s",
+                sid,
+                trading_sym,
+            )
+            return
+
+        if not strategy_name:
+            strategy_name = str(getattr(pos, "strategy", None) or "").strip()
+        strategy_obj = (
+            self._strategy_obj_for_name(strategy_name) if strategy_name else None
+        )
+        if strategy_obj is None:
+            strategy_obj = self.strategy
+            strategy_name = str(getattr(strategy_obj, "name", "") or strategy_name)
+
+        if sid:
+            self._delta_main_sl_retry.pop(sid, None)
+
+        self._force_close_position_missing_main_sl(
+            strategy_obj=strategy_obj,
+            strategy_name=strategy_name or "unknown",
+            pos=pos,
+            symbol=str(symbol_key),
+            structure_id=sid or str(getattr(pos, "structure_id", "") or ""),
+        )
 
     def _configure_reentry_at_cost_book(self) -> None:
         book = getattr(self.order_router, "reentry_at_cost_book", None)

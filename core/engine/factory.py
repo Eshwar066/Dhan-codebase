@@ -572,6 +572,7 @@ class EngineFactory:
                 config, "account_circuit_breaker_threshold", 5
             ),
             feed_stall_seconds=getattr(config, "feed_stall_seconds", 60.0),
+            execution_validator=getattr(config, "execution_validator", None),
         )
 
     @staticmethod

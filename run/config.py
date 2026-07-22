@@ -93,6 +93,20 @@ ENGINE_JOBS = [
         "strategy_timeout_seconds": 60,
         "latency_critical_ms": 6000,
         "latency_critical_cycles": 6,
+        # Delta OMS: reject ENTRY / MAIN_SL when book or mark is unsafe.
+        "execution_validator": {
+            "enabled": True,
+            "max_spread_pct": 0.10,
+            "max_mark_mid_pct": 0.50,
+            "max_quote_age_sec": 30.0,
+            "require_bid_ask": True,
+            "require_mark": True,
+            "default_sl_premium_mult": 2.0,
+            "infer_entry_sl_from_default_mult": False,
+            "min_stop_mark_ratio": 1.0,
+            "validate_entry": True,
+            "validate_stop": True,
+        },
         "telegram": {
             "bot_token": "8389724629:AAHY_CGcBF8HZCexedsEJFw80Mf6SxH5Bkk",
             "chat_id": "1021479950",

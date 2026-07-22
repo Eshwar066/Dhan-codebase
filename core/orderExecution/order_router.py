@@ -22,6 +22,15 @@ from core.broker.internal.dhan.mappings import dhan_correlation_id, format_broke
 from core.orderExecution.bracket_orders import BRACKET_TAGS, BracketLegRegistry
 from core.orderExecution.gtt_fallback_book import GttFallbackBook, GttFallbackWatch
 from core.orderExecution.reentry_at_cost_book import ReentryAtCostBook
+from core.orderExecution.execution_validator import (
+    ExecutionValidator,
+    ExecutionValidatorConfig,
+    MarketSnapshot,
+    ValidationResult,
+    config_from_mapping,
+    planned_sl_trigger_from_intent,
+    snapshot_from_ticker,
+)
 from core.orderExecution.intent_store import IntentStatus, IntentStore
 from core.models.order_intent import OrderIntent
 
@@ -145,6 +154,166 @@ class OrderRouter:
         self.on_broker_no_open_position: Optional[
             Callable[..., None]
         ] = None
+        # Delta execution validator (mark/mid/spread/stop gates). Wired by LiveEngine.
+        self.venue: Optional[str] = None
+        self.execution_validator: Optional[ExecutionValidator] = None
+        self.market_snapshot_provider: Optional[
+            Callable[[str], Optional[MarketSnapshot]]
+        ] = None
+        # Called when MAIN_SL fails mark validation: (intent, ValidationResult) -> None
+        self.on_invalid_stop: Optional[
+            Callable[[Any, ValidationResult], None]
+        ] = None
+
+    def configure_execution_validator(
+        self,
+        *,
+        venue: Optional[str] = None,
+        config: Optional[Any] = None,
+        snapshot_provider: Optional[
+            Callable[[str], Optional[MarketSnapshot]]
+        ] = None,
+        on_invalid_stop: Optional[Callable[[Any, ValidationResult], None]] = None,
+    ) -> None:
+        """Attach Delta OMS execution validator (no-op when disabled / non-Delta)."""
+        if venue is not None:
+            self.venue = str(venue).upper()
+        if snapshot_provider is not None:
+            self.market_snapshot_provider = snapshot_provider
+        if on_invalid_stop is not None:
+            self.on_invalid_stop = on_invalid_stop
+        if isinstance(config, ExecutionValidatorConfig):
+            cfg = config
+        elif isinstance(config, dict):
+            cfg = config_from_mapping(config)
+        else:
+            cfg = ExecutionValidatorConfig(
+                enabled=str(self.venue or "").upper() == "DELTA"
+            )
+        if self.venue:
+            cfg.venue = str(self.venue).upper()
+        self.execution_validator = ExecutionValidator(
+            cfg,
+            snapshot_provider=self.market_snapshot_provider,
+            venue=self.venue,
+        )
+
+    def _reject_execution_validation(
+        self,
+        intent: Any,
+        result: ValidationResult,
+        *,
+        intent_strategy_id: Any,
+        exec_price: Any = None,
+        qty: Any = None,
+    ) -> Dict[str, Any]:
+        reason = str(result.reason or "execution_validation_failed")
+        details = result.details or {}
+        msg = (
+            f"ExecutionValidator rejected: {reason} "
+            f"symbol={details.get('symbol')} mark={details.get('mark')} "
+            f"mid={details.get('mid')} trigger={details.get('trigger') or details.get('planned_sl_trigger')}"
+        )
+        self._log_oms_step(
+            "execution_validator",
+            intent,
+            ok=False,
+            message=msg,
+            intent_strategy_id=intent_strategy_id,
+            exec_price=exec_price,
+            qty=qty,
+            reason=reason,
+            **{k: details[k] for k in details if k not in ("symbol",)},
+        )
+        if self.engine_logger:
+            self.engine_logger.log(
+                "order_failed",
+                f"ORDER_FAILED intent_id={getattr(intent, 'intent_id', None)} "
+                f"reason={reason} | {msg}",
+                intent_id=getattr(intent, "intent_id", None),
+                strategy_id=intent_strategy_id,
+                symbol=details.get("symbol"),
+                side=getattr(intent, "side", None),
+                qty=qty,
+                reason=reason,
+                mark=details.get("mark"),
+                mid=details.get("mid"),
+                spread_pct=details.get("spread_pct"),
+                mark_mid_pct=details.get("mark_mid_pct"),
+                trigger=details.get("trigger") or details.get("planned_sl_trigger"),
+            )
+        try:
+            if getattr(intent, "intent_id", None) and self.intent_store:
+                self.intent_store.update(
+                    intent.intent_id,
+                    IntentStatus.REJECTED,
+                    order_state=OrderState.REJECTED,
+                )
+            if getattr(intent, "intent_id", None):
+                self._set_order_state(
+                    intent.intent_id,
+                    OrderState.REJECTED,
+                    action="execution_validator",
+                    message=msg,
+                )
+        except Exception as exc:
+            logger.warning("execution_validator reject bookkeeping failed: %s", exc)
+        return {"ok": False, "retryable": False, "reason": reason, "details": details}
+
+    def _validate_intent_execution(
+        self,
+        intent: Any,
+        *,
+        exec_price: Any = None,
+        planned_sl_trigger: Optional[float] = None,
+        intent_strategy_id: Any = None,
+        qty: Any = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Run ExecutionValidator when configured for this venue.
+        Returns a reject dict on failure, else None (ok / skipped).
+        """
+        validator = getattr(self, "execution_validator", None)
+        if validator is None:
+            return None
+        venue = str(getattr(self, "venue", None) or "").upper()
+        if not validator.applies_to_venue(venue):
+            return None
+        result = validator.validate_intent(
+            intent,
+            venue=venue,
+            exec_price=exec_price,
+            planned_sl_trigger=planned_sl_trigger,
+        )
+        if result.ok:
+            action = str(getattr(intent, "action", "") or "").upper()
+            tag = str(getattr(intent, "tag", "") or "").upper()
+            if action == "ENTRY" or tag == "MAIN_SL":
+                self._log_oms_step(
+                    "execution_validator",
+                    intent,
+                    ok=True,
+                    message=f"ExecutionValidator ok reason={result.reason or 'pass'}",
+                    intent_strategy_id=intent_strategy_id,
+                    exec_price=exec_price,
+                    qty=qty,
+                    mark=(result.details or {}).get("mark"),
+                    mid=(result.details or {}).get("mid"),
+                )
+            return None
+        tag_u = str(getattr(intent, "tag", "") or "").upper()
+        if tag_u == "MAIN_SL" and callable(getattr(self, "on_invalid_stop", None)):
+            try:
+                self.on_invalid_stop(intent, result)
+            except Exception as exc:
+                logger.warning("on_invalid_stop callback failed: %s", exc)
+        return self._reject_execution_validation(
+            intent,
+            result,
+            intent_strategy_id=intent_strategy_id,
+            exec_price=exec_price,
+            qty=qty,
+        )
 
     def reset_oms_session_boundary(self) -> None:
         """Call when starting a new trading session (same process) to tighten orphan fill acceptance."""
@@ -1621,6 +1790,16 @@ class OrderRouter:
             qty=qty,
         )
 
+        # Delta ExecutionValidator: mark/mid/spread + stop-vs-mark (ENTRY + MAIN_SL).
+        reject = self._validate_intent_execution(
+            intent,
+            exec_price=exec_price,
+            intent_strategy_id=intent_strategy_id,
+            qty=qty,
+        )
+        if reject is not None:
+            return reject
+
         self._log_oms_step(
             "place_order_start",
             intent,
@@ -2937,6 +3116,35 @@ class OrderRouter:
 
         sl_intent, sl_price = resolved[0]
         tgt_intent, tgt_price = resolved[1]
+        # Re-validate SL vs live mark immediately before bracket submit (post-fill safety net).
+        sl_reject = self._validate_intent_execution(
+            sl_intent,
+            exec_price=sl_price,
+            intent_strategy_id=getattr(sl_intent, "strategy", None)
+            or getattr(sl_intent, "strategy_id", None)
+            or bundle_item.get("strategy_id"),
+            qty=getattr(sl_intent, "qty", None),
+        )
+        if sl_reject is not None:
+            # Reject companion TARGET as well — do not leave a one-sided bracket.
+            for intent, _ in resolved:
+                if intent is sl_intent:
+                    continue
+                try:
+                    self.intent_store.update(
+                        intent.intent_id,
+                        IntentStatus.REJECTED,
+                        order_state=OrderState.REJECTED,
+                    )
+                    self._set_order_state(
+                        intent.intent_id,
+                        OrderState.REJECTED,
+                        action="execution_validator",
+                        message="Companion MAIN_SL rejected by ExecutionValidator",
+                    )
+                except Exception:
+                    pass
+            return sl_reject
         combo = place_fn(
             sl_intent,
             tgt_intent,
