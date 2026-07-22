@@ -63,9 +63,12 @@ documentation:
     One-hour BTC SuperTrend reversals sell one Put in bullish regimes or one Call
     in bearish regimes. Strike selection uses strictly OTM strikes outside SuperTrend
     with at least $120 premium, preferring 0DTE and then the next daily expiry.
+    A morning sleeve also sells 0DTE at 08:30 IST on the current 1H SuperTrend
+    (no 4H/1D filter, 10 lots, min premium $20), gated by ENABLE_MORNING_TRADES.
   rules: |
     - SuperTrend length 16, multiplier 1.5 on BTCUSD 60-minute closed candles
     - Daily sleeve enters only on a confirmed 1H SuperTrend flip (no mid-regime catch-up)
+    - Morning sleeve enters once per day on the 08:30 IST closed 1H bar (1H ST only; 0DTE; 10 lots)
     - Red to Green: sell one PE; Green to Red: sell one CE
     - Exit the old option before placing the opposite option
     - Broker MAIN_SL is a spot-triggered stop-LIMIT on the option (never market); open limits re-quote to best ask every 30s

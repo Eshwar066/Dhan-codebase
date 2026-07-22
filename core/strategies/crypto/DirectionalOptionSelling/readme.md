@@ -2,6 +2,18 @@
 
 BTC SuperTrend **directional option selling** on Delta Exchange.
 
+Sells puts when bullish, sells calls when bearish. Runs **three sleeves in parallel** (each can be open at the same time):
+
+| Sleeve | `structure_id` token | Enable switch |
+|--------|----------------------|---------------|
+| **Weekly** | `weekly` | `ENABLE_WEEKLY_TRADES` |
+| **Daily** | `daily` | `ENABLE_INTRADAY_TRADES` |
+| **Morning** | `morning` | `ENABLE_MORNING_TRADES` |
+
+When a switch is `False`, that sleeve takes **no new entries and no SL re-entries**. Open positions still trail SL, force-exit, reverse, and roll as usual.
+
+---
+
 ## Layout
 
 | File | Owns |
@@ -11,18 +23,9 @@ BTC SuperTrend **directional option selling** on Delta Exchange.
 | `trail_sl.py` (`DosTrailSlMixin`) | Broker MAIN_SL trail levels, modify, pending retry |
 | `constants.py` | Shared knobs (ST params, trail points, sleeves) |
 
-Sells puts when bullish, sells calls when bearish. Runs **two sleeves in parallel**:
-
-| Sleeve | Signal | HTF filter | Strike reference | Expiry |
-|--------|--------|------------|------------------|--------|
-| **Weekly** | 1D + 4H SuperTrend agree | same (1D + 4H) | 4H SuperTrend | Friday weekly (DTE ≥ 3) |
-| **Daily** | 1H SuperTrend | 1D + 4H must match 1H | 1H SuperTrend | 0DTE / 1DTE |
-
-Both sleeves may be open at the same time (one weekly + one daily).
-
 ---
 
-## Direction map
+## Direction map (all sleeves)
 
 | SuperTrend | Meaning | Action |
 |------------|---------|--------|
@@ -33,40 +36,129 @@ SuperTrend params: length **16**, factor **1.5**.
 
 ---
 
-## High-level flow
+## Sleeve comparison (lifecycle)
+
+| Topic | Weekly | Daily | Morning |
+|-------|--------|-------|---------|
+| **Enable flag** | `ENABLE_WEEKLY_TRADES` | `ENABLE_INTRADAY_TRADES` | `ENABLE_MORNING_TRADES` |
+| **Lots** | `ORDER_QTY_LOTS_WEEKLY` (10) | `ORDER_QTY_LOTS_DAILY` (10) | `ORDER_QTY_LOTS_MORNING` (10) |
+| **When it can enter** | On closed 1H bar, while 1D + 4H already agree | On closed 1H bar, **only** on a confirmed **1H ST flip** | Once per day on the **08:30 IST** closed 1H bar |
+| **Signal / direction** | Color of aligned 1D + 4H | Confirmed 1H SuperTrend after flip | Current confirmed 1H SuperTrend (no flip required) |
+| **HTF filter (1D + 4H)** | **Required** (1D must equal 4H) | **Required** (both must match 1H direction) | **None** — 1H only |
+| **Strike reference ST** | **4H** SuperTrend | **1H** SuperTrend | **1H** SuperTrend |
+| **Expiry** | Friday weekly; if DTE ≤ 2 → next Friday (min DTE **3**) | Before 17:25 IST → **0DTE**; at/after → **1DTE** | Always prefer **today 0DTE** |
+| **Qty / premium** | OTM, outside ST, premium ≥ **$120** | Same (≥ **$120**) | Same rules, premium ≥ **$20** |
+| **Duplicate guard** | No open weekly sleeve; skip if same Friday already open | No open daily sleeve; skip if same contract already open | No open morning sleeve; skip if same 0DTE expiry already open |
+| **Entry reason tag** | `weekly_htf_aligned` | `one_h_signal` | `morning_830` |
+
+---
+
+## Exits by sleeve
+
+| Exit type | Weekly | Daily | Morning |
+|-----------|--------|-------|---------|
+| **Signal / regime exit** | 1D **or** 4H no longer matches open weekly direction → `MAIN_EXIT` (`weekly_htf_misaligned`) | Confirmed **1H ST flip** against open daily direction → `MAIN_EXIT` (`one_h_reversal`) | Confirmed **1H ST flip** against open morning direction → `MAIN_EXIT` (`morning_one_h_reversal`) |
+| **Broker trail SL** | `MAIN_SL` on **4H ST ± 100** (spot trigger, option LIMIT cover) | `MAIN_SL` on **1H ST ± 100** | `MAIN_SL` on **1H ST ± 100** |
+| **Force exit (strategy)** | Spot hits **4H ST ± 300** → LIMIT exit | Spot hits **1H ST ± 300** → LIMIT exit | Spot hits **1H ST ± 300** → LIMIT exit |
+| **Strike proximity** | Spot within **±50** of option strike → LIMIT exit | Same | Same |
+| **17:25 IST rollover** | Only if holding **today’s** daily expiry (unusual for weekly Friday) → exit + next daily | If holding **today’s** expiry → exit + roll next day (≥ 200 pts from ST) | If still open on **today’s** 0DTE → **flat EXIT only** (`morning_0dte_flat`) — **no** next-expiry roll |
+| **Mid-bar / flicker** | Ignores unconfirmed 1H flicker; weekly cares about HTF | 1H flip needs **close confirmation** on new side of ST | Same close-confirmation rule as daily |
+
+After a signal exit (`MAIN_EXIT`), the sleeve usually **transitions**: cancel resting `MAIN_SL`, exit, then re-open in the new direction for **that same sleeve** (if its enable flag is on).
+
+---
+
+## SL / force-exit reentry by sleeve
+
+After broker `MAIN_SL` fill, strategy force-exit, or other full close that arms reentry:
+
+| Step | Weekly | Daily | Morning |
+|------|--------|-------|---------|
+| **Arm** | `_arm_sl_reentry(..., sleeve=weekly)` | `sleeve=daily` | `sleeve=morning` |
+| **When it fires** | Next **closed 1H bar** after the exit time | Same | Same |
+| **Direction** | Prefer live **4H** direction if known; else current 1H | Current confirmed **1H** | Current confirmed **1H** |
+| **HTF on reentry** | Must still pass weekly 1D+4H align inside `_build_entry` | Must still pass daily 1D+4H vs 1H filter | **No** HTF check |
+| **Expiry on reentry** | Weekly Friday (DTE ≥ 3) | 0DTE / 1DTE via clock (≥ 17:25 → 1DTE) | Force **0DTE** (`min_dte=0`) |
+| **Gated by** | `ENABLE_WEEKLY_TRADES` | `ENABLE_INTRADAY_TRADES` | `ENABLE_MORNING_TRADES` |
+| **Reason tags** | `sl_reentry_same` / `sl_reentry_flip` | Same | Same |
+
+If the enable flag is off, the sleeve **exits only** (no re-entry / no transition re-open).
+
+---
+
+## Risk controls (shared, applied per open sleeve)
+
+| Rule | Level | Reference ST | Who fires |
+|------|-------|--------------|-----------|
+| Trail SL | ST ± **100** | Weekly → **4H**; Daily / Morning → **1H** | Broker `MAIN_SL` (spot trigger, option LIMIT). Modify failures log `TRAIL_SL_STALE` and retry. |
+| Force exit | ST ± **300** | Same sleeve ST as above | Strategy on quote / candle |
+| Strike proximity | Spot within ± **50** of strike | Option strike | Strategy |
+| Expiry rollover | **17:25 IST** | Any open **today** expiry | Daily/weekly: exit + next daily (min **200** pts from ST). **Morning: flat exit only** (no roll). |
+
+---
+
+## High-level flow (closed 1H bar)
 
 ```mermaid
 flowchart TD
     A[1H candle closed] --> B[Update 1H SuperTrend]
     B --> C[Fetch / refresh 4H + 1D SuperTrend]
-    C --> D{Trail SL on open sleeves}
+    C --> D[Trail SL on all open sleeves]
     D --> E{Deferred / SL reentry?}
-    E -->|yes| F[Try sleeve reentry]
-    E -->|no| G[Weekly sleeve logic]
+    E -->|yes| F[Try that sleeve reentry]
+    E -->|no| G[Weekly exit / entry]
     F --> G
-    G --> H[Daily sleeve logic]
-    H --> I{17:25 IST rollover due?}
-    I -->|yes today-expiry open| J[Exit + roll to next daily]
-    I -->|no| K[Done]
-    J --> K
+    G --> H[Morning exit / 08:30 entry]
+    H --> I[Daily exit / flip entry]
+    I --> J{17:25 IST rollover?}
+    J -->|yes today-expiry open| K[Exit + roll next daily]
+    J -->|no| L[Done]
+    K --> L
 ```
 
 ---
 
-## Weekly sleeve
+## Three-sleeve overview
+
+```mermaid
+flowchart LR
+    subgraph HTF["Higher timeframes"]
+        D1[1D SuperTrend]
+        H4[4H SuperTrend]
+    end
+
+    subgraph LTF["Signal timeframe"]
+        H1[1H SuperTrend]
+    end
+
+    D1 --> W[Weekly sleeve]
+    H4 --> W
+    H4 --> F[Daily HTF filter]
+    D1 --> F
+    H1 --> Daily[Daily sleeve]
+    F --> Daily
+    H1 --> M[Morning sleeve]
+
+    W --> WP[Weekly PE/CE<br/>Friday expiry]
+    Daily --> DP[Daily PE/CE<br/>0DTE / 1DTE]
+    M --> MP[Morning PE/CE<br/>0DTE @ 08:30]
+```
+
+---
+
+## Weekly sleeve detail
 
 ### Entry
-
-1. **1D SuperTrend** and **4H SuperTrend** are the **same color**.
+1. **1D** and **4H** SuperTrend are the **same color**.
 2. No open weekly position yet.
 3. Sell near **4H SuperTrend** (OTM, outside ST, premium ≥ $120).
-4. Expiry = next Friday weekly; if DTE &lt; 3 (i.e. ≤ 2 days), use **next** Friday.
+4. Expiry = next Friday weekly; if DTE &lt; 3, use **next** Friday.
+5. Lots = `ORDER_QTY_LOTS_WEEKLY`.
 
-### Exit
-
-Exit weekly when **1D or 4H** no longer matches the open weekly direction.
-
-### Flow
+### Exit / manage
+- Exit when **1D or 4H** no longer matches open weekly direction.
+- Trail broker SL on **4H ST ± 100**.
+- Force exit on **4H ST ± 300** or strike ± 50.
 
 ```mermaid
 flowchart TD
@@ -86,22 +178,18 @@ flowchart TD
 
 ---
 
-## Daily sleeve (0DTE / 1DTE)
+## Daily sleeve detail (0DTE / 1DTE)
 
 ### Entry
-
-1. Driven by a confirmed **1H SuperTrend flip only** (no mid-regime / flat catch-up entries).
-2. Filter: for a **long (green / sell PE)**, **1D and 4H must both be green**; for **short (red / sell CE)**, **both must be red**.
+1. Confirmed **1H SuperTrend flip only** (no mid-regime catch-up).
+2. Filter: 1D and 4H must both match the new 1H direction.
 3. Sell near **1H SuperTrend**.
-4. Expiry:
-   - Before **17:25 IST** → today (**0DTE**)
-   - At/after **17:25 IST** → next day (**1DTE**)
+4. Before **17:25 IST** → 0DTE; at/after → 1DTE.
+5. Lots = `ORDER_QTY_LOTS_DAILY`.
 
-### Exit
-
-Exit daily on a confirmed **1H SuperTrend flip** against the open daily direction.
-
-### Flow
+### Exit / manage
+- Exit on confirmed **1H flip** against the position.
+- Trail on **1H ST ± 100**; force on **1H ST ± 300** or strike ± 50.
 
 ```mermaid
 flowchart TD
@@ -124,68 +212,45 @@ flowchart TD
 
 ---
 
-## Dual-sleeve overview
+## Morning sleeve detail (08:30 IST 0DTE)
 
-```mermaid
-flowchart LR
-    subgraph HTF["Higher timeframes"]
-        D1[1D SuperTrend]
-        H4[4H SuperTrend]
-    end
+### Entry
+1. Closed 1H bar whose close time is **08:30 IST** (once per calendar day).
+2. Direction = **current 1H SuperTrend** (no flip required; **no** 1D/4H filter).
+3. Prefer **today’s daily expiry** (0DTE).
+4. Sell near **1H SuperTrend** (OTM, outside ST, premium ≥ **$20**).
+5. Lots = `ORDER_QTY_LOTS_MORNING` (10).
+6. Gated by `ENABLE_MORNING_TRADES`.
 
-    subgraph LTF["Signal timeframe"]
-        H1[1H SuperTrend]
-    end
-
-    D1 --> W[Weekly sleeve]
-    H4 --> W
-    H4 --> F[Daily HTF filter]
-    D1 --> F
-    H1 --> Daily[Daily sleeve]
-    F --> Daily
-
-    W --> WP[Weekly PE/CE<br/>Friday expiry]
-    Daily --> DP[Daily PE/CE<br/>0DTE / 1DTE]
-```
-
----
-
-## Strike selection
-
-For both sleeves:
-
-1. Strictly **OTM** vs spot (CE above spot, PE below spot).
-2. Strike on the **outer side of SuperTrend** (CE &gt; ST, PE &lt; ST).
-3. Nearest eligible strike to the sleeve’s SuperTrend reference.
-4. Sell premium (best bid / mark) **≥ $120**.
-5. Qty = sleeve lots (`ORDER_QTY_LOTS_WEEKLY` / `ORDER_QTY_LOTS_DAILY`).
-
----
-
-## Risk & exits (all open sleeves)
+### Exit / manage
+- Exit on confirmed **1H flip** against the morning position (`morning_one_h_reversal`).
+- Trail / force / proximity same as daily (**1H** ST).
+- At **17:25 IST**, if still holding today’s 0DTE: **flat EXIT** (`morning_0dte_flat`) — cancel resting MAIN_SL and close; **do not** roll to next expiry.
+- SL reentry (from broker SL / force earlier in the day) stays on the morning sleeve and still prefers 0DTE (when `ENABLE_MORNING_TRADES` is on). After the 17:25 flat exit there is no re-open.
 
 ```mermaid
 flowchart TD
-    A[Open MAIN position] --> B[Broker MAIN_SL]
-    B --> C["Trail stop: bullish ST − 100 / bearish ST + 100"]
-    A --> D{Spot within ±50 of strike?}
-    D -->|yes| E[Strategy FORCE EXIT]
-    A --> F{Spot hits ST ± 300?}
+    A[On closed 1H bar] --> B{Close time == 08:30 IST?}
+    B -->|no| C[No morning entry today yet / wait]
+    B -->|yes| D{Already attempted today?}
+    D -->|yes| E[Skip]
+    D -->|no| F{Morning sleeve open?}
     F -->|yes| E
-    E --> G[Arm SL reentry for that sleeve]
-    G --> H[On next closed 1H bar: re-enter if rules allow]
-    C --> I[Broker stop fill]
-    I --> G
+    F -->|no| G{ENABLE_MORNING_TRADES?}
+    G -->|no| E
+    G -->|yes| H[ENTRY 0DTE near 1H ST]
+    H --> I[Sell PE if green / CE if red]
 ```
 
-| Rule | Level | Who fires |
-|------|-------|-----------|
-| Trail SL | ST ± **100** | Broker `MAIN_SL` (weekly trails on **4H close** and 1H refresh of live 4H ST; daily on 1H ST). Modify failures log `TRAIL_SL_STALE` at ERROR and retry until broker accepts. Meta ST advances only on success. |
-| Force exit | ST ± **300** | Strategy (quote / candle) |
-| Strike proximity | Spot within ± **50** of option strike | Strategy |
-| Expiry rollover | **17:25 IST** if holding today’s expiry | Exit + re-enter next daily (≥ 200 pts from ST) |
+---
 
-After any SL / force / external full close: wait for the **next closed 1H bar**, then try to re-enter the **same sleeve** under current SuperTrend + HTF rules.
+## Strike selection (all sleeves)
+
+1. Strictly **OTM** vs spot (CE above spot, PE below spot).
+2. Strike on the **outer side of SuperTrend** (CE &gt; ST, PE &lt; ST).
+3. Nearest eligible strike to that sleeve’s SuperTrend reference.
+4. Sell premium (best bid / mark) **≥ $120** (weekly / daily) or **≥ $20** (morning).
+5. Qty = sleeve lots (`ORDER_QTY_LOTS_WEEKLY` / `_DAILY` / `_MORNING`).
 
 ---
 
@@ -195,38 +260,54 @@ After any SL / force / external full close: wait for the **next closed 1H bar**,
 - Live: act only after the 1H bar is **fully closed** (not mid-bar).
 - Mid-bar risk is covered by broker trail SL + quote force exits.
 - 1H flips require **close confirmation** on the new side of SuperTrend (ignores flicker while close is still on the old side).
+- Morning slot uses the bar that **closes at 08:30 IST** (Delta BTC 60m bars are typically `:30` IST-aligned).
 
 ---
 
-## Parameters (code constants)
+## Parameters (`constants.py`)
 
 | Constant | Value | Role |
 |----------|-------|------|
 | `SUPER_TREND_LENGTH` | 16 | ATR length |
 | `SUPER_TREND_FACTOR` | 1.5 | ATR multiplier |
-| `MIN_PREMIUM_USD` | 120 | Min sell premium |
+| `MIN_PREMIUM_USD` | 120 | Min sell premium (weekly / daily) |
+| `MIN_PREMIUM_USD_MORNING` | 20 | Min sell premium (morning 08:30 sleeve) |
 | `TRAIL_SL_POINTS` | 100 | Broker trail vs ST |
-| `FORCE_EXIT_POINTS` | 300 | Strategy emergency vs sleeve ST (weekly=4H, daily=1H) |
+| `FORCE_EXIT_POINTS` | 300 | Strategy emergency vs sleeve ST |
 | `STRIKE_PROXIMITY_EXIT_POINTS` | 50 | Exit if spot near strike |
-| `ROLLOVER_TIME` | 17:25 IST | Daily expiry rollover |
+| `ROLLOVER_TIME` | 17:25 IST | Today-expiry rollover |
 | `ROLLOVER_MIN_STRIKE_DISTANCE` | 200 | Min distance on rollover strike |
-| `ORDER_QTY_LOTS_WEEKLY` | 2 | Weekly (4H) entry lots |
-| `ORDER_QTY_LOTS_DAILY` | 2 | Daily (1H) entry lots |
+| `ORDER_QTY_LOTS_WEEKLY` | 10 | Weekly entry lots |
+| `ORDER_QTY_LOTS_DAILY` | 10 | Daily entry lots |
+| `ORDER_QTY_LOTS_MORNING` | 10 | Morning 08:30 entry lots |
+| `MORNING_ENTRY_TIME` | 08:30 IST | Morning slot close time |
 | `WEEKLY_MIN_DTE` | 3 | Weekly Friday must be ≥ 3 DTE |
 | `HTF_TIMEFRAMES` | `4h`, `1d` | Higher-TF SuperTrend sources |
+| `SLEEVE_WEEKLY` / `DAILY` / `MORNING` | `weekly` / `daily` / `morning` | Sleeve ids in `structure_id` |
+
+Module switches in `DirectionalOptionSelling.py`:
+
+| Switch | Default (as checked in) | Sleeve |
+|--------|-------------------------|--------|
+| `ENABLE_WEEKLY_TRADES` | `False` | weekly |
+| `ENABLE_INTRADAY_TRADES` | `True` | daily |
+| `ENABLE_MORNING_TRADES` | `True` | morning |
 
 ---
 
-## Entry reason tags (logs / meta)
+## Entry / exit reason tags (logs / meta)
 
 | Reason | Sleeve | Meaning |
 |--------|--------|---------|
 | `weekly_htf_aligned` | weekly | 1D + 4H agree → weekly entry |
-| `weekly_htf_misaligned` | weekly | Exit: 1D/4H no longer agree |
+| `weekly_htf_misaligned` | weekly | Exit: 1D/4H no longer agree with open weekly |
 | `one_h_signal` | daily | Confirmed 1H flip + HTF filter pass |
-| `one_h_reversal` | daily | Exit: 1H flipped against position |
-| `sl_reentry_same` / `sl_reentry_flip` | either | Post-SL reentry on hour close |
-| `expiry_rollover` | daily (today expiry) | 17:25 IST roll |
+| `one_h_reversal` | daily | Exit: 1H flipped against daily position |
+| `morning_830` | morning | 08:30 IST clock-slot 0DTE entry |
+| `morning_one_h_reversal` | morning | Exit: 1H flipped against morning position |
+| `morning_0dte_flat` | morning | 17:25 IST flat exit of today’s 0DTE (no next-expiry roll) |
+| `sl_reentry_same` / `sl_reentry_flip` | any | Post-SL reentry on next hour close |
+| `expiry_rollover` | daily / weekly today-expiry | 17:25 IST roll to next daily |
 
 ---
 

@@ -21,12 +21,16 @@ from .constants import (
     HTF_TIMEFRAMES,
     META_KEY,
     MIN_PREMIUM_USD,
+    MIN_PREMIUM_USD_MORNING,
+    MORNING_ENTRY_TIME,
     ORDER_QTY_LOTS,
     ORDER_QTY_LOTS_DAILY,
+    ORDER_QTY_LOTS_MORNING,
     ORDER_QTY_LOTS_WEEKLY,
     ROLLOVER_MIN_STRIKE_DISTANCE,
     ROLLOVER_TIME,
     SLEEVE_DAILY,
+    SLEEVE_MORNING,
     SLEEVE_WEEKLY,
     STRIKE_PROXIMITY_EXIT_POINTS,
     SUPER_TREND_FACTOR,
@@ -45,6 +49,7 @@ logger = logging.getLogger(__name__)
 # that sleeve). Open positions still trail SL, force-exit, and roll as usual.
 ENABLE_WEEKLY_TRADES = False
 ENABLE_INTRADAY_TRADES = True
+ENABLE_MORNING_TRADES = True
 
 
 @dataclass(frozen=True)
@@ -84,18 +89,22 @@ class _PendingClosedEntry:
 
 class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, DeltaMktMixins, BaseStrategy):
     """
-    Dual-sleeve BTC SuperTrend option selling:
+    Multi-sleeve BTC SuperTrend option selling:
 
     - Weekly: when 1D and 4H SuperTrend agree, sell near 4H SuperTrend on the
       weekly Friday (skip to next week if DTE <= 2).
     - Daily (0DTE/1DTE): only on a confirmed 1H SuperTrend flip (no mid-regime
       catch-up), and only when 1D and 4H agree with that 1H direction; sell near
       1H SuperTrend (0DTE before 17:25 IST, else 1DTE).
+    - Morning (0DTE): every day on the 08:30 IST closed 1H bar, short in the
+      current 1H SuperTrend direction (no 4H/1D filter), 10 lots. SL / reentry
+      use ENABLE_MORNING_TRADES.
 
-    Both sleeves may be open together. Broker MAIN_SL trails at ST±100.
+    Sleeves may be open together. Broker MAIN_SL trails at ST±100.
 
-    Toggle ``ENABLE_WEEKLY_TRADES`` / ``ENABLE_INTRADAY_TRADES`` at module top
-    to disable new entries (and SL re-entries) per sleeve.
+    Toggle ``ENABLE_WEEKLY_TRADES`` / ``ENABLE_INTRADAY_TRADES`` /
+    ``ENABLE_MORNING_TRADES`` at module top to disable new entries (and SL
+    re-entries) per sleeve.
     """
 
     name = "DirectionalOptionSelling"
@@ -109,6 +118,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
     order_qty_lots = ORDER_QTY_LOTS
     order_qty_lots_weekly = ORDER_QTY_LOTS_WEEKLY
     order_qty_lots_daily = ORDER_QTY_LOTS_DAILY
+    order_qty_lots_morning = ORDER_QTY_LOTS_MORNING
     supertrend_length = SUPER_TREND_LENGTH
     supertrend_factor = SUPER_TREND_FACTOR
     bracket_leg_tags = ["MAIN_SL"]
@@ -119,14 +129,29 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         sleeve_u = str(sleeve or SLEEVE_DAILY).strip().lower()
         if sleeve_u == SLEEVE_WEEKLY:
             return bool(ENABLE_WEEKLY_TRADES)
+        if sleeve_u == SLEEVE_MORNING:
+            return bool(ENABLE_MORNING_TRADES)
         return bool(ENABLE_INTRADAY_TRADES)
 
     def _entry_qty_lots(self, sleeve: str) -> int:
-        """Lots for a new ENTRY: weekly (4H) vs daily (1H)."""
+        """Lots for a new ENTRY: weekly (4H) vs daily (1H flip) vs morning (08:30)."""
         sleeve_u = str(sleeve or SLEEVE_DAILY).strip().lower()
         if sleeve_u == SLEEVE_WEEKLY:
             return max(1, int(getattr(self, "order_qty_lots_weekly", ORDER_QTY_LOTS_WEEKLY) or 1))
+        if sleeve_u == SLEEVE_MORNING:
+            return max(
+                1,
+                int(getattr(self, "order_qty_lots_morning", ORDER_QTY_LOTS_MORNING) or 1),
+            )
         return max(1, int(getattr(self, "order_qty_lots_daily", ORDER_QTY_LOTS_DAILY) or 1))
+
+    @staticmethod
+    def _min_premium_for_sleeve(sleeve: str) -> float:
+        """Min sell premium: morning uses a lower floor ($20); others $120."""
+        sleeve_u = str(sleeve or SLEEVE_DAILY).strip().lower()
+        if sleeve_u == SLEEVE_MORNING:
+            return float(MIN_PREMIUM_USD_MORNING)
+        return float(MIN_PREMIUM_USD)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -145,6 +170,8 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         self._sl_reentry_sleeve: Optional[str] = None
         self._evaluated_bars: set[str] = set()
         self._rollover_dates: set[date] = set()
+        # Once-per-day guard for the 08:30 IST morning 0DTE entry.
+        self._morning_entry_dates: set[date] = set()
         # Cache last closed HTF SuperTrend per timeframe: {tf: (dir, st, bar_open_utc)}.
         self._htf_st_cache: Dict[str, Tuple[int, float, pd.Timestamp]] = {}
         self._confirmed_4h_direction: Optional[int] = None
@@ -506,7 +533,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         """Parse sleeve from sid like DirectionalOptionSelling:BTCUSD:weekly:..."""
         parts = [p.strip().lower() for p in str(structure_id or "").split(":")]
         for part in parts:
-            if part in (SLEEVE_WEEKLY, SLEEVE_DAILY):
+            if part in (SLEEVE_WEEKLY, SLEEVE_DAILY, SLEEVE_MORNING):
                 return part
         return None
 
@@ -533,7 +560,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
 
     def _normalize_sleeve(self, sleeve: Any, structure_id: str = "") -> str:
         sleeve_u = str(sleeve or "").strip().lower()
-        if sleeve_u not in (SLEEVE_WEEKLY, SLEEVE_DAILY):
+        if sleeve_u not in (SLEEVE_WEEKLY, SLEEVE_DAILY, SLEEVE_MORNING):
             sleeve_u = ""
         sid_sleeve = self._sleeve_from_structure_id(structure_id)
         # Structure id is authoritative when present (survives meta loss on restart).
@@ -905,10 +932,12 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         min_dte: int,
         min_strike_distance: float,
         target_expiry: Optional[str] = None,
+        min_premium: Optional[float] = None,
     ) -> Optional[tuple[float, float, pd.Series, str]]:
         source = _delta_source_from_ctx(ctx)
         if source is None:
             return None
+        floor = float(min_premium) if min_premium is not None else float(MIN_PREMIUM_USD)
         opt_letter = option_type[0].upper()
         products = source.get_products(use_cache=True) or []
         matching = [
@@ -955,7 +984,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                     except Exception:
                         ticker = None
                 quote = self._sell_premium(ticker)
-                if quote is None or quote[0] < MIN_PREMIUM_USD:
+                if quote is None or quote[0] < floor:
                     continue
                 premium, bid, ask = quote
                 row = pd.Series(
@@ -982,10 +1011,12 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         min_dte: int,
         min_strike_distance: float,
         target_expiry: Optional[str] = None,
+        min_premium: Optional[float] = None,
     ) -> Optional[tuple[float, float, pd.Series, str]]:
         df = self.load_delta_data_for_candle(candle, ctx)
         if df is None or df.empty:
             return None
+        floor = float(min_premium) if min_premium is not None else float(MIN_PREMIUM_USD)
         work = df.copy()
         work.columns = [
             "symbol", "price", "qty", "timestamp", "side", "opt_type", "strike", "expiry"
@@ -1020,7 +1051,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 .last()
             )
             latest["price"] = pd.to_numeric(latest["price"], errors="coerce")
-            latest = latest[(latest["price"] >= MIN_PREMIUM_USD) & (latest["qty"] > 0)]
+            latest = latest[(latest["price"] >= floor) & (latest["qty"] > 0)]
             if latest.empty:
                 continue
             latest = latest.copy()
@@ -1050,6 +1081,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         min_dte: int = 0,
         min_strike_distance: float = 0.0,
         target_expiry: Optional[str] = None,
+        min_premium: Optional[float] = None,
     ) -> Optional[tuple[float, float, pd.Series, str]]:
         option_type = self._option_type(direction)
         if RUN_MODE == RunMode.BACKTEST:
@@ -1061,6 +1093,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 min_dte=min_dte,
                 min_strike_distance=min_strike_distance,
                 target_expiry=target_expiry,
+                min_premium=min_premium,
             )
         return self._select_live_contract(
             candle,
@@ -1070,6 +1103,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             min_dte=min_dte,
             min_strike_distance=min_strike_distance,
             target_expiry=target_expiry,
+            min_premium=min_premium,
         )
 
     def _build_entry(
@@ -1084,7 +1118,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         sleeve: str = SLEEVE_DAILY,
     ) -> Optional[Any]:
         sleeve_u = str(sleeve or SLEEVE_DAILY).strip().lower()
-        if sleeve_u not in (SLEEVE_WEEKLY, SLEEVE_DAILY):
+        if sleeve_u not in (SLEEVE_WEEKLY, SLEEVE_DAILY, SLEEVE_MORNING):
             sleeve_u = SLEEVE_DAILY
         if not self._sleeve_entries_enabled(sleeve_u):
             return None
@@ -1098,6 +1132,13 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 candle.get("supertrend_4h")
                 or self._current_4h_supertrend
                 or self._current_supertrend
+                or candle.get("supertrend")
+                or 0
+            )
+        elif sleeve_u == SLEEVE_MORNING:
+            # Clock-slot 0DTE: 1H SuperTrend only — no 4H/1D filter.
+            supertrend = float(
+                self._current_supertrend
                 or candle.get("supertrend")
                 or 0
             )
@@ -1126,6 +1167,17 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                     target_expiry,
                 )
                 return None
+        elif sleeve_u == SLEEVE_MORNING:
+            # Prefer today's daily expiry; never roll morning slot to next day.
+            target_expiry = self._0dte_expiry_code(candle)
+            entry_min_dte = 0
+            if self._open_main_has_expiry(ctx, target_expiry):
+                logger.info(
+                    "%s skip morning ENTRY: already open on 0DTE expiry=%s",
+                    self.name,
+                    target_expiry,
+                )
+                return None
         selected = self._select_contract(
             candle,
             ctx,
@@ -1134,6 +1186,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             min_dte=entry_min_dte,
             min_strike_distance=min_strike_distance,
             target_expiry=target_expiry,
+            min_premium=self._min_premium_for_sleeve(sleeve_u),
         )
         if selected is None:
             logger.warning(
@@ -1141,7 +1194,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 self.name,
                 sleeve_u,
                 self._option_type(direction),
-                MIN_PREMIUM_USD,
+                self._min_premium_for_sleeve(sleeve_u),
                 supertrend,
             )
             return None
@@ -1266,6 +1319,17 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
 
     def _min_dte_for_candle(self, candle: dict) -> int:
         return 1 if self._closed_bar_time_ist(candle).time() >= ROLLOVER_TIME else 0
+
+    def _0dte_expiry_code(self, candle: dict) -> str:
+        """Today's daily expiry code (DDMMYY) for morning / 0DTE preference."""
+        return self._closed_bar_time_ist(candle).date().strftime("%d%m%y")
+
+    def _is_morning_entry_slot(self, candle: dict) -> bool:
+        """True when this closed 1H bar's close time is 08:30 IST."""
+        close_t = self._closed_bar_time_ist(candle).time().replace(
+            second=0, microsecond=0
+        )
+        return close_t == MORNING_ENTRY_TIME
 
     def _exit_intent(self, position: Any, candle: dict, ctx: Any, reason: str) -> Any:
         price = None
@@ -1588,6 +1652,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         min_dte: int = 0,
         min_strike_distance: float = 0.0,
         sleeve: Optional[str] = None,
+        reenter: bool = True,
     ) -> Optional[Any]:
         sid = str(getattr(position, "structure_id", "") or "")
         if not sid or sid in self._pending_exit_structure_ids:
@@ -1615,7 +1680,8 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             )
             return None
         self._pending_exit_structure_ids.add(sid)
-        if self._sleeve_entries_enabled(sleeve_u):
+        allow_reenter = bool(reenter) and self._sleeve_entries_enabled(sleeve_u)
+        if allow_reenter:
             self._pending_transition = _PendingTransition(
                 previous_structure_id=sid,
                 direction=direction,
@@ -1627,9 +1693,10 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         else:
             self._pending_transition = None
             logger.info(
-                "%s transition EXIT only (no re-entry) sleeve=%s disabled sid=%s",
+                "%s transition EXIT only (no re-entry) sleeve=%s reason=%s sid=%s",
                 self.name,
                 sleeve_u,
+                reason,
                 sid,
             )
         return self._exit_intent(position, candle, ctx, reason)
@@ -1666,28 +1733,67 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         today_positions = [
             position
             for position in positions
-            if self._expiry_date(getattr(position.instrument, "expiry", None)) == now.date()
+            if self._expiry_date(getattr(position.instrument, "expiry", None))
+            == now.date()
         ]
         if not today_positions:
             # Only mark done when flat — keep retrying if a today-expiry leg is open.
             if not positions:
                 self._rollover_dates.add(now.date())
             return None
-        position = today_positions[0]
+
+        # Prefer morning 0DTE flat-exit before daily/weekly roll of today-expiry.
+        def _sleeve_of(pos: Any) -> str:
+            meta = self._ensure_meta(pos, ctx)
+            return str(meta.sleeve) if meta is not None else SLEEVE_DAILY
+
+        morning_today = [
+            p for p in today_positions if _sleeve_of(p) == SLEEVE_MORNING
+        ]
+        position = (morning_today or today_positions)[0]
         meta = self._ensure_meta(position, ctx)
+        sleeve_u = str(meta.sleeve) if meta is not None else SLEEVE_DAILY
         direction = (
             self._confirmed_direction
             if self._confirmed_direction is not None
             else (meta.direction if meta is not None else 1)
         )
-        # Use last confirmed SuperTrend for next-expiry strike selection after EXIT fills.
         work_candle = self._candle_with_supertrend(candle)
         self._latest_candle = dict(work_candle)
         if self._current_supertrend is None and meta is not None:
             self._current_supertrend = float(meta.supertrend)
             work_candle["supertrend"] = float(meta.supertrend)
-        # Re-opening today's contract would defeat settlement protection, so rollover
-        # deliberately starts from the next listed daily expiry.
+
+        if sleeve_u == SLEEVE_MORNING:
+            # Morning is always 0DTE: flatten at 17:25 — never roll to next expiry.
+            intent = self._begin_transition(
+                position,
+                work_candle,
+                ctx,
+                direction=int(direction),
+                reason="morning_0dte_flat",
+                sleeve=SLEEVE_MORNING,
+                reenter=False,
+            )
+            if intent is not None:
+                remaining = [
+                    p
+                    for p in today_positions
+                    if str(getattr(p, "structure_id", "") or "")
+                    != str(getattr(position, "structure_id", "") or "")
+                ]
+                if not remaining:
+                    self._rollover_dates.add(now.date())
+                logger.info(
+                    "%s morning 0DTE flat EXIT at 17:25 expiry=%s direction=%s "
+                    "(no next-expiry rollover)",
+                    self.name,
+                    getattr(getattr(position, "instrument", None), "expiry", None),
+                    direction,
+                )
+            return intent
+
+        # Daily / weekly today-expiry: exit + re-enter next listed daily.
         intent = self._begin_transition(
             position,
             work_candle,
@@ -1696,10 +1802,17 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             reason="expiry_rollover",
             min_dte=1,
             min_strike_distance=ROLLOVER_MIN_STRIKE_DISTANCE,
-            sleeve=str(meta.sleeve) if meta is not None else SLEEVE_DAILY,
+            sleeve=sleeve_u,
         )
         if intent is not None:
-            self._rollover_dates.add(now.date())
+            remaining = [
+                p
+                for p in today_positions
+                if str(getattr(p, "structure_id", "") or "")
+                != str(getattr(position, "structure_id", "") or "")
+            ]
+            if not remaining:
+                self._rollover_dates.add(now.date())
             logger.info(
                 "%s expiry rollover EXIT started expiry=%s direction=%s ST=%.2f",
                 self.name,
@@ -1900,16 +2013,18 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                     if enter_dir == direction_at_sl
                     else "sl_reentry_flip"
                 )
+                if sleeve == SLEEVE_WEEKLY:
+                    reentry_min_dte = WEEKLY_MIN_DTE
+                elif sleeve == SLEEVE_MORNING:
+                    reentry_min_dte = 0
+                else:
+                    reentry_min_dte = self._min_dte_for_candle(candle)
                 intent = self._build_entry(
                     candle,
                     ctx,
                     enter_dir,
                     reason=reason,
-                    min_dte=(
-                        WEEKLY_MIN_DTE
-                        if sleeve == SLEEVE_WEEKLY
-                        else self._min_dte_for_candle(candle)
-                    ),
+                    min_dte=reentry_min_dte,
                     sleeve=sleeve,
                 )
                 if intent is not None:
@@ -1966,6 +2081,27 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                     if intent is not None:
                         intents.append(intent)
 
+        # Exit morning on confirmed 1H SuperTrend flip against the open morning direction.
+        morning_positions = self._open_main_positions(ctx, sleeve=SLEEVE_MORNING)
+        if morning_positions and one_h_signal:
+            mpos = morning_positions[0]
+            mmeta = self._ensure_meta(mpos, ctx)
+            mdir = int(mmeta.direction) if mmeta is not None else 0
+            if mdir and direction != mdir:
+                sid = str(getattr(mpos, "structure_id", "") or "")
+                if sid not in self._pending_exit_structure_ids:
+                    intent = self._begin_transition(
+                        mpos,
+                        candle,
+                        ctx,
+                        direction=int(direction),
+                        reason="morning_one_h_reversal",
+                        min_dte=0,
+                        sleeve=SLEEVE_MORNING,
+                    )
+                    if intent is not None:
+                        intents.append(intent)
+
         # Weekly entry: 1D + 4H already green/red together → weekly near 4H ST.
         if (
             SLEEVE_WEEKLY not in entered_sleeves
@@ -1985,6 +2121,31 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 if intent is not None:
                     intents.append(intent)
                     entered_sleeves.add(SLEEVE_WEEKLY)
+
+        # Morning 0DTE: once per day on the 08:30 IST closed 1H bar (1H ST only).
+        if (
+            SLEEVE_MORNING not in entered_sleeves
+            and self._is_morning_entry_slot(candle)
+            and not self._open_main_positions(ctx, sleeve=SLEEVE_MORNING)
+        ):
+            slot_date = self._closed_bar_time_ist(candle).date()
+            if slot_date not in self._morning_entry_dates:
+                self._morning_entry_dates.add(slot_date)
+                if len(self._morning_entry_dates) > 60:
+                    self._morning_entry_dates = set(
+                        sorted(self._morning_entry_dates)[-30:]
+                    )
+                intent = self._build_entry(
+                    candle,
+                    ctx,
+                    int(direction),
+                    reason="morning_830",
+                    min_dte=0,
+                    sleeve=SLEEVE_MORNING,
+                )
+                if intent is not None:
+                    intents.append(intent)
+                    entered_sleeves.add(SLEEVE_MORNING)
 
         # Daily 0DTE/1DTE: only on a confirmed 1H ST flip (no mid-regime entries).
         # HTF filter (1D+4H must match 1H) is enforced inside _build_entry.

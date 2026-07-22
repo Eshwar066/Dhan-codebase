@@ -1206,6 +1206,63 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         exit_fn.assert_called_once()
         self.assertIn(datetime(2026, 7, 19).date(), self.strategy._rollover_dates)
 
+    def test_morning_1725_flats_without_next_expiry_roll(self):
+        """Morning 0DTE at 17:25 must EXIT flat — no pending rollover re-entry."""
+        from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (
+            _PositionMeta,
+        )
+
+        instrument = SimpleNamespace(
+            option_type="PE",
+            expiry="220726",
+            strike=64000,
+            trading_symbol="P-BTC-64000-220726",
+            product_id=99,
+        )
+        position = SimpleNamespace(
+            tag="MAIN",
+            net_qty=-10,
+            structure_id="DirectionalOptionSelling:BTCUSD:morning:2026-07-22:PE:abc123",
+            instrument=instrument,
+            intent_id="m-entry",
+            avg_price=40,
+            strategy="DirectionalOptionSelling",
+        )
+        self.strategy._meta_by_structure_id[position.structure_id] = _PositionMeta(
+            symbol="BTCUSD",
+            direction=1,
+            option_type="PE",
+            supertrend=65000.0,
+            strike=64000.0,
+            expiry="220726",
+            entry_premium=40.0,
+            entry_reason="morning_830",
+            sleeve="morning",
+        )
+        ctx = SimpleNamespace(
+            position_store=_PositionStore([position]),
+            intent_store=None,
+            order_router=None,
+        )
+        self.strategy._confirmed_direction = 1
+        self.strategy._current_supertrend = 65000.0
+        quote = {
+            "symbol": "BTCUSD",
+            "ltp": 65100,
+            "ts": datetime(2026, 7, 22, 11, 55, tzinfo=timezone.utc).timestamp(),  # 17:25 IST
+        }
+        marker = object()
+        with patch.object(self.strategy, "_cancel_resting_main_sl", return_value=True):
+            with patch.object(
+                self.strategy, "_exit_intent", return_value=marker
+            ) as exit_fn:
+                result = self.strategy.on_quote(quote, ctx)
+        self.assertEqual(result, [marker])
+        self.assertIsNone(self.strategy._pending_transition)
+        exit_fn.assert_called_once()
+        self.assertEqual(exit_fn.call_args.args[3], "morning_0dte_flat")
+        self.assertIn(datetime(2026, 7, 22).date(), self.strategy._rollover_dates)
+
     def test_htf_entry_allowed_requires_1d_and_4h_match(self):
         s = DirectionalOptionSelling()
         candle = {
@@ -1680,15 +1737,23 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         mod = importlib.import_module(
             "core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling"
         )
-        self.assertTrue(DirectionalOptionSelling._sleeve_entries_enabled("weekly"))
-        self.assertTrue(DirectionalOptionSelling._sleeve_entries_enabled("daily"))
         prev_w = mod.ENABLE_WEEKLY_TRADES
         prev_d = mod.ENABLE_INTRADAY_TRADES
+        prev_m = mod.ENABLE_MORNING_TRADES
         try:
+            mod.ENABLE_WEEKLY_TRADES = True
+            mod.ENABLE_INTRADAY_TRADES = True
+            mod.ENABLE_MORNING_TRADES = True
+            self.assertTrue(DirectionalOptionSelling._sleeve_entries_enabled("weekly"))
+            self.assertTrue(DirectionalOptionSelling._sleeve_entries_enabled("daily"))
+            self.assertTrue(DirectionalOptionSelling._sleeve_entries_enabled("morning"))
+
             mod.ENABLE_WEEKLY_TRADES = False
             mod.ENABLE_INTRADAY_TRADES = False
+            mod.ENABLE_MORNING_TRADES = False
             self.assertFalse(DirectionalOptionSelling._sleeve_entries_enabled("weekly"))
             self.assertFalse(DirectionalOptionSelling._sleeve_entries_enabled("daily"))
+            self.assertFalse(DirectionalOptionSelling._sleeve_entries_enabled("morning"))
             s = DirectionalOptionSelling()
             with patch.object(s, "_open_main_positions", return_value=[]):
                 self.assertIsNone(
@@ -1709,9 +1774,173 @@ class DirectionalOptionSellingTests(unittest.TestCase):
                         sleeve="daily",
                     )
                 )
+                self.assertIsNone(
+                    s._build_entry(
+                        {"timestamp": pd.Timestamp("2026-07-22 08:30", tz="Asia/Kolkata")},
+                        SimpleNamespace(),
+                        1,
+                        reason="morning_830",
+                        sleeve="morning",
+                    )
+                )
+            # Intraday on / morning off / weekly off → only daily allowed.
+            mod.ENABLE_WEEKLY_TRADES = False
+            mod.ENABLE_INTRADAY_TRADES = True
+            mod.ENABLE_MORNING_TRADES = False
+            self.assertFalse(DirectionalOptionSelling._sleeve_entries_enabled("weekly"))
+            self.assertTrue(DirectionalOptionSelling._sleeve_entries_enabled("daily"))
+            self.assertFalse(DirectionalOptionSelling._sleeve_entries_enabled("morning"))
+            # Morning on alone.
+            mod.ENABLE_MORNING_TRADES = True
+            self.assertTrue(DirectionalOptionSelling._sleeve_entries_enabled("morning"))
         finally:
             mod.ENABLE_WEEKLY_TRADES = prev_w
             mod.ENABLE_INTRADAY_TRADES = prev_d
+            mod.ENABLE_MORNING_TRADES = prev_m
+
+    def test_entry_qty_lots_morning(self):
+        s = DirectionalOptionSelling()
+        s.order_qty_lots_morning = 10
+        self.assertEqual(s._entry_qty_lots("morning"), 10)
+        self.assertEqual(s._entry_qty_lots("MORNING"), 10)
+
+    def test_is_morning_entry_slot_0830_ist(self):
+        s = DirectionalOptionSelling()
+        # 60m bucket open 07:30 IST → close 08:30 IST (03:00 UTC open → 03:00+1h).
+        # Prefer bucket_ts: open at 02:00 UTC = 07:30 IST, close = 08:30 IST.
+        candle = {
+            "timestamp": datetime(2026, 7, 22, 2, 0, tzinfo=timezone.utc),
+            "bucket_ts": datetime(2026, 7, 22, 2, 0, tzinfo=timezone.utc).timestamp(),
+            "timeframe": "60",
+        }
+        self.assertTrue(s._is_morning_entry_slot(candle))
+        other = {
+            "timestamp": datetime(2026, 7, 22, 3, 0, tzinfo=timezone.utc),
+            "bucket_ts": datetime(2026, 7, 22, 3, 0, tzinfo=timezone.utc).timestamp(),
+            "timeframe": "60",
+        }
+        self.assertFalse(s._is_morning_entry_slot(other))
+
+    def test_morning_entry_fires_at_0830_without_htf(self):
+        """08:30 closed bar enters morning sleeve on 1H ST; skips daily HTF filter."""
+        ctx = SimpleNamespace(position_store=_PositionStore())
+        self.strategy._confirmed_direction = 1
+        self.strategy._current_supertrend = 65000.0
+        # Bar open 07:30 IST / close 08:30 IST.
+        candle = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 22, 2, 0, tzinfo=timezone.utc),
+            "bucket_ts": datetime(2026, 7, 22, 2, 0, tzinfo=timezone.utc).timestamp(),
+            "timeframe": "60",
+            "close": 65100.0,
+            "supertrend": 65000.0,
+            "supertrend_direction": 1,
+        }
+        marker = object()
+        with patch.object(self.strategy, "_bar_is_fully_closed", return_value=True):
+            with patch.object(
+                self.strategy,
+                "_refresh_htf_state",
+                return_value={"4h": (-1, 64000.0), "1d": (-1, 63000.0)},
+            ):
+                with patch.object(
+                    self.strategy, "_build_entry", return_value=marker
+                ) as build:
+                    with patch.object(
+                        self.strategy, "_daily_htf_aligned", return_value=False
+                    ) as daily_htf:
+                        result = self.strategy.on_candle(candle, ctx)
+        morning_calls = [
+            c for c in build.call_args_list if c.kwargs.get("sleeve") == "morning"
+        ]
+        self.assertEqual(len(morning_calls), 1)
+        self.assertEqual(morning_calls[0].kwargs["reason"], "morning_830")
+        self.assertEqual(morning_calls[0].kwargs["min_dte"], 0)
+        self.assertEqual(morning_calls[0].args[2], 1)
+        # Morning path must not depend on daily HTF alignment.
+        daily_htf.assert_not_called()
+        self.assertIn(marker, result or [])
+        # Once-per-day: second eval same day does not rebuild.
+        with patch.object(self.strategy, "_bar_is_fully_closed", return_value=True):
+            with patch.object(
+                self.strategy,
+                "_refresh_htf_state",
+                return_value={"4h": (-1, 64000.0), "1d": (-1, 63000.0)},
+            ):
+                with patch.object(
+                    self.strategy, "_build_entry", return_value=marker
+                ) as build2:
+                    self.strategy.on_candle(candle, ctx)
+        morning2 = [
+            c for c in build2.call_args_list if c.kwargs.get("sleeve") == "morning"
+        ]
+        self.assertEqual(len(morning2), 0)
+
+    def test_morning_build_entry_skips_daily_htf(self):
+        from dataclasses import dataclass
+
+        @dataclass
+        class _Intent:
+            intent_id: str = "i1"
+            qty: int = 1
+
+        s = DirectionalOptionSelling()
+        s._current_supertrend = 65000.0
+        candle = {
+            "timestamp": pd.Timestamp("2026-07-22 08:30", tz="Asia/Kolkata"),
+            "supertrend": 65000.0,
+            "close": 65100.0,
+        }
+        with patch.object(s, "_open_main_positions", return_value=[]):
+            with patch.object(s, "_open_main_has_expiry", return_value=False):
+                with patch.object(s, "_daily_htf_aligned") as daily_htf:
+                    with patch.object(
+                        s,
+                        "_select_contract",
+                        return_value=(
+                            64000.0,
+                            200.0,
+                            pd.Series({"symbol": "P-BTC-64000-220726"}),
+                            "220726",
+                        ),
+                    ) as select:
+                        with patch.object(
+                            s,
+                            "delta_option_trading_symbol",
+                            return_value="P-BTC-64000-220726",
+                        ):
+                            with patch.object(
+                                s, "_open_main_trading_symbols", return_value=set()
+                            ):
+                                with patch.object(
+                                    s,
+                                    "map_instrument_to_intent",
+                                    return_value=_Intent(),
+                                ):
+                                    ctx = SimpleNamespace(
+                                        exchange="DELTA",
+                                        instrument_store=SimpleNamespace(
+                                            intent_creation_details=MagicMock(
+                                                return_value=SimpleNamespace(
+                                                    trading_symbol="P-BTC-64000-220726"
+                                                )
+                                            )
+                                        ),
+                                        selected_expiry=None,
+                                    )
+                                    intent = s._build_entry(
+                                        candle,
+                                        ctx,
+                                        1,
+                                        reason="morning_830",
+                                        sleeve="morning",
+                                    )
+        self.assertIsNotNone(intent)
+        daily_htf.assert_not_called()
+        self.assertEqual(intent.qty, 10)
+        self.assertEqual(select.call_args.kwargs.get("target_expiry"), "220726")
+        sid = next(iter(s._meta_by_structure_id))
+        self.assertEqual(s._meta_by_structure_id[sid].sleeve, "morning")
 
 
 if __name__ == "__main__":
