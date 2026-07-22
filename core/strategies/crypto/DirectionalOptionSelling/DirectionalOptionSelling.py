@@ -41,6 +41,11 @@ from .trail_sl import DosTrailSlMixin, PendingTrailRetry as _PendingTrailRetry
 
 logger = logging.getLogger(__name__)
 
+# Sleeve entry switches (flip to False to stop new entries / SL re-entries for
+# that sleeve). Open positions still trail SL, force-exit, and roll as usual.
+ENABLE_WEEKLY_TRADES = False
+ENABLE_INTRADAY_TRADES = True
+
 
 @dataclass(frozen=True)
 class _PositionMeta:
@@ -88,6 +93,9 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
       1H SuperTrend (0DTE before 17:25 IST, else 1DTE).
 
     Both sleeves may be open together. Broker MAIN_SL trails at ST±100.
+
+    Toggle ``ENABLE_WEEKLY_TRADES`` / ``ENABLE_INTRADAY_TRADES`` at module top
+    to disable new entries (and SL re-entries) per sleeve.
     """
 
     name = "DirectionalOptionSelling"
@@ -104,6 +112,14 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
     supertrend_length = SUPER_TREND_LENGTH
     supertrend_factor = SUPER_TREND_FACTOR
     bracket_leg_tags = ["MAIN_SL"]
+
+    @staticmethod
+    def _sleeve_entries_enabled(sleeve: str) -> bool:
+        """Whether new entries / SL re-entries are allowed for this sleeve."""
+        sleeve_u = str(sleeve or SLEEVE_DAILY).strip().lower()
+        if sleeve_u == SLEEVE_WEEKLY:
+            return bool(ENABLE_WEEKLY_TRADES)
+        return bool(ENABLE_INTRADAY_TRADES)
 
     def _entry_qty_lots(self, sleeve: str) -> int:
         """Lots for a new ENTRY: weekly (4H) vs daily (1H)."""
@@ -306,6 +322,15 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         armed_after: Optional[Any] = None,
         sleeve: str = SLEEVE_DAILY,
     ) -> None:
+        sleeve_u = str(sleeve or SLEEVE_DAILY)
+        if not self._sleeve_entries_enabled(sleeve_u):
+            logger.info(
+                "%s deferred entry skipped sleeve=%s disabled reason=%s",
+                self.name,
+                sleeve_u,
+                reason,
+            )
+            return
         if armed_after is None:
             after = pd.Timestamp.now(tz=IST)
         else:
@@ -316,7 +341,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             armed_after=after,
             min_dte=int(min_dte),
             min_strike_distance=float(min_strike_distance),
-            sleeve=str(sleeve or SLEEVE_DAILY),
+            sleeve=sleeve_u,
         )
         logger.info(
             "%s deferred entry armed direction=%s reason=%s sleeve=%s after=%s "
@@ -324,7 +349,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             self.name,
             direction,
             reason,
-            sleeve,
+            sleeve_u,
             after,
         )
 
@@ -1061,6 +1086,8 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         sleeve_u = str(sleeve or SLEEVE_DAILY).strip().lower()
         if sleeve_u not in (SLEEVE_WEEKLY, SLEEVE_DAILY):
             sleeve_u = SLEEVE_DAILY
+        if not self._sleeve_entries_enabled(sleeve_u):
+            return None
         if self._open_main_positions(ctx, sleeve=sleeve_u):
             return None
         if sleeve_u == SLEEVE_WEEKLY:
@@ -1203,9 +1230,17 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         """
         if direction is None:
             return
+        sleeve_u = str(sleeve or SLEEVE_DAILY)
+        if not self._sleeve_entries_enabled(sleeve_u):
+            logger.info(
+                "%s SL reentry skipped sleeve=%s disabled",
+                self.name,
+                sleeve_u,
+            )
+            return
         self._sl_reentry_direction = int(direction)
         self._sl_reentry_after = self._timestamp_ist(exit_ts)
-        self._sl_reentry_sleeve = str(sleeve or SLEEVE_DAILY)
+        self._sl_reentry_sleeve = sleeve_u
         logger.info(
             "%s SL reentry armed direction=%s sleeve=%s after=%s "
             "(reenter on that bar's close)",
@@ -1580,14 +1615,23 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             )
             return None
         self._pending_exit_structure_ids.add(sid)
-        self._pending_transition = _PendingTransition(
-            previous_structure_id=sid,
-            direction=direction,
-            reason=reason,
-            min_dte=min_dte,
-            min_strike_distance=min_strike_distance,
-            sleeve=sleeve_u,
-        )
+        if self._sleeve_entries_enabled(sleeve_u):
+            self._pending_transition = _PendingTransition(
+                previous_structure_id=sid,
+                direction=direction,
+                reason=reason,
+                min_dte=min_dte,
+                min_strike_distance=min_strike_distance,
+                sleeve=sleeve_u,
+            )
+        else:
+            self._pending_transition = None
+            logger.info(
+                "%s transition EXIT only (no re-entry) sleeve=%s disabled sid=%s",
+                self.name,
+                sleeve_u,
+                sid,
+            )
         return self._exit_intent(position, candle, ctx, reason)
 
     def _candle_with_supertrend(self, candle: dict) -> dict:

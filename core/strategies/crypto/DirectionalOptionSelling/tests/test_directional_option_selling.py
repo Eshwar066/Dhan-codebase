@@ -1673,6 +1673,46 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertEqual(s._entry_qty_lots(""), 2)
         self.assertEqual(s._entry_qty_lots("WEEKLY"), 5)
 
+    def test_sleeve_entry_enable_flags(self):
+        import importlib
+
+        # Module that defines ENABLE_* flags (not the strategy class).
+        mod = importlib.import_module(
+            "core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling"
+        )
+        self.assertTrue(DirectionalOptionSelling._sleeve_entries_enabled("weekly"))
+        self.assertTrue(DirectionalOptionSelling._sleeve_entries_enabled("daily"))
+        prev_w = mod.ENABLE_WEEKLY_TRADES
+        prev_d = mod.ENABLE_INTRADAY_TRADES
+        try:
+            mod.ENABLE_WEEKLY_TRADES = False
+            mod.ENABLE_INTRADAY_TRADES = False
+            self.assertFalse(DirectionalOptionSelling._sleeve_entries_enabled("weekly"))
+            self.assertFalse(DirectionalOptionSelling._sleeve_entries_enabled("daily"))
+            s = DirectionalOptionSelling()
+            with patch.object(s, "_open_main_positions", return_value=[]):
+                self.assertIsNone(
+                    s._build_entry(
+                        {"timestamp": pd.Timestamp("2026-07-21 12:00", tz="Asia/Kolkata")},
+                        SimpleNamespace(),
+                        1,
+                        reason="weekly_htf_aligned",
+                        sleeve="weekly",
+                    )
+                )
+                self.assertIsNone(
+                    s._build_entry(
+                        {"timestamp": pd.Timestamp("2026-07-21 12:00", tz="Asia/Kolkata")},
+                        SimpleNamespace(),
+                        1,
+                        reason="one_h_signal",
+                        sleeve="daily",
+                    )
+                )
+        finally:
+            mod.ENABLE_WEEKLY_TRADES = prev_w
+            mod.ENABLE_INTRADAY_TRADES = prev_d
+
 
 if __name__ == "__main__":
     unittest.main()
