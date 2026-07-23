@@ -3,7 +3,7 @@ import os
 import threading
 import time
 from collections import defaultdict
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import pandas as pd
 from utils.logger.trade_logger import TradeLogger
@@ -1119,7 +1119,62 @@ class PositionManager:
 
         with self._lock:
             self.last_recon_time = time.time()
+            # Pre-market / transient API holes often return {}. Dropping every
+            # local leg then loses overnight ownership until the next good book.
+            if not broker_positions:
+                open_local = [
+                    s
+                    for s, p in self.positions.items()
+                    if int(getattr(p, "net_qty", 0) or 0) != 0
+                ]
+                if open_local:
+                    logger.warning(
+                        "Reconcile: empty broker book with %s open local leg(s); "
+                        "skipping drop/sync to preserve overnight positions",
+                        len(open_local),
+                    )
+                    return
+
+            from core.utils.expiry_resolver import ExpiryResolver
+
+            def _identity(sym: str) -> str:
+                return ExpiryResolver.option_identity_key(sym)
+
+            # Remap broker keys onto local engine symbols when compact vs
+            # space-separated Dhan names differ but strike/side match.
+            remapped: Dict[str, Any] = {}
+            local_by_id: Dict[str, str] = {}
+            for loc_sym in self.positions.keys():
+                ik = _identity(loc_sym)
+                if ik and ik not in local_by_id:
+                    local_by_id[ik] = loc_sym
+            for meta_sym in list(self.position_metadata.keys()):
+                ik = _identity(meta_sym)
+                if ik and ik not in local_by_id:
+                    local_by_id[ik] = meta_sym
+
+            for b_sym, bp in broker_positions.items():
+                engine_sym = b_sym
+                ik = _identity(b_sym)
+                if ik and ik in local_by_id:
+                    engine_sym = local_by_id[ik]
+                if engine_sym in remapped and engine_sym != b_sym:
+                    # Prefer non-zero qty if both forms appear.
+                    try:
+                        if abs(int(bp.get("qty") or 0)) <= abs(
+                            int(remapped[engine_sym].get("qty") or 0)
+                        ):
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                remapped[engine_sym] = bp
+            broker_positions = remapped
+
             broker_symbols = set(broker_positions.keys())
+            # Also treat identity-matched broker symbols as present.
+            broker_identities = {
+                _identity(s) for s in broker_symbols if _identity(s)
+            }
             local_symbols = set(self.positions.keys())
 
             for sym, bp in broker_positions.items():
@@ -1249,6 +1304,8 @@ class PositionManager:
             # fill CLOSE (on_fill → position_metadata.pop). Otherwise a false flat
             # + SYNC rewrite permanently loses structure_id and allows duplicate entries.
             for sym in local_symbols - broker_symbols:
+                if _identity(sym) and _identity(sym) in broker_identities:
+                    continue
                 pos = self.positions.get(sym)
                 if pos is not None:
                     self._merge_position_metadata(

@@ -680,13 +680,25 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         symbol: str,
     ) -> Any:
         # Dhan/Tradehull accepts STOPLIMIT ("SL"), not raw "SL-M" (KeyError).
-        # SELL stop-limit: trigger arms when premium falls; limit near trigger.
+        # SELL stop-limit: trigger arms when premium falls; limit must be
+        # strictly below trigger (DH-906 rejects trigger == price).
         trig = float(trigger_price)
+        tick = resolve_tick_size(
+            str(symbol or ""),
+            None,
+            instrument=getattr(entry_ref, "instrument", None),
+        )
+        limit = float(
+            round_by_tick_size(trig - tick, tick, floor_or_ceil="floor")
+            or max(tick, trig - tick)
+        )
+        if limit <= 0 or limit >= trig:
+            limit = max(float(tick), trig - float(tick))
         return self.create_order_intent(
             inst=entry_ref.instrument,
             side="SELL",
             qty=entry_ref.qty,
-            price=trig,
+            price=limit,
             order_type="SL",
             strategy=self.name,
             candle_ts=candle_ts,

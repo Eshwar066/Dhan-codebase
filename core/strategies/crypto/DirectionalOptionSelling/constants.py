@@ -30,7 +30,7 @@ SLEEVE_WEEKLY = "weekly"
 SLEEVE_DAILY = "daily"
 # Clock-slot 0DTE short on 1H SuperTrend (gated by ENABLE_MORNING_TRADES).
 SLEEVE_MORNING = "morning"
-MORNING_ENTRY_TIME = time(8, 30)
+MORNING_ENTRY_TIME = time(9, 30)
 # Weekly entry: if selected Friday is within 2 DTE, roll to next weekly Friday.
 WEEKLY_MIN_DTE = 3
 # Broker MAIN_SL trail modify: loud failure + retries when ST moved but SL did not.

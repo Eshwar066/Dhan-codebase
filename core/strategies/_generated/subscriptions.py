@@ -106,6 +106,7 @@ GENERATED_STRATEGY_SUBSCRIPTIONS: dict = {
             'timeframes': [
                 '60',
                 '4h',
+                '1d',
             ],
             'symbols': [
                 'BTCUSD',

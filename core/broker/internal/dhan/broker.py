@@ -21,7 +21,11 @@ def _quantize_order_prices(
     instrument_store: Any = None,
     side: str = "",
 ) -> Dict[str, Any]:
-    """Ensure limit/trigger prices are valid multiples of exchange tick size."""
+    """Ensure limit/trigger prices are valid multiples of exchange tick size.
+
+    Dhan STOPLIMIT (DH-906): SELL requires trigger > price; BUY requires trigger < price.
+    After tick rounding those can collapse to equal — nudge limit by one tick.
+    """
     sym = str(payload.get("tradingsymbol") or "").strip()
     if not sym:
         return payload
@@ -47,6 +51,37 @@ def _quantize_order_prices(
         rounded = round_by_tick_size(val, tick, floor_or_ceil=mode)
         if rounded is not None:
             out[key] = rounded
+
+    # Protective stop-limit only (STOPLIMIT / SL). SL-M has no resting limit.
+    is_stop_limit = order_type in {
+        "STOPLIMIT",
+        "STOP-LIMIT",
+        "SL",
+        "STOP",
+    }
+    if is_stop_limit:
+        try:
+            price = float(out.get("price") or 0)
+            trigger = float(out.get("trigger_price") or 0)
+        except (TypeError, ValueError):
+            price, trigger = 0.0, 0.0
+        if price > 0 and trigger > 0:
+            tick_f = float(tick) if tick and float(tick) > 0 else 0.05
+            if side_u == "SELL" and trigger <= price:
+                # Limit must sit strictly below trigger for a sell stop.
+                adj = round_by_tick_size(
+                    trigger - tick_f, tick, floor_or_ceil="floor"
+                )
+                if adj is None or adj <= 0 or adj >= trigger:
+                    adj = max(tick_f, trigger - tick_f)
+                out["price"] = float(adj)
+            elif side_u == "BUY" and trigger >= price:
+                adj = round_by_tick_size(
+                    trigger + tick_f, tick, floor_or_ceil="ceil"
+                )
+                if adj is None or adj <= trigger:
+                    adj = trigger + tick_f
+                out["price"] = float(adj)
     return out
 
 

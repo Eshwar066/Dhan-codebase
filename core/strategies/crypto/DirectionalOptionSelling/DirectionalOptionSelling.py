@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 # that sleeve). Open positions still trail SL, force-exit, and roll as usual.
 ENABLE_WEEKLY_TRADES = True
 ENABLE_INTRADAY_TRADES = True
-ENABLE_MORNING_TRADES = True
+ENABLE_MORNING_0DTE_TRADES = True
 # Weekly strike pick: when True, skip nearest eligible OTM (OTM1) and take the
 # next (OTM2); if that fails premium, fall through to OTM3+. Daily/morning
 # sleeves always use nearest eligible (OTM1).
@@ -102,12 +102,13 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
       1H SuperTrend (0DTE before 17:25 IST, else 1DTE).
     - Morning (0DTE): every day on the 08:30 IST closed 1H bar, short in the
       current 1H SuperTrend direction (no 4H/1D filter), 10 lots. SL / reentry
-      use ENABLE_MORNING_TRADES.
+      use ENABLE_MORNING_0DTE_TRADES.
 
-    Sleeves may be open together. Broker MAIN_SL trails at ST±100.
+    Sleeves may be open together. Broker MAIN_SL trails at ST±100 (CE SL kept
+    strictly below strike; PE SL kept strictly above strike).
 
     Toggle ``ENABLE_WEEKLY_TRADES`` / ``ENABLE_INTRADAY_TRADES`` /
-    ``ENABLE_MORNING_TRADES`` at module top to disable new entries (and SL
+    ``ENABLE_MORNING_0DTE_TRADES`` at module top to disable new entries (and SL
     re-entries) per sleeve. ``ENABLE_WEEKLY_DEEPER_OTM`` makes weekly
     strike selection skip OTM1 and prefer OTM2+.
     """
@@ -135,7 +136,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         if sleeve_u == SLEEVE_WEEKLY:
             return bool(ENABLE_WEEKLY_TRADES)
         if sleeve_u == SLEEVE_MORNING:
-            return bool(ENABLE_MORNING_TRADES)
+            return bool(ENABLE_MORNING_0DTE_TRADES)
         return bool(ENABLE_INTRADAY_TRADES)
 
     def _entry_qty_lots(self, sleeve: str) -> int:
@@ -238,6 +239,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
     @staticmethod
     def _option_type(direction: int) -> str:
         return "PE" if direction > 0 else "CE"
+
     @staticmethod
     def _spot_hits_level(
         *,
@@ -444,6 +446,13 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         if len(self._evaluated_bars) > 5000:
             self._evaluated_bars = set(sorted(self._evaluated_bars)[-2500:])
         return True
+
+    def unmark_evaluated(self, candle: dict) -> None:
+        """Allow retry when the engine accepted the bar but failed to queue on_candle."""
+        try:
+            self._evaluated_bars.discard(self._bar_key(candle))
+        except Exception:
+            pass
 
     @staticmethod
     def _is_strictly_otm(option_type: str, strike: float, spot: float) -> bool:
@@ -1487,13 +1496,22 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         direction: int,
         supertrend: float,
         option_limit: float,
+        strike: Optional[float] = None,
+        option_type: Optional[str] = None,
     ) -> Any:
         """
         Broker stop-limit on the option: trigger off BTC spot (ST ± 100),
-        buy-to-cover LIMIT on the option (never market). Open limits are
+        buy-to-cover LIMIT on the option (never market). CE SL is clamped
+        strictly below strike; PE SL strictly above strike. Open limits are
         re-quoted to best ask every 30s by the engine exit refresher.
         """
-        level = self._trail_sl_level(direction, supertrend)
+        ot = str(option_type or self._option_type(int(direction))).upper()
+        level = self._trail_sl_level(
+            int(direction),
+            float(supertrend),
+            strike=strike,
+            option_type=ot,
+        )
         limit_px = float(option_limit)
         if limit_px <= 0:
             limit_px = 1.0
@@ -1944,7 +1962,12 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 sleeve,
                 float(prev_ref),
                 ref_st,
-                self._trail_sl_level(pos_dir, ref_st),
+                self._trail_sl_level(
+                    pos_dir,
+                    ref_st,
+                    strike=meta.strike if meta is not None else None,
+                    option_type=meta.option_type if meta is not None else None,
+                ),
                 source,
             )
             self._apply_trail_sl_update(
@@ -2168,11 +2191,14 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         ):
             slot_date = self._closed_bar_time_ist(candle).date()
             if slot_date not in self._morning_entry_dates:
-                self._morning_entry_dates.add(slot_date)
-                if len(self._morning_entry_dates) > 60:
-                    self._morning_entry_dates = set(
-                        sorted(self._morning_entry_dates)[-30:]
-                    )
+                logger.info(
+                    "%s morning slot hit date=%s direction=%s ST=%.2f close=%.2f",
+                    self.name,
+                    slot_date,
+                    direction,
+                    float(supertrend),
+                    float(_close),
+                )
                 intent = self._build_entry(
                     candle,
                     ctx,
@@ -2182,8 +2208,22 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                     sleeve=SLEEVE_MORNING,
                 )
                 if intent is not None:
+                    # Consume the once-per-day slot only after a real ENTRY intent.
+                    self._morning_entry_dates.add(slot_date)
+                    if len(self._morning_entry_dates) > 60:
+                        self._morning_entry_dates = set(
+                            sorted(self._morning_entry_dates)[-30:]
+                        )
                     intents.append(intent)
                     entered_sleeves.add(SLEEVE_MORNING)
+                else:
+                    logger.warning(
+                        "%s morning slot missed date=%s direction=%s "
+                        "(build_entry returned None; will retry if slot bar re-eval)",
+                        self.name,
+                        slot_date,
+                        direction,
+                    )
 
         # Daily 0DTE/1DTE: only on a confirmed 1H ST flip (no mid-regime entries).
         # HTF filter (1D+4H must match 1H) is enforced inside _build_entry.
@@ -2409,6 +2449,20 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         )
         if instrument is None or not direction or supertrend <= 0:
             return []
+        try:
+            strike = float(meta.strike) if meta is not None else 0.0
+        except (TypeError, ValueError, AttributeError):
+            strike = 0.0
+        if strike <= 0:
+            try:
+                strike = float(getattr(instrument, "strike", 0) or 0)
+            except (TypeError, ValueError):
+                strike = 0.0
+        option_type = (
+            str(meta.option_type).upper()
+            if meta is not None and meta.option_type
+            else self._option_type(int(direction))
+        )
         entry_reason = meta.entry_reason if meta is not None else "unknown"
         inst_sym = getattr(instrument, "trading_symbol", None)
         default_qty = self._entry_qty_lots(
@@ -2448,15 +2502,25 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             direction=int(direction),
             supertrend=float(supertrend),
             option_limit=float(option_limit or 1.0),
+            strike=float(strike) if strike > 0 else None,
+            option_type=option_type,
         )
         logger.info(
-            "%s arm broker MAIN_SL sid=%s spot_trigger=%.2f option_limit=%.2f ST=%.2f direction=%s",
+            "%s arm broker MAIN_SL sid=%s spot_trigger=%.2f option_limit=%.2f "
+            "ST=%.2f direction=%s opt=%s strike=%.2f",
             self.name,
             sid,
-            self._trail_sl_level(int(direction), float(supertrend)),
+            self._trail_sl_level(
+                int(direction),
+                float(supertrend),
+                strike=float(strike) if strike > 0 else None,
+                option_type=option_type,
+            ),
             float(option_limit or 1.0),
             float(supertrend),
             direction,
+            option_type,
+            float(strike or 0),
         )
         return [intent]
 

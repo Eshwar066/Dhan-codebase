@@ -764,6 +764,13 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         local_snapshot = self.position_manager.snapshot()
         resolved_broker_positions = {}
         diff = []
+        from core.utils.expiry_resolver import ExpiryResolver
+
+        local_by_identity = {}
+        for loc_sym in local_snapshot.keys():
+            ik = ExpiryResolver.option_identity_key(loc_sym)
+            if ik and ik not in local_by_identity:
+                local_by_identity[ik] = loc_sym
 
         for b_sym, bp in broker_positions.items():
             # Resolve broker symbol (id or short_name) to engine symbol
@@ -772,11 +779,29 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 from core.orderExecution.position_manager import PositionManager
 
                 opt, strike = PositionManager._extract_option_hint(b_sym, None)
+                space = ExpiryResolver.parse_dhan_space_option_symbol(b_sym)
+                expiry = None
+                if space is not None:
+                    _root, expiry, space_strike, space_opt = space
+                    if strike is None:
+                        strike = space_strike
+                    if opt is None:
+                        opt = space_opt
+                # Venue is often "DHAN"; instrument master uses NSE/BSE.
+                exch = self.venue or "NSE"
                 inst = self.instrument_store.intent_creation_details(
-                    b_sym, self.venue, None, opt, strike
+                    b_sym, exch, expiry, opt, strike
                 )
+                if inst is None and str(exch).upper() == "DHAN":
+                    inst = self.instrument_store.intent_creation_details(
+                        b_sym, "NSE", expiry, opt, strike
+                    )
                 if inst:
                     engine_sym = inst.trading_symbol
+                else:
+                    ik = ExpiryResolver.option_identity_key(b_sym)
+                    if ik and ik in local_by_identity:
+                        engine_sym = local_by_identity[ik]
 
             resolved_broker_positions[engine_sym] = bp
 
@@ -810,6 +835,13 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
 
         for sym in set(local_snapshot.keys()) - set(resolved_broker_positions.keys()):
             if local_snapshot[sym].get("qty", 0) != 0:
+                # Identity already covered under a remapped broker key.
+                ik = ExpiryResolver.option_identity_key(sym)
+                if ik and any(
+                    ExpiryResolver.option_identity_key(bs) == ik
+                    for bs in resolved_broker_positions.keys()
+                ):
+                    continue
                 diff.append(
                     {
                         "symbol": sym,
@@ -3133,6 +3165,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
     ) -> List[Dict[str, Any]]:
         response_q: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         expected = 0
+        pending_close_owners = 0
         tf_filter = str(timeframe or "").strip() if timeframe is not None else ""
         candle_symbol = str(candle.get("symbol") or "").strip().upper()
         only_names = None
@@ -3166,6 +3199,15 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     strategy, candle, allow_live_persist=False
                 )
             if not strategy.should_evaluate(strategy_candle):
+                # Forming-bar / already-seen rejects are normal; track owners that
+                # still need a closed-bar retry so the engine does not dedup yet.
+                bar_closed_fn = getattr(strategy, "_bar_is_fully_closed", None)
+                if callable(bar_closed_fn):
+                    try:
+                        if not bar_closed_fn(strategy_candle):
+                            pending_close_owners += 1
+                    except Exception:
+                        pass
                 continue
             log_msg_fn = getattr(strategy, "eval_signal_log_message", None)
             if self.engine_logger and callable(log_msg_fn):
@@ -3200,6 +3242,22 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 queue_key=strategy_id,
             ):
                 expected += 1
+            else:
+                # should_evaluate already marked the bar; roll back so a later
+                # loop can retry instead of permanently skipping the close.
+                unmark = getattr(strategy, "unmark_evaluated", None)
+                if callable(unmark):
+                    try:
+                        unmark(strategy_candle)
+                    except Exception:
+                        pass
+                pending_close_owners += 1
+                logger.warning(
+                    "strategy_queue overflow; will retry bar strategy=%s symbol=%s tf=%s",
+                    strategy_id,
+                    candle_symbol,
+                    tf_filter or strategy_candle.get("timeframe"),
+                )
         out: List[Dict[str, Any]] = []
         completed = 0
         timeout = max(1.0, float(self.strategy_timeout_seconds or 5.0))
@@ -3229,6 +3287,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         f"threshold_sec={timeout:.1f}"
                     ),
                 )
+        # Stash for StrategyEvalService / bus path: avoid permanent dedup when
+        # owners still need a fully-closed retry (e.g. DOS close+2s buffer).
+        self._last_eval_pending_close_owners = int(pending_close_owners)
+        self._last_eval_queued = int(expected)
         return out
 
     def _log_intent_filled(self, trade: Dict[str, Any]) -> None:
@@ -3817,6 +3879,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     if bus is not None and self._event_bus_has_subscribers(
                         bus, EventType.BAR_CLOSED
                     ):
+                        # Reset before publish so a filtered/no-op handler cannot
+                        # reuse stale pending/queued counts from a prior bar.
+                        self._last_eval_pending_close_owners = 0
+                        self._last_eval_queued = 0
                         bus.publish(
                             make_event(
                                 EventType.BAR_CLOSED,
@@ -3831,8 +3897,16 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                                 engine_id=self.engine_id,
                             )
                         )
-                        # Dedup even if handlers filter/fail — bar already published.
-                        if eval_key is not None:
+                        # Dedup only when entry eval actually queued work (or no
+                        # owner is waiting on a not-yet-fully-closed buffer).
+                        pending = int(
+                            getattr(self, "_last_eval_pending_close_owners", 0) or 0
+                        )
+                        queued = int(getattr(self, "_last_eval_queued", 0) or 0)
+                        if (
+                            eval_key is not None
+                            and (pending <= 0 or queued > 0)
+                        ):
                             self._last_evaluated_candle_ts[eval_ts_key] = eval_key
                     else:
                         self._run_exits_and_rollover_for_closed_bar(

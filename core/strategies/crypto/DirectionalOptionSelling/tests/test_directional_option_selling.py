@@ -577,6 +577,30 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertEqual(self.strategy._force_exit_level(1, 118000), 117700)
         self.assertEqual(self.strategy._force_exit_level(-1, 118000), 118300)
 
+    def test_trail_sl_clamped_ce_below_strike_pe_above(self):
+        """ST±100 kept when valid; otherwise clamp CE < strike / PE > strike."""
+        s = self.strategy
+        # CE: ST+100 already below strike → keep ST±100.
+        self.assertEqual(
+            s._trail_sl_level(-1, 65000, strike=65500, option_type="CE"),
+            65100,
+        )
+        # CE: ST+100 would be >= strike → clamp to strike-1.
+        self.assertEqual(
+            s._trail_sl_level(-1, 65450, strike=65500, option_type="CE"),
+            65499,
+        )
+        # PE: ST-100 already above strike → keep ST±100.
+        self.assertEqual(
+            s._trail_sl_level(1, 66000, strike=65500, option_type="PE"),
+            65900,
+        )
+        # PE: ST-100 would be <= strike → clamp to strike+1.
+        self.assertEqual(
+            s._trail_sl_level(1, 65550, strike=65500, option_type="PE"),
+            65501,
+        )
+
     def test_quote_force_exit_uses_300_point_strategy_level(self):
         instrument = SimpleNamespace(
             option_type="PE",
@@ -1011,10 +1035,52 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         sl = intents[0]
         self.assertEqual(sl.tag, "MAIN_SL")
         self.assertEqual(sl.order_type, "SL")
-        self.assertEqual(sl.trigger_price, 117900)
+        # ST-100=117900 would be <= strike 118000; PE clamp → strike+1.
+        self.assertEqual(sl.trigger_price, 118001)
+        self.assertGreater(sl.trigger_price, 118000)
         self.assertEqual(sl.price, 350)
         self.assertEqual(sl.metadata_extras["stop_trigger_method"], "spot_price")
         self.assertEqual(sl.metadata_extras["direction"], 1)
+
+    def test_entry_filled_ce_sl_clamped_below_strike(self):
+        """CE short: when ST+100 crosses strike, MAIN_SL clamps to strike-1."""
+        instrument = SimpleNamespace(
+            option_type="CE",
+            expiry="240726",
+            strike=65500,
+            trading_symbol="C-BTC-65500-240726",
+            lot_size=1,
+        )
+        from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (
+            _PositionMeta,
+        )
+
+        sid = "DirectionalOptionSelling:BTCUSD:morning:2026-07-23:CE:abc123"
+        self.strategy._meta_by_structure_id[sid] = _PositionMeta(
+            symbol="BTCUSD",
+            direction=-1,
+            option_type="CE",
+            supertrend=65450,  # ST+100 = 65550 >= strike
+            strike=65500,
+            expiry="240726",
+            entry_premium=147,
+            entry_reason="morning_830",
+            sleeve="morning",
+        )
+        intents = self.strategy.on_main_entry_filled(
+            ctx=SimpleNamespace(position_store=_PositionStore()),
+            structure_id=sid,
+            instrument=instrument,
+            qty=1,
+            intent_id="parent_morn",
+            price=147,
+            candle_ts=datetime(2026, 7, 23, 15, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(len(intents), 1)
+        sl = intents[0]
+        self.assertEqual(sl.tag, "MAIN_SL")
+        self.assertEqual(sl.trigger_price, 65499)
+        self.assertLess(sl.trigger_price, 65500)
 
     def test_sl_at_1101_reenters_on_1130_close_same_direction(self):
         """SL at 11:01 inside 10:30→11:30 bar → re-enter at that bar's 11:30 close."""

@@ -44,6 +44,7 @@ subscriptions:
     timeframes:
     - '60'
     - 4h
+    - 1d
     symbols:
     - BTCUSD
   ScheduledSlot:
@@ -72,7 +73,7 @@ documentation:
     - Red to Green: sell one PE; Green to Red: sell one CE
     - Exit the old option before placing the opposite option
     - Broker MAIN_SL is a spot-triggered stop-LIMIT on the option (never market); open limits re-quote to best ask every 30s
-    - Broker SL stop_price is modified whenever the 60m SuperTrend value changes
+    - Broker SL stop_price is modified whenever SuperTrend changes (ST±100); CE SL kept < strike, PE SL kept > strike
     - Strategy emergency: if spot breaches ST±300 and position still open, place immediate LIMIT exit (also re-quoted every 30s)
     - Strike proximity: if spot trades within ±50 of the open option strike, exit immediately
     - After any SL fill, re-enter on that same 1hr candle's close (e.g. SL at 11:01 in 10:30-11:30 → decide at 11:30): unchanged SuperTrend → same direction; flipped → opposite

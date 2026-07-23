@@ -41,12 +41,76 @@ class DosTrailSlMixin:
     """ST±100 broker trail levels, modify, and pending retry queue."""
 
     @staticmethod
-    def _trail_sl_level(direction: int, supertrend: float) -> float:
-        """Broker SL level. Bullish: ST - 100. Bearish: ST + 100."""
+    def _trail_sl_level(
+        direction: int,
+        supertrend: float,
+        *,
+        strike: Optional[float] = None,
+        option_type: Optional[str] = None,
+    ) -> float:
+        """Broker SL level. Bullish: ST - 100. Bearish: ST + 100.
+
+        When strike is known, clamp so CE SL stays strictly below strike and
+        PE SL stays strictly above strike (still prefer ST±100 when valid).
+        """
         st = float(supertrend)
         if direction > 0:
-            return st - TRAIL_SL_POINTS
-        return st + TRAIL_SL_POINTS
+            level = st - TRAIL_SL_POINTS
+        else:
+            level = st + TRAIL_SL_POINTS
+        try:
+            k = float(strike) if strike is not None else 0.0
+        except (TypeError, ValueError):
+            k = 0.0
+        if k <= 0:
+            return level
+        ot = str(
+            option_type or ("PE" if direction > 0 else "CE")
+        ).strip().upper()[:1]
+        if ot == "C":
+            # Short CE: SL must be < strike.
+            return min(level, k - 1.0)
+        if ot == "P":
+            # Short PE: SL must be > strike.
+            return max(level, k + 1.0)
+        return level
+
+    @staticmethod
+    def _sl_strike_side_from_position(
+        position: Any, meta: Any = None
+    ) -> tuple[Optional[float], Optional[str]]:
+        """Resolve (strike, option_type) for MAIN_SL clamp from meta/instrument."""
+        strike: Optional[float] = None
+        option_type: Optional[str] = None
+        if meta is not None:
+            try:
+                k = float(getattr(meta, "strike", 0) or 0)
+            except (TypeError, ValueError):
+                k = 0.0
+            if k > 0:
+                strike = k
+            ot = str(getattr(meta, "option_type", "") or "").strip().upper()
+            if ot:
+                option_type = ot
+        inst = getattr(position, "instrument", None)
+        if strike is None and inst is not None:
+            try:
+                k = float(getattr(inst, "strike", 0) or 0)
+            except (TypeError, ValueError):
+                k = 0.0
+            if k > 0:
+                strike = k
+        if not option_type and inst is not None:
+            ot = str(getattr(inst, "option_type", "") or "").strip().upper()
+            if ot:
+                option_type = ot
+            else:
+                sym = str(getattr(inst, "trading_symbol", "") or "").upper()
+                if sym.startswith("P-") or ":PE:" in sym:
+                    option_type = "PE"
+                elif sym.startswith("C-") or ":CE:" in sym:
+                    option_type = "CE"
+        return strike, option_type
 
     @staticmethod
     def _force_exit_level(direction: int, supertrend: float) -> float:
@@ -96,7 +160,22 @@ class DosTrailSlMixin:
         Retries a few times immediately. Callers must treat False as stale SL and
         queue ``_pending_trail_retries`` so later candles/quotes keep trying.
         """
-        level = self._trail_sl_level(direction, supertrend)
+        sid = str(getattr(position, "structure_id", "") or "")
+        meta = None
+        if sid and hasattr(self, "_meta_by_structure_id"):
+            meta = self._meta_by_structure_id.get(sid)
+        if meta is None and callable(getattr(self, "_ensure_meta", None)):
+            try:
+                meta = self._ensure_meta(position, ctx)
+            except Exception:
+                meta = None
+        strike, option_type = self._sl_strike_side_from_position(position, meta)
+        level = self._trail_sl_level(
+            direction,
+            supertrend,
+            strike=strike,
+            option_type=option_type,
+        )
         router = getattr(ctx, "order_router", None)
         broker = getattr(router, "broker", None) if router is not None else None
         if broker is None:
@@ -108,7 +187,6 @@ class DosTrailSlMixin:
                 float(supertrend),
             )
             return False
-        sid = str(getattr(position, "structure_id", "") or "")
         qty = abs(int(getattr(position, "net_qty", 0) or 0)) or 1
         inst = getattr(position, "instrument", None)
         trading_symbol = str(getattr(inst, "trading_symbol", "") or "")
@@ -240,6 +318,8 @@ class DosTrailSlMixin:
         sid = str(structure_id or "").strip()
         if not sid:
             return
+        # Retry queue logging uses unclamped ST±100; broker modify re-resolves
+        # strike from the open position when it runs.
         desired = self._trail_sl_level(int(direction), float(target_supertrend))
         stale = (
             self._trail_sl_level(int(direction), float(prev_ref))

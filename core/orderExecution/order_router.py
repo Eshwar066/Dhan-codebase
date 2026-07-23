@@ -617,13 +617,44 @@ class OrderRouter:
         aliases = self._intent_symbol_aliases(intent_rec)
         if not aliases:
             return None
+        from core.utils.expiry_resolver import ExpiryResolver
+
         sym = self._intent_trading_symbol(intent_rec)
+        intent_ids = set()
+        for key in (
+            sym,
+            (intent_rec.get("payload") or {}).get("symbol"),
+            (intent_rec.get("payload") or {}).get("trading_symbol"),
+        ):
+            ik = ExpiryResolver.option_identity_key(str(key or ""))
+            if ik:
+                intent_ids.add(ik)
+        inst = intent_rec.get("instrument")
+        if inst is not None:
+            for attr in ("trading_symbol", "custom_symbol"):
+                ik = ExpiryResolver.option_identity_key(
+                    str(getattr(inst, attr, "") or "")
+                )
+                if ik:
+                    intent_ids.add(ik)
+            place_symbol = getattr(inst, "place_order_symbol", None)
+            if callable(place_symbol):
+                try:
+                    ik = ExpiryResolver.option_identity_key(str(place_symbol() or ""))
+                    if ik:
+                        intent_ids.add(ik)
+                except Exception:
+                    pass
+
         if sym and sym in broker_positions:
             return broker_positions.get(sym)
         for b_sym, row in broker_positions.items():
             if str(b_sym).strip().upper() == str(sym or "").strip().upper():
                 return row
             if self._alnum_symbol_key(b_sym) in aliases:
+                return row
+            bik = ExpiryResolver.option_identity_key(str(b_sym))
+            if bik and bik in intent_ids:
                 return row
         return None
 

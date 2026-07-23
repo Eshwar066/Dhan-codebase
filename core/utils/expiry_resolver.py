@@ -182,6 +182,95 @@ class ExpiryResolver:
         return ExpiryResolver.last_weekday_of_month(year, month, monthly_weekday)
 
     @staticmethod
+    def parse_dhan_space_option_symbol(
+        trading_symbol: str,
+    ) -> Optional[tuple]:
+        """
+        Parse Dhan place-order / SEM_CUSTOM_SYMBOL form.
+
+        ``BANKNIFTY 28 JUL 56300 PUT`` → (root, date(y, m, d), strike, CE|PE)
+        Year is inferred as current calendar year when omitted; if that date is
+        more than ~6 months in the past, use next year (year-end rollover).
+        """
+        import re
+
+        ts = str(trading_symbol or "").strip().upper()
+        m = re.match(
+            r"^([A-Z0-9]+)\s+(\d{1,2})\s+([A-Z]{3})(?:\s+(\d{2}))?\s+(\d+)\s+(CALL|PUT|CE|PE)$",
+            ts,
+        )
+        if not m:
+            return None
+        root = m.group(1)
+        day = int(m.group(2))
+        try:
+            month = dt.datetime.strptime(m.group(3).title(), "%b").month
+        except (TypeError, ValueError):
+            return None
+        yy = m.group(4)
+        strike = int(m.group(5))
+        opt = ExpiryResolver.normalize_option_side_compact(m.group(6))
+        today = dt.date.today()
+        if yy is not None:
+            year = 2000 + int(yy)
+        else:
+            year = today.year
+            try:
+                cand = dt.date(year, month, day)
+            except ValueError:
+                return None
+            # Rollover: Dec quote for Jan expiry can land in previous calendar year.
+            if cand < today - dt.timedelta(days=180):
+                year = today.year + 1
+        try:
+            exp = dt.date(year, month, day)
+        except ValueError:
+            return None
+        return root, exp, strike, opt
+
+    @staticmethod
+    def option_identity_key(trading_symbol: str) -> str:
+        """
+        Stable identity across compact vs space Dhan symbols (ignores expiry day/year).
+
+        ``BANKNIFTY-Jul2026-56300-PE`` and ``BANKNIFTY 28 JUL 56300 PUT`` → ``BANKNIFTY|56300|PE``.
+        """
+        import re
+
+        ts = str(trading_symbol or "").strip().upper()
+        if not ts:
+            return ""
+        parsed = ExpiryResolver.parse_dhan_space_option_symbol(ts)
+        if parsed is not None:
+            root, _exp, strike, opt = parsed
+            return f"{root}|{strike}|{opt}"
+        m = re.match(
+            r"^([A-Z0-9]+)-[A-Za-z]{3}\d{4}-(\d+)-([CP]E)$",
+            ts,
+            re.IGNORECASE,
+        )
+        if m:
+            return f"{m.group(1).upper()}|{int(m.group(2))}|{m.group(3).upper()}"
+        # Fallback: root + largest strike-like token + CE/PE
+        tokens = ts.replace("-", " ").split()
+        root = tokens[0] if tokens else ""
+        opt = ""
+        strike = None
+        for tok in tokens:
+            if tok in ("CE", "PE", "CALL", "PUT"):
+                opt = "CE" if tok in ("CE", "CALL") else "PE"
+            else:
+                try:
+                    val = int(tok)
+                    if val >= 100:
+                        strike = val
+                except (TypeError, ValueError):
+                    continue
+        if root and strike is not None and opt:
+            return f"{root}|{strike}|{opt}"
+        return ""
+
+    @staticmethod
     def last_weekday_of_month(year, month, weekday: int) -> dt.date:
         """Last ``weekday`` (Mon=0 … Sun=6) in the given calendar month."""
         if month == 12:

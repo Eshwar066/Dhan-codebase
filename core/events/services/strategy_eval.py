@@ -106,7 +106,12 @@ class StrategyEvalService:
                     )
 
         if eval_key is not None and eval_ts_key is not None:
-            engine._last_evaluated_candle_ts[eval_ts_key] = eval_key
+            # Do not permanently dedup when owners still refuse the bar as
+            # not-fully-closed (e.g. strategy close buffer ahead of engine).
+            pending = int(getattr(engine, "_last_eval_pending_close_owners", 0) or 0)
+            queued = int(getattr(engine, "_last_eval_queued", 0) or 0)
+            if pending <= 0 or queued > 0:
+                engine._last_evaluated_candle_ts[eval_ts_key] = eval_key
         return results
 
     def handle_bar_closed(self, event: Event) -> None:
