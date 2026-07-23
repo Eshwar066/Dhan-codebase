@@ -99,6 +99,56 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertEqual(selected[0], 118000)
         self.assertEqual(selected[3], "170726")
 
+    def test_live_selection_weekly_deeper_otm_skips_nearest(self):
+        """otm_skip=1 → OTM2 (skip nearest eligible outside ST)."""
+        products = [
+            {"symbol": "P-BTC-65500-310726", "strike_price": 65500},  # OTM1
+            {"symbol": "P-BTC-65400-310726", "strike_price": 65400},  # OTM2
+            {"symbol": "P-BTC-65300-310726", "strike_price": 65300},  # OTM3
+            {"symbol": "P-BTC-65700-310726", "strike_price": 65700},  # ITM vs spot
+        ]
+        source = _LiveSource(
+            products,
+            {
+                "P-BTC-65500-310726": _ticker(200),
+                "P-BTC-65400-310726": _ticker(180),
+                "P-BTC-65300-310726": _ticker(160),
+                "P-BTC-65700-310726": _ticker(220),
+            },
+        )
+        candle = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 23, 6, 0, tzinfo=timezone.utc),
+            "close": 65600,
+        }
+        with patch(
+            "core.strategies.crypto.DirectionalOptionSelling."
+            "DirectionalOptionSelling._delta_source_from_ctx",
+            return_value=source,
+        ):
+            nearest = self.strategy._select_live_contract(
+                candle,
+                SimpleNamespace(),
+                "PE",
+                65650,
+                min_dte=0,
+                min_strike_distance=0,
+                otm_skip=0,
+            )
+            deeper = self.strategy._select_live_contract(
+                candle,
+                SimpleNamespace(),
+                "PE",
+                65650,
+                min_dte=0,
+                min_strike_distance=0,
+                otm_skip=1,
+            )
+        self.assertIsNotNone(nearest)
+        self.assertEqual(nearest[0], 65500)
+        self.assertIsNotNone(deeper)
+        self.assertEqual(deeper[0], 65400)
+
     def test_live_selection_rejects_itm_and_atm(self):
         products = [
             {"symbol": "C-BTC-64400-190726", "strike_price": 64400},  # ITM CE

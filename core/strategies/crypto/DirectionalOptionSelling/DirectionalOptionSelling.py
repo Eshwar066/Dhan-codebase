@@ -50,6 +50,10 @@ logger = logging.getLogger(__name__)
 ENABLE_WEEKLY_TRADES = True
 ENABLE_INTRADAY_TRADES = True
 ENABLE_MORNING_TRADES = True
+# Weekly strike pick: when True, skip nearest eligible OTM (OTM1) and take the
+# next (OTM2); if that fails premium, fall through to OTM3+. Daily/morning
+# sleeves always use nearest eligible (OTM1).
+ENABLE_WEEKLY_DEEPER_OTM = True
 
 
 @dataclass(frozen=True)
@@ -104,7 +108,8 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
 
     Toggle ``ENABLE_WEEKLY_TRADES`` / ``ENABLE_INTRADAY_TRADES`` /
     ``ENABLE_MORNING_TRADES`` at module top to disable new entries (and SL
-    re-entries) per sleeve.
+    re-entries) per sleeve. ``ENABLE_WEEKLY_DEEPER_OTM`` makes weekly
+    strike selection skip OTM1 and prefer OTM2+.
     """
 
     name = "DirectionalOptionSelling"
@@ -946,11 +951,13 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         min_strike_distance: float,
         target_expiry: Optional[str] = None,
         min_premium: Optional[float] = None,
+        otm_skip: int = 0,
     ) -> Optional[tuple[float, float, pd.Series, str]]:
         source = _delta_source_from_ctx(ctx)
         if source is None:
             return None
         floor = float(min_premium) if min_premium is not None else float(MIN_PREMIUM_USD)
+        skip_n = max(0, int(otm_skip or 0))
         opt_letter = option_type[0].upper()
         products = source.get_products(use_cache=True) or []
         matching = [
@@ -985,6 +992,9 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 if distance >= float(min_strike_distance):
                     candidates.append((distance, strike, symbol, product))
             candidates.sort(key=lambda item: (item[0], item[1]))
+            # Skip nearest N eligible OTMs (0=OTM1, 1=start at OTM2, ...).
+            if skip_n:
+                candidates = candidates[skip_n:]
             try:
                 tickers = source.get_option_tickers_for_expiry("BTC", expiry, opt_letter) or {}
             except Exception:
@@ -1025,11 +1035,13 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         min_strike_distance: float,
         target_expiry: Optional[str] = None,
         min_premium: Optional[float] = None,
+        otm_skip: int = 0,
     ) -> Optional[tuple[float, float, pd.Series, str]]:
         df = self.load_delta_data_for_candle(candle, ctx)
         if df is None or df.empty:
             return None
         floor = float(min_premium) if min_premium is not None else float(MIN_PREMIUM_USD)
+        skip_n = max(0, int(otm_skip or 0))
         work = df.copy()
         work.columns = [
             "symbol", "price", "qty", "timestamp", "side", "opt_type", "strike", "expiry"
@@ -1080,7 +1092,12 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             latest = latest[latest["distance"] >= float(min_strike_distance)]
             if latest.empty:
                 continue
-            row = latest.sort_values(["distance", "strike"]).iloc[0]
+            latest = latest.sort_values(["distance", "strike"])
+            if skip_n:
+                latest = latest.iloc[skip_n:]
+            if latest.empty:
+                continue
+            row = latest.iloc[0]
             return float(row["strike"]), float(row["price"]), row, expiry
         return None
 
@@ -1095,6 +1112,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         min_strike_distance: float = 0.0,
         target_expiry: Optional[str] = None,
         min_premium: Optional[float] = None,
+        otm_skip: int = 0,
     ) -> Optional[tuple[float, float, pd.Series, str]]:
         option_type = self._option_type(direction)
         if RUN_MODE == RunMode.BACKTEST:
@@ -1107,6 +1125,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 min_strike_distance=min_strike_distance,
                 target_expiry=target_expiry,
                 min_premium=min_premium,
+                otm_skip=otm_skip,
             )
         return self._select_live_contract(
             candle,
@@ -1117,6 +1136,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             min_strike_distance=min_strike_distance,
             target_expiry=target_expiry,
             min_premium=min_premium,
+            otm_skip=otm_skip,
         )
 
     def _build_entry(
@@ -1200,6 +1220,11 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             min_strike_distance=min_strike_distance,
             target_expiry=target_expiry,
             min_premium=self._min_premium_for_sleeve(sleeve_u),
+            otm_skip=(
+                1
+                if sleeve_u == SLEEVE_WEEKLY and ENABLE_WEEKLY_DEEPER_OTM
+                else 0
+            ),
         )
         if selected is None:
             logger.warning(
