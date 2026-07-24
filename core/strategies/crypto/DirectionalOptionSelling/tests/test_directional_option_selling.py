@@ -601,6 +601,53 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             65501,
         )
 
+    def test_morning_pe_sl_clamped_above_strike_64800(self):
+        """Live bug: ST=64813.39 → ST-100=64713.39 was placed below PE strike 64800."""
+        level = self.strategy._trail_sl_level(
+            1, 64813.39, strike=64800.0, option_type="PE"
+        )
+        self.assertEqual(level, 64801.0)
+        self.assertGreater(level, 64800.0)
+
+    def test_morning_entry_filled_pe_sl_not_below_strike(self):
+        instrument = SimpleNamespace(
+            option_type="PE",
+            expiry="240726",
+            strike=64800,
+            trading_symbol="P-BTC-64800-240726",
+            lot_size=1,
+        )
+        from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (
+            _PositionMeta,
+        )
+
+        sid = "DirectionalOptionSelling:BTCUSD:morning:2026-07-24:PE:2f73a05b"
+        self.strategy._meta_by_structure_id[sid] = _PositionMeta(
+            symbol="BTCUSD",
+            direction=1,
+            option_type="PE",
+            supertrend=64813.39,
+            strike=64800.0,
+            expiry="240726",
+            entry_premium=34.0,
+            entry_reason="sl_reentry_flip",
+            sleeve="morning",
+        )
+        intents = self.strategy.on_main_entry_filled(
+            ctx=SimpleNamespace(position_store=_PositionStore()),
+            structure_id=sid,
+            instrument=instrument,
+            qty=1,
+            intent_id="e8a27d76",
+            price=34.0,
+            candle_ts=datetime(2026, 7, 24, 4, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(len(intents), 1)
+        sl = intents[0]
+        self.assertEqual(sl.trigger_price, 64801.0)
+        self.assertGreater(sl.trigger_price, 64800.0)
+        self.assertNotAlmostEqual(sl.trigger_price, 64713.39)
+
     def test_quote_force_exit_uses_300_point_strategy_level(self):
         instrument = SimpleNamespace(
             option_type="PE",

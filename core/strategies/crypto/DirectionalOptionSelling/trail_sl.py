@@ -52,6 +52,9 @@ class DosTrailSlMixin:
 
         When strike is known, clamp so CE SL stays strictly below strike and
         PE SL stays strictly above strike (still prefer ST±100 when valid).
+
+        Example (morning PE short): ST=64813.39, strike=64800 → ST-100=64713.39
+        is invalid; clamp to strike+1 = 64801.
         """
         st = float(supertrend)
         if direction > 0:
@@ -66,14 +69,37 @@ class DosTrailSlMixin:
             return level
         ot = str(
             option_type or ("PE" if direction > 0 else "CE")
-        ).strip().upper()[:1]
-        if ot == "C":
-            # Short CE: SL must be < strike.
-            return min(level, k - 1.0)
-        if ot == "P":
-            # Short PE: SL must be > strike.
-            return max(level, k + 1.0)
+        ).strip().upper()
+        if ot.startswith("C") and not ot.startswith("P"):
+            # Short CE: index SL must stay strictly below strike.
+            clamped = min(level, k - 1.0)
+            if clamped >= k:
+                clamped = k - 1.0
+            return float(clamped)
+        if ot.startswith("P"):
+            # Short PE: index SL must stay strictly above strike.
+            clamped = max(level, k + 1.0)
+            if clamped <= k:
+                clamped = k + 1.0
+            return float(clamped)
         return level
+
+    @staticmethod
+    def _strike_from_trading_symbol(trading_symbol: Any) -> Optional[float]:
+        """Parse strike from Delta symbols like ``P-BTC-64800-240726``."""
+        import re
+
+        sym = str(trading_symbol or "").strip().upper()
+        if not sym:
+            return None
+        m = re.match(r"^[PC]-BTC-(\d+)-", sym)
+        if not m:
+            return None
+        try:
+            k = float(m.group(1))
+        except (TypeError, ValueError):
+            return None
+        return k if k > 0 else None
 
     @staticmethod
     def _sl_strike_side_from_position(
@@ -100,15 +126,19 @@ class DosTrailSlMixin:
                 k = 0.0
             if k > 0:
                 strike = k
+        if strike is None and inst is not None:
+            strike = DosTrailSlMixin._strike_from_trading_symbol(
+                getattr(inst, "trading_symbol", None)
+            )
         if not option_type and inst is not None:
             ot = str(getattr(inst, "option_type", "") or "").strip().upper()
             if ot:
                 option_type = ot
             else:
                 sym = str(getattr(inst, "trading_symbol", "") or "").upper()
-                if sym.startswith("P-") or ":PE:" in sym:
+                if sym.startswith("P-") or ":PE:" in sym or "-PE-" in sym:
                     option_type = "PE"
-                elif sym.startswith("C-") or ":CE:" in sym:
+                elif sym.startswith("C-") or ":CE:" in sym or "-CE-" in sym:
                     option_type = "CE"
         return strike, option_type
 

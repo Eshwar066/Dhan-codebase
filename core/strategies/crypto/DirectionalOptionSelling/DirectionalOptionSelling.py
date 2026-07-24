@@ -2458,11 +2458,25 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 strike = float(getattr(instrument, "strike", 0) or 0)
             except (TypeError, ValueError):
                 strike = 0.0
+        if strike <= 0:
+            from .trail_sl import DosTrailSlMixin
+
+            parsed = DosTrailSlMixin._strike_from_trading_symbol(
+                getattr(instrument, "trading_symbol", None)
+            )
+            if parsed:
+                strike = float(parsed)
         option_type = (
             str(meta.option_type).upper()
             if meta is not None and meta.option_type
             else self._option_type(int(direction))
         )
+        if not option_type:
+            sym_u = str(getattr(instrument, "trading_symbol", "") or "").upper()
+            if sym_u.startswith("P-"):
+                option_type = "PE"
+            elif sym_u.startswith("C-"):
+                option_type = "CE"
         entry_reason = meta.entry_reason if meta is not None else "unknown"
         inst_sym = getattr(instrument, "trading_symbol", None)
         default_qty = self._entry_qty_lots(
@@ -2493,6 +2507,31 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 option_limit = float(kwargs.get("price") or 0)
             except (TypeError, ValueError):
                 option_limit = 0.0
+        spot_trigger = self._trail_sl_level(
+            int(direction),
+            float(supertrend),
+            strike=float(strike) if strike > 0 else None,
+            option_type=option_type,
+        )
+        # Hard assert: PE index SL must be > strike; CE must be < strike.
+        if strike > 0:
+            ot_u = str(option_type or "").upper()
+            if ot_u.startswith("P") and spot_trigger <= strike:
+                logger.error(
+                    "%s PE MAIN_SL clamp failed trigger=%.2f strike=%.2f; forcing strike+1",
+                    self.name,
+                    spot_trigger,
+                    strike,
+                )
+                spot_trigger = float(strike) + 1.0
+            elif ot_u.startswith("C") and not ot_u.startswith("P") and spot_trigger >= strike:
+                logger.error(
+                    "%s CE MAIN_SL clamp failed trigger=%.2f strike=%.2f; forcing strike-1",
+                    self.name,
+                    spot_trigger,
+                    strike,
+                )
+                spot_trigger = float(strike) - 1.0
         intent = self._build_main_sl_intent(
             instrument=instrument,
             qty=fill_qty,
@@ -2505,17 +2544,19 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             strike=float(strike) if strike > 0 else None,
             option_type=option_type,
         )
+        # Keep intent trigger aligned with the guarded level (in case builder drifts).
+        try:
+            intent.trigger_price = float(spot_trigger)
+            if getattr(intent, "metadata_extras", None) is not None:
+                intent.metadata_extras["trail_sl_level"] = float(spot_trigger)
+        except Exception:
+            pass
         logger.info(
             "%s arm broker MAIN_SL sid=%s spot_trigger=%.2f option_limit=%.2f "
             "ST=%.2f direction=%s opt=%s strike=%.2f",
             self.name,
             sid,
-            self._trail_sl_level(
-                int(direction),
-                float(supertrend),
-                strike=float(strike) if strike > 0 else None,
-                option_type=option_type,
-            ),
+            float(spot_trigger),
             float(option_limit or 1.0),
             float(supertrend),
             direction,
