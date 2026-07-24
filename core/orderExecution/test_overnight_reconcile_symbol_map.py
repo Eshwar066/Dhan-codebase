@@ -19,7 +19,7 @@ class TestOvernightReconcileSymbolMap(unittest.TestCase):
         self.assertEqual(a, "BANKNIFTY|56300|PE")
         self.assertEqual(a, b)
 
-    def test_empty_broker_book_preserves_local_overnight(self):
+    def test_empty_broker_book_zeros_local_qty_keeps_metadata(self):
         pm = PositionManager.__new__(PositionManager)
         pm._lock = __import__("threading").RLock()
         pm.open_positions_csv_path = None
@@ -31,6 +31,8 @@ class TestOvernightReconcileSymbolMap(unittest.TestCase):
                 "intent_id": "x",
             }
         }
+        from core.orderExecution.position_manager import Position
+
         inst = Instrument(
             trading_symbol="BANKNIFTY-Jul2026-56300-PE",
             custom_symbol="BANKNIFTY-Jul2026-56300-PE",
@@ -39,18 +41,6 @@ class TestOvernightReconcileSymbolMap(unittest.TestCase):
             instrument_type="OP",
             lot_size=30,
         )
-        pos = SimpleNamespace(
-            instrument=inst,
-            net_qty=30,
-            avg_price=148.5,
-            strategy="BankNiftyBTST",
-            tag="MAIN",
-            structure_id="BankNiftyBTST:BANKNIFTY:2026-07-22:PE",
-            intent_id="x",
-        )
-        # Use a real Position-like object via PM positions dict
-        from core.orderExecution.position_manager import Position
-
         real = Position(inst)
         real.net_qty = 30
         real.avg_price = 148.5
@@ -65,8 +55,8 @@ class TestOvernightReconcileSymbolMap(unittest.TestCase):
         pm.merge_ownership_from_all_strategy_open_positions_csvs = MagicMock()
 
         pm.reconcile_with_broker({})
-        self.assertIn("BANKNIFTY-Jul2026-56300-PE", pm.positions)
-        self.assertEqual(pm.positions["BANKNIFTY-Jul2026-56300-PE"].net_qty, 30)
+        self.assertNotIn("BANKNIFTY-Jul2026-56300-PE", pm.positions)
+        pm._merge_position_metadata.assert_called()
 
     def test_space_broker_key_maps_onto_compact_local(self):
         pm = PositionManager.__new__(PositionManager)

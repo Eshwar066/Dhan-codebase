@@ -90,6 +90,9 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         self._evaluated_signal_keys: set[str] = set()
         self._cancel_evaluated_signal_keys: set[str] = set()
         self._arm_sl_signaled_keys: set[str] = set()
+        # One broker reconcile per exit slot evaluation (candle key → positions map).
+        self._exit_broker_recon_key: Optional[str] = None
+        self._exit_broker_positions: Optional[Dict[str, Any]] = None
 
     def get_warmup_period(self):
         return 0
@@ -511,6 +514,129 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
             )
         )
 
+    def _exit_recon_cache_key(self, candle: dict) -> str:
+        slot = self._active_slot(candle)
+        slot_s = slot.strftime("%H:%M") if isinstance(slot, time) else str(slot)
+        return f"{self._evaluate_signal_key(candle)}|{slot_s}"
+
+    def _reconcile_broker_positions_for_exit(
+        self, candle: dict, ctx: Any
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Live Dhan: fetch broker positions once per exit slot and sync PM.
+        Returns the broker map (may be empty). None only when the fetch failed
+        (caller may fall back to local). Backtest/paper skip the round-trip.
+        """
+        if RUN_MODE != RunMode.LIVE:
+            return {}
+        cache_key = self._exit_recon_cache_key(candle)
+        if (
+            self._exit_broker_recon_key == cache_key
+            and self._exit_broker_positions is not None
+        ):
+            return self._exit_broker_positions
+
+        router = getattr(ctx, "order_router", None)
+        broker = getattr(router, "broker", None) if router is not None else None
+        pm = getattr(ctx, "position_store", None)
+        getter = getattr(broker, "get_positions_for_recon", None) if broker else None
+        if not callable(getter):
+            self._exit_broker_recon_key = cache_key
+            self._exit_broker_positions = {}
+            return {}
+
+        try:
+            broker_positions = getter() or {}
+        except Exception as exc:
+            print(
+                f"BankNiftyBTST: broker reconcile before exit failed: {exc}; "
+                "falling back to local open positions"
+            )
+            self._exit_broker_recon_key = cache_key
+            self._exit_broker_positions = None
+            return None
+
+        if pm is not None and hasattr(pm, "reconcile_with_broker"):
+            try:
+                pm.reconcile_with_broker(broker_positions, strategy=self.name)
+            except Exception as exc:
+                print(
+                    f"BankNiftyBTST: position_store reconcile before exit failed: {exc}"
+                )
+
+        self._exit_broker_recon_key = cache_key
+        self._exit_broker_positions = dict(broker_positions)
+        print(
+            f"BankNiftyBTST: reconciled broker positions before exit "
+            f"({len(broker_positions)} symbol(s))"
+        )
+        return self._exit_broker_positions
+
+    @staticmethod
+    def _position_symbol_keys(position: Any) -> set[str]:
+        from core.utils.expiry_resolver import ExpiryResolver
+
+        keys: set[str] = set()
+        inst = getattr(position, "instrument", None)
+        candidates = []
+        if inst is not None:
+            candidates.extend(
+                [
+                    getattr(inst, "trading_symbol", None),
+                    getattr(inst, "custom_symbol", None),
+                ]
+            )
+            place = getattr(inst, "place_order_symbol", None)
+            if callable(place):
+                try:
+                    candidates.append(place())
+                except Exception:
+                    pass
+        for raw in candidates:
+            s = str(raw or "").strip()
+            if not s:
+                continue
+            keys.add(s.upper())
+            keys.add("".join(ch for ch in s.upper() if ch.isalnum()))
+            ik = ExpiryResolver.option_identity_key(s)
+            if ik:
+                keys.add(ik)
+        keys.discard("")
+        return keys
+
+    def _broker_has_open_position(
+        self,
+        position: Any,
+        broker_positions: Optional[Dict[str, Any]],
+    ) -> bool:
+        """True if broker book still shows non-zero qty for this local MAIN."""
+        if broker_positions is None:
+            # Fetch failed — do not block exit on local truth.
+            return int(getattr(position, "net_qty", 0) or 0) != 0
+        if not broker_positions:
+            return False
+        from core.utils.expiry_resolver import ExpiryResolver
+
+        want = self._position_symbol_keys(position)
+        if not want:
+            return int(getattr(position, "net_qty", 0) or 0) != 0
+        for b_sym, row in broker_positions.items():
+            b_keys = {
+                str(b_sym or "").strip().upper(),
+                "".join(ch for ch in str(b_sym or "").upper() if ch.isalnum()),
+            }
+            ik = ExpiryResolver.option_identity_key(str(b_sym or ""))
+            if ik:
+                b_keys.add(ik)
+            if not (want & b_keys):
+                continue
+            try:
+                qty = int((row or {}).get("qty") or 0)
+            except (TypeError, ValueError):
+                qty = 0
+            return qty != 0
+        return False
+
     def _arm_missing_sl_intents(self, candle: dict, ctx: Any) -> List[Any]:
         """
         For each open MAIN leg with no resting MAIN_SL, place SL until T+1 9:25 exit.
@@ -598,9 +724,14 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         ps = getattr(ctx, "position_store", None)
         if ps is None or not hasattr(ps, "get_open_positions"):
             return []
+
+        # Live Dhan: reconcile once, then only exit legs still open at broker.
+        broker_positions = self._reconcile_broker_positions_for_exit(candle, ctx)
+
         trade_dt = pd.Timestamp(candle["timestamp"]).date()
         intents: List[Any] = []
         # Prefer strategy-scoped; fall back to all opens and filter by structure_id.
+        # Re-read after reconcile so locally-dropped flats are not exited.
         positions = list(ps.get_open_positions(strategy=self.name) or [])
         if not positions:
             positions = list(ps.get_open_positions() or [])
@@ -635,6 +766,15 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
             if entry_date is None or trade_dt <= entry_date:
                 continue
             if self._active_slot(candle) != EXIT_TIME:
+                continue
+            if not self._broker_has_open_position(position, broker_positions):
+                sym = getattr(
+                    getattr(position, "instrument", None), "trading_symbol", sid
+                )
+                print(
+                    f"BankNiftyBTST: skip MAIN_EXIT for {sym} — "
+                    "not open on broker after reconcile"
+                )
                 continue
             # Ensure tag is MAIN for exit intent builders / OMS bookkeeping.
             if not getattr(position, "tag", None):
@@ -782,7 +922,13 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         trade_dt = pd.Timestamp(candle["timestamp"]).date()
         if trade_dt <= entry_date:
             return False
-        return self._active_slot(candle) == EXIT_TIME
+        if self._active_slot(candle) != EXIT_TIME:
+            return False
+        if ctx is not None:
+            broker_positions = self._reconcile_broker_positions_for_exit(candle, ctx)
+            if not self._broker_has_open_position(position, broker_positions):
+                return False
+        return True
 
     def on_position_exit(self, position, candle, ctx):
         price = (

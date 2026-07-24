@@ -1524,6 +1524,149 @@ class OrderRouter:
             "reason": "broker_flat_synced",
         }
 
+    def sync_local_after_manual_broker_flat(
+        self,
+        *,
+        trading_symbol: str,
+        structure_id: Optional[str] = None,
+        strategy_id: Optional[str] = None,
+        reason: str = "manual_broker_exit",
+    ) -> int:
+        """
+        Manual Dhan exit: cancel resting local intents/orders for this leg and
+        drop GTT fallback watches. Returns number of intents cancelled.
+        """
+        from core.utils.expiry_resolver import ExpiryResolver
+
+        sym = str(trading_symbol or "").strip()
+        sid = str(structure_id or "").strip()
+        strat = str(strategy_id or "").strip()
+        if not sym and not sid:
+            return 0
+        store = self.intent_store
+        if store is None:
+            return 0
+
+        want_keys = set()
+        if sym:
+            want_keys.add(sym.upper())
+            want_keys.add(self._alnum_symbol_key(sym))
+            ik = ExpiryResolver.option_identity_key(sym)
+            if ik:
+                want_keys.add(ik)
+        want_keys.discard("")
+
+        pending = (
+            list(store.list_by_status(IntentStatus.CREATED))
+            + list(store.list_by_status(IntentStatus.VALIDATED))
+            + list(store.list_by_status(IntentStatus.SENT))
+            + list(store.list_by_status(IntentStatus.ACKED))
+        )
+        cancelled = 0
+        for rec in pending:
+            payload = rec.get("payload") or {}
+            rec_sid = str(
+                rec.get("structure_id") or payload.get("structure_id") or ""
+            ).strip()
+            rec_strat = str(
+                rec.get("strategy")
+                or payload.get("strategy_id")
+                or ""
+            ).strip()
+            if sid and rec_sid and rec_sid != sid:
+                continue
+            if strat and rec_strat and rec_strat != strat:
+                continue
+            if want_keys:
+                aliases = self._intent_symbol_aliases(rec)
+                if isinstance(rec, dict):
+                    rec_sym = str(
+                        (rec.get("payload") or {}).get("symbol")
+                        or rec.get("trading_symbol")
+                        or ""
+                    ).strip()
+                    inst = rec.get("instrument")
+                    if not rec_sym and inst is not None:
+                        rec_sym = str(
+                            getattr(inst, "trading_symbol", "") or ""
+                        ).strip()
+                else:
+                    rec_sym = self._intent_trading_symbol(rec)
+                if rec_sym:
+                    aliases.add(self._alnum_symbol_key(rec_sym))
+                    from core.utils.expiry_resolver import ExpiryResolver
+
+                    ik = ExpiryResolver.option_identity_key(rec_sym)
+                    if ik:
+                        aliases.add(ik)
+                if not (aliases & want_keys) and not (
+                    sid and rec_sid and rec_sid == sid
+                ):
+                    continue
+            tag_u = str(rec.get("tag") or payload.get("tag") or "").upper()
+            action_u = str(rec.get("action") or payload.get("action") or "").upper()
+            # Cancel protective/exit/entry leftovers for this closed leg.
+            if action_u not in ("FORCE_EXIT", "EXIT", "ENTRY") and tag_u not in (
+                "MAIN_SL",
+                "MAIN_TARGET",
+                "MAIN_EXIT",
+                "MAIN",
+            ):
+                continue
+            intent_id = str(rec.get("intent_id") or "")
+            if not intent_id:
+                continue
+            broker_order_id = rec.get("broker_order_id")
+            if broker_order_id and self.broker and hasattr(
+                self.broker, "cancel_order_by_id"
+            ):
+                try:
+                    self.broker.cancel_order_by_id(
+                        str(broker_order_id),
+                        intent_id=intent_id,
+                        reason=reason,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "manual flat: broker cancel failed intent=%s order=%s: %s",
+                        intent_id,
+                        broker_order_id,
+                        exc,
+                    )
+            try:
+                book = getattr(self, "gtt_fallback_book", None)
+                if book is not None:
+                    watch = getattr(book, "_watches", {}).get(intent_id)
+                    if watch is not None:
+                        self.cancel_gtt_fallback_watch(watch, reason=reason)
+            except Exception:
+                pass
+            store.update(
+                intent_id,
+                IntentStatus.CANCELLED,
+                order_state=OrderState.CANCELLED,
+            )
+            self._set_order_state(
+                intent_id,
+                OrderState.CANCELLED,
+                action="manual_broker_flat",
+                message=reason,
+            )
+            cancelled += 1
+
+        if self.engine_logger and cancelled:
+            self.engine_logger.log(
+                "reconciliation",
+                (
+                    f"MANUAL_FLAT_SYNC cancelled={cancelled} "
+                    f"trading_symbol={sym} structure_id={sid} reason={reason}"
+                ),
+                symbol=sym or None,
+                structure_id=sid or None,
+                strategy_id=strat or None,
+            )
+        return cancelled
+
     @staticmethod
     def _coerce_positive_exec_price(price: Any) -> Optional[float]:
         if price is None:

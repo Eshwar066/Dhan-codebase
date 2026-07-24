@@ -909,6 +909,16 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 merge_own(engine_id=self.engine_id)
             except Exception:
                 pass
+        # Manual Dhan exits: clear ownership + cancel resting local orders when
+        # broker confirms flat. Runs after CSV merge so stale SYNC rows cannot
+        # resurrect metadata for legs already closed on Dhan.
+        try:
+            self._apply_manual_flat_closes_after_reconcile(resolved_broker_positions)
+        except Exception as exc:
+            if self.engine_logger:
+                self.engine_logger.reconciliation(
+                    f"manual flat sync after reconcile failed: {exc}"
+                )
         self._restore_strategies_after_reconcile(intent_store)
         self._ensure_bracket_legs_after_reconcile()
         if self._open_positions_logger is not None and self.run_mode == RunMode.LIVE:
@@ -1117,6 +1127,76 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         if not intent_store:
             return
         broker = getattr(self.order_router, "broker", None)
+        broker_positions = None
+        if broker is not None and hasattr(broker, "get_positions_for_recon"):
+            try:
+                broker_positions = broker.get_positions_for_recon() or {}
+            except Exception as exc:
+                if self.engine_logger:
+                    self.engine_logger.reconciliation(
+                        f"Bracket ensure: broker position fetch failed: {exc}"
+                    )
+                broker_positions = None
+
+        from core.utils.expiry_resolver import ExpiryResolver
+
+        def _broker_confirms_open(trading_symbol: str, pos: Any) -> bool:
+            """Do not re-arm SL/target when broker is flat for this contract."""
+            if broker_positions is None:
+                # Fetch failed — keep prior behavior (local qty already checked).
+                return True
+            if not broker_positions:
+                return False
+            want = {
+                str(trading_symbol or "").strip().upper(),
+                "".join(
+                    ch for ch in str(trading_symbol or "").upper() if ch.isalnum()
+                ),
+            }
+            ik = ExpiryResolver.option_identity_key(str(trading_symbol or ""))
+            if ik:
+                want.add(ik)
+            inst = getattr(pos, "instrument", None)
+            if inst is not None:
+                for attr in ("trading_symbol", "custom_symbol"):
+                    raw = str(getattr(inst, attr, "") or "")
+                    if raw:
+                        want.add(raw.upper())
+                        want.add("".join(ch for ch in raw.upper() if ch.isalnum()))
+                        oid = ExpiryResolver.option_identity_key(raw)
+                        if oid:
+                            want.add(oid)
+                place = getattr(inst, "place_order_symbol", None)
+                if callable(place):
+                    try:
+                        raw = str(place() or "")
+                        if raw:
+                            want.add(raw.upper())
+                            want.add(
+                                "".join(ch for ch in raw.upper() if ch.isalnum())
+                            )
+                            oid = ExpiryResolver.option_identity_key(raw)
+                            if oid:
+                                want.add(oid)
+                    except Exception:
+                        pass
+            want.discard("")
+            for b_sym, row in broker_positions.items():
+                b_keys = {
+                    str(b_sym or "").strip().upper(),
+                    "".join(ch for ch in str(b_sym or "").upper() if ch.isalnum()),
+                }
+                bik = ExpiryResolver.option_identity_key(str(b_sym or ""))
+                if bik:
+                    b_keys.add(bik)
+                if not (want & b_keys):
+                    continue
+                try:
+                    return int((row or {}).get("qty") or 0) != 0
+                except (TypeError, ValueError):
+                    return False
+            return False
+
         for sym, pos in list(self.position_manager.positions.items()):
             if int(pos.net_qty or 0) == 0:
                 continue
@@ -1155,6 +1235,12 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         pass
             sim_brackets_ok = True
             sym = getattr(getattr(pos, "instrument", None), "trading_symbol", None) or sym
+            if not _broker_confirms_open(sym, pos):
+                if self.engine_logger:
+                    self.engine_logger.reconciliation(
+                        f"Skip bracket re-arm for {sym}: not open on broker"
+                    )
+                continue
             if self.run_mode == RunMode.PAPER and broker is not None:
                 pending_sl = getattr(broker, "_pending_sl", {}) or {}
                 pending_tgt = getattr(broker, "_pending_target", {}) or {}
@@ -1352,13 +1438,24 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         sym = str(trading_symbol or "").strip()
         sid = str(structure_id or "").strip()
         strat = str(strategy_id or "").strip()
+        reason = str(message or "no_open_position")
+        clear_meta = "manual" in reason.lower() or reason in (
+            "manual_broker_exit",
+            "confirmed_broker_flat",
+        )
 
         synced = False
         pm = self.position_manager
         if sym and hasattr(pm, "sync_symbol_flat_at_broker"):
             synced = bool(
-                pm.sync_symbol_flat_at_broker(sym, reason="no_open_position")
+                pm.sync_symbol_flat_at_broker(
+                    sym, reason=reason, clear_metadata=clear_meta
+                )
             )
+            if clear_meta and not synced and hasattr(pm, "clear_ownership_metadata"):
+                # Already flat locally but metadata/CSV ghosts remain.
+                if pm.clear_ownership_metadata(sym):
+                    synced = True
 
         if sid:
             self._delta_main_sl_retry.pop(sid, None)
@@ -1377,7 +1474,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 "reconciliation",
                 (
                     f"PM synced flat trading_symbol={sym} structure_id={sid} "
-                    f"strategy_id={strat} reason=no_open_position"
+                    f"strategy_id={strat} reason={reason} clear_metadata={clear_meta}"
                 ),
                 symbol=sym or None,
                 structure_id=sid or None,
@@ -1390,6 +1487,144 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 sid,
                 message,
             )
+
+    @staticmethod
+    def _nse_session_open_for_manual_flat() -> bool:
+        """NSE cash session 09:15–15:30 IST — only then treat empty book as real flat."""
+        now = dt.datetime.now(IST).time()
+        return dt_time(9, 15) <= now <= dt_time(15, 30)
+
+    def _broker_open_qty_map(
+        self, broker_positions: Optional[Dict[str, Any]]
+    ) -> Dict[str, int]:
+        """Map engine/identity keys → abs qty for flat detection."""
+        from core.utils.expiry_resolver import ExpiryResolver
+
+        out: Dict[str, int] = {}
+        for b_sym, row in (broker_positions or {}).items():
+            try:
+                qty = abs(int((row or {}).get("qty") or 0))
+            except (TypeError, ValueError):
+                qty = 0
+            keys = {
+                str(b_sym or "").strip().upper(),
+                "".join(ch for ch in str(b_sym or "").upper() if ch.isalnum()),
+            }
+            ik = ExpiryResolver.option_identity_key(str(b_sym or ""))
+            if ik:
+                keys.add(ik)
+            for k in keys:
+                if k:
+                    out[k] = max(out.get(k, 0), qty)
+        return out
+
+    def _apply_manual_flat_closes_after_reconcile(
+        self, broker_positions: Dict[str, Any]
+    ) -> None:
+        """
+        Manual square-off sync (Dhan) after broker reconcile.
+
+        Contract:
+        - Market hours (09:15–15:30 IST) + broker confirms leg gone
+          (missing from a real book, qty 0, or empty book in-session)
+          → clear ownership metadata, cancel resting local intents, and
+            cancel broker orders when ``broker_order_id`` is known.
+          Prevents: manual exit → flat at Dhan → old MAIN_SL still live →
+          unexpected short/reverse fill.
+        - Outside market hours + empty/ambiguous broker book
+          → do nothing here (keep metadata). PM may zero local qty but must
+          not delete ownership so a temporary API hole cannot make the
+          strategy forget an overnight carry and recreate it after restart.
+        - Outside hours + non-empty book with this leg absent
+          → still clear (broker confirmed that specific contract is gone).
+        """
+        from core.utils.expiry_resolver import ExpiryResolver
+
+        if self.run_mode != RunMode.LIVE:
+            return
+        book = broker_positions if isinstance(broker_positions, dict) else {}
+        # Overnight / pre-open empty book is ambiguous — keep ownership.
+        if not book and not self._nse_session_open_for_manual_flat():
+            if self.engine_logger:
+                self.engine_logger.reconciliation(
+                    "Skip manual-flat metadata clear: empty broker book "
+                    "outside NSE session (09:15–15:30 IST)"
+                )
+            return
+
+        open_map = self._broker_open_qty_map(book)
+        pm = self.position_manager
+        router = getattr(self, "order_router", None)
+        sync_fn = getattr(router, "sync_local_after_manual_broker_flat", None)
+
+        candidates: Dict[str, Dict[str, Any]] = {}
+        for sym, pos in list(getattr(pm, "positions", {}).items()):
+            if int(getattr(pos, "net_qty", 0) or 0) == 0:
+                continue
+            candidates[str(sym)] = pm.ownership_snapshot(sym) if hasattr(
+                pm, "ownership_snapshot"
+            ) else {
+                "strategy": getattr(pos, "strategy", None),
+                "structure_id": getattr(pos, "structure_id", None),
+                "tag": getattr(pos, "tag", None),
+                "intent_id": getattr(pos, "intent_id", None),
+            }
+        for sym, meta in list(getattr(pm, "position_metadata", {}).items()):
+            if sym not in candidates:
+                candidates[str(sym)] = dict(meta or {})
+
+        for sym, own in candidates.items():
+            keys = {
+                str(sym).strip().upper(),
+                "".join(ch for ch in str(sym).upper() if ch.isalnum()),
+            }
+            ik = ExpiryResolver.option_identity_key(str(sym))
+            if ik:
+                keys.add(ik)
+            broker_qty = 0
+            matched = False
+            for k in keys:
+                if k in open_map:
+                    matched = True
+                    broker_qty = max(broker_qty, open_map[k])
+            # Still open on broker → leave alone.
+            if matched and broker_qty != 0:
+                continue
+            # Confirmed flat:
+            # - in-session empty book (gate above), or
+            # - non-empty book and this identity absent / qty 0.
+            if hasattr(pm, "sync_symbol_flat_at_broker"):
+                pm.sync_symbol_flat_at_broker(
+                    sym, reason="confirmed_broker_flat", clear_metadata=True
+                )
+            elif hasattr(pm, "clear_ownership_metadata"):
+                pm.clear_ownership_metadata(sym)
+
+            # Drop in-memory BTST meta so 9:15/9:25 will not resurrect the leg.
+            strat_name = str(own.get("strategy") or "").strip()
+            sid = str(own.get("structure_id") or "").strip()
+            if strat_name and sid:
+                strategy_obj = self._strategy_obj_for_name(strat_name)
+                meta_map = getattr(strategy_obj, "_meta_by_structure_id", None)
+                if isinstance(meta_map, dict):
+                    meta_map.pop(sid, None)
+
+            cancelled = 0
+            if callable(sync_fn):
+                cancelled = int(
+                    sync_fn(
+                        trading_symbol=sym,
+                        structure_id=sid or None,
+                        strategy_id=strat_name or None,
+                        reason="manual_broker_exit",
+                    )
+                    or 0
+                )
+            if self.engine_logger:
+                self.engine_logger.reconciliation(
+                    f"Manual/broker flat close synced for {sym} "
+                    f"(cancelled_intents={cancelled})"
+                )
 
     def _force_close_position_missing_main_sl(
         self,

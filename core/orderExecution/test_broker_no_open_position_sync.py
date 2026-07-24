@@ -157,7 +157,9 @@ class TestBrokerNoOpenPositionSync(unittest.TestCase):
         )
 
         pm.sync_symbol_flat_at_broker.assert_called_once_with(
-            "P-BTC-63200-210726", reason="no_open_position"
+            "P-BTC-63200-210726",
+            reason="no_open_position",
+            clear_metadata=False,
         )
         self.assertNotIn("sid-1", eng._delta_main_sl_retry)
         self.assertNotIn("sid-1", book._watches)

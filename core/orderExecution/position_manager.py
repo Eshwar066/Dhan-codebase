@@ -1119,8 +1119,10 @@ class PositionManager:
 
         with self._lock:
             self.last_recon_time = time.time()
-            # Pre-market / transient API holes often return {}. Dropping every
-            # local leg then loses overnight ownership until the next good book.
+            # Empty broker book: zero local qty but KEEP ownership metadata.
+            # LiveEngine only clears metadata on empty books during NSE hours
+            # (09:15–15:30). Outside that window an empty/ambiguous response must
+            # not make the strategy forget an overnight carry.
             if not broker_positions:
                 open_local = [
                     s
@@ -1130,9 +1132,24 @@ class PositionManager:
                 if open_local:
                     logger.warning(
                         "Reconcile: empty broker book with %s open local leg(s); "
-                        "skipping drop/sync to preserve overnight positions",
+                        "zeroing local qty (retaining ownership metadata)",
                         len(open_local),
                     )
+                    for sym in open_local:
+                        pos = self.positions.get(sym)
+                        if pos is None:
+                            continue
+                        self._merge_position_metadata(
+                            sym,
+                            strategy=getattr(pos, "strategy", None),
+                            structure_id=getattr(pos, "structure_id", None),
+                            tag=getattr(pos, "tag", None),
+                            intent_id=getattr(pos, "intent_id", None),
+                        )
+                        strategy = getattr(pos, "strategy", None)
+                        self.positions.pop(sym, None)
+                        if strategy and strategy in self.strategy_pos:
+                            self.strategy_pos[strategy].pop(sym, None)
                     return
 
             from core.utils.expiry_resolver import ExpiryResolver
@@ -1325,39 +1342,83 @@ class PositionManager:
                 self.positions.pop(sym, None)
 
     def sync_symbol_flat_at_broker(
-        self, trading_symbol: str, *, reason: str = ""
+        self, trading_symbol: str, *, reason: str = "", clear_metadata: bool = False
     ) -> bool:
         """
-        Broker confirms no open position (e.g. Delta no_open_position on bracket).
-        Drop local qty tracking but retain ownership metadata until fill CLOSE.
+        Broker confirms no open position (manual exit / no_open_position).
+        Drop local qty. When ``clear_metadata=True`` (confirmed manual close),
+        also drop ownership metadata so restart will not re-arm SL / restore CSV ghosts.
         """
         sym = str(trading_symbol or "").strip()
         if not sym:
             return False
         with self._lock:
             pos = self.positions.get(sym)
-            if pos is None or int(getattr(pos, "net_qty", 0) or 0) == 0:
+            meta = dict(self.position_metadata.get(sym) or {})
+            had_qty = pos is not None and int(getattr(pos, "net_qty", 0) or 0) != 0
+            if not had_qty and not meta:
                 return False
-            self._merge_position_metadata(
-                sym,
-                strategy=getattr(pos, "strategy", None),
-                structure_id=getattr(pos, "structure_id", None),
-                tag=getattr(pos, "tag", None),
-                intent_id=getattr(pos, "intent_id", None),
+            if pos is not None and not clear_metadata:
+                self._merge_position_metadata(
+                    sym,
+                    strategy=getattr(pos, "strategy", None),
+                    structure_id=getattr(pos, "structure_id", None),
+                    tag=getattr(pos, "tag", None),
+                    intent_id=getattr(pos, "intent_id", None),
+                )
+            qty_was = int(getattr(pos, "net_qty", 0) or 0) if pos is not None else 0
+            strategy = (
+                getattr(pos, "strategy", None) if pos is not None else meta.get("strategy")
             )
-            logger.warning(
-                "Reconcile: broker flat for %s (was qty=%s); "
-                "removing local position but retaining ownership metadata%s",
-                sym,
-                pos.net_qty,
-                f" ({reason})" if reason else "",
-            )
-            strategy = getattr(pos, "strategy", None)
-            self.positions.pop(sym, None)
+            if pos is not None:
+                self.positions.pop(sym, None)
             self._structure_slices.pop(sym, None)
             if strategy:
                 self.strategy_pos[strategy][sym] = 0
+            if clear_metadata:
+                self.position_metadata.pop(sym, None)
+                logger.warning(
+                    "Reconcile: broker flat for %s (was qty=%s); "
+                    "removed local position and cleared ownership metadata%s",
+                    sym,
+                    qty_was,
+                    f" ({reason})" if reason else "",
+                )
+            else:
+                logger.warning(
+                    "Reconcile: broker flat for %s (was qty=%s); "
+                    "removing local position but retaining ownership metadata%s",
+                    sym,
+                    qty_was,
+                    f" ({reason})" if reason else "",
+                )
             return True
+
+    def clear_ownership_metadata(self, trading_symbol: str) -> Optional[Dict[str, Any]]:
+        """Drop ownership metadata for ``trading_symbol``; return the prior bucket."""
+        sym = str(trading_symbol or "").strip()
+        if not sym:
+            return None
+        with self._lock:
+            return self.position_metadata.pop(sym, None)
+
+    def ownership_snapshot(self, trading_symbol: str) -> Dict[str, Any]:
+        sym = str(trading_symbol or "").strip()
+        if not sym:
+            return {}
+        with self._lock:
+            out = dict(self.position_metadata.get(sym) or {})
+            pos = self.positions.get(sym)
+            if pos is not None:
+                if not out.get("strategy"):
+                    out["strategy"] = getattr(pos, "strategy", None)
+                if not out.get("structure_id"):
+                    out["structure_id"] = getattr(pos, "structure_id", None)
+                if not out.get("tag"):
+                    out["tag"] = getattr(pos, "tag", None)
+                if not out.get("intent_id"):
+                    out["intent_id"] = getattr(pos, "intent_id", None)
+            return {k: v for k, v in out.items() if v not in (None, "")}
 
     # ---------------------
     # POSITION CHECKS
