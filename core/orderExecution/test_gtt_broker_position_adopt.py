@@ -152,6 +152,264 @@ class TestGttBrokerPositionAdopt(unittest.TestCase):
         router.broker.cancel_order_by_id.assert_not_called()
         self.assertNotIn("gtt-1", router._order_state)
 
+    def test_restore_from_disk_rebuilds_intent_stub(self):
+        import tempfile
+        from pathlib import Path
+
+        from core.orderExecution.intent_store import IntentStore
+
+        router = OrderRouter.__new__(OrderRouter)
+        router.intent_store = IntentStore()
+        router.engine_id = "test_engine"
+        router._order_state_engine_id = "test_engine"
+        router._order_state = {}
+        router._logs_root = Path(tempfile.mkdtemp())
+        router._set_order_state = MagicMock()
+        book = GttFallbackBook(router, engine_logger=None)
+        watch = GttFallbackWatch(
+            gtt_intent_id="f2bd-test",
+            strategy_id="BankNiftyBTST",
+            structure_id="BankNiftyBTST:BANKNIFTY:2026-07-24:CE",
+            trading_symbol="BANKNIFTY 28 JUL 57200 CALL",
+            side="BUY",
+            limit_price=161.4,
+            entry_date=date.today(),
+            broker_order_id="34132607241157",
+            metadata_extras={"execution_mode": "HYBRID_GTT"},
+            symbol="BANKNIFTY-Jul2026-57200-CE",
+            phase=GttFallbackPhase.GTT,
+        )
+        book._watches[watch.gtt_intent_id] = watch
+        book._persist_watches()
+        book._watches.clear()
+        n = book.restore_from_disk()
+        self.assertEqual(n, 1)
+        self.assertIn("f2bd-test", book._watches)
+        rec = router.intent_store.get("f2bd-test")
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["status"], IntentStatus.SENT)
+        self.assertEqual(
+            str((rec.get("payload") or {}).get("execution_mode")), "HYBRID_GTT"
+        )
+
+    def test_rebind_attaches_metadata_without_shadow_sl_hook(self):
+        """Regression 2026-07-24: rebind+ensure both armed MAIN_SL → duplicates."""
+        from core.orderExecution.intent_store import IntentStore
+
+        router = OrderRouter.__new__(OrderRouter)
+        router.intent_store = IntentStore()
+        router.engine_id = "test_engine"
+        router._order_state_engine_id = "test_engine"
+        router._order_state = {}
+        router._logs_root = None
+        router._set_order_state = MagicMock()
+        router._adopt_main_entry_shadow_fill = MagicMock()
+
+        pm = MagicMock()
+        pm.positions = {}
+        pm._lock = MagicMock()
+        pm._lock.__enter__ = MagicMock(return_value=None)
+        pm._lock.__exit__ = MagicMock(return_value=False)
+        router.position_manager = pm
+
+        book = GttFallbackBook(router, engine_logger=None)
+        book._watches["pe-1"] = GttFallbackWatch(
+            gtt_intent_id="pe-1",
+            strategy_id="BankNiftyBTST",
+            structure_id="BankNiftyBTST:BANKNIFTY:2026-07-24:PE",
+            trading_symbol="BANKNIFTY 28 JUL 55500 PUT",
+            side="BUY",
+            limit_price=149.2,
+            entry_date=date.today(),
+            broker_order_id="341",
+            metadata_extras={
+                "execution_mode": "HYBRID_GTT",
+                "banknifty_btst": {
+                    "symbol": "BANKNIFTY",
+                    "entry_date": date.today().isoformat(),
+                    "option_type": "PE",
+                    "ref_premium": 99.0,
+                    "limit_price": 149.2,
+                },
+            },
+            symbol="BANKNIFTY-Jul2026-55500-PE",
+            phase=GttFallbackPhase.GTT,
+        )
+        n = book.rebind_filled_legs_for_brackets(
+            {
+                "BANKNIFTY-Jul2026-55500-PE": {
+                    "qty": 30,
+                    "avg_price": 149.2,
+                    "lot_size": 30,
+                }
+            }
+        )
+        self.assertEqual(n, 1)
+        router._adopt_main_entry_shadow_fill.assert_not_called()
+        pm._merge_position_metadata.assert_called()
+
+
+class TestForeverTriggeredNormalize(unittest.TestCase):
+    def test_triggered_maps_to_filled(self):
+        from core.broker.internal.dhan.broker import DhanBroker
+
+        broker = DhanBroker.__new__(DhanBroker)
+        norm = broker._normalize_forever_order_for_recon(
+            {
+                "orderId": "34132607241158",
+                "tradingSymbol": "BANKNIFTY-Jul2026-55500-PE",
+                "quantity": 30,
+                "price": 149.2,
+                "orderStatus": "TRIGGERED",
+                "correlationId": "NR",
+            }
+        )
+        self.assertEqual(norm["status"], "filled")
+        self.assertEqual(norm["filled_size"], 30.0)
+
+
+class TestGttFallbackHarden(unittest.TestCase):
+    def _watch(self, **kwargs):
+        defaults = dict(
+            gtt_intent_id="gtt-ce",
+            strategy_id="BankNiftyBTST",
+            structure_id="BankNiftyBTST:BANKNIFTY:2026-07-24:CE",
+            trading_symbol="BANKNIFTY 28 JUL 57200 CALL",
+            side="BUY",
+            limit_price=161.4,
+            entry_date=date(2026, 7, 24),
+            trigger_field="ltp",
+            trigger_op=">=",
+            confirm_ticks=1,
+            max_fallback_price=170.0,
+            phase=GttFallbackPhase.GTT,
+            instrument=SimpleNamespace(
+                trading_symbol="BANKNIFTY-Jul2026-57200-CE",
+                custom_symbol="BANKNIFTY-Jul2026-57200-CE",
+                lot_size=30,
+                place_order_symbol=lambda: "BANKNIFTY 28 JUL 57200 CALL",
+            ),
+        )
+        defaults.update(kwargs)
+        return GttFallbackWatch(**defaults)
+
+    def test_triggered_forever_skips_fallback_limit(self):
+        router = MagicMock()
+        store = MagicMock()
+        rec = {
+            "intent_id": "gtt-ce",
+            "status": IntentStatus.SENT,
+            "broker_order_id": "341",
+            "payload": {"action": "ENTRY", "execution_mode": "HYBRID_GTT"},
+        }
+        store.get.return_value = rec
+        router.intent_store = store
+        router._try_sync_gtt_intent_fill.return_value = True
+        router.adopt_gtt_intent_from_broker_positions.return_value = False
+        router.broker.find_forever_order_by_client_id.return_value = {
+            "status": "filled",  # normalized TRIGGERED
+            "filled_size": 30,
+            "size": 30,
+            "order_id": "341",
+        }
+        router.broker.get_positions_for_recon.return_value = {}
+        router.cancel_gtt_fallback_watch.return_value = True
+
+        book = GttFallbackBook(router, engine_logger=None)
+        watch = self._watch()
+        book._watches[watch.gtt_intent_id] = watch
+        quote = BidAskLtp(bid=188.0, ask=190.4, ltp=189.0)
+        now = datetime(2026, 7, 24, 12, 28, tzinfo=IST)
+        book._tick_watch(watch, now, quote_override=quote, check_quotes=True)
+
+        router.place_gtt_fallback_order.assert_not_called()
+        self.assertEqual(watch.phase, GttFallbackPhase.FILLED)
+
+    def test_price_cap_skips_limit_above_170(self):
+        router = MagicMock()
+        store = MagicMock()
+        rec = {
+            "intent_id": "gtt-ce",
+            "status": IntentStatus.SENT,
+            "broker_order_id": "341",
+            "payload": {"action": "ENTRY", "execution_mode": "HYBRID_GTT"},
+        }
+        store.get.return_value = rec
+        store.has_pending_intent.return_value = False
+        router.intent_store = store
+        router._try_sync_gtt_intent_fill.return_value = False
+        router.adopt_gtt_intent_from_broker_positions.return_value = False
+        router.broker.find_forever_order_by_client_id.return_value = {
+            "status": "pending",
+            "filled_size": 0,
+            "size": 30,
+            "order_id": "341",
+        }
+        router.broker.get_positions_for_recon.return_value = {}
+        router.cancel_gtt_fallback_watch.return_value = True
+        router.broker.cancel_open_day_orders_for_symbol.return_value = 0
+
+        book = GttFallbackBook(router, engine_logger=None)
+        watch = self._watch()
+        book._watches[watch.gtt_intent_id] = watch
+        # Ask 190.4 > max 170 → must not place, must cancel Forever without LIMIT.
+        quote = BidAskLtp(bid=188.0, ask=190.4, ltp=189.0)
+        now = datetime(2026, 7, 24, 12, 28, tzinfo=IST)
+        book._tick_watch(watch, now, quote_override=quote, check_quotes=True)
+
+        router.place_gtt_fallback_order.assert_not_called()
+        router.cancel_gtt_fallback_watch.assert_called()
+        self.assertEqual(watch.phase, GttFallbackPhase.CANCELLED)
+
+    def test_price_cap_allows_limit_below_170(self):
+        router = MagicMock()
+        store = MagicMock()
+        rec = {
+            "intent_id": "gtt-ce",
+            "status": IntentStatus.SENT,
+            "broker_order_id": "341",
+            "payload": {"action": "ENTRY", "execution_mode": "HYBRID_GTT"},
+        }
+        store.get.return_value = rec
+        store.has_pending_intent.return_value = False
+        store.list_by_status.return_value = []
+        router.intent_store = store
+        router._try_sync_gtt_intent_fill.return_value = False
+        router.adopt_gtt_intent_from_broker_positions.return_value = False
+        router.broker.find_forever_order_by_client_id.return_value = {
+            "status": "pending",
+            "filled_size": 0,
+            "size": 30,
+            "order_id": "341",
+        }
+        router.broker.get_positions_for_recon.return_value = {}
+        router.cancel_gtt_fallback_watch.return_value = True
+        router.broker.cancel_open_day_orders_for_symbol.return_value = 0
+        router.place_gtt_fallback_order.return_value = "fb-1"
+
+        book = GttFallbackBook(router, engine_logger=None)
+        watch = self._watch()
+        book._watches[watch.gtt_intent_id] = watch
+        quote = BidAskLtp(bid=161.0, ask=162.5, ltp=162.0)
+        now = datetime(2026, 7, 24, 12, 28, tzinfo=IST)
+        book._tick_watch(watch, now, quote_override=quote, check_quotes=True)
+
+        router.place_gtt_fallback_order.assert_called_once()
+        _args, kwargs = router.place_gtt_fallback_order.call_args
+        self.assertLess(float(kwargs["price"]), 170.0)
+        self.assertEqual(watch.phase, GttFallbackPhase.FALLBACK_SENT)
+
+    def test_gtt_still_unfilled_treats_triggered_as_filled(self):
+        router = MagicMock()
+        router.broker.find_forever_order_by_client_id.return_value = {
+            "status": "triggered",
+            "filled_size": 0,
+            "size": 30,
+        }
+        book = GttFallbackBook(router, engine_logger=None)
+        watch = self._watch()
+        self.assertFalse(book._gtt_still_unfilled(watch, None))
+
 
 if __name__ == "__main__":
     unittest.main()

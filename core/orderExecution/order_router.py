@@ -3625,21 +3625,36 @@ class OrderRouter:
         if rec.get("status") == IntentStatus.FILLED:
             return True
         broker_order_id = rec.get("broker_order_id") or watch.broker_order_id
+        forever = None
         # Resolve Forever order id from broker if local id missing (avoids
         # marking CANCELLED locally while Forever stays live → duplicate LIMITs).
-        if (
-            not broker_order_id
-            and self.broker
-            and hasattr(self.broker, "find_forever_order_by_client_id")
-        ):
+        if self.broker and hasattr(self.broker, "find_forever_order_by_client_id"):
             try:
                 forever = self.broker.find_forever_order_by_client_id(watch.gtt_intent_id)
             except Exception:
                 forever = None
             if isinstance(forever, dict):
-                broker_order_id = forever.get("order_id") or forever.get("id")
-                if broker_order_id:
+                oid = forever.get("order_id") or forever.get("id")
+                if oid and not broker_order_id:
+                    broker_order_id = oid
                     watch.broker_order_id = str(broker_order_id)
+                # Already TRIGGERED/TRADED — do not mark CANCELLED or stack a LIMIT.
+                status = str(forever.get("status") or "").lower()
+                filled = float(forever.get("filled_size") or 0)
+                size = float(forever.get("size") or 0)
+                if status in (
+                    "filled",
+                    "traded",
+                    "complete",
+                    "completed",
+                    "triggered",
+                ) or (size > 0 and filled >= size):
+                    logger.info(
+                        "GTT cancel skipped — Forever already fired intent=%s status=%s",
+                        watch.gtt_intent_id,
+                        status,
+                    )
+                    return False
         if not broker_order_id:
             logger.warning(
                 "GTT cancel skipped — no broker_order_id intent=%s reason=%s",
@@ -3676,6 +3691,19 @@ class OrderRouter:
         if store is None or watch.instrument is None:
             return None
         limit = float(price) if price is not None and float(price) > 0 else float(watch.limit_price)
+        cap = getattr(watch, "max_fallback_price", None)
+        if cap is not None:
+            try:
+                if float(limit) >= float(cap):
+                    logger.warning(
+                        "GTT fallback LIMIT blocked by price cap intent=%s price=%s max=%s",
+                        watch.gtt_intent_id,
+                        limit,
+                        cap,
+                    )
+                    return None
+            except (TypeError, ValueError):
+                pass
         meta = dict(watch.metadata_extras or {})
         meta["execution_mode"] = "LIMIT"
         meta["gtt_fallback_parent"] = watch.gtt_intent_id

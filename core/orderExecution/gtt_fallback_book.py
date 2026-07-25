@@ -13,12 +13,14 @@ Flow per leg:
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 from zoneinfo import ZoneInfo
 
@@ -29,6 +31,11 @@ IST = ZoneInfo("Asia/Kolkata")
 logger = logging.getLogger(__name__)
 
 DEFAULT_ACTIVE_UNTIL = time(15, 20)
+# Dhan Forever statuses that mean the GTT already fired (child order live/filled).
+# Placing a fallback LIMIT on top of these races into double entry.
+_FOREVER_FIRED_STATUSES = frozenset(
+    {"filled", "traded", "complete", "completed", "triggered"}
+)
 
 
 class GttFallbackPhase(str, Enum):
@@ -67,6 +74,8 @@ class GttFallbackWatch:
     candle_ts: Any = None
     symbol: str = ""
     confirm_ticks: int = 1
+    # Skip fallback LIMIT when computed premium is >= this (strictly place only if < max).
+    max_fallback_price: Optional[float] = None
     _trigger_hits: int = 0
 
 
@@ -291,6 +300,25 @@ def _fallback_limit_price(watch: GttFallbackWatch, quote: Optional[BidAskLtp]) -
     return limit
 
 
+def _parse_max_fallback_price(raw: Any) -> Optional[float]:
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return val if val > 0 else None
+
+
+def _fallback_price_allowed(watch: GttFallbackWatch, price: float) -> bool:
+    """True when fallback LIMIT premium is strictly below max_fallback_price (if set)."""
+    cap = watch.max_fallback_price
+    if cap is None:
+        return True
+    try:
+        return float(price) < float(cap)
+    except (TypeError, ValueError):
+        return False
+
+
 class GttFallbackBook:
     def __init__(
         self,
@@ -307,6 +335,622 @@ class GttFallbackBook:
         self._quote_provider: Optional[QuoteProvider] = None
         self._subscribe_cb: Optional[SubscribeCallback] = None
         self._last_tick_log: Dict[str, float] = {}
+        self._persist_path = self._resolve_persist_path(order_router)
+
+    @staticmethod
+    def _resolve_persist_path(order_router: Any) -> Path:
+        logs_root = getattr(order_router, "_logs_root", None)
+        if logs_root is None:
+            logs_root = Path(__file__).resolve().parents[2] / "logs"
+        engine_id = str(
+            getattr(order_router, "_order_state_engine_id", None)
+            or getattr(order_router, "engine_id", None)
+            or "default"
+        ).replace(" ", "_").replace("/", "_")
+        path = Path(logs_root) / f"gtt_watches_{engine_id}.json"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        return path
+
+    def _watch_to_dict(self, watch: GttFallbackWatch) -> Dict[str, Any]:
+        engine_sym = str(
+            getattr(watch.instrument, "trading_symbol", None) or ""
+        ).strip()
+        # Intent.symbol is often the underlying (BANKNIFTY); broker positions use
+        # the option contract. Prefer instrument / place-order symbol for restore.
+        if not engine_sym or engine_sym.upper() in {"BANKNIFTY", "NIFTY", "SENSEX"}:
+            engine_sym = str(watch.trading_symbol or watch.symbol or "").strip()
+        return {
+            "gtt_intent_id": watch.gtt_intent_id,
+            "strategy_id": watch.strategy_id,
+            "structure_id": watch.structure_id,
+            "trading_symbol": watch.trading_symbol,
+            "side": watch.side,
+            "limit_price": watch.limit_price,
+            "entry_date": watch.entry_date.isoformat(),
+            "trigger_field": watch.trigger_field,
+            "trigger_op": watch.trigger_op,
+            "active_until": watch.active_until.strftime("%H:%M"),
+            "phase": watch.phase.value if isinstance(watch.phase, GttFallbackPhase) else str(watch.phase),
+            "fallback_intent_id": watch.fallback_intent_id,
+            "broker_order_id": watch.broker_order_id,
+            "metadata_extras": dict(watch.metadata_extras or {}),
+            "qty": watch.qty,
+            "symbol": engine_sym,
+            "confirm_ticks": watch.confirm_ticks,
+            "max_fallback_price": watch.max_fallback_price,
+            "engine_symbol": engine_sym,
+        }
+
+    def _persist_watches(self) -> None:
+        path = self._persist_path
+        if path is None:
+            return
+        with self._lock:
+            rows = [
+                self._watch_to_dict(w)
+                for w in self._watches.values()
+                if w.phase in (GttFallbackPhase.GTT, GttFallbackPhase.FALLBACK_SENT)
+            ]
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"watches": rows}, indent=2), encoding="utf-8")
+        except OSError as exc:
+            logger.warning("GttFallback persist failed path=%s: %s", path, exc)
+
+    def _resolve_instrument(self, trading_symbol: str, engine_symbol: str = "") -> Any:
+        store = self._instrument_store
+        if store is None or not hasattr(store, "intent_creation_details"):
+            return None
+        for sym in (engine_symbol, trading_symbol):
+            s = str(sym or "").strip()
+            if not s:
+                continue
+            try:
+                from core.orderExecution.position_manager import PositionManager
+
+                opt, strike = PositionManager._extract_option_hint(s, "")
+                inst = store.intent_creation_details(s, "NSE", None, opt, strike)
+                if inst is not None:
+                    return inst
+            except Exception:
+                continue
+        return None
+
+    def _ensure_intent_stub(self, watch: GttFallbackWatch) -> Optional[Dict[str, Any]]:
+        """Rebuild a pending HYBRID_GTT ENTRY intent after process restart."""
+        router = self._router
+        store = getattr(router, "intent_store", None)
+        if store is None:
+            return None
+        iid = str(watch.gtt_intent_id or "")
+        if not iid:
+            return None
+        if store.exists(iid):
+            rec = store.get(iid)
+            if rec is not None and watch.broker_order_id and not rec.get("broker_order_id"):
+                rec["broker_order_id"] = watch.broker_order_id
+            if rec is not None and rec.get("instrument") is None and watch.instrument is not None:
+                rec["instrument"] = watch.instrument
+            return rec
+        extras = dict(watch.metadata_extras or {})
+        extras.setdefault("execution_mode", "HYBRID_GTT")
+        engine_sym = str(
+            getattr(watch.instrument, "trading_symbol", None) or ""
+        ).strip()
+        if not engine_sym or engine_sym.upper() in {"BANKNIFTY", "NIFTY", "SENSEX"}:
+            engine_sym = str(watch.trading_symbol or watch.symbol or "").strip()
+        payload = {
+            "action": "ENTRY",
+            "side": watch.side,
+            "symbol": engine_sym,
+            "trading_symbol": watch.trading_symbol,
+            "price": watch.limit_price,
+            "qty": watch.qty,
+            "strategy": watch.strategy_id,
+            "strategy_id": watch.strategy_id,
+            "structure_id": watch.structure_id,
+            "tag": "MAIN",
+            "execution_mode": "HYBRID_GTT",
+            "strategy_meta": extras,
+            "engine_id": getattr(router, "engine_id", None),
+        }
+        rec = store.create(payload=payload, intent_id=iid)
+        try:
+            store.update(iid, IntentStatus.VALIDATED)
+            store.update(
+                iid,
+                IntentStatus.SENT,
+                broker_order_id=watch.broker_order_id,
+            )
+        except ValueError:
+            pass
+        rec = store.get(iid) or rec
+        if watch.instrument is None:
+            watch.instrument = self._resolve_instrument(
+                watch.trading_symbol, engine_sym
+            )
+        if rec is not None:
+            rec["instrument"] = watch.instrument
+            rec["side"] = watch.side
+            rec["qty"] = watch.qty
+            rec["price"] = watch.limit_price
+            rec["tag"] = "MAIN"
+            rec["structure_id"] = watch.structure_id
+            rec["strategy"] = watch.strategy_id
+            rec["action"] = "ENTRY"
+            rec["broker_order_id"] = watch.broker_order_id
+            rec["strategy_meta"] = extras
+        if hasattr(router, "_set_order_state"):
+            try:
+                from core.orderExecution.order_router import OrderState
+
+                cur = getattr(router, "_order_state", {}).get(iid)
+                if cur not in (
+                    OrderState.FILLED,
+                    OrderState.CANCELLED,
+                    OrderState.REJECTED,
+                ):
+                    router._set_order_state(
+                        iid,
+                        OrderState.OPEN,
+                        action="gtt_watch_restore",
+                        message="Restored HYBRID_GTT watch after restart",
+                    )
+            except Exception:
+                pass
+        return rec
+
+    def restore_from_disk(self) -> int:
+        """Reload active watches persisted before restart; rebuild intent stubs."""
+        path = self._persist_path
+        if path is None or not path.is_file():
+            return 0
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("GttFallback restore_from_disk failed: %s", exc)
+            return 0
+        rows = data.get("watches") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return 0
+        today = datetime.now(IST).date()
+        restored = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            iid = str(row.get("gtt_intent_id") or "")
+            if not iid or iid in self._watches:
+                continue
+            phase = str(row.get("phase") or GttFallbackPhase.GTT.value).upper()
+            if phase not in (
+                GttFallbackPhase.GTT.value,
+                GttFallbackPhase.FALLBACK_SENT.value,
+            ):
+                continue
+            try:
+                entry_d = date.fromisoformat(str(row.get("entry_date") or "")[:10])
+            except ValueError:
+                entry_d = today
+            if entry_d != today:
+                continue
+            try:
+                limit_price = float(row.get("limit_price") or 0)
+            except (TypeError, ValueError):
+                continue
+            if limit_price <= 0:
+                continue
+            trading_symbol = str(row.get("trading_symbol") or "").strip()
+            if not trading_symbol:
+                continue
+            engine_sym = str(row.get("engine_symbol") or row.get("symbol") or "")
+            inst = self._resolve_instrument(trading_symbol, engine_sym)
+            try:
+                confirm_ticks = max(1, int(row.get("confirm_ticks") or 1))
+            except (TypeError, ValueError):
+                confirm_ticks = 1
+            max_fb = _parse_max_fallback_price(row.get("max_fallback_price"))
+            if max_fb is None:
+                extras = row.get("metadata_extras") or {}
+                fb = extras.get("gtt_fallback") if isinstance(extras, dict) else {}
+                if isinstance(fb, dict):
+                    max_fb = _parse_max_fallback_price(fb.get("max_fallback_price"))
+            watch = GttFallbackWatch(
+                gtt_intent_id=iid,
+                strategy_id=str(row.get("strategy_id") or ""),
+                structure_id=str(row.get("structure_id") or ""),
+                trading_symbol=trading_symbol,
+                side=str(row.get("side") or "BUY").upper(),
+                limit_price=limit_price,
+                entry_date=entry_d,
+                trigger_field=str(row.get("trigger_field") or "ask"),
+                trigger_op=str(row.get("trigger_op") or "<="),
+                active_until=_parse_hhmm(row.get("active_until"), DEFAULT_ACTIVE_UNTIL),
+                broker_order_id=str(row.get("broker_order_id") or "") or None,
+                metadata_extras=dict(row.get("metadata_extras") or {}),
+                instrument=inst,
+                qty=int(row.get("qty") or 1),
+                symbol=str(row.get("symbol") or engine_sym or ""),
+                phase=GttFallbackPhase.FALLBACK_SENT
+                if phase == GttFallbackPhase.FALLBACK_SENT.value
+                else GttFallbackPhase.GTT,
+                fallback_intent_id=str(row.get("fallback_intent_id") or "") or None,
+                confirm_ticks=confirm_ticks,
+                max_fallback_price=max_fb,
+            )
+            with self._lock:
+                self._watches[iid] = watch
+            self._ensure_intent_stub(watch)
+            restored += 1
+        if restored and self._subscribe_cb:
+            syms = list({w.trading_symbol for w in self._watches.values()})
+            try:
+                self._subscribe_cb(syms)
+            except Exception as exc:
+                logger.warning("GttFallback restore subscribe failed: %s", exc)
+        if restored:
+            self._log(
+                "gtt_fallback_restored",
+                f"restored {restored} watch(es) from disk",
+            )
+        return restored
+
+    def restore_missing_from_strategy_logs(self, *, include_filled: bool = False) -> int:
+        """
+        After a restart that wiped IntentStore, rebuild today's HYBRID_GTT watches
+        from strategy JSON logs (gtt_fallback_registered / order_placed).
+        """
+        logs_root = getattr(self._router, "_logs_root", None)
+        if logs_root is None:
+            return 0
+        order_state = getattr(self._router, "_order_state", {}) or {}
+        terminal = set()
+        try:
+            from core.orderExecution.order_router import OrderState
+
+            terminal = {
+                OrderState.FILLED,
+                OrderState.CANCELLED,
+                OrderState.REJECTED,
+            }
+        except Exception:
+            pass
+        today = datetime.now(IST).date()
+        # intent_id -> partial fields gathered from logs
+        found: Dict[str, Dict[str, Any]] = {}
+        for path in Path(logs_root).glob("*/*.log"):
+            # Skip dated rotations like BankNiftyBTST.log.2026-07-23
+            if path.suffix != ".log":
+                continue
+            try:
+                lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            except OSError:
+                continue
+            strategy_guess = path.parent.name
+            for line in lines:
+                if (
+                    "gtt_fallback_registered" not in line
+                    and "order_placed" not in line
+                    and "signal_generated" not in line
+                ):
+                    continue
+                try:
+                    evt = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(evt, dict):
+                    continue
+                ts = str(evt.get("timestamp") or "")
+                if len(ts) >= 10:
+                    try:
+                        if date.fromisoformat(ts[:10]) != today:
+                            continue
+                    except ValueError:
+                        pass
+                et = str(evt.get("event_type") or "")
+                iid = str(evt.get("intent_id") or "")
+                if not iid:
+                    continue
+                row = found.setdefault(
+                    iid, {"intent_id": iid, "strategy_id": strategy_guess}
+                )
+                if et == "gtt_fallback_registered":
+                    msg = str(evt.get("message") or "")
+                    trading_symbol = ""
+                    limit_price = 0.0
+                    if "watch=" in msg:
+                        rest = msg.split("watch=", 1)[1]
+                        if " limit=" in rest:
+                            trading_symbol, lim = rest.split(" limit=", 1)
+                            trading_symbol = trading_symbol.strip()
+                            try:
+                                limit_price = float(lim.strip())
+                            except ValueError:
+                                limit_price = 0.0
+                    if trading_symbol:
+                        row["trading_symbol"] = trading_symbol
+                    if limit_price > 0:
+                        row["limit_price"] = limit_price
+                    row["strategy_id"] = str(
+                        evt.get("strategy_id")
+                        or row.get("strategy_id")
+                        or strategy_guess
+                    )
+                    row["from_gtt_log"] = True
+                elif et == "order_placed":
+                    oid = evt.get("order_id")
+                    if oid:
+                        row["broker_order_id"] = str(oid)
+                    sym = str(evt.get("symbol") or "")
+                    if sym:
+                        row["engine_symbol"] = sym
+                elif et == "signal_generated" and str(
+                    evt.get("action") or ""
+                ).upper() == "ENTRY":
+                    try:
+                        px = float(evt.get("price") or 0)
+                    except (TypeError, ValueError):
+                        px = 0.0
+                    if px > 0:
+                        row["limit_price"] = px
+                    sym = str(evt.get("symbol") or "")
+                    if sym:
+                        row["engine_symbol"] = sym
+                    row["strategy_id"] = str(
+                        evt.get("strategy_id")
+                        or row.get("strategy_id")
+                        or strategy_guess
+                    )
+
+        restored = 0
+        for iid, row in found.items():
+            if not row.get("from_gtt_log"):
+                continue
+            if iid in self._watches:
+                continue
+            st = order_state.get(iid)
+            # include_filled=True used by bracket rebind after restart.
+            if st in terminal and not include_filled:
+                continue
+            trading_symbol = str(row.get("trading_symbol") or "").strip()
+            engine_sym = str(row.get("engine_symbol") or "")
+            try:
+                limit_price = float(row.get("limit_price") or 0)
+            except (TypeError, ValueError):
+                limit_price = 0.0
+            if not trading_symbol or limit_price <= 0:
+                continue
+            strategy_id = str(row.get("strategy_id") or "")
+            # Reconstruct BTST structure_id when possible.
+            structure_id = ""
+            opt = "CE" if "CALL" in trading_symbol.upper() or engine_sym.upper().endswith("-CE") else (
+                "PE" if "PUT" in trading_symbol.upper() or engine_sym.upper().endswith("-PE") else ""
+            )
+            if strategy_id and opt:
+                structure_id = f"{strategy_id}:BANKNIFTY:{today.isoformat()}:{opt}"
+            extras = {
+                "execution_mode": "HYBRID_GTT",
+                "gtt_fallback": {
+                    "trigger_field": "ltp",
+                    "trigger_op": ">=",
+                    "active_until": "15:20",
+                    "confirm_ticks": 2,
+                    "max_fallback_price": 170.0,
+                },
+            }
+            if strategy_id == "BankNiftyBTST" and opt:
+                extras["banknifty_btst"] = {
+                    "symbol": "BANKNIFTY",
+                    "entry_date": today.isoformat(),
+                    "option_type": opt,
+                    "ref_premium": limit_price / 1.5,
+                    "limit_price": limit_price,
+                }
+            inst = self._resolve_instrument(trading_symbol, engine_sym)
+            watch = GttFallbackWatch(
+                gtt_intent_id=iid,
+                strategy_id=strategy_id,
+                structure_id=structure_id,
+                trading_symbol=trading_symbol,
+                side="BUY",
+                limit_price=limit_price,
+                entry_date=today,
+                trigger_field="ltp",
+                trigger_op=">=",
+                active_until=DEFAULT_ACTIVE_UNTIL,
+                broker_order_id=str(row.get("broker_order_id") or "") or None,
+                metadata_extras=extras,
+                instrument=inst,
+                qty=1,
+                symbol=engine_sym or trading_symbol,
+                phase=GttFallbackPhase.GTT,
+                confirm_ticks=2,
+                max_fallback_price=170.0 if strategy_id == "BankNiftyBTST" else None,
+            )
+            with self._lock:
+                self._watches[iid] = watch
+            self._ensure_intent_stub(watch)
+            restored += 1
+        if restored:
+            self._persist_watches()
+            if self._subscribe_cb:
+                try:
+                    self._subscribe_cb(
+                        list({w.trading_symbol for w in self._watches.values()})
+                    )
+                except Exception:
+                    pass
+            self._log(
+                "gtt_fallback_restored",
+                f"restored {restored} watch(es) from strategy logs",
+            )
+        return restored
+
+    def rebind_filled_legs_for_brackets(
+        self, broker_positions: Dict[str, Any]
+    ) -> int:
+        """
+        After restart, FILLED HYBRID_GTT intents are skipped by adopt. If the broker
+        still holds the leg, re-attach ownership metadata only.
+
+        Do NOT call the MAIN fill / MAIN_SL hook here — LiveEngine's
+        ``_ensure_bracket_legs_after_reconcile`` is the single arm path. Calling
+        both produced duplicate STOPLIMIT SLs (see 2026-07-24 10:19 PE).
+        """
+        if not broker_positions:
+            return 0
+        router = self._router
+        pm = getattr(router, "position_manager", None)
+        if pm is None:
+            return 0
+        from core.utils.expiry_resolver import ExpiryResolver
+
+        # Ensure today's log-based watches exist even if already FILLED locally.
+        logs_root = getattr(router, "_logs_root", None)
+        today = datetime.now(IST).date()
+        candidates: Dict[str, Dict[str, Any]] = {}
+        with self._lock:
+            for w in self._watches.values():
+                candidates[w.gtt_intent_id] = {
+                    "intent_id": w.gtt_intent_id,
+                    "strategy_id": w.strategy_id,
+                    "structure_id": w.structure_id,
+                    "trading_symbol": w.trading_symbol,
+                    "limit_price": w.limit_price,
+                    "broker_order_id": w.broker_order_id,
+                    "metadata_extras": dict(w.metadata_extras or {}),
+                    "instrument": w.instrument,
+                    "qty": w.qty,
+                    "side": w.side,
+                }
+        if logs_root is not None:
+            # Pull FILLED legs that were dropped from the watch file after adopt.
+            self.restore_missing_from_strategy_logs(include_filled=True)
+            with self._lock:
+                for w in self._watches.values():
+                    candidates.setdefault(
+                        w.gtt_intent_id,
+                        {
+                            "intent_id": w.gtt_intent_id,
+                            "strategy_id": w.strategy_id,
+                            "structure_id": w.structure_id,
+                            "trading_symbol": w.trading_symbol,
+                            "limit_price": w.limit_price,
+                            "broker_order_id": w.broker_order_id,
+                            "metadata_extras": dict(w.metadata_extras or {}),
+                            "instrument": w.instrument,
+                            "qty": w.qty,
+                            "side": w.side,
+                        },
+                    )
+
+        rebound = 0
+        for iid, row in candidates.items():
+            trading_symbol = str(row.get("trading_symbol") or "")
+            if not trading_symbol:
+                continue
+            want = {
+                "".join(ch for ch in trading_symbol.upper() if ch.isalnum()),
+            }
+            ik = ExpiryResolver.option_identity_key(trading_symbol)
+            if ik:
+                want.add(ik)
+            matched_sym = None
+            matched_bp = None
+            for b_sym, bp in broker_positions.items():
+                try:
+                    qty = int((bp or {}).get("qty") or 0)
+                except (TypeError, ValueError):
+                    qty = 0
+                if qty == 0:
+                    continue
+                b_keys = {
+                    "".join(ch for ch in str(b_sym).upper() if ch.isalnum()),
+                }
+                bik = ExpiryResolver.option_identity_key(str(b_sym))
+                if bik:
+                    b_keys.add(bik)
+                if want & b_keys:
+                    matched_sym = str(b_sym)
+                    matched_bp = bp
+                    break
+            if not matched_sym or matched_bp is None:
+                continue
+
+            watch = GttFallbackWatch(
+                gtt_intent_id=str(iid),
+                strategy_id=str(row.get("strategy_id") or ""),
+                structure_id=str(row.get("structure_id") or ""),
+                trading_symbol=trading_symbol,
+                side=str(row.get("side") or "BUY").upper(),
+                limit_price=float(row.get("limit_price") or 0),
+                entry_date=today,
+                broker_order_id=str(row.get("broker_order_id") or "") or None,
+                metadata_extras=dict(row.get("metadata_extras") or {}),
+                instrument=row.get("instrument"),
+                qty=int(row.get("qty") or 1),
+                symbol=matched_sym,
+                phase=GttFallbackPhase.GTT,
+            )
+            if watch.instrument is None:
+                watch.instrument = self._resolve_instrument(
+                    trading_symbol, matched_sym
+                )
+            if watch.instrument is not None and matched_sym:
+                try:
+                    watch.instrument.trading_symbol = matched_sym
+                except Exception:
+                    pass
+            rec = self._ensure_intent_stub(watch)
+            if rec is None:
+                continue
+            extras = dict(row.get("metadata_extras") or {})
+            strategy = str(row.get("strategy_id") or "") or None
+            structure_id = str(row.get("structure_id") or "") or None
+            try:
+                avg = float(
+                    matched_bp.get("avg_price") or watch.limit_price or 0
+                )
+            except (TypeError, ValueError):
+                avg = float(watch.limit_price or 0)
+            try:
+                with pm._lock:
+                    pm._merge_position_metadata(
+                        matched_sym,
+                        strategy=strategy,
+                        structure_id=structure_id,
+                        tag="MAIN",
+                        intent_id=str(iid),
+                        metadata_extras=extras,
+                    )
+                    pos = pm.positions.get(matched_sym)
+                    if pos is not None:
+                        if strategy:
+                            pos.strategy = strategy
+                        if structure_id:
+                            pos.structure_id = structure_id
+                        pos.tag = "MAIN"
+                        pos.intent_id = str(iid)
+                        if avg > 0 and not float(getattr(pos, "avg_price", 0) or 0):
+                            pos.avg_price = avg
+                        if watch.instrument is not None:
+                            # Prefer resolved lot_size over bare reconcile Instrument(lot=1).
+                            try:
+                                lot = int(getattr(watch.instrument, "lot_size", 0) or 0)
+                                if lot > 1:
+                                    pos.instrument.lot_size = lot
+                            except Exception:
+                                pass
+                rebound += 1
+            except Exception as exc:
+                logger.warning(
+                    "GttFallback rebind metadata failed intent=%s: %s",
+                    iid,
+                    exc,
+                )
+        return rebound
 
     def set_quote_provider(self, provider: Optional[QuoteProvider]) -> None:
         self._quote_provider = provider
@@ -387,6 +1031,7 @@ class GttFallbackBook:
             candle_ts=candle_ts,
             symbol=str(getattr(intent, "symbol", "") or ""),
             confirm_ticks=confirm_ticks,
+            max_fallback_price=_parse_max_fallback_price(fb.get("max_fallback_price")),
         )
         with self._lock:
             self._watches[watch.gtt_intent_id] = watch
@@ -395,6 +1040,7 @@ class GttFallbackBook:
                 self._subscribe_cb([watch.trading_symbol])
             except Exception as exc:
                 logger.warning("GttFallback subscribe failed: %s", exc)
+        self._persist_watches()
         self._log(
             "gtt_fallback_registered",
             f"watch={watch.trading_symbol} limit={watch.limit_price}",
@@ -414,6 +1060,7 @@ class GttFallbackBook:
             if w is None:
                 return
             w.phase = GttFallbackPhase.FILLED
+        self._persist_watches()
 
     def cancel_watch(self, intent_id: str, *, reason: str = "cancelled") -> None:
         with self._lock:
@@ -421,6 +1068,7 @@ class GttFallbackBook:
             if w is None:
                 return
             w.phase = GttFallbackPhase.CANCELLED
+        self._persist_watches()
         self._log("gtt_fallback_cancelled", reason, intent_id=intent_id)
 
     def cancel_all_for_strategy(self, strategy_id: str, *, trade_date: Optional[date] = None) -> int:
@@ -518,9 +1166,13 @@ class GttFallbackBook:
                     symbol=str(payload.get("symbol") or rec.get("symbol") or ""),
                     phase=GttFallbackPhase.GTT,
                     confirm_ticks=confirm_ticks,
+                    max_fallback_price=_parse_max_fallback_price(
+                        fb.get("max_fallback_price")
+                    ),
                 )
                 with self._lock:
                     self._watches[iid] = watch
+                self._ensure_intent_stub(watch)
                 restored += 1
         if restored and self._subscribe_cb:
             syms = list({w.trading_symbol for w in self._watches.values()})
@@ -528,6 +1180,8 @@ class GttFallbackBook:
                 self._subscribe_cb(syms)
             except Exception as exc:
                 logger.warning("GttFallback restore subscribe failed: %s", exc)
+        if restored:
+            self._persist_watches()
         return restored
 
     def tick(self, now_ist: Optional[datetime] = None) -> None:
@@ -667,22 +1321,7 @@ class GttFallbackBook:
         # Broker position truth is checked here (rather than on every quote) because
         # a Forever fill can reach Dhan positions before its order/fill update reaches
         # the local PositionManager.
-        if self._broker_position_open(watch):
-            if self._adopt_fill_from_broker(watch, rec):
-                self.on_fill(watch.gtt_intent_id)
-                self._log(
-                    "gtt_fallback_position_detected",
-                    f"adopted fill + skip LIMIT; broker position already open "
-                    f"{watch.trading_symbol}",
-                    intent_id=watch.gtt_intent_id,
-                )
-                return
-            self._log(
-                "gtt_fallback_position_detected",
-                f"broker position open but adopt failed; keep watching "
-                f"{watch.trading_symbol}",
-                intent_id=watch.gtt_intent_id,
-            )
+        if self._adopt_if_already_in(watch, rec):
             return
         if not self._gtt_still_unfilled(watch, rec):
             if self._adopt_fill_from_broker(watch, rec):
@@ -701,34 +1340,63 @@ class GttFallbackBook:
             if self._adopt_fill_from_broker(watch, rec):
                 self.on_fill(watch.gtt_intent_id)
             return
-        if self._broker_position_open(watch):
-            if self._adopt_fill_from_broker(watch, rec):
-                self.on_fill(watch.gtt_intent_id)
-                self._log(
-                    "gtt_fallback_position_detected",
-                    f"adopted fill + skip LIMIT; broker position already open "
-                    f"{watch.trading_symbol}",
-                    intent_id=watch.gtt_intent_id,
-                )
-            else:
-                self._log(
-                    "gtt_fallback_position_detected",
-                    f"broker position open but adopt failed; keep watching "
-                    f"{watch.trading_symbol}",
-                    intent_id=watch.gtt_intent_id,
-                )
+        if self._adopt_if_already_in(watch, rec):
+            return
+
+        # Price-cap check BEFORE cancelling Forever so we do not abandon GTT
+        # only to refuse the LIMIT (Jul 24 CE chased ask @190).
+        fallback_price = _fallback_limit_price(watch, quote)
+        if not _fallback_price_allowed(watch, fallback_price):
+            self._log(
+                "gtt_fallback_price_cap_skip",
+                f"skip LIMIT @ {fallback_price} "
+                f"(max_fallback_price={watch.max_fallback_price}) "
+                f"{watch.trading_symbol}",
+                intent_id=watch.gtt_intent_id,
+            )
+            # If Forever already fired, adopt; else cancel Forever + watch — do not chase.
+            if self._forever_already_fired(watch) or self._broker_position_open(watch):
+                if self._adopt_fill_from_broker(watch, rec):
+                    self.on_fill(watch.gtt_intent_id)
+                return
+            router.cancel_gtt_fallback_watch(watch, reason="fallback_price_cap")
+            self._cancel_open_child_day_orders(watch)
+            self.cancel_watch(watch.gtt_intent_id, reason="fallback_price_cap")
             return
 
         if watch.phase == GttFallbackPhase.GTT:
             cancelled = router.cancel_gtt_fallback_watch(watch, reason="fallback_trigger")
             if not cancelled:
-                # Cancel failed — do not place LIMIT on top of live Forever order.
+                # Cancel failed OR Forever already TRIGGERED/filled — adopt, never stack LIMIT.
+                if self._adopt_fill_from_broker(watch, rec):
+                    self.on_fill(watch.gtt_intent_id)
+                    self._log(
+                        "gtt_fallback_triggered_adopt",
+                        f"Forever already fired; skip LIMIT {watch.trading_symbol}",
+                        intent_id=watch.gtt_intent_id,
+                    )
+                    return
                 self._log(
                     "gtt_fallback_cancel_failed",
                     f"skip LIMIT; Forever still open {watch.trading_symbol}",
                     intent_id=watch.gtt_intent_id,
                 )
                 return
+
+        # Post-cancel race: Forever child may have filled while we cancelled parent.
+        if self._adopt_if_already_in(watch, store.get(watch.gtt_intent_id) if store else None):
+            return
+        self._cancel_open_child_day_orders(watch)
+        if self._broker_position_open(watch):
+            if self._adopt_fill_from_broker(watch, rec):
+                self.on_fill(watch.gtt_intent_id)
+                self._log(
+                    "gtt_fallback_position_detected",
+                    f"adopted fill after Forever cancel; skip LIMIT "
+                    f"{watch.trading_symbol}",
+                    intent_id=watch.gtt_intent_id,
+                )
+            return
 
         if watch.fallback_intent_id:
             return
@@ -757,7 +1425,19 @@ class GttFallbackBook:
                 if pending_fb:
                     return
 
+        # Recompute ask after cancel; re-check price cap on the final quote.
         fallback_price = _fallback_limit_price(watch, quote)
+        if not _fallback_price_allowed(watch, fallback_price):
+            self._log(
+                "gtt_fallback_price_cap_skip",
+                f"skip LIMIT @ {fallback_price} after cancel "
+                f"(max_fallback_price={watch.max_fallback_price}) "
+                f"{watch.trading_symbol}",
+                intent_id=watch.gtt_intent_id,
+            )
+            self.cancel_watch(watch.gtt_intent_id, reason="fallback_price_cap")
+            return
+
         fallback_id = router.place_gtt_fallback_order(watch, price=fallback_price)
         if fallback_id:
             watch.phase = GttFallbackPhase.FALLBACK_SENT
@@ -769,6 +1449,85 @@ class GttFallbackBook:
                 intent_id=fallback_id,
                 parent_intent_id=watch.gtt_intent_id,
             )
+
+    def _adopt_if_already_in(
+        self, watch: GttFallbackWatch, rec: Optional[Dict]
+    ) -> bool:
+        """Adopt + complete watch when broker already has the leg or Forever fired."""
+        if not (
+            self._broker_position_open(watch) or self._forever_already_fired(watch)
+        ):
+            return False
+        if self._adopt_fill_from_broker(watch, rec):
+            self.on_fill(watch.gtt_intent_id)
+            self._log(
+                "gtt_fallback_position_detected",
+                f"adopted fill + skip LIMIT; broker already in "
+                f"{watch.trading_symbol}",
+                intent_id=watch.gtt_intent_id,
+            )
+            return True
+        self._log(
+            "gtt_fallback_position_detected",
+            f"broker already in but adopt failed; keep watching "
+            f"{watch.trading_symbol}",
+            intent_id=watch.gtt_intent_id,
+        )
+        return True
+
+    def _forever_already_fired(self, watch: GttFallbackWatch) -> bool:
+        """True when Dhan Forever is TRIGGERED/TRADED (child may be live or filled)."""
+        broker = getattr(self._router, "broker", None)
+        if not broker or not hasattr(broker, "find_forever_order_by_client_id"):
+            return False
+        try:
+            order = broker.find_forever_order_by_client_id(watch.gtt_intent_id)
+        except Exception:
+            return False
+        if not order:
+            return False
+        status = str(order.get("status") or "").lower()
+        filled = float(order.get("filled_size") or 0)
+        size = float(order.get("size") or 0)
+        if status in _FOREVER_FIRED_STATUSES:
+            return True
+        return size > 0 and filled >= size
+
+    def _cancel_open_child_day_orders(self, watch: GttFallbackWatch) -> int:
+        """
+        Cancel resting day BUY/SELL orders on this contract left by a Forever child
+        (often correlationId=NR) so fallback LIMIT cannot stack on top.
+        """
+        broker = getattr(self._router, "broker", None)
+        cancel_fn = getattr(broker, "cancel_open_day_orders_for_symbol", None)
+        if not callable(cancel_fn):
+            return 0
+        try:
+            n = int(
+                cancel_fn(
+                    watch.trading_symbol,
+                    side=str(watch.side or "BUY").upper(),
+                    exclude_order_ids={
+                        str(watch.broker_order_id or ""),
+                        str(watch.fallback_intent_id or ""),
+                    },
+                )
+                or 0
+            )
+        except Exception as exc:
+            logger.warning(
+                "GTT child day-order cancel failed sym=%s: %s",
+                watch.trading_symbol,
+                exc,
+            )
+            return 0
+        if n:
+            self._log(
+                "gtt_fallback_child_cancelled",
+                f"cancelled {n} open day order(s) on {watch.trading_symbol}",
+                intent_id=watch.gtt_intent_id,
+            )
+        return n
 
     def _structure_filled(self, watch: GttFallbackWatch) -> bool:
         pm = getattr(self._router, "position_manager", None)
@@ -912,9 +1671,13 @@ class GttFallbackBook:
                 status = str(order.get("status") or "").lower()
                 filled = float(order.get("filled_size") or 0)
                 size = float(order.get("size") or 0)
-                if status == "filled" or (size > 0 and filled >= size):
+                # TRIGGERED = Forever fired (child live/filled) — never treat as unfilled.
+                if status in _FOREVER_FIRED_STATUSES or (
+                    size > 0 and filled >= size
+                ):
                     return False
                 if status in ("cancelled", "rejected", "expired"):
+                    # Terminal without fill → eligible for fallback LIMIT.
                     return True
                 return True
         if rec and rec.get("status") in (

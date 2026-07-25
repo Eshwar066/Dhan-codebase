@@ -28,12 +28,14 @@ class DhanBrokerApi:
         tag: Optional[str] = None,
         correlation_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        # Keep floats: option SL ticks are 0.05. int() collapses 72.85/72.9 → 72/72
+        # and Dhan rejects with DH-906 (trigger must be strictly greater than price).
         return self._source.place_order(
             tradingsymbol=tradingsymbol,
             exchange=exchange,
             quantity=quantity,
-            price=int(price),
-            trigger_price=int(trigger_price),
+            price=float(price or 0),
+            trigger_price=float(trigger_price or 0),
             order_type=order_type,
             transaction_type=transaction_type,
             trade_type=trade_type,

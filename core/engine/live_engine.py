@@ -521,6 +521,35 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         strategy_obj = self._strategy_obj_for_name(strategy_name)
         if strategy_obj is None:
             return
+        # Deduplicate concurrent MAIN_SL arms for the same structure (rebind+ensure race).
+        sid = str(kwargs.get("structure_id") or "").strip()
+        if sid:
+            armed = getattr(self, "_main_sl_arm_inflight", None)
+            if armed is None:
+                self._main_sl_arm_inflight = set()
+                armed = self._main_sl_arm_inflight
+            if sid in armed:
+                return
+            intent_store = getattr(self.order_router, "intent_store", None)
+            if intent_store is not None and intent_store.has_pending_intent(
+                str(strategy_name or ""),
+                sid,
+                tags=["MAIN_SL"],
+                actions=["FORCE_EXIT"],
+            ):
+                return
+            armed.add(sid)
+        try:
+            self._on_pm_main_entry_fill_impl(**kwargs)
+        finally:
+            if sid:
+                getattr(self, "_main_sl_arm_inflight", set()).discard(sid)
+
+    def _on_pm_main_entry_fill_impl(self, **kwargs: Any) -> None:
+        strategy_name = kwargs.get("strategy")
+        strategy_obj = self._strategy_obj_for_name(strategy_name)
+        if strategy_obj is None:
+            return
         fn = getattr(strategy_obj, "on_main_entry_filled", None)
         if not callable(fn):
             return
@@ -1266,6 +1295,20 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             candle_ts = dt.datetime.now(dt.timezone.utc)
             inst = pos.instrument
             lot_size = max(1, int(getattr(inst, "lot_size", 0) or 1))
+            # Bare broker-reconcile Instrument often defaults lot_size=1; prefer store.
+            if lot_size <= 1 and self.instrument_store is not None:
+                try:
+                    resolved = self.instrument_store.intent_creation_details(
+                        str(sym), "NSE", None, None, None
+                    )
+                    if resolved is not None:
+                        lot_size = max(
+                            1, int(getattr(resolved, "lot_size", 0) or lot_size)
+                        )
+                        if getattr(inst, "lot_size", 1) in (0, 1) and lot_size > 1:
+                            inst.lot_size = lot_size
+                except Exception:
+                    pass
             fill_qty = max(1, abs(int(pos.net_qty)) // lot_size)
             self._on_pm_main_entry_fill(
                 instrument=inst,
@@ -2527,7 +2570,42 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             book.set_quote_provider(CompositeQuoteProvider(*providers))
         book.set_subscribe_callback(self._gtt_fallback_subscribe)
         try:
-            book.restore_from_intent_store()
+            n_store = book.restore_from_intent_store()
+            n_disk = book.restore_from_disk()
+            n_logs = book.restore_missing_from_strategy_logs()
+            if (n_store or n_disk or n_logs) and self.engine_logger:
+                self.engine_logger.reconciliation(
+                    f"GTT watches restored store={n_store} disk={n_disk} logs={n_logs}"
+                )
+            adopt_fn = getattr(
+                self.order_router, "adopt_pending_entries_from_broker_positions", None
+            )
+            broker = getattr(self.order_router, "broker", None)
+            positions = {}
+            if broker is not None and hasattr(broker, "get_positions_for_recon"):
+                try:
+                    positions = broker.get_positions_for_recon() or {}
+                except Exception:
+                    positions = {}
+            if callable(adopt_fn) and positions:
+                n = adopt_fn(positions)
+                if n and self.engine_logger:
+                    self.engine_logger.reconciliation(
+                        f"Adopted {n} pending GTT ENTRY fill(s) after watch restore"
+                    )
+            # FILLED GTT intents skipped by adopt still need ownership + MAIN_SL.
+            rebind = getattr(book, "rebind_filled_legs_for_brackets", None)
+            if callable(rebind) and positions:
+                try:
+                    n_rebind = rebind(positions)
+                    if n_rebind and self.engine_logger:
+                        self.engine_logger.reconciliation(
+                            f"Rebound {n_rebind} filled GTT leg(s) for bracket re-arm"
+                        )
+                except Exception as exc:
+                    logger.warning("GttFallback filled-leg rebind failed: %s", exc)
+            if positions:
+                self._ensure_bracket_legs_after_reconcile()
         except Exception as exc:
             logger.warning("GttFallbackBook restore failed: %s", exc)
 

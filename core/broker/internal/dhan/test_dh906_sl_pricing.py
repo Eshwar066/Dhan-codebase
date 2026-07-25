@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+from core.broker.internal.dhan.api import DhanBrokerApi
 from core.broker.internal.dhan.broker import _order_intent_to_payload, _quantize_order_prices
 
 
@@ -48,6 +50,25 @@ class TestDh906SlPricing(unittest.TestCase):
         self.assertGreater(
             float(payload["trigger_price"]), float(payload["price"])
         )
+
+    def test_place_order_api_preserves_decimal_ticks(self):
+        """Regression: int(price) collapsed 72.85/72.9 → 72/72 → DH-906."""
+        source = MagicMock()
+        source.place_order.return_value = {"status": "success", "order_id": "1"}
+        api = DhanBrokerApi(source)
+        api.place_order(
+            tradingsymbol="BANKNIFTY 28 JUL 55900 PUT",
+            exchange="NFO",
+            quantity=30,
+            price=72.85,
+            trigger_price=72.9,
+            order_type="STOPLIMIT",
+            transaction_type="SELL",
+        )
+        kwargs = source.place_order.call_args.kwargs
+        self.assertEqual(kwargs["price"], 72.85)
+        self.assertEqual(kwargs["trigger_price"], 72.9)
+        self.assertGreater(kwargs["trigger_price"], kwargs["price"])
 
 
 if __name__ == "__main__":

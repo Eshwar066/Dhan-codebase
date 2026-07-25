@@ -39,7 +39,8 @@ LIMIT_PREM_MULT = 1.5
 SL_OF_LIMIT = 0.5
 # Live ENTRY: Dhan Forever (GTT) + engine watch (HYBRID_GTT).
 # Watch fires when premium (LTP) reaches GTT price from below; if Forever
-# still unfilled, cancel THAT leg's GTT only and place resting LIMIT at best ask/bid.
+# still unfilled, cancel THAT leg's GTT only and place resting LIMIT at best ask/bid
+# only when ask/ltp < max_fallback_price (170). Never place on top of TRIGGERED Forever.
 # The other leg (e.g. PE) stays on Forever until 15:20.
 # After MAIN fill: place SL (STOPLIMIT) on that position.
 ENTRY_EXECUTION_MODE = "HYBRID_GTT"
@@ -229,12 +230,23 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         if structure_id in self._meta_by_structure_id:
             return True
         try:
+            limit_price = float(raw["limit_price"])
+            ref_raw = raw.get("ref_premium")
+            if ref_raw is None or float(ref_raw) <= 0:
+                # Recovered GTT watches may only persist limit (= ref × LIMIT_PREM_MULT).
+                ref_premium = (
+                    limit_price / float(LIMIT_PREM_MULT)
+                    if float(LIMIT_PREM_MULT) > 0
+                    else limit_price
+                )
+            else:
+                ref_premium = float(ref_raw)
             meta = _BtstLegMeta(
                 symbol=str(raw["symbol"]),
                 entry_date=date.fromisoformat(str(raw["entry_date"])),
                 option_type=str(raw["option_type"]),
-                ref_premium=float(raw["ref_premium"]),
-                limit_price=float(raw["limit_price"]),
+                ref_premium=ref_premium,
+                limit_price=limit_price,
             )
         except (KeyError, TypeError, ValueError):
             return False
@@ -483,6 +495,8 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
                 "trigger_op": ">=",
                 "active_until": CANCEL_TIME.strftime("%H:%M"),
                 "confirm_ticks": 2,
+                # Do not chase premium: fallback LIMIT only if ask/ltp < 170.
+                "max_fallback_price": 170.0,
             }
 
         return self.create_order_intent(
@@ -864,6 +878,9 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
         if not structure_id or not intent_id:
             return []
         sid = str(structure_id)
+        # Idempotent: never arm a second MAIN_SL for the same structure.
+        if self._has_resting_main_sl(ctx, sid):
+            return []
         self._ensure_btst_meta_for_main_fill(
             sid, instrument, ctx, intent_id, metadata_extras
         )

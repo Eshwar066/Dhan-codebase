@@ -1104,12 +1104,16 @@ class DhanSource:
         Returns dict with "status" ("success" | "error"), "order_id", and on failure
         "message" + "payload" for OMS/engine logs.
         """
+        # Preserve decimal ticks (NFO options use 0.05). Truncating with int()
+        # turns SELL stop-limits like price=72.85 trigger=72.9 into 72/72 → DH-906.
+        px = float(price or 0)
+        trig = float(trigger_price or 0)
         request_payload = {
             "tradingsymbol": tradingsymbol,
             "exchange": str(exchange).upper(),
             "quantity": int(quantity),
-            "price": int(price) if price else 0,
-            "trigger_price": int(trigger_price) if trigger_price else 0,
+            "price": px,
+            "trigger_price": trig,
             "order_type": str(order_type).upper(),
             "transaction_type": str(transaction_type).upper(),
             "trade_type": str(trade_type).upper(),
@@ -1127,8 +1131,8 @@ class DhanSource:
                 tradingsymbol=tradingsymbol,
                 exchange=exchange.upper(),
                 quantity=int(quantity),
-                price=int(price) if price else 0,
-                trigger_price=int(trigger_price) if trigger_price else 0,
+                price=px,
+                trigger_price=trig,
                 order_type=order_type.upper(),
                 transaction_type=transaction_type.upper(),
                 trade_type=trade_type.upper(),

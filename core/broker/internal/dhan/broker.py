@@ -814,7 +814,10 @@ class DhanBroker(BaseBroker):
             )
         except (TypeError, ValueError):
             filled = 0.0
-        traded_statuses = {"traded", "complete", "completed"}
+        # Dhan Forever: TRIGGERED means the GTT fired (child LIMIT placed). Treat as
+        # filled for OMS adopt — status often stays TRIGGERED while the child is TRADED
+        # with correlationId=NR, so client-id fill lookup alone will miss the entry.
+        traded_statuses = {"traded", "complete", "completed", "triggered"}
         if status in traded_statuses and filled <= 0 and qty > 0:
             filled = qty
         if filled <= 0 and status in traded_statuses:
@@ -895,6 +898,7 @@ class DhanBroker(BaseBroker):
         """Pending Forever (GTT) orders for reconciliation (not in regular order book)."""
         closed_statuses = {
             "traded",
+            "triggered",
             "cancelled",
             "rejected",
             "expired",
@@ -1079,6 +1083,73 @@ class DhanBroker(BaseBroker):
                 "status": status or "open",
             })
         return out
+
+    def cancel_open_day_orders_for_symbol(
+        self,
+        trading_symbol: str,
+        *,
+        side: Optional[str] = None,
+        exclude_order_ids: Optional[set] = None,
+    ) -> int:
+        """
+        Cancel resting day orders on ``trading_symbol`` (Forever child LIMITs often
+        land with correlationId=NR and would otherwise stack under a fallback LIMIT).
+        """
+        want = "".join(ch for ch in str(trading_symbol or "").upper() if ch.isalnum())
+        if not want:
+            return 0
+        side_u = str(side or "").upper()
+        exclude = {str(x) for x in (exclude_order_ids or set()) if x}
+        closed = {
+            "filled",
+            "cancelled",
+            "rejected",
+            "complete",
+            "completed",
+            "trigger cancelled",
+            "traded",
+            "expired",
+        }
+        cancelled = 0
+        try:
+            orders = self.api.get_order_list() or []
+        except Exception as exc:
+            logger.warning("Dhan get_order_list for child cancel failed: %s", exc)
+            return 0
+        for o in orders if isinstance(orders, list) else []:
+            if not isinstance(o, dict):
+                continue
+            status = str(o.get("orderStatus") or o.get("status") or "").lower()
+            if status in closed:
+                continue
+            sym = str(
+                o.get("tradingSymbol")
+                or o.get("trading_symbol")
+                or o.get("securityId")
+                or ""
+            )
+            key = "".join(ch for ch in sym.upper() if ch.isalnum())
+            if key != want:
+                continue
+            txn = str(
+                o.get("transactionType")
+                or o.get("transaction_type")
+                or o.get("side")
+                or ""
+            ).upper()
+            if side_u and txn and side_u not in txn and txn not in side_u:
+                # Dhan uses BUY/SELL; tolerate B/S abbreviations.
+                if not (
+                    (side_u == "BUY" and txn.startswith("B"))
+                    or (side_u == "SELL" and txn.startswith("S"))
+                ):
+                    continue
+            oid = str(o.get("orderId") or o.get("order_id") or "").strip()
+            if not oid or oid in exclude:
+                continue
+            if self.cancel_order_by_id(oid, reason="gtt_fallback_child"):
+                cancelled += 1
+        return cancelled
 
     def note_dhan_modify(self, broker_order_id: str) -> bool:
         """
