@@ -2,13 +2,14 @@
 
 BTC SuperTrend **directional option selling** on Delta Exchange.
 
-Sells puts when bullish, sells calls when bearish. Runs **three sleeves in parallel** (each can be open at the same time):
+Sells puts when bullish, sells calls when bearish. Runs **four sleeves in parallel** (each can be open at the same time):
 
 | Sleeve | `structure_id` token | Enable switch |
 |--------|----------------------|---------------|
 | **Weekly** | `weekly` | `ENABLE_WEEKLY_TRADES` |
+| **Monthly** | `monthly` | `ENABLE_MONTHLY_TRADES` |
 | **Daily** | `daily` | `ENABLE_INTRADAY_TRADES` |
-| **Morning** | `morning` | `ENABLE_MORNING_TRADES` |
+| **Morning** | `morning` | `ENABLE_MORNING_0DTE_TRADES` |
 
 When a switch is `False`, that sleeve takes **no new entries and no SL re-entries**. Open positions still trail SL, force-exit, reverse, and roll as usual.
 
@@ -38,31 +39,31 @@ SuperTrend params: length **16**, factor **1.5**.
 
 ## Sleeve comparison (lifecycle)
 
-| Topic | Weekly | Daily | Morning |
-|-------|--------|-------|---------|
-| **Enable flag** | `ENABLE_WEEKLY_TRADES` | `ENABLE_INTRADAY_TRADES` | `ENABLE_MORNING_TRADES` |
-| **Lots** | `ORDER_QTY_LOTS_WEEKLY` (10) | `ORDER_QTY_LOTS_DAILY` (10) | `ORDER_QTY_LOTS_MORNING` (10) |
-| **When it can enter** | On closed 1H bar, while 1D + 4H already agree | On closed 1H bar, **only** on a confirmed **1H ST flip** | Once per day on the **08:30 IST** closed 1H bar |
-| **Signal / direction** | Color of aligned 1D + 4H | Confirmed 1H SuperTrend after flip | Current confirmed 1H SuperTrend (no flip required) |
-| **HTF filter (1D + 4H)** | **Required** (1D must equal 4H) | **Required** (both must match 1H direction) | **None** — 1H only |
-| **Strike reference ST** | **4H** SuperTrend | **1H** SuperTrend | **1H** SuperTrend |
-| **Expiry** | Friday weekly; if DTE ≤ 2 → next Friday (min DTE **3**) | Before 17:25 IST → **0DTE**; at/after → **1DTE** | Always prefer **today 0DTE** |
-| **Qty / premium** | OTM, outside ST, premium ≥ **$120** | Same (≥ **$120**); also `|strike−spot| ≥ **400**` | Same rules, premium ≥ **$20**; also `|strike−spot| ≥ **400**` |
-| **Duplicate guard** | No open weekly sleeve; skip if same Friday already open | No open daily sleeve; skip if same contract already open | No open morning sleeve; skip if same 0DTE expiry already open |
-| **Entry reason tag** | `weekly_htf_aligned` | `one_h_signal` | `morning_830` |
+| Topic | Weekly | Monthly | Daily | Morning |
+|-------|--------|---------|-------|---------|
+| **Enable flag** | `ENABLE_WEEKLY_TRADES` | `ENABLE_MONTHLY_TRADES` | `ENABLE_INTRADAY_TRADES` | `ENABLE_MORNING_0DTE_TRADES` |
+| **Lots** | `ORDER_QTY_LOTS_WEEKLY` (50) | Same as weekly | `ORDER_QTY_LOTS_DAILY` (10) | `ORDER_QTY_LOTS_MORNING` (10) |
+| **When it can enter** | On **closed 4H bar**, while 1D + 4H already agree | On closed 1H bar, **only** on a confirmed **1D ST flip** | On closed 1H bar, **only** on a confirmed **1H ST flip** | Once per day on the **09:30 IST** closed 1H bar |
+| **Signal / direction** | Color of aligned 1D + 4H | New 1D SuperTrend after flip | Confirmed 1H SuperTrend after flip | Current confirmed 1H SuperTrend (no flip required) |
+| **HTF filter (1D + 4H)** | **Required** (1D must equal 4H) | **None** (flip is the filter) | **Required** (both must match 1H direction) | **None** — 1H only |
+| **Strike reference ST** | **4H** SuperTrend | **4H** SuperTrend | **1H** SuperTrend | **1H** SuperTrend |
+| **Expiry** | Friday weekly; if DTE ≤ 2 → next Friday (min DTE **3**) | Monthly last Friday; if DTE &lt; **7** → next month | Before 17:25 IST → **0DTE**; at/after → **1DTE** | Always prefer **today 0DTE** |
+| **Qty / premium** | OTM, outside ST, premium ≥ **$120**; deeper OTM if enabled | Same as weekly | Same (≥ **$120**); also `|strike−spot| ≥ **400**` | Same rules, premium ≥ **$20**; also `|strike−spot| ≥ **400**` |
+| **Duplicate guard** | No open weekly sleeve; skip if same Friday already open | No open monthly sleeve; skip if same expiry already open | No open daily sleeve; skip if same contract already open | No open morning sleeve; skip if same 0DTE expiry already open |
+| **Entry reason tag** | `weekly_htf_aligned` | `one_d_signal` | `one_h_signal` | `morning_830` |
 
 ---
 
 ## Exits by sleeve
 
-| Exit type | Weekly | Daily | Morning |
-|-----------|--------|-------|---------|
-| **Signal / regime exit** | 1D **or** 4H no longer matches open weekly direction → `MAIN_EXIT` (`weekly_htf_misaligned`) | Confirmed **1H ST flip** against open daily direction → `MAIN_EXIT` (`one_h_reversal`) | Confirmed **1H ST flip** against open morning direction → `MAIN_EXIT` (`morning_one_h_reversal`) |
-| **Broker trail SL** | Starts at **2× entry premium** (`mark_price`); switches once to **4H ST ± 100** (`spot_price`) when short is green and ST moved favorably | Same → **1H ST ± 100** | Same → **1H ST ± 100** |
-| **Force exit (strategy)** | Spot hits **4H ST ± 300** → LIMIT exit | Spot hits **1H ST ± 300** → LIMIT exit | Spot hits **1H ST ± 300** → LIMIT exit |
-| **Strike proximity** | Spot within **±50** of option strike → LIMIT exit | Same | Same |
-| **17:25 IST rollover** | Only if holding **today’s** daily expiry (unusual for weekly Friday) → exit + next daily | If holding **today’s** expiry → exit + roll next day (≥ 200 pts from ST) | If still open on **today’s** 0DTE → **flat EXIT only** (`morning_0dte_flat`) — **no** next-expiry roll |
-| **Mid-bar / flicker** | Ignores unconfirmed 1H flicker; weekly cares about HTF | 1H flip needs **close confirmation** on new side of ST | Same close-confirmation rule as daily |
+| Exit type | Weekly | Monthly | Daily | Morning |
+|-----------|--------|---------|-------|---------|
+| **Signal / regime exit** | 1D **or** 4H no longer matches open weekly direction → `MAIN_EXIT` (`weekly_htf_misaligned`) | Confirmed **1D ST flip** against open monthly → `MAIN_EXIT` (`one_d_reversal`) | Confirmed **1H ST flip** against open daily direction → `MAIN_EXIT` (`one_h_reversal`) | Confirmed **1H ST flip** against open morning direction → `MAIN_EXIT` (`morning_one_h_reversal`) |
+| **Broker trail SL** | Starts at **2× entry premium**; switches once to **4H ST ± 100** when green + ST favorable | Same as weekly (4H) | Same → **1H ST ± 100** | Same → **1H ST ± 100** |
+| **Force exit (strategy)** | Spot hits **4H ST ± 300** → LIMIT exit | Same (4H) | Spot hits **1H ST ± 300** → LIMIT exit | Spot hits **1H ST ± 300** → LIMIT exit |
+| **Strike proximity** | Spot within **±50** of option strike → LIMIT exit | Same | Same | Same |
+| **17:25 IST rollover** | Only if holding **today’s** daily expiry (unusual for weekly Friday) → exit + next daily | Unlikely (monthly expiry) | If holding **today’s** expiry → exit + roll next day (≥ 200 pts from ST) | If still open on **today’s** 0DTE → **flat EXIT only** (`morning_0dte_flat`) — **no** next-expiry roll |
+| **Mid-bar / flicker** | Ignores unconfirmed 1H flicker; weekly cares about HTF | 1D flip seen on next closed 1H after HTF refresh | 1H flip needs **close confirmation** on new side of ST | Same close-confirmation rule as daily |
 
 After a signal exit (`MAIN_EXIT`), the sleeve usually **transitions**: cancel resting `MAIN_SL`, exit, then re-open in the new direction for **that same sleeve** (if its enable flag is on).
 
@@ -72,14 +73,14 @@ After a signal exit (`MAIN_EXIT`), the sleeve usually **transitions**: cancel re
 
 After broker `MAIN_SL` fill, strategy force-exit, or other full close that arms reentry:
 
-| Step | Weekly | Daily | Morning |
-|------|--------|-------|---------|
-| **Arm** | `_arm_sl_reentry(..., sleeve=weekly)` | `sleeve=daily` | `sleeve=morning` |
-| **When it fires** | Next **closed 1H bar** after the exit time | Same | Same |
-| **Direction** | Prefer live **4H** direction if known; else current 1H | Current confirmed **1H** | Current confirmed **1H** |
-| **HTF on reentry** | Must still pass weekly 1D+4H align inside `_build_entry` | Must still pass daily 1D+4H vs 1H filter | **No** HTF check |
-| **Expiry on reentry** | Weekly Friday (DTE ≥ 3) | 0DTE / 1DTE via clock (≥ 17:25 → 1DTE) | Force **0DTE** (`min_dte=0`) |
-| **Gated by** | `ENABLE_WEEKLY_TRADES` | `ENABLE_INTRADAY_TRADES` | `ENABLE_MORNING_TRADES` |
+| Step | Weekly | Monthly | Daily | Morning |
+|------|--------|---------|-------|---------|
+| **Arm** | `_arm_sl_reentry(..., sleeve=weekly)` | `sleeve=monthly` | `sleeve=daily` | `sleeve=morning` |
+| **When it fires** | Next **closed 4H bar** after the exit time | Next **closed 1H bar** after the exit time | Same | Same |
+| **Direction** | Prefer live **4H** direction if known; else current 1H | Prefer live **1D** direction if known; else current 1H | Current confirmed **1H** | Current confirmed **1H** |
+| **HTF on reentry** | Must still pass weekly 1D+4H align inside `_build_entry` | No continuous align (flip-only sleeve) | Must still pass daily 1D+4H vs 1H filter | **No** HTF check |
+| **Expiry on reentry** | Weekly Friday (DTE ≥ 3) | Monthly last Friday (DTE ≥ 7) | 0DTE / 1DTE via clock (≥ 17:25 → 1DTE) | Force **0DTE** (`min_dte=0`) |
+| **Gated by** | `ENABLE_WEEKLY_TRADES` | `ENABLE_MONTHLY_TRADES` | `ENABLE_INTRADAY_TRADES` | `ENABLE_MORNING_0DTE_TRADES` |
 | **Reason tags** | `sl_reentry_same` / `sl_reentry_flip` | Same | Same |
 
 If the enable flag is off, the sleeve **exits only** (no re-entry / no transition re-open).
@@ -284,16 +285,18 @@ flowchart TD
 | `ORDER_QTY_LOTS_MORNING` | 10 | Morning 08:30 entry lots |
 | `MORNING_ENTRY_TIME` | 08:30 IST | Morning slot close time |
 | `WEEKLY_MIN_DTE` | 3 | Weekly Friday must be ≥ 3 DTE |
+| `MONTHLY_MIN_DTE` | 7 | Monthly last-Friday must be ≥ 7 DTE |
 | `HTF_TIMEFRAMES` | `4h`, `1d` | Higher-TF SuperTrend sources |
-| `SLEEVE_WEEKLY` / `DAILY` / `MORNING` | `weekly` / `daily` / `morning` | Sleeve ids in `structure_id` |
+| `SLEEVE_WEEKLY` / `MONTHLY` / `DAILY` / `MORNING` | `weekly` / `monthly` / `daily` / `morning` | Sleeve ids in `structure_id` |
 
 Module switches in `DirectionalOptionSelling.py`:
 
 | Switch | Default (as checked in) | Sleeve |
 |--------|-------------------------|--------|
-| `ENABLE_WEEKLY_TRADES` | `False` | weekly |
+| `ENABLE_WEEKLY_TRADES` | `True` | weekly |
+| `ENABLE_MONTHLY_TRADES` | `True` | monthly |
 | `ENABLE_INTRADAY_TRADES` | `True` | daily |
-| `ENABLE_MORNING_TRADES` | `True` | morning |
+| `ENABLE_MORNING_0DTE_TRADES` | `True` | morning |
 
 ---
 
@@ -303,6 +306,8 @@ Module switches in `DirectionalOptionSelling.py`:
 |--------|--------|---------|
 | `weekly_htf_aligned` | weekly | 1D + 4H agree → weekly entry |
 | `weekly_htf_misaligned` | weekly | Exit: 1D/4H no longer agree with open weekly |
+| `one_d_signal` | monthly | Confirmed 1D flip → monthly entry |
+| `one_d_reversal` | monthly | Exit: 1D flipped against monthly position |
 | `one_h_signal` | daily | Confirmed 1H flip + HTF filter pass |
 | `one_h_reversal` | daily | Exit: 1H flipped against daily position |
 | `morning_830` | morning | 08:30 IST clock-slot 0DTE entry |

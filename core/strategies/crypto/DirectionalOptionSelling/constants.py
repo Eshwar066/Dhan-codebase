@@ -36,11 +36,15 @@ HTF_TIMEFRAMES = ("4h", "1d")
 HTF_LOOKBACK_DAYS = {"4h": 45, "1d": 120}
 SLEEVE_WEEKLY = "weekly"
 SLEEVE_DAILY = "daily"
-# Clock-slot 0DTE short on 1H SuperTrend (gated by ENABLE_MORNING_TRADES).
+# Clock-slot 0DTE short on 1H SuperTrend (gated by ENABLE_MORNING_0DTE_TRADES).
 SLEEVE_MORNING = "morning"
+# 1D SuperTrend flip → monthly (last Friday) expiry; gated by ENABLE_MONTHLY_TRADES.
+SLEEVE_MONTHLY = "monthly"
 MORNING_ENTRY_TIME = time(9, 30)
 # Weekly entry: if selected Friday is within 2 DTE, roll to next weekly Friday.
 WEEKLY_MIN_DTE = 3
+# Monthly entry: if selected last-Friday is within this DTE, roll to next month.
+MONTHLY_MIN_DTE = 7
 # Broker MAIN_SL trail modify: loud failure + retries when ST moved but SL did not.
 TRAIL_SL_MODIFY_ATTEMPTS = 3
 TRAIL_SL_IMMEDIATE_RETRY_SLEEP_SEC = 0.35

@@ -23,6 +23,7 @@ from .constants import (
     MIN_PREMIUM_USD,
     MIN_PREMIUM_USD_MORNING,
     MIN_STRIKE_SPOT_DISTANCE,
+    MONTHLY_MIN_DTE,
     MORNING_ENTRY_TIME,
     ORDER_QTY_LOTS,
     ORDER_QTY_LOTS_DAILY,
@@ -32,6 +33,7 @@ from .constants import (
     ROLLOVER_MIN_STRIKE_DISTANCE,
     ROLLOVER_TIME,
     SLEEVE_DAILY,
+    SLEEVE_MONTHLY,
     SLEEVE_MORNING,
     SLEEVE_WEEKLY,
     SL_MODE_INDEX,
@@ -52,9 +54,10 @@ logger = logging.getLogger(__name__)
 # Sleeve entry switches (flip to False to stop new entries / SL re-entries for
 # that sleeve). Open positions still trail SL, force-exit, and roll as usual.
 ENABLE_WEEKLY_TRADES = True
+ENABLE_MONTHLY_TRADES = True
 ENABLE_INTRADAY_TRADES = True
 ENABLE_MORNING_0DTE_TRADES = True
-# Weekly strike pick: when True, skip nearest eligible OTM (OTM1) and take the
+# Weekly / monthly strike pick: when True, skip nearest eligible OTM (OTM1) and take the
 # next (OTM2); if that fails premium, fall through to OTM3+. Daily/morning
 # sleeves always use nearest eligible (OTM1).
 ENABLE_WEEKLY_DEEPER_OTM = True
@@ -101,8 +104,11 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
     """
     Multi-sleeve BTC SuperTrend option selling:
 
-    - Weekly: when 1D and 4H SuperTrend agree, sell near 4H SuperTrend on the
-      weekly Friday (skip to next week if DTE <= 2).
+    - Weekly: when 1D and 4H SuperTrend agree on a **closed 4H bar**, sell near
+      4H SuperTrend on the weekly Friday (skip to next week if DTE <= 2).
+    - Monthly: only on a confirmed **1D SuperTrend flip**, sell near 4H
+      SuperTrend on the monthly (last Friday) expiry. Same qty / premium /
+      deeper-OTM style as weekly; gated by ``ENABLE_MONTHLY_TRADES``.
     - Daily (0DTE/1DTE): only on a confirmed 1H SuperTrend flip (no mid-regime
       catch-up), and only when 1D and 4H agree with that 1H direction; sell near
       1H SuperTrend (0DTE before 17:25 IST, else 1DTE).
@@ -115,10 +121,10 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
     favorably, it switches once to index trail at ST±100 (CE SL kept strictly
     below strike; PE SL kept strictly above strike).
 
-    Toggle ``ENABLE_WEEKLY_TRADES`` / ``ENABLE_INTRADAY_TRADES`` /
-    ``ENABLE_MORNING_0DTE_TRADES`` at module top to disable new entries (and SL
-    re-entries) per sleeve. ``ENABLE_WEEKLY_DEEPER_OTM`` makes weekly
-    strike selection skip OTM1 and prefer OTM2+.
+    Toggle ``ENABLE_WEEKLY_TRADES`` / ``ENABLE_MONTHLY_TRADES`` /
+    ``ENABLE_INTRADAY_TRADES`` / ``ENABLE_MORNING_0DTE_TRADES`` at module top to
+    disable new entries (and SL re-entries) per sleeve. ``ENABLE_WEEKLY_DEEPER_OTM``
+    makes weekly / monthly strike selection skip OTM1 and prefer OTM2+.
     """
 
     name = "DirectionalOptionSelling"
@@ -143,14 +149,16 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         sleeve_u = str(sleeve or SLEEVE_DAILY).strip().lower()
         if sleeve_u == SLEEVE_WEEKLY:
             return bool(ENABLE_WEEKLY_TRADES)
+        if sleeve_u == SLEEVE_MONTHLY:
+            return bool(ENABLE_MONTHLY_TRADES)
         if sleeve_u == SLEEVE_MORNING:
             return bool(ENABLE_MORNING_0DTE_TRADES)
         return bool(ENABLE_INTRADAY_TRADES)
 
     def _entry_qty_lots(self, sleeve: str) -> int:
-        """Lots for a new ENTRY: weekly (4H) vs daily (1H flip) vs morning (08:30)."""
+        """Lots for a new ENTRY: weekly/monthly (HTF) vs daily vs morning."""
         sleeve_u = str(sleeve or SLEEVE_DAILY).strip().lower()
-        if sleeve_u == SLEEVE_WEEKLY:
+        if sleeve_u in (SLEEVE_WEEKLY, SLEEVE_MONTHLY):
             return max(1, int(getattr(self, "order_qty_lots_weekly", ORDER_QTY_LOTS_WEEKLY) or 1))
         if sleeve_u == SLEEVE_MORNING:
             return max(
@@ -158,6 +166,11 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 int(getattr(self, "order_qty_lots_morning", ORDER_QTY_LOTS_MORNING) or 1),
             )
         return max(1, int(getattr(self, "order_qty_lots_daily", ORDER_QTY_LOTS_DAILY) or 1))
+
+    @staticmethod
+    def _uses_4h_trail(sleeve: str) -> bool:
+        """Weekly and monthly trail / force-exit off 4H SuperTrend."""
+        return str(sleeve or "").strip().lower() in (SLEEVE_WEEKLY, SLEEVE_MONTHLY)
 
     @staticmethod
     def _min_premium_for_sleeve(sleeve: str) -> float:
@@ -234,6 +247,41 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         )
         return code
 
+    def _monthly_expiry_for_entry(self, candle: dict, ctx: Any) -> str:
+        """
+        Monthly (last Friday) expiry code. If DTE < MONTHLY_MIN_DTE, advance to
+        the next month's last Friday.
+        """
+        import calendar as _cal
+
+        code = str(self.monthlyExpiry(candle, ctx) or "").strip()
+        trade_date = self._timestamp_ist(candle["timestamp"]).date()
+        exp = self._expiry_date(code)
+        if exp is None:
+            return code
+
+        def _last_friday(year: int, month: int) -> date:
+            last_day = _cal.monthrange(year, month)[1]
+            d = date(year, month, last_day)
+            offset = (d.weekday() - 4) % 7
+            return d - timedelta(days=offset)
+
+        while (exp - trade_date).days < MONTHLY_MIN_DTE:
+            if exp.month == 12:
+                y, m = exp.year + 1, 1
+            else:
+                y, m = exp.year, exp.month + 1
+            exp = _last_friday(y, m)
+            code = exp.strftime("%d%m%y")
+        ctx.selected_expiry = code
+        logger.info(
+            "%s monthly expiry selected code=%s dte=%s",
+            self.name,
+            code,
+            (exp - trade_date).days,
+        )
+        return code
+
     @staticmethod
     def _normal_direction(value: Any) -> Optional[int]:
         try:
@@ -271,10 +319,10 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         """
         SuperTrend used for ST±300 force-exit / should_exit.
 
-        Weekly sleeve must use 4H ST only (never 1H). Daily uses 1H.
+        Weekly / monthly sleeves must use 4H ST only (never 1H). Daily uses 1H.
         """
         sleeve_u = str(sleeve or SLEEVE_DAILY).strip().lower()
-        if sleeve_u == SLEEVE_WEEKLY:
+        if self._uses_4h_trail(sleeve_u):
             for candidate in (
                 self._current_4h_supertrend,
                 meta.supertrend if meta is not None else None,
@@ -556,7 +604,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         """Parse sleeve from sid like DirectionalOptionSelling:BTCUSD:weekly:..."""
         parts = [p.strip().lower() for p in str(structure_id or "").split(":")]
         for part in parts:
-            if part in (SLEEVE_WEEKLY, SLEEVE_DAILY, SLEEVE_MORNING):
+            if part in (SLEEVE_WEEKLY, SLEEVE_DAILY, SLEEVE_MORNING, SLEEVE_MONTHLY):
                 return part
         return None
 
@@ -583,7 +631,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
 
     def _normalize_sleeve(self, sleeve: Any, structure_id: str = "") -> str:
         sleeve_u = str(sleeve or "").strip().lower()
-        if sleeve_u not in (SLEEVE_WEEKLY, SLEEVE_DAILY, SLEEVE_MORNING):
+        if sleeve_u not in (SLEEVE_WEEKLY, SLEEVE_DAILY, SLEEVE_MORNING, SLEEVE_MONTHLY):
             sleeve_u = ""
         sid_sleeve = self._sleeve_from_structure_id(structure_id)
         # Structure id is authoritative when present (survives meta loss on restart).
@@ -649,8 +697,8 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                         strike = float(parts[2])
                     if not expiry:
                         expiry = str(parts[3])
-            # Weekly sleeve trails 4H ST; daily trails 1H ST.
-            if sleeve == SLEEVE_WEEKLY:
+            # Weekly / monthly sleeves trail 4H ST; daily / morning trail 1H ST.
+            if self._uses_4h_trail(sleeve):
                 st = float(
                     self._current_4h_supertrend
                     or self._current_supertrend
@@ -1186,7 +1234,12 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         sleeve: str = SLEEVE_DAILY,
     ) -> Optional[Any]:
         sleeve_u = str(sleeve or SLEEVE_DAILY).strip().lower()
-        if sleeve_u not in (SLEEVE_WEEKLY, SLEEVE_DAILY, SLEEVE_MORNING):
+        if sleeve_u not in (
+            SLEEVE_WEEKLY,
+            SLEEVE_DAILY,
+            SLEEVE_MORNING,
+            SLEEVE_MONTHLY,
+        ):
             sleeve_u = SLEEVE_DAILY
         if not self._sleeve_entries_enabled(sleeve_u):
             return None
@@ -1196,6 +1249,15 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             if not self._weekly_htf_aligned(int(direction), ctx, candle):
                 return None
             # Prefer 4H SuperTrend for weekly strike / trail reference.
+            supertrend = float(
+                candle.get("supertrend_4h")
+                or self._current_4h_supertrend
+                or self._current_supertrend
+                or candle.get("supertrend")
+                or 0
+            )
+        elif sleeve_u == SLEEVE_MONTHLY:
+            # 1D flip entry: no continuous 1D+4H align gate; strike off 4H ST.
             supertrend = float(
                 candle.get("supertrend_4h")
                 or self._current_4h_supertrend
@@ -1235,6 +1297,16 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                     target_expiry,
                 )
                 return None
+        elif sleeve_u == SLEEVE_MONTHLY:
+            target_expiry = self._monthly_expiry_for_entry(candle, ctx)
+            entry_min_dte = MONTHLY_MIN_DTE
+            if target_expiry and self._open_main_has_expiry(ctx, target_expiry):
+                logger.info(
+                    "%s skip monthly ENTRY: already open on expiry=%s",
+                    self.name,
+                    target_expiry,
+                )
+                return None
         elif sleeve_u == SLEEVE_MORNING:
             # Prefer today's daily expiry; never roll morning slot to next day.
             target_expiry = self._0dte_expiry_code(candle)
@@ -1247,7 +1319,8 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 )
                 return None
         # Morning / daily: keep strike far enough from spot to avoid immediate
-        # ±STRIKE_PROXIMITY_EXIT_POINTS exits. Weekly uses ST distance / otm_skip.
+        # ±STRIKE_PROXIMITY_EXIT_POINTS exits. Weekly / monthly use ST distance /
+        # deeper OTM.
         spot_gate = (
             float(MIN_STRIKE_SPOT_DISTANCE)
             if sleeve_u in (SLEEVE_MORNING, SLEEVE_DAILY)
@@ -1264,7 +1337,8 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             min_premium=self._min_premium_for_sleeve(sleeve_u),
             otm_skip=(
                 1
-                if sleeve_u == SLEEVE_WEEKLY and ENABLE_WEEKLY_DEEPER_OTM
+                if sleeve_u in (SLEEVE_WEEKLY, SLEEVE_MONTHLY)
+                and ENABLE_WEEKLY_DEEPER_OTM
                 else 0
             ),
             min_strike_spot_distance=spot_gate,
@@ -2063,13 +2137,14 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             if sl_mode not in (SL_MODE_PREMIUM, SL_MODE_INDEX):
                 sl_mode = SL_MODE_INDEX
 
-            if sleeve == SLEEVE_WEEKLY:
+            if self._uses_4h_trail(sleeve):
                 ref_st = float(weekly_st) if weekly_st is not None else 0.0
                 if ref_st <= 0:
                     logger.error(
-                        "%s TRAIL_SKIP_WEEKLY sid=%s source=%s reason=no_live_4h_st "
+                        "%s TRAIL_SKIP_%s sid=%s source=%s reason=no_live_4h_st "
                         "meta_ST=%s (will not fall back to 1H/entry ST)",
                         self.name,
+                        str(sleeve).upper(),
                         sid,
                         source,
                         f"{float(meta.supertrend):.2f}" if meta is not None else "None",
@@ -2262,8 +2337,9 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         if str(candle.get("symbol") or "").strip().upper() != "BTCUSD":
             return None
         tf = self._candle_timeframe(candle)
-        # 4H/1D closed bars: trail weekly SL only — do not treat HTF ST as 1H signal.
-        if tf.lower() in ("4h", "4", "240", "1d", "d"):
+        tf_l = tf.lower()
+        # 1D closed bars: trail HTF sleeves only.
+        if tf_l in ("1d", "d"):
             if RUN_MODE != RunMode.BACKTEST and not self._bar_is_fully_closed(candle):
                 return None
             switch = self._trail_open_sleeves(
@@ -2274,6 +2350,24 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 source=f"htf_bar:{tf}",
             )
             return switch or None
+        # 4H closed bars: trail + weekly entry / exit / SL reentry (not 1H path).
+        if tf_l in ("4h", "4", "240"):
+            if RUN_MODE != RunMode.BACKTEST and not self._bar_is_fully_closed(candle):
+                return None
+            intents: List[Any] = []
+            switch = self._trail_open_sleeves(
+                ctx,
+                candle,
+                one_h_st=self._current_supertrend,
+                previous_st=self._current_supertrend,
+                source=f"htf_bar:{tf}",
+            )
+            if switch:
+                intents.extend(switch)
+            weekly = self._process_weekly_on_4h_close(candle, ctx)
+            if weekly:
+                intents.extend(weekly)
+            return intents or None
         # Live only: never confirm flips / entries on a forming hour bar.
         # Mid-bar risk = broker MAIN_SL (+ quote proximity / ST±300). ST reverse only at close.
         if RUN_MODE != RunMode.BACKTEST and not self._bar_is_fully_closed(candle):
@@ -2318,9 +2412,17 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         self._current_supertrend = supertrend
         self._latest_candle = dict(candle)
 
+        prev_1d = self._confirmed_1d_direction
         htf = self._refresh_htf_state(ctx, candle)
         one_h_signal = previous is not None and direction != previous
-        intents: List[Any] = []
+        one_d_signal = False
+        one_d_dir: Optional[int] = None
+        if htf is not None:
+            one_d_dir = int(htf["1d"][0])
+            one_d_signal = (
+                prev_1d is not None and one_d_dir != int(prev_1d)
+            )
+        intents = []
 
         switch = self._trail_open_sleeves(
             ctx,
@@ -2339,14 +2441,22 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             rollover = self._rollover_intent_if_due(candle, ctx, closed_bar=True)
             return [rollover] if rollover is not None else None
 
-        # SL reentry for the sleeve that was stopped out.
+        # SL reentry for non-weekly sleeves (weekly reenters on 4H close only).
         entered_sleeves: set[str] = set()
         if self._sl_reentry_ready(candle):
             sleeve = str(self._sl_reentry_sleeve or SLEEVE_DAILY)
-            if not self._open_main_positions(ctx, sleeve=sleeve):
+            if sleeve == SLEEVE_WEEKLY:
+                logger.debug(
+                    "%s defer weekly SL reentry until 4H close",
+                    self.name,
+                )
+            elif not self._open_main_positions(ctx, sleeve=sleeve):
                 direction_at_sl = int(self._sl_reentry_direction or 0)
-                if sleeve == SLEEVE_WEEKLY and self._confirmed_4h_direction is not None:
-                    enter_dir = int(self._confirmed_4h_direction)
+                if (
+                    sleeve == SLEEVE_MONTHLY
+                    and self._confirmed_1d_direction is not None
+                ):
+                    enter_dir = int(self._confirmed_1d_direction)
                 else:
                     enter_dir = int(direction)
                 reason = (
@@ -2354,8 +2464,8 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                     if enter_dir == direction_at_sl
                     else "sl_reentry_flip"
                 )
-                if sleeve == SLEEVE_WEEKLY:
-                    reentry_min_dte = WEEKLY_MIN_DTE
+                if sleeve == SLEEVE_MONTHLY:
+                    reentry_min_dte = MONTHLY_MIN_DTE
                 elif sleeve == SLEEVE_MORNING:
                     reentry_min_dte = 0
                 else:
@@ -2373,30 +2483,23 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                     intents.append(intent)
                     entered_sleeves.add(sleeve)
 
-        # Exit weekly when 1D or 4H no longer agrees with the open weekly direction.
-        weekly_positions = self._open_main_positions(ctx, sleeve=SLEEVE_WEEKLY)
-        if weekly_positions and htf is not None:
-            wpos = weekly_positions[0]
-            wmeta = self._ensure_meta(wpos, ctx)
-            wdir = int(wmeta.direction) if wmeta is not None else 0
-            if wdir and (
-                htf["4h"][0] != wdir or htf["1d"][0] != wdir
-            ):
-                sid = str(getattr(wpos, "structure_id", "") or "")
-                new_dir = (
-                    int(htf["4h"][0])
-                    if htf["4h"][0] == htf["1d"][0]
-                    else int(htf["4h"][0])
-                )
+        # Exit monthly on confirmed 1D SuperTrend flip against the open monthly direction.
+        monthly_positions = self._open_main_positions(ctx, sleeve=SLEEVE_MONTHLY)
+        if monthly_positions and one_d_signal and one_d_dir is not None:
+            mpos = monthly_positions[0]
+            mmeta = self._ensure_meta(mpos, ctx)
+            mdir = int(mmeta.direction) if mmeta is not None else 0
+            if mdir and one_d_dir != mdir:
+                sid = str(getattr(mpos, "structure_id", "") or "")
                 if sid not in self._pending_exit_structure_ids:
                     intent = self._begin_transition(
-                        wpos,
+                        mpos,
                         candle,
                         ctx,
-                        direction=new_dir,
-                        reason="weekly_htf_misaligned",
-                        min_dte=WEEKLY_MIN_DTE,
-                        sleeve=SLEEVE_WEEKLY,
+                        direction=int(one_d_dir),
+                        reason="one_d_reversal",
+                        min_dte=MONTHLY_MIN_DTE,
+                        sleeve=SLEEVE_MONTHLY,
                     )
                     if intent is not None:
                         intents.append(intent)
@@ -2443,25 +2546,24 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                     if intent is not None:
                         intents.append(intent)
 
-        # Weekly entry: 1D + 4H already green/red together → weekly near 4H ST.
+        # Monthly: only on a confirmed 1D ST flip → monthly last-Friday expiry.
         if (
-            SLEEVE_WEEKLY not in entered_sleeves
-            and htf is not None
-            and htf["4h"][0] == htf["1d"][0]
+            SLEEVE_MONTHLY not in entered_sleeves
+            and one_d_signal
+            and one_d_dir is not None
+            and not self._open_main_positions(ctx, sleeve=SLEEVE_MONTHLY)
         ):
-            want = int(htf["4h"][0])
-            if not self._open_main_positions(ctx, sleeve=SLEEVE_WEEKLY):
-                intent = self._build_entry(
-                    candle,
-                    ctx,
-                    want,
-                    reason="weekly_htf_aligned",
-                    min_dte=WEEKLY_MIN_DTE,
-                    sleeve=SLEEVE_WEEKLY,
-                )
-                if intent is not None:
-                    intents.append(intent)
-                    entered_sleeves.add(SLEEVE_WEEKLY)
+            intent = self._build_entry(
+                candle,
+                ctx,
+                int(one_d_dir),
+                reason="one_d_signal",
+                min_dte=MONTHLY_MIN_DTE,
+                sleeve=SLEEVE_MONTHLY,
+            )
+            if intent is not None:
+                intents.append(intent)
+                entered_sleeves.add(SLEEVE_MONTHLY)
 
         # Morning 0DTE: once per day on the 08:30 IST closed 1H bar (1H ST only).
         if (
@@ -2528,6 +2630,118 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         if rollover is not None:
             intents.append(rollover)
         return intents or None
+
+    def _process_weekly_on_4h_close(
+        self, candle: dict, ctx: Any
+    ) -> List[Any]:
+        """
+        Weekly sleeve decisions only on closed 4H bars: SL reentry, HTF regime
+        exit, and aligned entry. 1H bars never open a new weekly.
+        """
+        intents: List[Any] = []
+        htf = self._refresh_htf_state(ctx, candle)
+        if htf is None:
+            # Still allow SL reentry direction from cached 4H if present.
+            htf_dirs_ok = (
+                self._confirmed_4h_direction is not None
+                and self._confirmed_1d_direction is not None
+                and int(self._confirmed_4h_direction)
+                == int(self._confirmed_1d_direction)
+            )
+            if not htf_dirs_ok and not self._sl_reentry_ready(candle):
+                return intents
+
+        entered = False
+        # Weekly SL reentry waits for the next closed 4H (not 1H).
+        if (
+            self._sl_reentry_ready(candle)
+            and str(self._sl_reentry_sleeve or "") == SLEEVE_WEEKLY
+            and not self._open_main_positions(ctx, sleeve=SLEEVE_WEEKLY)
+        ):
+            direction_at_sl = int(self._sl_reentry_direction or 0)
+            if self._confirmed_4h_direction is not None:
+                enter_dir = int(self._confirmed_4h_direction)
+            elif htf is not None:
+                enter_dir = int(htf["4h"][0])
+            else:
+                enter_dir = direction_at_sl
+            reason = (
+                "sl_reentry_same"
+                if enter_dir == direction_at_sl
+                else "sl_reentry_flip"
+            )
+            intent = self._build_entry(
+                candle,
+                ctx,
+                enter_dir,
+                reason=reason,
+                min_dte=WEEKLY_MIN_DTE,
+                sleeve=SLEEVE_WEEKLY,
+            )
+            if intent is not None:
+                self._clear_sl_reentry()
+                intents.append(intent)
+                entered = True
+
+        weekly_positions = self._open_main_positions(ctx, sleeve=SLEEVE_WEEKLY)
+        if weekly_positions and htf is not None:
+            wpos = weekly_positions[0]
+            wmeta = self._ensure_meta(wpos, ctx)
+            wdir = int(wmeta.direction) if wmeta is not None else 0
+            if wdir and (
+                htf["4h"][0] != wdir or htf["1d"][0] != wdir
+            ):
+                sid = str(getattr(wpos, "structure_id", "") or "")
+                new_dir = (
+                    int(htf["4h"][0])
+                    if htf["4h"][0] == htf["1d"][0]
+                    else int(htf["4h"][0])
+                )
+                if sid not in self._pending_exit_structure_ids:
+                    intent = self._begin_transition(
+                        wpos,
+                        candle,
+                        ctx,
+                        direction=new_dir,
+                        reason="weekly_htf_misaligned",
+                        min_dte=WEEKLY_MIN_DTE,
+                        sleeve=SLEEVE_WEEKLY,
+                    )
+                    if intent is not None:
+                        intents.append(intent)
+
+        # Entry: 1D + 4H agree on this closed 4H bar.
+        aligned = False
+        want = 0
+        if htf is not None and htf["4h"][0] == htf["1d"][0]:
+            aligned = True
+            want = int(htf["4h"][0])
+        elif (
+            self._confirmed_4h_direction is not None
+            and self._confirmed_1d_direction is not None
+            and int(self._confirmed_4h_direction)
+            == int(self._confirmed_1d_direction)
+        ):
+            aligned = True
+            want = int(self._confirmed_4h_direction)
+
+        if (
+            not entered
+            and aligned
+            and want
+            and not self._open_main_positions(ctx, sleeve=SLEEVE_WEEKLY)
+        ):
+            intent = self._build_entry(
+                candle,
+                ctx,
+                want,
+                reason="weekly_htf_aligned",
+                min_dte=WEEKLY_MIN_DTE,
+                sleeve=SLEEVE_WEEKLY,
+            )
+            if intent is not None:
+                intents.append(intent)
+        return intents
 
     def on_quote(self, quote: dict, ctx: Any) -> Optional[List[Any]]:
         if str(quote.get("symbol") or "").strip().upper() != "BTCUSD":
@@ -2653,7 +2867,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             if meta is not None
             else (
                 self._confirmed_4h_direction
-                if sleeve == SLEEVE_WEEKLY
+                if self._uses_4h_trail(sleeve)
                 else self._confirmed_direction
             )
         )

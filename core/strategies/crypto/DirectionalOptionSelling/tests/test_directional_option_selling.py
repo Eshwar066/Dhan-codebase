@@ -1660,8 +1660,8 @@ class DirectionalOptionSellingTests(unittest.TestCase):
                 )
                 select.assert_not_called()
 
-    def test_flat_htf_aligned_does_not_enter_daily_without_1h_flip(self):
-        """Weekly may enter on HTF align; daily must wait for a 1H ST flip."""
+    def test_flat_htf_aligned_does_not_enter_weekly_or_daily_on_1h(self):
+        """Weekly waits for 4H close; daily waits for a 1H ST flip."""
         self.strategy._confirmed_direction = 1
         self.strategy._current_supertrend = 64000.0
         candle = {
@@ -1691,9 +1691,61 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         daily_calls = [
             c for c in build.call_args_list if c.kwargs.get("sleeve") == "daily"
         ]
-        self.assertTrue(weekly_calls)
-        self.assertEqual(weekly_calls[0].kwargs["reason"], "weekly_htf_aligned")
+        self.assertFalse(weekly_calls)
         self.assertFalse(daily_calls)
+        self.assertIsNone(result)
+
+    def test_weekly_enters_only_on_4h_close(self):
+        """Aligned HTF on closed 4H opens weekly; same state on 1H does not."""
+        ctx = SimpleNamespace(position_store=_PositionStore())
+        self.strategy._confirmed_direction = 1
+        self.strategy._current_supertrend = 65000.0
+        self.strategy._confirmed_4h_direction = 1
+        self.strategy._confirmed_1d_direction = 1
+        self.strategy._current_4h_supertrend = 64700.0
+        marker = object()
+        h1 = {
+            "symbol": "BTCUSD",
+            "timeframe": "60",
+            "timestamp": datetime(2026, 7, 27, 14, 0, tzinfo=timezone.utc),
+            "close": 65000,
+            "supertrend": 65000,
+            "supertrend_direction": 1,
+        }
+        h4 = {
+            "symbol": "BTCUSD",
+            "timeframe": "4h",
+            "timestamp": datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc),
+            "close": 65000,
+            "supertrend": 64700,
+            "supertrend_direction": 1,
+            "supertrend_4h": 64700,
+        }
+        with patch.object(self.strategy, "_bar_is_fully_closed", return_value=True):
+            with patch.object(
+                self.strategy,
+                "_refresh_htf_state",
+                return_value={"4h": (1, 64700.0), "1d": (1, 63500.0)},
+            ):
+                with patch.object(
+                    self.strategy, "_trail_open_sleeves", return_value=[]
+                ):
+                    with patch.object(
+                        self.strategy, "_build_entry", return_value=marker
+                    ) as build:
+                        self.assertIsNone(self.strategy.on_candle(h1, ctx))
+                        self.assertFalse(
+                            any(
+                                c.kwargs.get("sleeve") == "weekly"
+                                for c in build.call_args_list
+                            )
+                        )
+                        result = self.strategy.on_candle(h4, ctx)
+        weekly_calls = [
+            c for c in build.call_args_list if c.kwargs.get("sleeve") == "weekly"
+        ]
+        self.assertEqual(len(weekly_calls), 1)
+        self.assertEqual(weekly_calls[0].kwargs["reason"], "weekly_htf_aligned")
         self.assertIn(marker, result or [])
 
     def test_weekly_expiry_shifts_when_dte_le_2(self):
@@ -1710,16 +1762,26 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertEqual(ctx.selected_expiry, "240726")
 
     def test_dual_sleeve_weekly_and_daily_can_both_enter(self):
-        """On a confirmed 1H flip with HTF aligned, weekly + daily may both enter."""
+        """1H flip opens daily; closed 4H with HTF align opens weekly."""
         ctx = SimpleNamespace(position_store=_PositionStore())
         self.strategy._confirmed_direction = -1
         self.strategy._current_supertrend = 64000.0
-        candle = {
+        h1 = {
             "symbol": "BTCUSD",
+            "timeframe": "60",
             "timestamp": datetime(2026, 7, 20, 10, 0, tzinfo=timezone.utc),
             "close": 65000,
             "supertrend": 64000,
             "supertrend_direction": 1,
+        }
+        h4 = {
+            "symbol": "BTCUSD",
+            "timeframe": "4h",
+            "timestamp": datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc),
+            "close": 65000,
+            "supertrend": 63500,
+            "supertrend_direction": 1,
+            "supertrend_4h": 63500,
         }
         weekly_marker = object()
         daily_marker = object()
@@ -1738,13 +1800,19 @@ class DirectionalOptionSellingTests(unittest.TestCase):
                 self.strategy, "_bar_is_fully_closed", return_value=True
             ):
                 with patch.object(
-                    self.strategy, "_build_entry", side_effect=_build
-                ) as build:
-                    result = self.strategy.on_candle(candle, ctx)
-        self.assertEqual(result, [weekly_marker, daily_marker])
+                    self.strategy, "_trail_open_sleeves", return_value=[]
+                ):
+                    with patch.object(
+                        self.strategy, "_build_entry", side_effect=_build
+                    ) as build:
+                        r1 = self.strategy.on_candle(h1, ctx)
+                        r4 = self.strategy.on_candle(h4, ctx)
+        self.assertEqual(r1, [daily_marker])
+        self.assertEqual(r4, [weekly_marker])
         sleeves = [c.kwargs.get("sleeve") for c in build.call_args_list]
-        self.assertEqual(sleeves, ["weekly", "daily"])
-        self.assertEqual(build.call_args_list[1].kwargs["reason"], "one_h_signal")
+        self.assertEqual(sleeves, ["daily", "weekly"])
+        self.assertEqual(build.call_args_list[0].kwargs["reason"], "one_h_signal")
+        self.assertEqual(build.call_args_list[1].kwargs["reason"], "weekly_htf_aligned")
 
     def test_latest_closed_st_from_df(self):
         s = DirectionalOptionSelling()
@@ -1811,9 +1879,102 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             "weekly",
         )
         self.assertEqual(
+            s._sleeve_from_structure_id(
+                "DirectionalOptionSelling:BTCUSD:monthly:2026-07-27:PE:abc12345"
+            ),
+            "monthly",
+        )
+        self.assertEqual(
             s._normalize_sleeve("daily", "DirectionalOptionSelling:BTCUSD:weekly:x:PE:abc"),
             "weekly",
         )
+        self.assertEqual(
+            s._normalize_sleeve(
+                "daily", "DirectionalOptionSelling:BTCUSD:monthly:x:CE:def"
+            ),
+            "monthly",
+        )
+
+    def test_entry_qty_lots_monthly_matches_weekly(self):
+        s = DirectionalOptionSelling()
+        s.order_qty_lots_weekly = 50
+        self.assertEqual(s._entry_qty_lots("monthly"), 50)
+        self.assertEqual(s._entry_qty_lots("MONTHLY"), 50)
+        self.assertTrue(s._uses_4h_trail("monthly"))
+
+    def test_monthly_enters_only_on_1d_flip(self):
+        """Steady 1D does not enter monthly; 1D flip does."""
+        ctx = SimpleNamespace(position_store=_PositionStore())
+        self.strategy._confirmed_direction = 1
+        self.strategy._current_supertrend = 65000.0
+        self.strategy._confirmed_1d_direction = -1
+        self.strategy._confirmed_4h_direction = 1
+        self.strategy._current_4h_supertrend = 64800.0
+        candle = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 27, 10, 0, tzinfo=timezone.utc),
+            "bucket_ts": datetime(2026, 7, 27, 10, 0, tzinfo=timezone.utc).timestamp(),
+            "timeframe": "60",
+            "close": 65200.0,
+            "supertrend": 65000.0,
+            "supertrend_direction": 1,
+        }
+        marker = object()
+        with patch.object(self.strategy, "_bar_is_fully_closed", return_value=True):
+            with patch.object(
+                self.strategy,
+                "_refresh_htf_state",
+                return_value={"4h": (1, 64800.0), "1d": (-1, 64000.0)},
+            ):
+                # Same 1D as prev → no monthly.
+                with patch.object(
+                    self.strategy, "_build_entry", return_value=None
+                ) as build:
+                    self.strategy.on_candle(candle, ctx)
+                monthly_calls = [
+                    c
+                    for c in build.call_args_list
+                    if c.kwargs.get("sleeve") == "monthly"
+                ]
+                self.assertEqual(monthly_calls, [])
+
+            # Flip 1D -1 → +1
+            self.strategy._confirmed_1d_direction = -1
+            with patch.object(
+                self.strategy,
+                "_refresh_htf_state",
+                side_effect=lambda *_a, **_k: (
+                    setattr(self.strategy, "_confirmed_1d_direction", 1)
+                    or {"4h": (1, 64800.0), "1d": (1, 64000.0)}
+                ),
+            ):
+                with patch.object(
+                    self.strategy, "_build_entry", return_value=marker
+                ) as build:
+                    with patch.object(
+                        self.strategy, "_open_main_positions", return_value=[]
+                    ):
+                        result = self.strategy.on_candle(candle, ctx)
+        monthly_calls = [
+            c for c in build.call_args_list if c.kwargs.get("sleeve") == "monthly"
+        ]
+        self.assertEqual(len(monthly_calls), 1)
+        self.assertEqual(monthly_calls[0].kwargs.get("reason"), "one_d_signal")
+        self.assertEqual(monthly_calls[0].args[2], 1)  # direction
+        self.assertIn(marker, result or [])
+
+    def test_monthly_expiry_rolls_when_dte_low(self):
+        s = DirectionalOptionSelling()
+        # 25 Jul 2026 is a Saturday; last Friday July = 31 Jul → DTE=6 < 7 → Aug.
+        candle = {
+            "timestamp": datetime(2026, 7, 25, 6, 0, tzinfo=timezone.utc),
+        }
+        ctx = SimpleNamespace()
+        with patch.object(s, "monthlyExpiry", return_value="310726"):
+            code = s._monthly_expiry_for_entry(candle, ctx)
+        # Next month last Friday Aug 2026 = 28 Aug → 280826
+        self.assertEqual(code, "280826")
+        self.assertEqual(ctx.selected_expiry, "280826")
 
     def test_fallback_meta_uses_symbol_and_structure_id(self):
         s = DirectionalOptionSelling()
@@ -1987,8 +2148,8 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         meta = s._ensure_meta(pos, SimpleNamespace(intent_store=None))
         self.assertEqual(meta.sleeve, "weekly")
 
-    def test_4h_bar_trails_weekly_without_1h_entry(self):
-        """Closed 4H BarClosed must trail weekly SL and must not run 1H entry logic."""
+    def test_4h_bar_trails_weekly_and_may_enter_when_flat(self):
+        """Closed 4H BarClosed trails weekly SL; does not run 1H flip logic."""
         from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (
             _PositionMeta,
         )
@@ -2055,9 +2216,15 @@ class DirectionalOptionSellingTests(unittest.TestCase):
                     self.strategy, "_modify_broker_trail_sl", return_value=True
                 ) as modify:
                     with patch.object(
-                        self.strategy, "_build_entry", return_value=object()
-                    ) as build:
-                        result = self.strategy.on_candle(candle, ctx)
+                        self.strategy,
+                        "_refresh_htf_state",
+                        return_value={"4h": (1, 65659.07), "1d": (1, 64000.0)},
+                    ):
+                        with patch.object(
+                            self.strategy, "_build_entry", return_value=object()
+                        ) as build:
+                            result = self.strategy.on_candle(candle, ctx)
+        # Open weekly already → no new ENTRY; trail still runs.
         self.assertIsNone(result)
         build.assert_not_called()
         modify.assert_called_once()
@@ -2065,7 +2232,7 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertAlmostEqual(
             self.strategy._meta_by_structure_id[sid].supertrend, 65659.07
         )
-        # 1H ST must stay untouched by the 4H trail-only path.
+        # 1H ST must stay untouched by the 4H trail path.
         self.assertAlmostEqual(self.strategy._current_supertrend, 66257.55)
 
     def test_restore_does_not_seed_stale_4h_from_meta(self):
@@ -2137,20 +2304,25 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             "core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling"
         )
         prev_w = mod.ENABLE_WEEKLY_TRADES
+        prev_mo = mod.ENABLE_MONTHLY_TRADES
         prev_d = mod.ENABLE_INTRADAY_TRADES
-        prev_m = mod.ENABLE_MORNING_TRADES
+        prev_m = mod.ENABLE_MORNING_0DTE_TRADES
         try:
             mod.ENABLE_WEEKLY_TRADES = True
+            mod.ENABLE_MONTHLY_TRADES = True
             mod.ENABLE_INTRADAY_TRADES = True
-            mod.ENABLE_MORNING_TRADES = True
+            mod.ENABLE_MORNING_0DTE_TRADES = True
             self.assertTrue(DirectionalOptionSelling._sleeve_entries_enabled("weekly"))
+            self.assertTrue(DirectionalOptionSelling._sleeve_entries_enabled("monthly"))
             self.assertTrue(DirectionalOptionSelling._sleeve_entries_enabled("daily"))
             self.assertTrue(DirectionalOptionSelling._sleeve_entries_enabled("morning"))
 
             mod.ENABLE_WEEKLY_TRADES = False
+            mod.ENABLE_MONTHLY_TRADES = False
             mod.ENABLE_INTRADAY_TRADES = False
-            mod.ENABLE_MORNING_TRADES = False
+            mod.ENABLE_MORNING_0DTE_TRADES = False
             self.assertFalse(DirectionalOptionSelling._sleeve_entries_enabled("weekly"))
+            self.assertFalse(DirectionalOptionSelling._sleeve_entries_enabled("monthly"))
             self.assertFalse(DirectionalOptionSelling._sleeve_entries_enabled("daily"))
             self.assertFalse(DirectionalOptionSelling._sleeve_entries_enabled("morning"))
             s = DirectionalOptionSelling()
@@ -2162,6 +2334,15 @@ class DirectionalOptionSellingTests(unittest.TestCase):
                         1,
                         reason="weekly_htf_aligned",
                         sleeve="weekly",
+                    )
+                )
+                self.assertIsNone(
+                    s._build_entry(
+                        {"timestamp": pd.Timestamp("2026-07-21 12:00", tz="Asia/Kolkata")},
+                        SimpleNamespace(),
+                        1,
+                        reason="one_d_signal",
+                        sleeve="monthly",
                     )
                 )
                 self.assertIsNone(
@@ -2182,20 +2363,23 @@ class DirectionalOptionSellingTests(unittest.TestCase):
                         sleeve="morning",
                     )
                 )
-            # Intraday on / morning off / weekly off → only daily allowed.
+            # Intraday on / morning off / weekly off / monthly on → daily + monthly.
             mod.ENABLE_WEEKLY_TRADES = False
+            mod.ENABLE_MONTHLY_TRADES = True
             mod.ENABLE_INTRADAY_TRADES = True
-            mod.ENABLE_MORNING_TRADES = False
+            mod.ENABLE_MORNING_0DTE_TRADES = False
             self.assertFalse(DirectionalOptionSelling._sleeve_entries_enabled("weekly"))
+            self.assertTrue(DirectionalOptionSelling._sleeve_entries_enabled("monthly"))
             self.assertTrue(DirectionalOptionSelling._sleeve_entries_enabled("daily"))
             self.assertFalse(DirectionalOptionSelling._sleeve_entries_enabled("morning"))
             # Morning on alone.
-            mod.ENABLE_MORNING_TRADES = True
+            mod.ENABLE_MORNING_0DTE_TRADES = True
             self.assertTrue(DirectionalOptionSelling._sleeve_entries_enabled("morning"))
         finally:
             mod.ENABLE_WEEKLY_TRADES = prev_w
+            mod.ENABLE_MONTHLY_TRADES = prev_mo
             mod.ENABLE_INTRADAY_TRADES = prev_d
-            mod.ENABLE_MORNING_TRADES = prev_m
+            mod.ENABLE_MORNING_0DTE_TRADES = prev_m
 
     def test_entry_qty_lots_morning(self):
         s = DirectionalOptionSelling()
