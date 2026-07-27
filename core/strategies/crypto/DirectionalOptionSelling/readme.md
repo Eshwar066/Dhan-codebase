@@ -47,7 +47,7 @@ SuperTrend params: length **16**, factor **1.5**.
 | **HTF filter (1D + 4H)** | **Required** (1D must equal 4H) | **Required** (both must match 1H direction) | **None** — 1H only |
 | **Strike reference ST** | **4H** SuperTrend | **1H** SuperTrend | **1H** SuperTrend |
 | **Expiry** | Friday weekly; if DTE ≤ 2 → next Friday (min DTE **3**) | Before 17:25 IST → **0DTE**; at/after → **1DTE** | Always prefer **today 0DTE** |
-| **Qty / premium** | OTM, outside ST, premium ≥ **$120** | Same (≥ **$120**) | Same rules, premium ≥ **$20** |
+| **Qty / premium** | OTM, outside ST, premium ≥ **$120** | Same (≥ **$120**); also `|strike−spot| ≥ **400**` | Same rules, premium ≥ **$20**; also `|strike−spot| ≥ **400**` |
 | **Duplicate guard** | No open weekly sleeve; skip if same Friday already open | No open daily sleeve; skip if same contract already open | No open morning sleeve; skip if same 0DTE expiry already open |
 | **Entry reason tag** | `weekly_htf_aligned` | `one_h_signal` | `morning_830` |
 
@@ -58,7 +58,7 @@ SuperTrend params: length **16**, factor **1.5**.
 | Exit type | Weekly | Daily | Morning |
 |-----------|--------|-------|---------|
 | **Signal / regime exit** | 1D **or** 4H no longer matches open weekly direction → `MAIN_EXIT` (`weekly_htf_misaligned`) | Confirmed **1H ST flip** against open daily direction → `MAIN_EXIT` (`one_h_reversal`) | Confirmed **1H ST flip** against open morning direction → `MAIN_EXIT` (`morning_one_h_reversal`) |
-| **Broker trail SL** | `MAIN_SL` on **4H ST ± 100** (spot trigger, option LIMIT cover) | `MAIN_SL` on **1H ST ± 100** | `MAIN_SL` on **1H ST ± 100** |
+| **Broker trail SL** | Starts at **2× entry premium** (`mark_price`); switches once to **4H ST ± 100** (`spot_price`) when short is green and ST moved favorably | Same → **1H ST ± 100** | Same → **1H ST ± 100** |
 | **Force exit (strategy)** | Spot hits **4H ST ± 300** → LIMIT exit | Spot hits **1H ST ± 300** → LIMIT exit | Spot hits **1H ST ± 300** → LIMIT exit |
 | **Strike proximity** | Spot within **±50** of option strike → LIMIT exit | Same | Same |
 | **17:25 IST rollover** | Only if holding **today’s** daily expiry (unusual for weekly Friday) → exit + next daily | If holding **today’s** expiry → exit + roll next day (≥ 200 pts from ST) | If still open on **today’s** 0DTE → **flat EXIT only** (`morning_0dte_flat`) — **no** next-expiry roll |
@@ -90,7 +90,7 @@ If the enable flag is off, the sleeve **exits only** (no re-entry / no transitio
 
 | Rule | Level | Reference ST | Who fires |
 |------|-------|--------------|-----------|
-| Trail SL | ST ± **100** | Weekly → **4H**; Daily / Morning → **1H** | Broker `MAIN_SL` (spot trigger, option LIMIT). Modify failures log `TRAIL_SL_STALE` and retry. |
+| Trail SL | **2× entry** mark, then ST ± **100** | Weekly → **4H**; Daily / Morning → **1H** (after premium→index switch) | Broker `MAIN_SL`. Premium while red/flat; one-way switch to spot trail when green + ST favorable. Modify failures log `TRAIL_SL_STALE` and retry. |
 | Force exit | ST ± **300** | Same sleeve ST as above | Strategy on quote / candle |
 | Strike proximity | Spot within ± **50** of strike | Option strike | Strategy |
 | Expiry rollover | **17:25 IST** | Any open **today** expiry | Daily/weekly: exit + next daily (min **200** pts from ST). **Morning: flat exit only** (no roll). |
@@ -272,9 +272,11 @@ flowchart TD
 | `SUPER_TREND_FACTOR` | 1.5 | ATR multiplier |
 | `MIN_PREMIUM_USD` | 120 | Min sell premium (weekly / daily) |
 | `MIN_PREMIUM_USD_MORNING` | 20 | Min sell premium (morning 08:30 sleeve) |
-| `TRAIL_SL_POINTS` | 100 | Broker trail vs ST |
+| `TRAIL_SL_POINTS` | 100 | Index-mode broker trail vs ST |
+| `PREMIUM_SL_MULT` | 2.0 | Initial mark SL = entry × this |
 | `FORCE_EXIT_POINTS` | 300 | Strategy emergency vs sleeve ST |
 | `STRIKE_PROXIMITY_EXIT_POINTS` | 50 | Exit if spot near strike |
+| `MIN_STRIKE_SPOT_DISTANCE` | 400 | Morning / daily ENTRY min \|strike−spot\| |
 | `ROLLOVER_TIME` | 17:25 IST | Today-expiry rollover |
 | `ROLLOVER_MIN_STRIKE_DISTANCE` | 200 | Min distance on rollover strike |
 | `ORDER_QTY_LOTS_WEEKLY` | 10 | Weekly entry lots |

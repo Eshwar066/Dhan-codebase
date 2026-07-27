@@ -9,14 +9,22 @@ MIN_PREMIUM_USD = 120
 MIN_PREMIUM_USD_MORNING = 20
 # Broker MAIN_SL trails SuperTrend on the spot index: bullish ST-100 / bearish ST+100.
 TRAIL_SL_POINTS = 100.0
+# Initial MAIN_SL: option mark stop at entry_premium × this multiplier (short cover).
+PREMIUM_SL_MULT = 2.0
+# MAIN_SL mode: start on option mark; switch once to index/ST trail when green + ST favors.
+SL_MODE_PREMIUM = "premium"
+SL_MODE_INDEX = "index"
 # Strategy emergency: if spot breaches ST±300 and the position is still open, fire LIMIT exit.
 FORCE_EXIT_POINTS = 300.0
 # Extra risk: if spot trades within ±50 of the open option strike, exit immediately.
 STRIKE_PROXIMITY_EXIT_POINTS = 50.0
+# Morning / daily ENTRY: require |strike − spot| ≥ this so we don't sell into the
+# proximity-exit band (skip nearer strikes and fall through to the next eligible).
+MIN_STRIKE_SPOT_DISTANCE = 400.0
 ROLLOVER_TIME = time(17, 25)
 ROLLOVER_MIN_STRIKE_DISTANCE = 200.0
 # Sleeve-specific entry size (lots). Weekly = 4H HTF entry; daily = 1H flip entry.
-ORDER_QTY_LOTS_WEEKLY = 10
+ORDER_QTY_LOTS_WEEKLY = 50
 ORDER_QTY_LOTS_DAILY = 10
 # 08:30 IST scheduled 0DTE entry (1H SuperTrend only; no 4H/1D filter).
 ORDER_QTY_LOTS_MORNING = 10

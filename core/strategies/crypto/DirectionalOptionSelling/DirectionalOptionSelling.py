@@ -22,16 +22,20 @@ from .constants import (
     META_KEY,
     MIN_PREMIUM_USD,
     MIN_PREMIUM_USD_MORNING,
+    MIN_STRIKE_SPOT_DISTANCE,
     MORNING_ENTRY_TIME,
     ORDER_QTY_LOTS,
     ORDER_QTY_LOTS_DAILY,
     ORDER_QTY_LOTS_MORNING,
     ORDER_QTY_LOTS_WEEKLY,
+    PREMIUM_SL_MULT,
     ROLLOVER_MIN_STRIKE_DISTANCE,
     ROLLOVER_TIME,
     SLEEVE_DAILY,
     SLEEVE_MORNING,
     SLEEVE_WEEKLY,
+    SL_MODE_INDEX,
+    SL_MODE_PREMIUM,
     STRIKE_PROXIMITY_EXIT_POINTS,
     SUPER_TREND_FACTOR,
     SUPER_TREND_LENGTH,
@@ -67,6 +71,8 @@ class _PositionMeta:
     entry_premium: float
     entry_reason: str
     sleeve: str = SLEEVE_DAILY
+    # premium = option-mark SL at 2× entry; index = spot SuperTrend trail.
+    sl_mode: str = SL_MODE_PREMIUM
 
 
 @dataclass(frozen=True)
@@ -104,8 +110,10 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
       current 1H SuperTrend direction (no 4H/1D filter), 10 lots. SL / reentry
       use ENABLE_MORNING_0DTE_TRADES.
 
-    Sleeves may be open together. Broker MAIN_SL trails at ST±100 (CE SL kept
-    strictly below strike; PE SL kept strictly above strike).
+    Sleeves may be open together. Broker MAIN_SL starts at **2× entry premium**
+    (option mark trigger). Once the short is green and SuperTrend has moved
+    favorably, it switches once to index trail at ST±100 (CE SL kept strictly
+    below strike; PE SL kept strictly above strike).
 
     Toggle ``ENABLE_WEEKLY_TRADES`` / ``ENABLE_INTRADAY_TRADES`` /
     ``ENABLE_MORNING_0DTE_TRADES`` at module top to disable new entries (and SL
@@ -539,6 +547,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 "entry_premium": meta.entry_premium,
                 "entry_reason": meta.entry_reason,
                 "sleeve": meta.sleeve,
+                "sl_mode": meta.sl_mode,
             },
         )
 
@@ -594,6 +603,10 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             return False
         try:
             sleeve = self._normalize_sleeve(raw.get("sleeve"), structure_id)
+            raw_mode = str(raw.get("sl_mode") or "").strip().lower()
+            # Legacy restores (no sl_mode) were always on index/ST trail.
+            if raw_mode not in (SL_MODE_PREMIUM, SL_MODE_INDEX):
+                raw_mode = SL_MODE_INDEX
             meta = _PositionMeta(
                 symbol=str(raw["symbol"]).upper(),
                 direction=int(raw["direction"]),
@@ -604,6 +617,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 entry_premium=float(raw["entry_premium"]),
                 entry_reason=str(raw.get("entry_reason") or "signal"),
                 sleeve=sleeve,
+                sl_mode=raw_mode,
             )
         except (KeyError, TypeError, ValueError):
             return False
@@ -654,6 +668,8 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 entry_premium=float(getattr(position, "avg_price", 0) or 0),
                 entry_reason="restored",
                 sleeve=sleeve,
+                # Unknown history → assume already on index trail (pre-premium-SL).
+                sl_mode=SL_MODE_INDEX,
             )
         except (TypeError, ValueError):
             return None
@@ -961,12 +977,14 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         target_expiry: Optional[str] = None,
         min_premium: Optional[float] = None,
         otm_skip: int = 0,
+        min_strike_spot_distance: float = 0.0,
     ) -> Optional[tuple[float, float, pd.Series, str]]:
         source = _delta_source_from_ctx(ctx)
         if source is None:
             return None
         floor = float(min_premium) if min_premium is not None else float(MIN_PREMIUM_USD)
         skip_n = max(0, int(otm_skip or 0))
+        spot_floor = max(0.0, float(min_strike_spot_distance or 0))
         opt_letter = option_type[0].upper()
         products = source.get_products(use_cache=True) or []
         matching = [
@@ -996,6 +1014,8 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 if not self._is_strictly_otm(option_type, strike, spot):
                     continue
                 if not self._is_outside_supertrend(option_type, strike, supertrend):
+                    continue
+                if abs(float(strike) - float(spot)) < spot_floor:
                     continue
                 distance = abs(strike - supertrend)
                 if distance >= float(min_strike_distance):
@@ -1045,12 +1065,14 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         target_expiry: Optional[str] = None,
         min_premium: Optional[float] = None,
         otm_skip: int = 0,
+        min_strike_spot_distance: float = 0.0,
     ) -> Optional[tuple[float, float, pd.Series, str]]:
         df = self.load_delta_data_for_candle(candle, ctx)
         if df is None or df.empty:
             return None
         floor = float(min_premium) if min_premium is not None else float(MIN_PREMIUM_USD)
         skip_n = max(0, int(otm_skip or 0))
+        spot_floor = max(0.0, float(min_strike_spot_distance or 0))
         work = df.copy()
         work.columns = [
             "symbol", "price", "qty", "timestamp", "side", "opt_type", "strike", "expiry"
@@ -1093,6 +1115,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 latest["strike"].apply(
                     lambda strike: self._is_strictly_otm(option_type, strike, spot)
                     and self._is_outside_supertrend(option_type, strike, supertrend)
+                    and abs(float(strike) - float(spot)) >= spot_floor
                 )
             ]
             if latest.empty:
@@ -1122,6 +1145,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         target_expiry: Optional[str] = None,
         min_premium: Optional[float] = None,
         otm_skip: int = 0,
+        min_strike_spot_distance: float = 0.0,
     ) -> Optional[tuple[float, float, pd.Series, str]]:
         option_type = self._option_type(direction)
         if RUN_MODE == RunMode.BACKTEST:
@@ -1135,6 +1159,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 target_expiry=target_expiry,
                 min_premium=min_premium,
                 otm_skip=otm_skip,
+                min_strike_spot_distance=min_strike_spot_distance,
             )
         return self._select_live_contract(
             candle,
@@ -1146,6 +1171,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             target_expiry=target_expiry,
             min_premium=min_premium,
             otm_skip=otm_skip,
+            min_strike_spot_distance=min_strike_spot_distance,
         )
 
     def _build_entry(
@@ -1220,6 +1246,13 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                     target_expiry,
                 )
                 return None
+        # Morning / daily: keep strike far enough from spot to avoid immediate
+        # ±STRIKE_PROXIMITY_EXIT_POINTS exits. Weekly uses ST distance / otm_skip.
+        spot_gate = (
+            float(MIN_STRIKE_SPOT_DISTANCE)
+            if sleeve_u in (SLEEVE_MORNING, SLEEVE_DAILY)
+            else 0.0
+        )
         selected = self._select_contract(
             candle,
             ctx,
@@ -1234,15 +1267,18 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 if sleeve_u == SLEEVE_WEEKLY and ENABLE_WEEKLY_DEEPER_OTM
                 else 0
             ),
+            min_strike_spot_distance=spot_gate,
         )
         if selected is None:
             logger.warning(
-                "%s: no %s %s contract premium >= %.2f near SuperTrend %.2f",
+                "%s: no %s %s contract premium >= %.2f near SuperTrend %.2f"
+                " (min |strike-spot|=%.0f)",
                 self.name,
                 sleeve_u,
                 self._option_type(direction),
                 self._min_premium_for_sleeve(sleeve_u),
                 supertrend,
+                spot_gate,
             )
             return None
         strike, premium, row, expiry = selected
@@ -1280,6 +1316,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             entry_premium=premium,
             entry_reason=reason,
             sleeve=sleeve_u,
+            sl_mode=SL_MODE_PREMIUM,
         )
         intent = self.map_instrument_to_intent(
             inst=inst,
@@ -1485,6 +1522,75 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                     break
         return px if px > 0 else None
 
+    def _live_option_mark_price(
+        self, instrument: Any, ctx: Any
+    ) -> Optional[float]:
+        """Option mark / mid for short unrealized P&L (premium decay = green)."""
+        symbol = str(getattr(instrument, "trading_symbol", "") or "")
+        if not symbol:
+            return None
+        source = _delta_source_from_ctx(ctx)
+        ticker = None
+        if source is not None:
+            try:
+                ticker = source.get_ticker(symbol)
+            except Exception:
+                ticker = None
+        if not isinstance(ticker, dict):
+            return None
+        quotes = ticker.get("quotes") or {}
+        try:
+            bid = float(quotes.get("best_bid") or 0)
+        except (TypeError, ValueError):
+            bid = 0.0
+        try:
+            ask = float(quotes.get("best_ask") or 0)
+        except (TypeError, ValueError):
+            ask = 0.0
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2.0
+        for key in ("mark_price", "close", "price"):
+            try:
+                px = float(ticker.get(key) or 0)
+            except (TypeError, ValueError):
+                px = 0.0
+            if px > 0:
+                return px
+        if bid > 0:
+            return bid
+        if ask > 0:
+            return ask
+        return None
+
+    @staticmethod
+    def _short_premium_pnl_positive(entry_premium: float, mark: float) -> bool:
+        """Short option is green when mark has decayed below entry premium."""
+        try:
+            entry = float(entry_premium)
+            m = float(mark)
+        except (TypeError, ValueError):
+            return False
+        return entry > 0 and m > 0 and m < entry
+
+    @staticmethod
+    def _st_moved_favorably(
+        direction: int, prev_st: float, new_st: float
+    ) -> bool:
+        """PE short (dir>0): ST rising; CE short (dir<0): ST falling."""
+        try:
+            prev = float(prev_st)
+            cur = float(new_st)
+        except (TypeError, ValueError):
+            return False
+        if direction > 0:
+            return cur > prev + 1e-9
+        if direction < 0:
+            return cur < prev - 1e-9
+        return False
+
+    def _premium_sl_trigger(self, entry_premium: float) -> float:
+        return max(0.01, float(entry_premium) * float(PREMIUM_SL_MULT))
+
     def _build_main_sl_intent(
         self,
         *,
@@ -1498,28 +1604,70 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         option_limit: float,
         strike: Optional[float] = None,
         option_type: Optional[str] = None,
+        sl_mode: str = SL_MODE_PREMIUM,
+        entry_premium: Optional[float] = None,
     ) -> Any:
         """
-        Broker stop-limit on the option: trigger off BTC spot (ST ± 100),
-        buy-to-cover LIMIT on the option (never market). CE SL is clamped
-        strictly below strike; PE SL strictly above strike. Open limits are
-        re-quoted to best ask every 30s by the engine exit refresher.
+        Broker stop-LIMIT cover on the option.
+
+        - premium mode: trigger on option mark at 2× entry premium.
+        - index mode: trigger on BTC spot (ST ± 100); CE/PE clamp vs strike.
         """
         ot = str(option_type or self._option_type(int(direction))).upper()
-        level = self._trail_sl_level(
-            int(direction),
-            float(supertrend),
-            strike=strike,
-            option_type=ot,
-        )
-        limit_px = float(option_limit)
-        if limit_px <= 0:
-            limit_px = 1.0
+        mode = str(sl_mode or SL_MODE_PREMIUM).strip().lower()
+        if mode not in (SL_MODE_PREMIUM, SL_MODE_INDEX):
+            mode = SL_MODE_PREMIUM
+
+        if mode == SL_MODE_PREMIUM:
+            try:
+                entry = float(entry_premium or 0)
+            except (TypeError, ValueError):
+                entry = 0.0
+            level = self._premium_sl_trigger(entry)
+            stop_method = "mark_price"
+            limit_px = float(option_limit) if float(option_limit or 0) > 0 else level
+            # Buy-to-cover stop-LIMIT: limit must be at least the trigger.
+            if limit_px < level:
+                limit_px = level
+            extras = {
+                "stop_trigger_method": stop_method,
+                "direction": int(direction),
+                "trigger_symbol": str(
+                    getattr(instrument, "trading_symbol", "") or ""
+                ),
+                "sl_mode": SL_MODE_PREMIUM,
+                "premium_sl_trigger": float(level),
+                "entry_premium": float(entry),
+                "option_limit": float(limit_px),
+                "exit_reason": "broker_main_sl_premium",
+            }
+        else:
+            level = self._trail_sl_level(
+                int(direction),
+                float(supertrend),
+                strike=strike,
+                option_type=ot,
+            )
+            stop_method = "spot_price"
+            limit_px = float(option_limit)
+            if limit_px <= 0:
+                limit_px = 1.0
+            extras = {
+                "stop_trigger_method": stop_method,
+                "direction": int(direction),
+                "trigger_symbol": "BTCUSD",
+                "sl_mode": SL_MODE_INDEX,
+                "trail_sl_level": float(level),
+                "supertrend": float(supertrend),
+                "option_limit": float(limit_px),
+                "exit_reason": "broker_main_sl",
+            }
+
         return self.create_order_intent(
             inst=instrument,
             side="BUY",
             qty=max(1, int(qty)),
-            price=limit_px,
+            price=float(limit_px),
             order_type="SL",
             strategy=self.name,
             candle_ts=candle_ts,
@@ -1528,16 +1676,8 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             symbol="BTCUSD",
             action="FORCE_EXIT",
             parent_intent_id=parent_intent_id,
-            trigger_price=level,
-            metadata_extras={
-                "stop_trigger_method": "spot_price",
-                "direction": int(direction),
-                "trigger_symbol": "BTCUSD",
-                "trail_sl_level": float(level),
-                "supertrend": float(supertrend),
-                "option_limit": float(limit_px),
-                "exit_reason": "broker_main_sl",
-            },
+            trigger_price=float(level),
+            metadata_extras=extras,
         )
     def _broker_still_has_position(self, ctx: Any, position: Any) -> bool:
         """True when local MAIN is open; prefer live broker position check when available."""
@@ -1886,8 +2026,15 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         one_h_st: Optional[float],
         previous_st: Optional[float],
         source: str = "on_candle",
-    ) -> None:
-        """Trail broker MAIN_SL: weekly on live 4H ST, daily on 1H ST."""
+    ) -> List[Any]:
+        """
+        Manage broker MAIN_SL per open MAIN:
+
+        - premium mode: keep 2× mark SL while red; when green + ST favorable,
+          cancel premium SL and return a new index/ST MAIN_SL intent.
+        - index mode: trail spot SL on SuperTrend as before.
+        """
+        switch_intents: List[Any] = []
         positions = self._open_main_positions(ctx)
         if not positions:
             logger.debug(
@@ -1895,7 +2042,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 self.name,
                 source,
             )
-            return
+            return switch_intents
         weekly_st = self._resolve_weekly_trail_st(ctx, candle)
         for position in positions:
             meta = self._ensure_meta(position, ctx)
@@ -1908,6 +2055,14 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 continue
             sleeve = str(meta.sleeve) if meta is not None else SLEEVE_DAILY
             sid = str(getattr(position, "structure_id", "") or "")
+            sl_mode = (
+                str(meta.sl_mode).strip().lower()
+                if meta is not None
+                else SL_MODE_INDEX
+            )
+            if sl_mode not in (SL_MODE_PREMIUM, SL_MODE_INDEX):
+                sl_mode = SL_MODE_INDEX
+
             if sleeve == SLEEVE_WEEKLY:
                 ref_st = float(weekly_st) if weekly_st is not None else 0.0
                 if ref_st <= 0:
@@ -1934,6 +2089,22 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                     )
                     continue
             prev_ref = float(meta.supertrend) if meta is not None else previous_st
+
+            if sl_mode == SL_MODE_PREMIUM:
+                switched = self._maybe_switch_premium_sl_to_index(
+                    ctx,
+                    position,
+                    meta=meta,
+                    ref_st=ref_st,
+                    prev_ref=float(prev_ref) if prev_ref is not None else None,
+                    candle=candle,
+                    source=source,
+                )
+                if switched is not None:
+                    switch_intents.append(switched)
+                continue
+
+            # Index / SuperTrend trail path.
             if prev_ref is None:
                 self._apply_trail_sl_update(
                     ctx,
@@ -1979,6 +2150,113 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 prev_ref=float(prev_ref),
             )
         self._retry_pending_trail_sl(ctx)
+        return switch_intents
+
+    def _maybe_switch_premium_sl_to_index(
+        self,
+        ctx: Any,
+        position: Any,
+        *,
+        meta: Optional[_PositionMeta],
+        ref_st: float,
+        prev_ref: Optional[float],
+        candle: dict,
+        source: str,
+    ) -> Optional[Any]:
+        """
+        While on premium SL: if short is green and ST moved favorably, cancel
+        the mark SL and return a new spot/ST MAIN_SL intent (one-way switch).
+        """
+        if meta is None:
+            return None
+        sid = str(getattr(position, "structure_id", "") or "")
+        pos_dir = int(meta.direction)
+        entry = float(meta.entry_premium or 0)
+        if entry <= 0 or ref_st <= 0:
+            return None
+        mark = self._live_option_mark_price(getattr(position, "instrument", None), ctx)
+        if mark is None or mark <= 0:
+            logger.debug(
+                "%s premium SL keep sid=%s source=%s reason=no_mark",
+                self.name,
+                sid,
+                source,
+            )
+            return None
+        green = self._short_premium_pnl_positive(entry, mark)
+        if not green:
+            logger.info(
+                "%s premium SL keep sid=%s source=%s mark=%.2f entry=%.2f (red/flat)",
+                self.name,
+                sid,
+                source,
+                mark,
+                entry,
+            )
+            return None
+        if prev_ref is None:
+            logger.info(
+                "%s premium SL keep sid=%s source=%s green but no prev ST to compare",
+                self.name,
+                sid,
+                source,
+            )
+            return None
+        if not self._st_moved_favorably(pos_dir, float(prev_ref), float(ref_st)):
+            logger.info(
+                "%s premium SL keep sid=%s source=%s green but ST not favorable "
+                "prev=%.2f new=%.2f dir=%s",
+                self.name,
+                sid,
+                source,
+                float(prev_ref),
+                float(ref_st),
+                pos_dir,
+            )
+            return None
+
+        cancelled = self._cancel_resting_main_sl(ctx, position)
+        logger.info(
+            "%s switch MAIN_SL premium→index sid=%s source=%s mark=%.2f entry=%.2f "
+            "ST %.2f→%.2f cancel_ok=%s",
+            self.name,
+            sid,
+            source,
+            mark,
+            entry,
+            float(prev_ref),
+            float(ref_st),
+            cancelled,
+        )
+        option_limit = self._live_option_limit_price(
+            getattr(position, "instrument", None), ctx, side="BUY"
+        )
+        if option_limit is None or float(option_limit) <= 0:
+            option_limit = max(mark, 1.0)
+        qty = abs(int(getattr(position, "net_qty", 0) or 0)) or self._entry_qty_lots(
+            meta.sleeve
+        )
+        intent = self._build_main_sl_intent(
+            instrument=getattr(position, "instrument", None),
+            qty=int(qty),
+            structure_id=sid,
+            parent_intent_id=None,
+            candle_ts=candle.get("timestamp") or datetime.now(),
+            direction=pos_dir,
+            supertrend=float(ref_st),
+            option_limit=float(option_limit),
+            strike=float(meta.strike) if meta.strike else None,
+            option_type=meta.option_type,
+            sl_mode=SL_MODE_INDEX,
+            entry_premium=entry,
+        )
+        self._meta_by_structure_id[sid] = replace(
+            meta,
+            sl_mode=SL_MODE_INDEX,
+            supertrend=float(ref_st),
+        )
+        self._clear_trail_sl_retry(sid)
+        return intent
 
     def on_candle(self, candle: dict, ctx: Any) -> Optional[List[Any]]:
         if str(candle.get("symbol") or "").strip().upper() != "BTCUSD":
@@ -1988,14 +2266,14 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         if tf.lower() in ("4h", "4", "240", "1d", "d"):
             if RUN_MODE != RunMode.BACKTEST and not self._bar_is_fully_closed(candle):
                 return None
-            self._trail_open_sleeves(
+            switch = self._trail_open_sleeves(
                 ctx,
                 candle,
                 one_h_st=self._current_supertrend,
                 previous_st=self._current_supertrend,
                 source=f"htf_bar:{tf}",
             )
-            return None
+            return switch or None
         # Live only: never confirm flips / entries on a forming hour bar.
         # Mid-bar risk = broker MAIN_SL (+ quote proximity / ST±300). ST reverse only at close.
         if RUN_MODE != RunMode.BACKTEST and not self._bar_is_fully_closed(candle):
@@ -2044,13 +2322,15 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         one_h_signal = previous is not None and direction != previous
         intents: List[Any] = []
 
-        self._trail_open_sleeves(
+        switch = self._trail_open_sleeves(
             ctx,
             candle,
             one_h_st=supertrend,
             previous_st=previous_st,
             source="1h_bar",
         )
+        if switch:
+            intents.extend(switch)
 
         deferred = self._consume_pending_closed_entry(candle, ctx, direction)
         if deferred is not None:
@@ -2507,31 +2787,24 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 option_limit = float(kwargs.get("price") or 0)
             except (TypeError, ValueError):
                 option_limit = 0.0
-        spot_trigger = self._trail_sl_level(
-            int(direction),
-            float(supertrend),
-            strike=float(strike) if strike > 0 else None,
-            option_type=option_type,
-        )
-        # Hard assert: PE index SL must be > strike; CE must be < strike.
-        if strike > 0:
-            ot_u = str(option_type or "").upper()
-            if ot_u.startswith("P") and spot_trigger <= strike:
-                logger.error(
-                    "%s PE MAIN_SL clamp failed trigger=%.2f strike=%.2f; forcing strike+1",
-                    self.name,
-                    spot_trigger,
-                    strike,
-                )
-                spot_trigger = float(strike) + 1.0
-            elif ot_u.startswith("C") and not ot_u.startswith("P") and spot_trigger >= strike:
-                logger.error(
-                    "%s CE MAIN_SL clamp failed trigger=%.2f strike=%.2f; forcing strike-1",
-                    self.name,
-                    spot_trigger,
-                    strike,
-                )
-                spot_trigger = float(strike) - 1.0
+        try:
+            entry_prem = float(meta.entry_premium) if meta is not None else float(
+                kwargs.get("price") or 0
+            )
+        except (TypeError, ValueError, AttributeError):
+            entry_prem = float(option_limit or 0)
+        if entry_prem <= 0:
+            entry_prem = float(option_limit or 1.0)
+        premium_trigger = self._premium_sl_trigger(entry_prem)
+        # Cover LIMIT at least the 2× trigger so a mark stop can fill.
+        cover_limit = max(float(option_limit or 0), premium_trigger)
+        if meta is not None:
+            self._meta_by_structure_id[sid] = replace(
+                meta,
+                sl_mode=SL_MODE_PREMIUM,
+                entry_premium=float(entry_prem),
+            )
+            meta = self._meta_by_structure_id[sid]
         intent = self._build_main_sl_intent(
             instrument=instrument,
             qty=fill_qty,
@@ -2540,24 +2813,20 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             candle_ts=candle_ts or datetime.now(),
             direction=int(direction),
             supertrend=float(supertrend),
-            option_limit=float(option_limit or 1.0),
+            option_limit=float(cover_limit),
             strike=float(strike) if strike > 0 else None,
             option_type=option_type,
+            sl_mode=SL_MODE_PREMIUM,
+            entry_premium=float(entry_prem),
         )
-        # Keep intent trigger aligned with the guarded level (in case builder drifts).
-        try:
-            intent.trigger_price = float(spot_trigger)
-            if getattr(intent, "metadata_extras", None) is not None:
-                intent.metadata_extras["trail_sl_level"] = float(spot_trigger)
-        except Exception:
-            pass
         logger.info(
-            "%s arm broker MAIN_SL sid=%s spot_trigger=%.2f option_limit=%.2f "
-            "ST=%.2f direction=%s opt=%s strike=%.2f",
+            "%s arm broker MAIN_SL sid=%s mode=premium mark_trigger=%.2f "
+            "option_limit=%.2f entry=%.2f ST=%.2f direction=%s opt=%s strike=%.2f",
             self.name,
             sid,
-            float(spot_trigger),
-            float(option_limit or 1.0),
+            float(premium_trigger),
+            float(cover_limit),
+            float(entry_prem),
             float(supertrend),
             direction,
             option_type,

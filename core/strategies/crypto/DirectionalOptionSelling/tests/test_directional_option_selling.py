@@ -99,6 +99,47 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertEqual(selected[0], 118000)
         self.assertEqual(selected[3], "170726")
 
+    def test_live_selection_skips_strikes_inside_spot_gate(self):
+        """|strike−spot| < 400 skipped; fall through to next eligible CE."""
+        products = [
+            {"symbol": "C-BTC-65400-270726", "strike_price": 65400},  # ~133 from spot
+            {"symbol": "C-BTC-65500-270726", "strike_price": 65500},  # ~233
+            {"symbol": "C-BTC-65700-270726", "strike_price": 65700},  # ~433 OK
+            {"symbol": "C-BTC-65800-270726", "strike_price": 65800},  # farther
+        ]
+        source = _LiveSource(
+            products,
+            {
+                "C-BTC-65400-270726": _ticker(141),
+                "C-BTC-65500-270726": _ticker(100),
+                "C-BTC-65700-270726": _ticker(55),
+                "C-BTC-65800-270726": _ticker(40),
+            },
+        )
+        candle = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 27, 4, 0, tzinfo=timezone.utc),
+            "close": 65267.5,
+        }
+        with patch(
+            "core.strategies.crypto.DirectionalOptionSelling."
+            "DirectionalOptionSelling._delta_source_from_ctx",
+            return_value=source,
+        ):
+            selected = self.strategy._select_live_contract(
+                candle,
+                SimpleNamespace(),
+                "CE",
+                65354.57,
+                min_dte=0,
+                min_strike_distance=0,
+                min_premium=20,
+                min_strike_spot_distance=400,
+            )
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected[0], 65700)
+        self.assertEqual(selected[3], "270726")
+
     def test_live_selection_weekly_deeper_otm_skips_nearest(self):
         """otm_skip=1 → OTM2 (skip nearest eligible outside ST)."""
         products = [
@@ -609,7 +650,7 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertEqual(level, 64801.0)
         self.assertGreater(level, 64800.0)
 
-    def test_morning_entry_filled_pe_sl_not_below_strike(self):
+    def test_morning_entry_filled_arms_premium_sl_2x(self):
         instrument = SimpleNamespace(
             option_type="PE",
             expiry="240726",
@@ -618,6 +659,7 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             lot_size=1,
         )
         from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (
+            SL_MODE_PREMIUM,
             _PositionMeta,
         )
 
@@ -644,9 +686,12 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         )
         self.assertEqual(len(intents), 1)
         sl = intents[0]
-        self.assertEqual(sl.trigger_price, 64801.0)
-        self.assertGreater(sl.trigger_price, 64800.0)
-        self.assertNotAlmostEqual(sl.trigger_price, 64713.39)
+        self.assertEqual(sl.trigger_price, 68.0)  # 2× entry premium
+        self.assertEqual(sl.metadata_extras["stop_trigger_method"], "mark_price")
+        self.assertEqual(sl.metadata_extras["sl_mode"], SL_MODE_PREMIUM)
+        self.assertEqual(
+            self.strategy._meta_by_structure_id[sid].sl_mode, SL_MODE_PREMIUM
+        )
 
     def test_quote_force_exit_uses_300_point_strategy_level(self):
         instrument = SimpleNamespace(
@@ -817,6 +862,10 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         )
         self.strategy._confirmed_direction = 1
         self.strategy._current_supertrend = 118000
+        from core.strategies.crypto.DirectionalOptionSelling.constants import (
+            SL_MODE_INDEX,
+        )
+
         self.strategy._meta_by_structure_id[position.structure_id] = _PositionMeta(
             symbol="BTCUSD",
             direction=1,
@@ -827,6 +876,7 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             entry_premium=350,
             entry_reason="weekly_htf_aligned",
             sleeve="weekly",
+            sl_mode=SL_MODE_INDEX,
         )
         candle = {
             "symbol": "BTCUSD",
@@ -881,6 +931,10 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.strategy._confirmed_direction = 1
         self.strategy._current_supertrend = 65059.55
         self.strategy._current_4h_supertrend = None
+        from core.strategies.crypto.DirectionalOptionSelling.constants import (
+            SL_MODE_INDEX,
+        )
+
         self.strategy._meta_by_structure_id[position.structure_id] = _PositionMeta(
             symbol="BTCUSD",
             direction=1,
@@ -891,6 +945,7 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             entry_premium=303,
             entry_reason="weekly_htf_aligned",
             sleeve="weekly",
+            sl_mode=SL_MODE_INDEX,
         )
         candle = {
             "symbol": "BTCUSD",
@@ -952,6 +1007,10 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             intent_store=None,
             order_router=SimpleNamespace(broker=broker),
         )
+        from core.strategies.crypto.DirectionalOptionSelling.constants import (
+            SL_MODE_INDEX,
+        )
+
         sid = position.structure_id
         self.strategy._confirmed_direction = 1
         self.strategy._current_supertrend = 65000
@@ -966,6 +1025,7 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             entry_premium=303,
             entry_reason="weekly_htf_aligned",
             sleeve="weekly",
+            sl_mode=SL_MODE_INDEX,
         )
         candle = {
             "symbol": "BTCUSD",
@@ -1045,7 +1105,7 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertEqual(snap[0], 1)
         self.assertAlmostEqual(snap[1], 64896.29)
 
-    def test_on_main_entry_filled_arms_spot_trail_sl(self):
+    def test_on_main_entry_filled_arms_premium_sl_2x(self):
         instrument = SimpleNamespace(
             option_type="PE",
             expiry="180726",
@@ -1056,6 +1116,7 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.strategy._confirmed_direction = 1
         self.strategy._current_supertrend = 118000
         from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (
+            SL_MODE_PREMIUM,
             _PositionMeta,
         )
 
@@ -1082,15 +1143,14 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         sl = intents[0]
         self.assertEqual(sl.tag, "MAIN_SL")
         self.assertEqual(sl.order_type, "SL")
-        # ST-100=117900 would be <= strike 118000; PE clamp → strike+1.
-        self.assertEqual(sl.trigger_price, 118001)
-        self.assertGreater(sl.trigger_price, 118000)
-        self.assertEqual(sl.price, 350)
-        self.assertEqual(sl.metadata_extras["stop_trigger_method"], "spot_price")
+        self.assertEqual(sl.trigger_price, 700.0)  # 2× entry
+        self.assertEqual(sl.price, 700.0)  # cover LIMIT >= trigger
+        self.assertEqual(sl.metadata_extras["stop_trigger_method"], "mark_price")
+        self.assertEqual(sl.metadata_extras["sl_mode"], SL_MODE_PREMIUM)
         self.assertEqual(sl.metadata_extras["direction"], 1)
 
-    def test_entry_filled_ce_sl_clamped_below_strike(self):
-        """CE short: when ST+100 crosses strike, MAIN_SL clamps to strike-1."""
+    def test_index_sl_ce_clamped_below_strike(self):
+        """Index-mode CE: when ST+100 crosses strike, MAIN_SL clamps to strike-1."""
         instrument = SimpleNamespace(
             option_type="CE",
             expiry="240726",
@@ -1098,36 +1158,163 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             trading_symbol="C-BTC-65500-240726",
             lot_size=1,
         )
+        from core.strategies.crypto.DirectionalOptionSelling.constants import (
+            SL_MODE_INDEX,
+        )
+
+        sl = self.strategy._build_main_sl_intent(
+            instrument=instrument,
+            qty=1,
+            structure_id="sid-ce-index",
+            parent_intent_id=None,
+            candle_ts=datetime(2026, 7, 23, 15, 0, tzinfo=timezone.utc),
+            direction=-1,
+            supertrend=65450,  # ST+100 = 65550 >= strike
+            option_limit=147,
+            strike=65500,
+            option_type="CE",
+            sl_mode=SL_MODE_INDEX,
+            entry_premium=147,
+        )
+        self.assertEqual(sl.tag, "MAIN_SL")
+        self.assertEqual(sl.trigger_price, 65499)
+        self.assertLess(sl.trigger_price, 65500)
+        self.assertEqual(sl.metadata_extras["stop_trigger_method"], "spot_price")
+
+    def test_premium_sl_switches_to_index_when_green_and_st_favorable(self):
+        """CE short: mark < entry and ST falls → cancel premium SL, arm spot ST SL."""
+        from core.strategies.crypto.DirectionalOptionSelling.constants import (
+            SL_MODE_INDEX,
+            SL_MODE_PREMIUM,
+        )
         from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (
             _PositionMeta,
         )
 
-        sid = "DirectionalOptionSelling:BTCUSD:morning:2026-07-23:CE:abc123"
+        instrument = SimpleNamespace(
+            option_type="CE",
+            expiry="240726",
+            strike=65500,
+            trading_symbol="C-BTC-65500-240726",
+            lot_size=1,
+            product_id=11,
+        )
+        position = SimpleNamespace(
+            tag="MAIN",
+            net_qty=-1,
+            structure_id="DirectionalOptionSelling:BTCUSD:daily:ce-switch",
+            instrument=instrument,
+            intent_id="entry1",
+            avg_price=20,
+        )
+        ctx = SimpleNamespace(
+            position_store=_PositionStore([position]),
+            intent_store=None,
+            order_router=SimpleNamespace(broker=SimpleNamespace()),
+        )
+        sid = position.structure_id
         self.strategy._meta_by_structure_id[sid] = _PositionMeta(
             symbol="BTCUSD",
             direction=-1,
             option_type="CE",
-            supertrend=65450,  # ST+100 = 65550 >= strike
+            supertrend=66000.0,
             strike=65500,
             expiry="240726",
-            entry_premium=147,
-            entry_reason="morning_830",
-            sleeve="morning",
+            entry_premium=20.0,
+            entry_reason="one_h_signal",
+            sleeve="daily",
+            sl_mode=SL_MODE_PREMIUM,
         )
-        intents = self.strategy.on_main_entry_filled(
-            ctx=SimpleNamespace(position_store=_PositionStore()),
-            structure_id=sid,
-            instrument=instrument,
-            qty=1,
-            intent_id="parent_morn",
-            price=147,
-            candle_ts=datetime(2026, 7, 23, 15, 0, tzinfo=timezone.utc),
-        )
+        with patch.object(
+            self.strategy, "_live_option_mark_price", return_value=15.0
+        ):
+            with patch.object(
+                self.strategy, "_cancel_resting_main_sl", return_value=True
+            ):
+                with patch.object(
+                    self.strategy, "_live_option_limit_price", return_value=16.0
+                ):
+                    intents = self.strategy._trail_open_sleeves(
+                        ctx,
+                        {
+                            "close": 65000.0,
+                            "timestamp": datetime(
+                                2026, 7, 23, 10, 0, tzinfo=timezone.utc
+                            ),
+                        },
+                        one_h_st=65000.0,
+                        previous_st=66000.0,
+                        source="test",
+                    )
         self.assertEqual(len(intents), 1)
         sl = intents[0]
         self.assertEqual(sl.tag, "MAIN_SL")
-        self.assertEqual(sl.trigger_price, 65499)
-        self.assertLess(sl.trigger_price, 65500)
+        self.assertEqual(sl.metadata_extras["stop_trigger_method"], "spot_price")
+        self.assertEqual(sl.metadata_extras["sl_mode"], SL_MODE_INDEX)
+        # ST 65000 + 100 = 65100, CE clamp keeps SL < strike → 65100 ok
+        self.assertEqual(sl.trigger_price, 65100.0)
+        self.assertEqual(
+            self.strategy._meta_by_structure_id[sid].sl_mode, SL_MODE_INDEX
+        )
+
+    def test_premium_sl_stays_when_still_red(self):
+        from core.strategies.crypto.DirectionalOptionSelling.constants import (
+            SL_MODE_PREMIUM,
+        )
+        from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (
+            _PositionMeta,
+        )
+
+        instrument = SimpleNamespace(
+            option_type="CE",
+            expiry="240726",
+            strike=65500,
+            trading_symbol="C-BTC-65500-240726",
+            lot_size=1,
+        )
+        position = SimpleNamespace(
+            tag="MAIN",
+            net_qty=-1,
+            structure_id="DirectionalOptionSelling:BTCUSD:daily:ce-red",
+            instrument=instrument,
+            intent_id="entry1",
+            avg_price=20,
+        )
+        ctx = SimpleNamespace(
+            position_store=_PositionStore([position]),
+            intent_store=None,
+            order_router=SimpleNamespace(broker=SimpleNamespace()),
+        )
+        sid = position.structure_id
+        self.strategy._meta_by_structure_id[sid] = _PositionMeta(
+            symbol="BTCUSD",
+            direction=-1,
+            option_type="CE",
+            supertrend=66000.0,
+            strike=65500,
+            expiry="240726",
+            entry_premium=20.0,
+            entry_reason="one_h_signal",
+            sleeve="daily",
+            sl_mode=SL_MODE_PREMIUM,
+        )
+        with patch.object(
+            self.strategy, "_live_option_mark_price", return_value=25.0
+        ):
+            intents = self.strategy._trail_open_sleeves(
+                ctx,
+                {
+                    "close": 65000.0,
+                    "timestamp": datetime(2026, 7, 23, 10, 0, tzinfo=timezone.utc),
+                },
+                one_h_st=65000.0,
+                previous_st=66000.0,
+                source="test",
+            )
+        self.assertEqual(intents, [])
+        self.assertEqual(
+            self.strategy._meta_by_structure_id[sid].sl_mode, SL_MODE_PREMIUM
+        )
 
     def test_sl_at_1101_reenters_on_1130_close_same_direction(self):
         """SL at 11:01 inside 10:30→11:30 bar → re-enter at that bar's 11:30 close."""
@@ -1826,6 +2013,10 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             intent_store=None,
             order_router=SimpleNamespace(broker=SimpleNamespace()),
         )
+        from core.strategies.crypto.DirectionalOptionSelling.constants import (
+            SL_MODE_INDEX,
+        )
+
         sid = position.structure_id
         self.strategy._meta_by_structure_id[sid] = _PositionMeta(
             symbol="BTCUSD",
@@ -1837,6 +2028,7 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             entry_premium=303,
             entry_reason="weekly_htf_aligned",
             sleeve="weekly",
+            sl_mode=SL_MODE_INDEX,
         )
         # Stale seed that previously blocked trail after restart.
         self.strategy._current_4h_supertrend = 64497.31

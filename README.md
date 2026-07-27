@@ -313,3 +313,5 @@ sudo systemctl daemon-reload
 sudo systemctl start dhan-oi-positional-buy.service
 sudo systemctl start dhan-leaps-rsi.service
 sudo systemctl enable option-buildup-scheduler.service
+
+python utils/delta/refresh_crypto_indicator_history.py --only 60,4h,1d
