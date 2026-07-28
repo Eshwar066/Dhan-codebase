@@ -351,7 +351,7 @@ ENGINE_JOBS = [
 
         "live": {"exchange": "DELTA", "sector": "YES"},
 
-        "symbols": ["BTCUSD"],
+        "symbols": ["BTCUSD", "ETHUSD"],
 
     },
 

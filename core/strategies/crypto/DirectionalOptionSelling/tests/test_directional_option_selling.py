@@ -2296,6 +2296,42 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertEqual(s._entry_qty_lots(""), 2)
         self.assertEqual(s._entry_qty_lots("WEEKLY"), 5)
 
+    def test_symbol_config_btc_vs_eth_and_runtime_isolation(self):
+        from core.strategies.crypto.DirectionalOptionSelling.constants import (
+            symbol_config,
+        )
+
+        s = DirectionalOptionSelling()
+        self.assertIn("ETHUSD", s.underlying_symbols)
+        self.assertEqual(symbol_config("BTCUSD")["option_root"], "BTC")
+        self.assertEqual(symbol_config("ETHUSD")["option_root"], "ETH")
+        self.assertGreater(
+            float(symbol_config("BTCUSD")["min_premium_usd"]),
+            float(symbol_config("ETHUSD")["min_premium_usd"]),
+        )
+        self.assertEqual(s._entry_qty_lots("weekly", "BTCUSD"), 50)
+        self.assertEqual(s._entry_qty_lots("weekly", "ETHUSD"), 10)
+        self.assertEqual(
+            s._trail_sl_level(1, 100.0, symbol="ETHUSD"),
+            100.0 - float(symbol_config("ETHUSD")["trail_sl_points"]),
+        )
+        s._bind_symbol("ETHUSD")
+        s._confirmed_direction = 1
+        s._bind_symbol("BTCUSD")
+        s._confirmed_direction = -1
+        s._bind_symbol("ETHUSD")
+        self.assertEqual(s._confirmed_direction, 1)
+        s._bind_symbol("BTCUSD")
+        self.assertEqual(s._confirmed_direction, -1)
+        self.assertTrue(s.should_evaluate(
+            {
+                "symbol": "ETHUSD",
+                "timestamp": datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc),
+                "bucket_ts": datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc).timestamp(),
+                "timeframe": "60",
+            }
+        ))
+
     def test_sleeve_entry_enable_flags(self):
         import importlib
 

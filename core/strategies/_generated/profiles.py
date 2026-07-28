@@ -70,6 +70,7 @@ STRATEGY_PROFILES: dict = {
     'DirectionalOptionSelling': {
         'symbols': [
             'BTCUSD',
+            'ETHUSD',
         ],
         'exchange': 'NSE',
         'delta': {

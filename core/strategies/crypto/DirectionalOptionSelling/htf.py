@@ -11,13 +11,18 @@ import pandas as pd
 from core.strategies.deltaMktMixins import _delta_source_from_ctx
 from core.utils import indicator_history as ind_hist
 
-from .constants import HTF_LOOKBACK_DAYS, HTF_TIMEFRAMES
+from .constants import HTF_LOOKBACK_DAYS, HTF_TIMEFRAMES, normalize_underlying
 
 logger = logging.getLogger(__name__)
 
 
 class DosHtfMixin:
     """1D/4H SuperTrend fetch, cache, stamp, and entry alignment filters."""
+
+    def _htf_underlying(self, candle: Optional[dict] = None) -> str:
+        if candle is not None:
+            return normalize_underlying(candle.get("symbol"))
+        return normalize_underlying(getattr(self, "_active_symbol", None) or "BTCUSD")
 
     @staticmethod
     def _tf_bar_seconds(timeframe: str) -> int:
@@ -71,7 +76,7 @@ class DosHtfMixin:
         return direction, st, pd.Timestamp(row["timestamp"]).tz_convert("UTC")
 
     def _fetch_htf_ohlc(
-        self, ctx: Any, timeframe: str, as_of_utc: pd.Timestamp
+        self, ctx: Any, timeframe: str, as_of_utc: pd.Timestamp, *, symbol: Optional[str] = None
     ) -> Optional[pd.DataFrame]:
         source = _delta_source_from_ctx(ctx)
         if source is None or not hasattr(source, "get_intraday"):
@@ -79,9 +84,10 @@ class DosHtfMixin:
         lookback = int(HTF_LOOKBACK_DAYS.get(timeframe, 60))
         end_d = pd.Timestamp(as_of_utc).tz_convert("UTC").date()
         start_d = end_d - timedelta(days=lookback)
+        under = normalize_underlying(symbol or getattr(self, "_active_symbol", None))
         try:
             return source.get_intraday(
-                "BTCUSD",
+                under,
                 start_d.isoformat(),
                 end_d.isoformat(),
                 timeframe,
@@ -89,12 +95,20 @@ class DosHtfMixin:
             )
         except Exception as exc:
             logger.warning(
-                "%s HTF fetch failed tf=%s: %s", self.name, timeframe, exc
+                "%s HTF fetch failed symbol=%s tf=%s: %s",
+                self.name,
+                under,
+                timeframe,
+                exc,
             )
             return None
 
     def _latest_closed_st_from_indicator_history(
-        self, timeframe: str, as_of_utc: pd.Timestamp
+        self,
+        timeframe: str,
+        as_of_utc: pd.Timestamp,
+        *,
+        symbol: Optional[str] = None,
     ) -> Optional[Tuple[int, float, pd.Timestamp]]:
         """
         Last fully closed SuperTrend from live ``indicator_history.jsonl``.
@@ -110,14 +124,16 @@ class DosHtfMixin:
             as_of = as_of.tz_localize("UTC")
         else:
             as_of = as_of.tz_convert("UTC")
+        under = normalize_underlying(symbol or getattr(self, "_active_symbol", None))
         try:
             rows = ind_hist.load_indicator_history_rows(
-                "BTCUSD", timeframe, max_rows=80
+                under, timeframe, max_rows=80
             )
         except Exception as exc:
             logger.debug(
-                "%s indicator history read failed tf=%s: %s",
+                "%s indicator history read failed symbol=%s tf=%s: %s",
                 self.name,
+                under,
                 timeframe,
                 exc,
             )
@@ -159,10 +175,13 @@ class DosHtfMixin:
     ) -> Optional[Tuple[int, float, pd.Timestamp]]:
         """Cached last-closed SuperTrend for ``timeframe`` (4h / 1d)."""
         as_of = self._as_of_utc(candle)
+        under = self._htf_underlying(candle)
         cached = self._htf_st_cache.get(timeframe)
         bar_sec = self._tf_bar_seconds(timeframe)
         # Prefer live indicator history (updated on 4h/1d close) over REST.
-        hist = self._latest_closed_st_from_indicator_history(timeframe, as_of)
+        hist = self._latest_closed_st_from_indicator_history(
+            timeframe, as_of, symbol=under
+        )
         if hist is not None:
             if cached is None or hist[2] > cached[2] or abs(hist[1] - cached[1]) > 1e-6:
                 self._htf_st_cache[timeframe] = hist
@@ -173,7 +192,7 @@ class DosHtfMixin:
             # Still on the same closed HTF bar — reuse cache.
             if as_of < next_close + pd.Timedelta(seconds=bar_sec):
                 return cached
-        df = self._fetch_htf_ohlc(ctx, timeframe, as_of)
+        df = self._fetch_htf_ohlc(ctx, timeframe, as_of, symbol=under)
         snap = self._latest_closed_st_from_df(df, timeframe=timeframe, as_of_utc=as_of)
         if snap is not None:
             self._htf_st_cache[timeframe] = snap
@@ -322,14 +341,17 @@ class DosHtfMixin:
         Used after restart and for weekly trail so we never rely on entry-meta ST
         as if it were the live 4H line.
         """
+        under = self._htf_underlying(candle)
         if candle is None:
             candle = {
-                "symbol": "BTCUSD",
+                "symbol": under,
                 "timestamp": pd.Timestamp.now(tz="UTC"),
                 "timeframe": "4h",
             }
         as_of = self._as_of_utc(candle)
-        hist = self._latest_closed_st_from_indicator_history("4h", as_of)
+        hist = self._latest_closed_st_from_indicator_history(
+            "4h", as_of, symbol=under
+        )
         if hist is None:
             return None
         direction, st, bar_open = hist
@@ -346,17 +368,22 @@ class DosHtfMixin:
         Must NOT use open-position meta direction (e.g. weekly PE = +1) — that
         masks the real 1H state after restart and skips the next daily flip entry.
         """
+        under = self._htf_underlying(candle)
         if candle is None:
             candle = {
-                "symbol": "BTCUSD",
+                "symbol": under,
                 "timestamp": pd.Timestamp.now(tz="UTC"),
                 "timeframe": "60",
             }
         as_of = self._as_of_utc(candle)
         # Primary TF key in indicator history is "60".
-        hist = self._latest_closed_st_from_indicator_history("60", as_of)
+        hist = self._latest_closed_st_from_indicator_history(
+            "60", as_of, symbol=under
+        )
         if hist is None:
-            hist = self._latest_closed_st_from_indicator_history("1h", as_of)
+            hist = self._latest_closed_st_from_indicator_history(
+                "1h", as_of, symbol=under
+            )
         if hist is None:
             return None
         direction, st, _bar_open = hist

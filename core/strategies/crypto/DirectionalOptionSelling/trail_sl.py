@@ -16,6 +16,7 @@ from .constants import (
     TRAIL_SL_MODIFY_ATTEMPTS,
     TRAIL_SL_PENDING_RETRY_GAP_SEC,
     TRAIL_SL_POINTS,
+    symbol_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,20 +48,28 @@ class DosTrailSlMixin:
         *,
         strike: Optional[float] = None,
         option_type: Optional[str] = None,
+        trail_points: Optional[float] = None,
+        symbol: Optional[str] = None,
     ) -> float:
-        """Broker SL level. Bullish: ST - 100. Bearish: ST + 100.
+        """Broker SL level. Bullish: ST − trail_points. Bearish: ST + trail_points.
 
         When strike is known, clamp so CE SL stays strictly below strike and
-        PE SL stays strictly above strike (still prefer ST±100 when valid).
+        PE SL stays strictly above strike (still prefer ST±points when valid).
 
-        Example (morning PE short): ST=64813.39, strike=64800 → ST-100=64713.39
+        Example (morning PE short, BTC): ST=64813.39, strike=64800 → ST-100=64713.39
         is invalid; clamp to strike+1 = 64801.
         """
+        if trail_points is None:
+            pts = float(symbol_config(symbol)["trail_sl_points"])
+        else:
+            pts = float(trail_points)
+        if pts <= 0:
+            pts = float(TRAIL_SL_POINTS)
         st = float(supertrend)
         if direction > 0:
-            level = st - TRAIL_SL_POINTS
+            level = st - pts
         else:
-            level = st + TRAIL_SL_POINTS
+            level = st + pts
         try:
             k = float(strike) if strike is not None else 0.0
         except (TypeError, ValueError):
@@ -86,13 +95,13 @@ class DosTrailSlMixin:
 
     @staticmethod
     def _strike_from_trading_symbol(trading_symbol: Any) -> Optional[float]:
-        """Parse strike from Delta symbols like ``P-BTC-64800-240726``."""
+        """Parse strike from Delta symbols like ``P-BTC-64800-240726`` / ``C-ETH-...``."""
         import re
 
         sym = str(trading_symbol or "").strip().upper()
         if not sym:
             return None
-        m = re.match(r"^[PC]-BTC-(\d+)-", sym)
+        m = re.match(r"^[PC]-(?:BTC|ETH|XBT)-(\d+(?:\.\d+)?)-", sym)
         if not m:
             return None
         try:
@@ -143,12 +152,24 @@ class DosTrailSlMixin:
         return strike, option_type
 
     @staticmethod
-    def _force_exit_level(direction: int, supertrend: float) -> float:
-        """Strategy emergency exit level. Bullish: ST - 300. Bearish: ST + 300."""
+    def _force_exit_level(
+        direction: int,
+        supertrend: float,
+        *,
+        force_points: Optional[float] = None,
+        symbol: Optional[str] = None,
+    ) -> float:
+        """Strategy emergency exit level. Bullish: ST − pts. Bearish: ST + pts."""
+        if force_points is None:
+            pts = float(symbol_config(symbol)["force_exit_points"])
+        else:
+            pts = float(force_points)
+        if pts <= 0:
+            pts = float(FORCE_EXIT_POINTS)
         st = float(supertrend)
         if direction > 0:
-            return st - FORCE_EXIT_POINTS
-        return st + FORCE_EXIT_POINTS
+            return st - pts
+        return st + pts
 
     def _find_main_sl_record(self, ctx: Any, structure_id: str) -> Optional[dict]:
         intent_store = getattr(ctx, "intent_store", None)

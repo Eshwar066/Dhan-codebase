@@ -22,7 +22,7 @@ GENERATED_STRATEGY_SUBSCRIPTIONS: dict = {
             'enabled': True,
         },
         'QuoteUpdated': {
-            'enabled': True,
+            'enabled': False,
             'symbols': [
                 'BTCUSD',
                 'ETHUSD',
@@ -110,6 +110,7 @@ GENERATED_STRATEGY_SUBSCRIPTIONS: dict = {
             ],
             'symbols': [
                 'BTCUSD',
+                'ETHUSD',
             ],
         },
         'FeedDisconnected': {
@@ -131,12 +132,14 @@ GENERATED_STRATEGY_SUBSCRIPTIONS: dict = {
             'enabled': True,
             'symbols': [
                 'BTCUSD',
+                'ETHUSD',
             ],
         },
         'ScheduledSlot': {
             'enabled': False,
             'symbols': [
                 'BTCUSD',
+                'ETHUSD',
             ],
         },
     },

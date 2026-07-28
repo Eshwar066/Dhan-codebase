@@ -16,6 +16,7 @@ broker:
     leverage: 5
 symbols:
 - BTCUSD
+- ETHUSD
 exchange: NSE
 timeframe: '60'
 schedule:
@@ -47,35 +48,26 @@ subscriptions:
     - 1d
     symbols:
     - BTCUSD
+    - ETHUSD
   ScheduledSlot:
     enabled: false
     symbols:
     - BTCUSD
+    - ETHUSD
   QuoteUpdated:
     enabled: true
     symbols:
     - BTCUSD
+    - ETHUSD
 execution:
   bracket_leg_tags:
   - MAIN_SL
 documentation:
-  title: BTC SuperTrend Option Selling
+  title: BTC/ETH SuperTrend Option Selling
   overview: >
-    One-hour BTC SuperTrend reversals sell one Put in bullish regimes or one Call
-    in bearish regimes. Strike selection uses strictly OTM strikes outside SuperTrend
-    with at least $120 premium, preferring 0DTE and then the next daily expiry.
-    A morning sleeve also sells 0DTE at 08:30 IST on the current 1H SuperTrend
-    (no 4H/1D filter, 10 lots, min premium $20), gated by ENABLE_MORNING_TRADES.
+    Multi-sleeve SuperTrend option selling for BTCUSD and ETHUSD. Per-symbol
+    knobs (premium floors, trail points, lots) live in SYMBOL_CONFIG.
   rules: |
-    - SuperTrend length 16, multiplier 1.5 on BTCUSD 60-minute closed candles
-    - Daily sleeve enters only on a confirmed 1H SuperTrend flip (no mid-regime catch-up)
-    - Morning sleeve enters once per day on the 08:30 IST closed 1H bar (1H ST only; 0DTE; 10 lots)
-    - Red to Green: sell one PE; Green to Red: sell one CE
-    - Exit the old option before placing the opposite option
-    - Broker MAIN_SL is a spot-triggered stop-LIMIT on the option (never market); open limits re-quote to best ask every 30s
-    - Broker SL stop_price is modified whenever SuperTrend changes (ST±100); CE SL kept < strike, PE SL kept > strike
-    - Strategy emergency: if spot breaches ST±300 and position still open, place immediate LIMIT exit (also re-quoted every 30s)
-    - Strike proximity: if spot trades within ±50 of the open option strike, exit immediately
-    - After any SL fill, re-enter on that same 1hr candle's close (e.g. SL at 11:01 in 10:30-11:30 → decide at 11:30): unchanged SuperTrend → same direction; flipped → opposite
-    - At 17:25 IST, cancel resting MAIN_SL, exit today's expiry, then sell next-day
-      OTM strike outside SuperTrend (min 200 pts) with premium >= $120
+    - SuperTrend length 16, multiplier 1.5 on 60-minute closed candles
+    - Symbol-wise config for strike selection / risk distances / lots
+    - Sleeves: weekly, monthly, daily, morning (see readme.md)

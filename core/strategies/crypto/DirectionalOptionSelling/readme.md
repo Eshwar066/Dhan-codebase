@@ -2,14 +2,16 @@
 
 BTC SuperTrend **directional option selling** on Delta Exchange.
 
-Sells puts when bullish, sells calls when bearish. Runs **four sleeves in parallel** (each can be open at the same time):
+BTC SuperTrend **directional option selling** on Delta Exchange (also **ETHUSD**).
+
+Sells puts when bullish, sells calls when bearish. Runs **four sleeves in parallel** per underlying (each can be open at the same time). Knobs that differ by coin (premium floors, trail/force points, lots, strike distance) live in ``SYMBOL_CONFIG`` in `constants.py`.
 
 | Sleeve | `structure_id` token | Enable switch |
 |--------|----------------------|---------------|
-| **Weekly** | `weekly` | `ENABLE_WEEKLY_TRADES` |
-| **Monthly** | `monthly` | `ENABLE_MONTHLY_TRADES` |
-| **Daily** | `daily` | `ENABLE_INTRADAY_TRADES` |
-| **Morning** | `morning` | `ENABLE_MORNING_0DTE_TRADES` |
+| **Weekly** | `weekly` | `ENABLE_WEEKLY_TRADES` (+ per-symbol `enable_weekly`) |
+| **Monthly** | `monthly` | `ENABLE_MONTHLY_TRADES` (+ per-symbol `enable_monthly`) |
+| **Daily** | `daily` | `ENABLE_INTRADAY_TRADES` (+ per-symbol `enable_intraday`) |
+| **Morning** | `morning` | `ENABLE_MORNING_0DTE_TRADES` (+ per-symbol `enable_morning`) |
 
 When a switch is `False`, that sleeve takes **no new entries and no SL re-entries**. Open positions still trail SL, force-exit, reverse, and roll as usual.
 
@@ -289,7 +291,7 @@ flowchart TD
 | `HTF_TIMEFRAMES` | `4h`, `1d` | Higher-TF SuperTrend sources |
 | `SLEEVE_WEEKLY` / `MONTHLY` / `DAILY` / `MORNING` | `weekly` / `monthly` / `daily` / `morning` | Sleeve ids in `structure_id` |
 
-Module switches in `DirectionalOptionSelling.py`:
+Module switches in `DirectionalOptionSelling.py` (global; AND with per-symbol `enable_*`):
 
 | Switch | Default (as checked in) | Sleeve |
 |--------|-------------------------|--------|
@@ -297,6 +299,8 @@ Module switches in `DirectionalOptionSelling.py`:
 | `ENABLE_MONTHLY_TRADES` | `True` | monthly |
 | `ENABLE_INTRADAY_TRADES` | `True` | daily |
 | `ENABLE_MORNING_0DTE_TRADES` | `True` | morning |
+
+Per-underlying knobs: `SYMBOL_CONFIG` in `constants.py` (`BTCUSD` / `ETHUSD`) — premium floors, trail/force/proximity points, lots, DTE, deeper OTM, and per-sleeve `enable_*`.
 
 ---
 
