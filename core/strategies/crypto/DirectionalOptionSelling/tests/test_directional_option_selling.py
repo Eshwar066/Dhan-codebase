@@ -1895,11 +1895,17 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             "monthly",
         )
 
-    def test_entry_qty_lots_monthly_matches_weekly(self):
+    def test_entry_qty_lots_monthly_independent(self):
         s = DirectionalOptionSelling()
+        self.assertEqual(s._entry_qty_lots("monthly", "BTCUSD"), 50)
+        self.assertEqual(s._entry_qty_lots("weekly", "BTCUSD"), 50)
+        self.assertEqual(s._entry_qty_lots("monthly", "ETHUSD"), 10)
+        self.assertEqual(s._entry_qty_lots("weekly", "ETHUSD"), 10)
         s.order_qty_lots_weekly = 50
-        self.assertEqual(s._entry_qty_lots("monthly"), 50)
-        self.assertEqual(s._entry_qty_lots("MONTHLY"), 50)
+        s.order_qty_lots_monthly = 25
+        self.assertEqual(s._entry_qty_lots("monthly"), 25)
+        self.assertEqual(s._entry_qty_lots("MONTHLY"), 25)
+        self.assertEqual(s._entry_qty_lots("weekly"), 50)
         self.assertTrue(s._uses_4h_trail("monthly"))
 
     def test_monthly_enters_only_on_1d_flip(self):

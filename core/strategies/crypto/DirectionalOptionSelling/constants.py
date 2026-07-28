@@ -41,6 +41,7 @@ _SYMBOL_CONFIG_BTC: Dict[str, Any] = {
     "strike_proximity_exit_points": 50.0,
     "premium_sl_mult": 2.0,
     "order_qty_lots_weekly": 50,
+    "order_qty_lots_monthly": 50,
     "order_qty_lots_daily": 10,
     "order_qty_lots_morning": 10,
     "weekly_min_dte": 3,
@@ -64,6 +65,7 @@ _SYMBOL_CONFIG_ETH: Dict[str, Any] = {
     "strike_proximity_exit_points": 3.0,
     "premium_sl_mult": 2.0,
     "order_qty_lots_weekly": 10,
+    "order_qty_lots_monthly": 10,
     "order_qty_lots_daily": 5,
     "order_qty_lots_morning": 5,
     "weekly_min_dte": 3,
@@ -92,6 +94,7 @@ STRIKE_PROXIMITY_EXIT_POINTS = float(_SYMBOL_CONFIG_BTC["strike_proximity_exit_p
 MIN_STRIKE_SPOT_DISTANCE = float(_SYMBOL_CONFIG_BTC["min_strike_spot_distance"])
 ROLLOVER_MIN_STRIKE_DISTANCE = float(_SYMBOL_CONFIG_BTC["rollover_min_strike_distance"])
 ORDER_QTY_LOTS_WEEKLY = int(_SYMBOL_CONFIG_BTC["order_qty_lots_weekly"])
+ORDER_QTY_LOTS_MONTHLY = int(_SYMBOL_CONFIG_BTC["order_qty_lots_monthly"])
 ORDER_QTY_LOTS_DAILY = int(_SYMBOL_CONFIG_BTC["order_qty_lots_daily"])
 ORDER_QTY_LOTS_MORNING = int(_SYMBOL_CONFIG_BTC["order_qty_lots_morning"])
 ORDER_QTY_LOTS = ORDER_QTY_LOTS_DAILY

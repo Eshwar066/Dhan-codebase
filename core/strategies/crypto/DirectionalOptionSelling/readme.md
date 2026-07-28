@@ -44,7 +44,7 @@ SuperTrend params: length **16**, factor **1.5**.
 | Topic | Weekly | Monthly | Daily | Morning |
 |-------|--------|---------|-------|---------|
 | **Enable flag** | `ENABLE_WEEKLY_TRADES` | `ENABLE_MONTHLY_TRADES` | `ENABLE_INTRADAY_TRADES` | `ENABLE_MORNING_0DTE_TRADES` |
-| **Lots** | `ORDER_QTY_LOTS_WEEKLY` (50) | Same as weekly | `ORDER_QTY_LOTS_DAILY` (10) | `ORDER_QTY_LOTS_MORNING` (10) |
+| **Lots** | `order_qty_lots_weekly` (BTC 50) | `order_qty_lots_monthly` (BTC 50) | `order_qty_lots_daily` (BTC 10) | `order_qty_lots_morning` (BTC 10) |
 | **When it can enter** | On **closed 4H bar**, while 1D + 4H already agree | On closed 1H bar, **only** on a confirmed **1D ST flip** | On closed 1H bar, **only** on a confirmed **1H ST flip** | Once per day on the **09:30 IST** closed 1H bar |
 | **Signal / direction** | Color of aligned 1D + 4H | New 1D SuperTrend after flip | Confirmed 1H SuperTrend after flip | Current confirmed 1H SuperTrend (no flip required) |
 | **HTF filter (1D + 4H)** | **Required** (1D must equal 4H) | **None** (flip is the filter) | **Required** (both must match 1H direction) | **None** — 1H only |

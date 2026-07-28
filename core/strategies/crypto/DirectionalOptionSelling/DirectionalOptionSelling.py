@@ -27,6 +27,7 @@ from .constants import (
     MORNING_ENTRY_TIME,
     ORDER_QTY_LOTS,
     ORDER_QTY_LOTS_DAILY,
+    ORDER_QTY_LOTS_MONTHLY,
     ORDER_QTY_LOTS_MORNING,
     ORDER_QTY_LOTS_WEEKLY,
     PREMIUM_SL_MULT,
@@ -157,6 +158,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
     expiryType = "Daily"
     order_qty_lots = ORDER_QTY_LOTS
     order_qty_lots_weekly = ORDER_QTY_LOTS_WEEKLY
+    order_qty_lots_monthly = ORDER_QTY_LOTS_MONTHLY
     order_qty_lots_daily = ORDER_QTY_LOTS_DAILY
     order_qty_lots_morning = ORDER_QTY_LOTS_MORNING
     supertrend_length = SUPER_TREND_LENGTH
@@ -345,14 +347,20 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         return bool(ENABLE_INTRADAY_TRADES) and bool(cfg.get("enable_intraday", True))
 
     def _entry_qty_lots(self, sleeve: str, symbol: Any = None) -> int:
-        """Lots for a new ENTRY: weekly/monthly (HTF) vs daily vs morning."""
+        """Lots for a new ENTRY: weekly / monthly / daily / morning."""
         sleeve_u = str(sleeve or SLEEVE_DAILY).strip().lower()
         cfg = self._symbol_cfg(symbol)
         inst = getattr(self, "__dict__", {})
-        if sleeve_u in (SLEEVE_WEEKLY, SLEEVE_MONTHLY):
+        if sleeve_u == SLEEVE_WEEKLY:
             if "order_qty_lots_weekly" in inst:
                 return max(1, int(inst["order_qty_lots_weekly"] or 1))
             return max(1, int(cfg.get("order_qty_lots_weekly") or ORDER_QTY_LOTS_WEEKLY))
+        if sleeve_u == SLEEVE_MONTHLY:
+            if "order_qty_lots_monthly" in inst:
+                return max(1, int(inst["order_qty_lots_monthly"] or 1))
+            return max(
+                1, int(cfg.get("order_qty_lots_monthly") or ORDER_QTY_LOTS_MONTHLY)
+            )
         if sleeve_u == SLEEVE_MORNING:
             if "order_qty_lots_morning" in inst:
                 return max(1, int(inst["order_qty_lots_morning"] or 1))
