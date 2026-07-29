@@ -153,6 +153,8 @@ class EngineConfig:
     feed_stall_seconds: float = 60.0
     # Delta OMS ExecutionValidator knobs (mark/mid/spread/stop gates). Optional dict.
     execution_validator: Optional[Dict[str, Any]] = None
+    # Delta-only economic event ENTRY blackout (YAML + local JSON cache). Optional dict.
+    event_blackout: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         if self.base_dir is None:

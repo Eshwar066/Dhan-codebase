@@ -806,6 +806,72 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             result = self.strategy.on_quote(quote_hit, ctx)
         self.assertEqual(result, [marker])
 
+    def test_should_exit_ignores_foreign_underlying_candle(self):
+        """ETHUSD candle must not ST±300-exit a BTC morning PE (live bug 29 Jul)."""
+        from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (
+            _PositionMeta,
+        )
+        from core.events.services.exit_rollover import _position_matches_candle_symbol
+
+        instrument = SimpleNamespace(
+            option_type="PE",
+            expiry="290726",
+            strike=63200,
+            trading_symbol="P-BTC-63200-290726",
+        )
+        sid = "DirectionalOptionSelling:BTCUSD:morning:2026-07-29:PE:302abf28"
+        position = SimpleNamespace(
+            tag="MAIN",
+            net_qty=-10,
+            structure_id=sid,
+            instrument=instrument,
+            avg_price=41.0,
+        )
+        ctx = SimpleNamespace(
+            position_store=_PositionStore([position]),
+            live_source=None,
+            instrument_store=None,
+            intent_store=None,
+            order_router=None,
+        )
+        self.strategy._meta_by_structure_id[sid] = _PositionMeta(
+            symbol="BTCUSD",
+            direction=1,
+            option_type="PE",
+            supertrend=63503.26,
+            strike=63200,
+            expiry="290726",
+            entry_premium=41.0,
+            entry_reason="morning_830",
+            sleeve="morning",
+        )
+        self.strategy._bind_symbol("BTCUSD")
+        self.strategy._current_supertrend = 63503.26
+        self.strategy._confirmed_direction = 1
+        # ETH bar: spot ~1910 is far below BTC force level ST-300≈63203.
+        eth_candle = {
+            "symbol": "ETHUSD",
+            "timestamp": datetime(2026, 7, 29, 6, 0, tzinfo=timezone.utc),
+            "open": 1904.7,
+            "high": 1914.55,
+            "low": 1902.55,
+            "close": 1911.9,
+        }
+        self.assertFalse(self.strategy.should_exit(position, eth_candle, ctx))
+        self.assertEqual(self.strategy.on_position_exit(position, eth_candle, ctx), [])
+        # Same levels on a BTC candle would correctly force-exit.
+        btc_hit = {
+            "symbol": "BTCUSD",
+            "timestamp": datetime(2026, 7, 29, 6, 0, tzinfo=timezone.utc),
+            "open": 63300,
+            "high": 63400,
+            "low": 63100,
+            "close": 63150,
+        }
+        self.assertTrue(self.strategy.should_exit(position, btc_hit, ctx))
+        self.assertTrue(_position_matches_candle_symbol(position, "BTCUSD"))
+        self.assertFalse(_position_matches_candle_symbol(position, "ETHUSD"))
+
     def test_risk_supertrend_weekly_never_falls_back_to_1h(self):
         s = DirectionalOptionSelling()
         s._current_supertrend = 66827.33

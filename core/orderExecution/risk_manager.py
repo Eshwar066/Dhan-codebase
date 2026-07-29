@@ -46,11 +46,14 @@ class RiskManager:
         check_short_option_margin: Optional[
             Callable[[Any, Dict[str, float]], bool]
         ] = None,
+        event_blackout_guard: Optional[Any] = None,
     ):
         self.pm = position_manager
         self.engine_logger = engine_logger
         # Option shorting: callable(intent, price_map) -> True if SPAN + exposure margin OK
         self.check_short_option_margin = check_short_option_margin
+        # Delta economic-event ENTRY blackout (no network; local calendar only)
+        self.event_blackout_guard = event_blackout_guard
 
         # Limits
         self.max_portfolio_exposure = max_portfolio_exposure
@@ -141,6 +144,34 @@ class RiskManager:
         if self._kill_switch_blocked:
             self._log_block("Entry blocked: kill switch active")
             return False
+
+        if self.event_blackout_guard is not None:
+            try:
+                block_fn = getattr(self.event_blackout_guard, "should_block_entry", None)
+                if callable(block_fn):
+                    blocked, detail = block_fn(intent)
+                    if blocked:
+                        msg = (
+                            f"Entry blocked: {detail}"
+                            if detail
+                            else "Entry blocked: economic event blackout"
+                        )
+                        self._log_block(msg)
+                        return False
+                elif self.event_blackout_guard.is_blackout_active():
+                    detail = ""
+                    describe = getattr(self.event_blackout_guard, "describe_active", None)
+                    if callable(describe):
+                        detail = describe() or ""
+                    msg = "Entry blocked: economic event blackout"
+                    if detail:
+                        msg = f"{msg} ({detail})"
+                    self._log_block(msg)
+                    return False
+            except Exception as e:
+                # Do not permanently starve entries on guard bugs; hard empty-calendar
+                # path already fail-opens. Log loudly and continue other checks.
+                self._log_block(f"Economic event blackout check error (ignored): {e}")
 
         symbol = intent.instrument.trading_symbol
         side = intent.side

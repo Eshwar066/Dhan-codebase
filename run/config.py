@@ -108,6 +108,21 @@ ENGINE_JOBS = [
             "validate_entry": True,
             "validate_stop": True,
         },
+        # Block NEW ENTRY around high-impact USD macro events (±60m default).
+        # Exits / FORCE_EXIT / MAIN_SL remain allowed. No network on trade path.
+        "event_blackout": {
+            "enabled": True,
+            "minutes_before": 60,
+            "minutes_after": 60,
+            # On same-session HIGH events (e.g. FOMC ~23:30 IST): no 0DTE after
+            # 17:30 IST; no 1DTE until the event blackout ends. DTE>=2 still OK
+            # outside the ±60m window.
+            "short_dte_rules_enabled": True,
+            "zero_dte_cutoff_ist": "17:30",
+            "block_1dte_until_event_done": True,
+            "manual_yaml": "run/calendars/delta_event_blackout.yaml",
+            "cache_json": "logs/calendars/delta_economic_events.json",
+        },
         "telegram": {
             "bot_token": "8389724629:AAHY_CGcBF8HZCexedsEJFw80Mf6SxH5Bkk",
             "chat_id": "1021479950",

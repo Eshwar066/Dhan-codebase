@@ -115,6 +115,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         account_circuit_breaker_threshold: int = 5,
         feed_stall_seconds: float = 60.0,
         execution_validator: Optional[Dict[str, Any]] = None,
+        event_blackout_guard: Optional[Any] = None,
     ):
         super().__init__(
             strategy,
@@ -163,9 +164,18 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self._execution_validator_cfg = (
             dict(execution_validator) if isinstance(execution_validator, dict) else None
         )
+        self._event_blackout_guard = event_blackout_guard
         self.market_exchange = str(market_exchange or "").upper()
         self.engine_logger = engine_logger
         self._configure_execution_validator()
+        # Keep RiskManager guard in sync if factory attached it elsewhere.
+        if (
+            event_blackout_guard is not None
+            and self.order_router is not None
+            and getattr(self.order_router, "risk", None) is not None
+            and getattr(self.order_router.risk, "event_blackout_guard", None) is None
+        ):
+            self.order_router.risk.event_blackout_guard = event_blackout_guard
         self.feed_stale_seconds = feed_stale_seconds
         self._last_tick_timestamp: Dict[str, float] = {}
         self._last_candle_timestamp: Dict[str, float] = {}
@@ -1870,6 +1880,17 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             reasons.append("memory")
         if self._entries_paused_latency:
             reasons.append("latency")
+        guard = getattr(self, "_event_blackout_guard", None)
+        if (
+            guard is not None
+            and str(getattr(self, "venue", "") or "").upper() == "DELTA"
+        ):
+            try:
+                if guard.is_blackout_active(venue="DELTA"):
+                    reasons.append("economic_event_blackout")
+            except Exception:
+                # Soft pause path: do not crash the loop; hard gate is RiskManager.
+                reasons.append("economic_event_blackout")
         return reasons
 
     def _log_entry_skipped_if_paused(

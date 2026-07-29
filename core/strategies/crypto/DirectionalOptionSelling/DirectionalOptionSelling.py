@@ -3158,6 +3158,20 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         if ctx is None or getattr(position, "tag", None) != "MAIN":
             return False
         meta = self._ensure_meta(position, ctx)
+        # Never compare a foreign underlying candle (e.g. ETHUSD) to this
+        # position's ST±force / proximity bands (BTC morning false exits).
+        pos_under = self._resolve_underlying(
+            meta=meta,
+            position=position,
+            structure_id=str(getattr(position, "structure_id", "") or ""),
+        )
+        candle_under = normalize_underlying((candle or {}).get("symbol"))
+        if (
+            candle_under in SUPPORTED_UNDERLYINGS
+            and pos_under in SUPPORTED_UNDERLYINGS
+            and candle_under != pos_under
+        ):
+            return False
         sleeve = str(meta.sleeve) if meta is not None else SLEEVE_DAILY
         pos_strike = self._position_strike(position, meta)
         spot = float(candle.get("close") or 0)
@@ -3169,13 +3183,13 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             low=low,
             high=high,
             band=float(
-                self._symbol_cfg(
-                    self._resolve_underlying(candle=candle, meta=meta, position=position)
-                ).get("strike_proximity_exit_points")
+                self._symbol_cfg(pos_under).get("strike_proximity_exit_points")
                 or STRIKE_PROXIMITY_EXIT_POINTS
             ),
         ):
             return True
+        # Bind so 1H/4H risk ST comes from this position's underlying runtime.
+        self._bind_symbol(pos_under)
         supertrend = self._risk_supertrend_for_sleeve(sleeve, meta)
         position_direction = (
             meta.direction
@@ -3191,9 +3205,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         force_level = self._force_exit_level(
             int(position_direction),
             float(supertrend),
-            symbol=self._resolve_underlying(
-                candle=candle, meta=meta, position=position
-            ),
+            symbol=pos_under,
         )
         return self._spot_hits_level(
             direction=int(position_direction),
@@ -3207,12 +3219,28 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         sid = str(getattr(position, "structure_id", "") or "")
         if not sid or sid in self._pending_exit_structure_ids:
             return []
-        self._pending_exit_structure_ids.add(sid)
         meta = self._ensure_meta(position, ctx)
-        sleeve = str(meta.sleeve) if meta is not None else SLEEVE_DAILY
         under = self._resolve_underlying(
-            candle=candle, meta=meta, position=position
+            meta=meta,
+            position=position,
+            structure_id=sid,
         )
+        candle_under = normalize_underlying((candle or {}).get("symbol"))
+        if (
+            candle_under in SUPPORTED_UNDERLYINGS
+            and under in SUPPORTED_UNDERLYINGS
+            and candle_under != under
+        ):
+            logger.warning(
+                "%s on_position_exit skipped cross-symbol candle=%s position=%s sid=%s",
+                self.name,
+                candle_under,
+                under,
+                sid,
+            )
+            return []
+        self._pending_exit_structure_ids.add(sid)
+        sleeve = str(meta.sleeve) if meta is not None else SLEEVE_DAILY
         self._bind_symbol(under)
         self._arm_sl_reentry(
             meta.direction if meta is not None else self._confirmed_direction,
@@ -3225,8 +3253,12 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         low = float(candle.get("low") or spot or 0)
         high = float(candle.get("high") or spot or 0)
         reason = "strategy_force_exit_300"
+        prox_band = float(
+            self._symbol_cfg(under).get("strike_proximity_exit_points")
+            or STRIKE_PROXIMITY_EXIT_POINTS
+        )
         if pos_strike is not None and self._spot_near_position_strike(
-            spot=spot, strike=pos_strike, low=low, high=high
+            spot=spot, strike=pos_strike, low=low, high=high, band=prox_band
         ):
             reason = "strategy_strike_proximity_exit"
         return [self._exit_intent(position, candle, ctx, reason)]

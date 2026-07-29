@@ -13,6 +13,58 @@ def _position_allows_strategy_exit(pos: Any) -> bool:
     return tag_u == "MAIN" or tag_u.startswith("MAIN_")
 
 
+def _structure_underlying(structure_id: Any) -> Optional[str]:
+    """Parse ``Strategy:BTCUSD:sleeve:...`` → BTCUSD when present."""
+    parts = str(structure_id or "").split(":")
+    if len(parts) >= 2:
+        cand = str(parts[1] or "").strip().upper()
+        if cand.endswith("USD") or cand in ("BTC", "ETH", "NIFTY", "BANKNIFTY"):
+            return cand
+    return None
+
+
+def _position_matches_candle_symbol(position: Any, symbol: str) -> bool:
+    """
+    True when ``position`` belongs to ``symbol`` (candle underlying).
+
+    Used after strategy-wide position fallbacks so an ETHUSD bar cannot
+    force-exit a BTCUSD leg (and vice versa).
+    """
+    sym_u = str(symbol or "").strip().upper()
+    if not sym_u:
+        return True
+    sid_under = _structure_underlying(getattr(position, "structure_id", None))
+    if sid_under:
+        # Normalize short roots.
+        if sid_under == "BTC":
+            sid_under = "BTCUSD"
+        elif sid_under == "ETH":
+            sid_under = "ETHUSD"
+        return sid_under == sym_u
+    inst = getattr(position, "instrument", None)
+    for attr in ("underlying_symbol", "underlying", "symbol"):
+        val = str(getattr(inst, attr, "") or "").strip().upper()
+        if not val:
+            continue
+        if val == sym_u:
+            return True
+        if val in ("BTC", "XBT") and sym_u == "BTCUSD":
+            return True
+        if val == "ETH" and sym_u == "ETHUSD":
+            return True
+    trading = str(getattr(inst, "trading_symbol", "") or "").strip().upper()
+    if trading:
+        if sym_u == "BTCUSD" and ("-BTC-" in trading or trading.startswith(("P-BTC", "C-BTC"))):
+            return True
+        if sym_u == "ETHUSD" and ("-ETH-" in trading or trading.startswith(("P-ETH", "C-ETH"))):
+            return True
+        # Unknown encoding — do not guess; keep legacy single-symbol behavior.
+        if "-BTC-" in trading or "-ETH-" in trading:
+            return False
+    # No underlying signal on the position — keep (single-symbol / legacy).
+    return True
+
+
 class ExitRolloverService:
     """
     Runs strategy ``should_exit`` / ``on_position_exit`` and hedge rollover.
@@ -72,7 +124,8 @@ class ExitRolloverService:
         )
         # Dhan compact option symbols + strippered ownership after broker sync can
         # make the combined filter miss legs. Fall back to strategy-only, then
-        # structure_id prefix match for this strategy.
+        # structure_id prefix match for this strategy — but always re-filter to
+        # the candle underlying so multi-symbol strategies cannot cross-exit.
         if not open_positions:
             open_positions = engine.position_manager.get_open_positions(
                 strategy=strategy.name
@@ -83,6 +136,12 @@ class ExitRolloverService:
                 p
                 for p in (engine.position_manager.get_open_positions() or [])
                 if str(getattr(p, "structure_id", "") or "").startswith(prefix)
+            ]
+        if symbol:
+            open_positions = [
+                p
+                for p in open_positions
+                if _position_matches_candle_symbol(p, symbol)
             ]
         exited_structures: set[str] = set()
         for position in open_positions:

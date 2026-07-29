@@ -283,6 +283,16 @@ class EngineFactory:
             known_strategies=_loaded_strategies,
             debug_mode=bool(getattr(config, "debug_mode", False)),
         )
+        event_blackout_guard = None
+        if str(getattr(config, "broker_name", "") or "").upper() == "DELTA":
+            from core.utils.calendar.economic_events import EventBlackoutGuard
+
+            event_blackout_guard = EventBlackoutGuard.from_config(
+                getattr(config, "event_blackout", None),
+                venue=config.broker_name,
+                engine_logger=engine_logger,
+                base_dir=getattr(config, "base_dir", None),
+            )
         risk_manager = RiskManager(
             position_manager=position_manager,
             capital=config.capital,
@@ -293,6 +303,7 @@ class EngineFactory:
             or 10000000,
             cooldown_seconds=getattr(config, "cooldown_seconds", None) or 5,
             engine_logger=engine_logger,
+            event_blackout_guard=event_blackout_guard,
         )
 
         # ---------- Instruments (needed by OrderRouter) ----------
@@ -573,6 +584,7 @@ class EngineFactory:
             ),
             feed_stall_seconds=getattr(config, "feed_stall_seconds", 60.0),
             execution_validator=getattr(config, "execution_validator", None),
+            event_blackout_guard=event_blackout_guard,
         )
 
     @staticmethod
