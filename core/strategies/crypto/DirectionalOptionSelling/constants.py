@@ -32,6 +32,7 @@ TRAIL_SL_PENDING_RETRY_GAP_SEC = 5.0
 # ---------------------------------------------------------------------------
 _SYMBOL_CONFIG_BTC: Dict[str, Any] = {
     "option_root": "BTC",
+    "enabled": True,
     "min_premium_usd": 120.0,
     "min_premium_usd_morning": 20.0,
     "min_strike_spot_distance": 400.0,
@@ -40,10 +41,10 @@ _SYMBOL_CONFIG_BTC: Dict[str, Any] = {
     "force_exit_points": 300.0,
     "strike_proximity_exit_points": 50.0,
     "premium_sl_mult": 2.0,
-    "order_qty_lots_weekly": 50,
-    "order_qty_lots_monthly": 50,
+    "order_qty_lots_weekly": 10,
+    "order_qty_lots_monthly": 10,
     "order_qty_lots_daily": 10,
-    "order_qty_lots_morning": 10,
+    "order_qty_lots_morning": 100,
     "weekly_min_dte": 3,
     "monthly_min_dte": 7,
     "enable_weekly_deeper_otm": True,
@@ -56,6 +57,7 @@ _SYMBOL_CONFIG_BTC: Dict[str, Any] = {
 # ETH scaled ~spot ratio vs BTC (~1/18–1/20). Tune live as needed.
 _SYMBOL_CONFIG_ETH: Dict[str, Any] = {
     "option_root": "ETH",
+    "enabled": True,
     "min_premium_usd": 8.0,
     "min_premium_usd_morning": 2.0,
     "min_strike_spot_distance": 20.0,

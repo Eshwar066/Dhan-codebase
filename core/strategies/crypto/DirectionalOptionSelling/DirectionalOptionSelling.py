@@ -64,6 +64,10 @@ ENABLE_WEEKLY_TRADES = True
 ENABLE_MONTHLY_TRADES = True
 ENABLE_INTRADAY_TRADES = True
 ENABLE_MORNING_0DTE_TRADES = True
+# Per-underlying master switches (False = no new entries / SL re-entries for that
+# symbol). Open risk still trails, force-exits, and rolls.
+ENABLE_BTCUSD_TRADES = True
+ENABLE_ETHUSD_TRADES = True
 # Weekly / monthly strike pick: when True, skip nearest eligible OTM (OTM1) and take the
 # next (OTM2); if that fails premium, fall through to OTM3+. Daily/morning
 # sleeves always use nearest eligible (OTM1). Per-symbol deeper-OTM also applies.
@@ -332,8 +336,23 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         self._rt().rollover_dates = value
 
     @staticmethod
+    def _symbol_entries_enabled(symbol: Any = None) -> bool:
+        """Master per-underlying gate for new entries / SL re-entries."""
+        under = normalize_underlying(symbol)
+        cfg = symbol_config(under)
+        if not bool(cfg.get("enabled", True)):
+            return False
+        if under == "BTCUSD":
+            return bool(ENABLE_BTCUSD_TRADES)
+        if under == "ETHUSD":
+            return bool(ENABLE_ETHUSD_TRADES)
+        return True
+
+    @staticmethod
     def _sleeve_entries_enabled(sleeve: str, symbol: Any = None) -> bool:
         """Whether new entries / SL re-entries are allowed for this sleeve."""
+        if not DirectionalOptionSelling._symbol_entries_enabled(symbol):
+            return False
         sleeve_u = str(sleeve or SLEEVE_DAILY).strip().lower()
         cfg = symbol_config(symbol)
         if sleeve_u == SLEEVE_WEEKLY:

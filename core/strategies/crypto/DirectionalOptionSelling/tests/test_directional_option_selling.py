@@ -2404,6 +2404,53 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             }
         ))
 
+    def test_symbol_entry_enable_flags(self):
+        import importlib
+
+        mod = importlib.import_module(
+            "core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling"
+        )
+        prev_btc = mod.ENABLE_BTCUSD_TRADES
+        prev_eth = mod.ENABLE_ETHUSD_TRADES
+        try:
+            mod.ENABLE_BTCUSD_TRADES = True
+            mod.ENABLE_ETHUSD_TRADES = True
+            self.assertTrue(
+                DirectionalOptionSelling._symbol_entries_enabled("BTCUSD")
+            )
+            self.assertTrue(
+                DirectionalOptionSelling._symbol_entries_enabled("ETHUSD")
+            )
+            self.assertTrue(
+                DirectionalOptionSelling._sleeve_entries_enabled("daily", "BTCUSD")
+            )
+            self.assertTrue(
+                DirectionalOptionSelling._sleeve_entries_enabled("weekly", "ETHUSD")
+            )
+
+            mod.ENABLE_BTCUSD_TRADES = False
+            self.assertFalse(
+                DirectionalOptionSelling._symbol_entries_enabled("BTCUSD")
+            )
+            self.assertFalse(
+                DirectionalOptionSelling._sleeve_entries_enabled("daily", "BTCUSD")
+            )
+            self.assertFalse(
+                DirectionalOptionSelling._sleeve_entries_enabled("morning", "BTCUSD")
+            )
+            # ETH still allowed when only BTC is disabled.
+            self.assertTrue(
+                DirectionalOptionSelling._sleeve_entries_enabled("daily", "ETHUSD")
+            )
+
+            mod.ENABLE_ETHUSD_TRADES = False
+            self.assertFalse(
+                DirectionalOptionSelling._sleeve_entries_enabled("weekly", "ETHUSD")
+            )
+        finally:
+            mod.ENABLE_BTCUSD_TRADES = prev_btc
+            mod.ENABLE_ETHUSD_TRADES = prev_eth
+
     def test_sleeve_entry_enable_flags(self):
         import importlib
 
