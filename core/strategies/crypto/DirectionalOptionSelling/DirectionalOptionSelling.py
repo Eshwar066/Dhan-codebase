@@ -67,7 +67,7 @@ ENABLE_MORNING_0DTE_TRADES = True
 # Per-underlying master switches (False = no new entries / SL re-entries for that
 # symbol). Open risk still trails, force-exits, and rolls.
 ENABLE_BTCUSD_TRADES = True
-ENABLE_ETHUSD_TRADES = True
+ENABLE_ETHUSD_TRADES = False
 # Weekly / monthly strike pick: when True, skip nearest eligible OTM (OTM1) and take the
 # next (OTM2); if that fails premium, fall through to OTM3+. Daily/morning
 # sleeves always use nearest eligible (OTM1). Per-symbol deeper-OTM also applies.
@@ -426,6 +426,17 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         # structure_id → pending broker trail SL retry after failed modify.
         self._pending_trail_retries: Dict[str, _PendingTrailRetry] = {}
         self._evaluated_bars: set[str] = set()
+        logger.info(
+            "%s entry switches weekly=%s monthly=%s daily=%s morning=%s "
+            "BTCUSD=%s ETHUSD=%s",
+            self.name,
+            ENABLE_WEEKLY_TRADES,
+            ENABLE_MONTHLY_TRADES,
+            ENABLE_INTRADAY_TRADES,
+            ENABLE_MORNING_0DTE_TRADES,
+            ENABLE_BTCUSD_TRADES,
+            ENABLE_ETHUSD_TRADES,
+        )
 
     def get_warmup_period(self) -> int:
         return max(50, SUPER_TREND_LENGTH * 4)
@@ -1511,6 +1522,19 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         ):
             sleeve_u = SLEEVE_DAILY
         if not self._sleeve_entries_enabled(sleeve_u, under):
+            logger.info(
+                "%s skip %s ENTRY: sleeve/symbol disabled symbol=%s "
+                "(weekly=%s monthly=%s daily=%s morning=%s BTC=%s ETH=%s)",
+                self.name,
+                sleeve_u,
+                under,
+                ENABLE_WEEKLY_TRADES,
+                ENABLE_MONTHLY_TRADES,
+                ENABLE_INTRADAY_TRADES,
+                ENABLE_MORNING_0DTE_TRADES,
+                ENABLE_BTCUSD_TRADES,
+                ENABLE_ETHUSD_TRADES,
+            )
             return None
         if self._open_main_positions(ctx, sleeve=sleeve_u, underlying=under):
             return None
