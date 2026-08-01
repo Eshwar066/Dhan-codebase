@@ -107,6 +107,73 @@ class TestFourHourLiquidityBook(unittest.TestCase):
         self.assertEqual(side, "LONG")
         self.assertEqual(zone.price, 95.0)
 
+    def test_weekend_4h_bars_not_used_as_levels(self):
+        """Sat/Sun 4H OHLC must not become prev_4h or swing_4h levels (IST)."""
+        book = FourHourLiquidityBook(persist=False)
+        # Friday 2026-07-24
+        book.on_4h_close(
+            "BTCUSD",
+            _c(
+                o=100,
+                h=110,
+                l=90,
+                c=105,
+                timeframe="4h",
+                ts="2026-07-24T08:00:00Z",
+                candle_timestamp_ist="2026-07-24 13:30",
+            ),
+        )
+        snap = book.snapshot("BTCUSD")
+        self.assertIn(110.0, snap["highs"])
+        self.assertIn(90.0, snap["lows"])
+
+        # Saturday extreme high — must not become a level; keep Fri as prev_4h.
+        # OHLC chosen so it does not also sweep Friday's levels.
+        book.on_4h_close(
+            "BTCUSD",
+            _c(
+                o=105,
+                h=150,
+                l=91,
+                c=140,
+                timeframe="4h",
+                ts="2026-07-25T08:00:00Z",
+                candle_timestamp_ist="2026-07-25 13:30",
+            ),
+        )
+        snap = book.snapshot("BTCUSD")
+        self.assertNotIn(150.0, snap["highs"])
+        self.assertIn(110.0, snap["highs"])
+        self.assertIn(90.0, snap["lows"])
+        st = book._state("BTCUSD")
+        self.assertTrue(
+            all("2026-07-25" not in z.bar_key for z in st.high_zones + st.low_zones)
+        )
+
+        # Sunday extreme low — same rule
+        book.on_4h_close(
+            "BTCUSD",
+            _c(
+                o=140,
+                h=145,
+                l=60,
+                c=70,
+                timeframe="4h",
+                ts="2026-07-26T08:00:00Z",
+                candle_timestamp_ist="2026-07-26 13:30",
+            ),
+        )
+        snap = book.snapshot("BTCUSD")
+        self.assertNotIn(60.0, snap["lows"])
+        self.assertNotIn(145.0, snap["highs"])
+        st = book._state("BTCUSD")
+        self.assertTrue(
+            all(
+                "2026-07-25" not in z.bar_key and "2026-07-26" not in z.bar_key
+                for z in st.high_zones + st.low_zones
+            )
+        )
+
     def test_mark_consumed_removes_zone(self):
         book = FourHourLiquidityBook(persist=False)
         book.on_4h_close(
