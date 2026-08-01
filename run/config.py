@@ -370,6 +370,26 @@ ENGINE_JOBS = [
 
     },
 
+    {
+        "engine_id": "delta_liquidity_sweep_bt",
+        "venue": "DELTA",
+        "enabled": False,
+        "run_mode": "BACKTEST",
+        "capital": 200_000,
+        "strategies": ["LiquiditySweepStrategy"],
+        "delta_india": True,
+        "delta_testnet": False,
+        "delta_leverage": 5,
+        "ORDER_QTY_LOTS": 1,
+        "backtest": {
+            "start_date": "2026-07-01",
+            "end_date": "2026-07-03",
+            "timeframe": "1",
+            "exchange": "DELTA",
+            "sector": "YES",
+        },
+    },
+
 ]
 
 

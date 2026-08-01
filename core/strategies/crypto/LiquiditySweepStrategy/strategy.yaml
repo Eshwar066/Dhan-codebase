@@ -39,6 +39,30 @@ dependencies:
   - MarketStructureMixin
   - IndiaMktMixins
   meta_key: liquidity_sweep
+subscriptions:
+  BarClosed:
+    enabled: true
+    timeframes:
+    - '1'
+    - 4h
+    symbols:
+    - BTCUSD
+    - ETHUSD
+  ScheduledSlot:
+    enabled: false
+    symbols:
+    - BTCUSD
+    - ETHUSD
+  QuoteUpdated:
+    enabled: false
+    symbols:
+    - BTCUSD
+    - ETHUSD
+  IntentCreated: true
+  IntentFilled: true
+  PositionClosed: true
+  FeedDisconnected: true
+  FeedRecovered: true
 documentation:
   title: Liquidity Sweep
-  overview: Delta crypto PDH/PDL sweep + reversal sub-strategies.
+  overview: Delta crypto 4H liquidity zones swept on 1m + reversal sub-strategies.

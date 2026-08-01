@@ -1,11 +1,13 @@
 """
-Gautham liquidity sweep — PDH/PDL sweep + three-candle reversal entry on 1m.
+Gautham liquidity sweep — 4H liquidity sweep + two-candle reversal entry on 1m.
 
-Rules (IST calendar day)
-- Levels: previous day high / low (``pdh`` / ``pdl`` + ``sweep_pdh`` / ``sweep_pdl``).
-- SHORT: PDH swept → 1st red → 2nd red → 3rd breaks 2nd red low → enter; SL = 2nd red high.
-- LONG: PDL swept → 1st green → 2nd green → 3rd breaks 2nd green high → enter; SL = 2nd green low.
-- Max 2 stop-outs per day; after each SL, require a fresh sweep before re-entry.
+Rules
+- Levels: active 4H liquidity zones from ``logs/indicators/{SYM}/4h/indicator_history.jsonl``.
+- SHORT: 4H high zone swept on 1m → 1st red bar → 2nd red breaks 1st red low → enter;
+  SL = 1st red high.
+- LONG: 4H low zone swept on 1m → 1st green bar → 2nd green breaks 1st green high → enter;
+  SL = 1st green low.
+- Max 2 stop-outs per day; after each SL, require a fresh 4H-zone sweep before re-entry.
 - Parent handles 1:1 partial (50%) + trail on remainder.
 """
 
@@ -14,10 +16,14 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, Optional, TYPE_CHECKING
 
 import pandas as pd
 
+from core.strategies.crypto.LiquiditySweepStrategy.four_hour_liquidity import (
+    FourHourLiquidityBook,
+    LiquidityZone,
+)
 from core.utils import indicator_history as ind_hist
 
 if TYPE_CHECKING:
@@ -50,15 +56,17 @@ class _SymbolDayState:
     second_rev_high: float = 0.0
     second_rev_low: float = 0.0
     sweep_bar_key: Optional[str] = None
+    armed_zone: Optional[LiquidityZone] = None
     consumed_sweeps: set = field(default_factory=set)
 
 
 class GauthamLiquiditySweep:
-    """Sub-strategy logic for PDH/PDL sweep + three reversal candle entries."""
+    """Sub-strategy: 4H zone sweep on 1m + dual reversal candle entries."""
 
     name = SUB_NAME
 
-    def __init__(self) -> None:
+    def __init__(self, zones: Optional[FourHourLiquidityBook] = None) -> None:
+        self.zones = zones or FourHourLiquidityBook()
         self._day: Dict[str, _SymbolDayState] = {}
 
     @staticmethod
@@ -103,17 +111,8 @@ class GauthamLiquiditySweep:
         st.second_rev_high = 0.0
         st.second_rev_low = 0.0
         st.sweep_bar_key = None
+        st.armed_zone = None
         st.consumed_sweeps = set()
-
-    @staticmethod
-    def _flag(val: Any) -> bool:
-        n = pd.to_numeric(val, errors="coerce")
-        if pd.isna(n):
-            return bool(val)
-        try:
-            return int(n) != 0
-        except (TypeError, ValueError):
-            return bool(val)
 
     @staticmethod
     def _is_red(candle: dict) -> bool:
@@ -146,8 +145,9 @@ class GauthamLiquiditySweep:
         st.setup_side = None
         st.phase = "idle"
         st.sweep_bar_key = None
+        st.armed_zone = None
         logger.info(
-            "GauthamLiquiditySweep SL hit %s sl_hits=%s/%s — await fresh PDH/PDL sweep",
+            "GauthamLiquiditySweep SL hit %s sl_hits=%s/%s — await fresh 4H liquidity sweep",
             sym,
             st.sl_hits,
             MAX_SL_PER_DAY,
@@ -161,21 +161,20 @@ class GauthamLiquiditySweep:
                 return True
         return False
 
-    def _detect_sweep(self, candle: dict, st: _SymbolDayState) -> Optional[str]:
+    def _detect_sweep(
+        self, symbol: str, candle: dict, st: _SymbolDayState
+    ) -> Optional[tuple[str, LiquidityZone]]:
         bar_key = self._bar_key(candle)
         if not bar_key or bar_key in st.consumed_sweeps:
             return None
-        if self._flag(candle.get("sweep_pdh")):
-            pdh = pd.to_numeric(candle.get("pdh"), errors="coerce")
-            if not pd.isna(pdh):
-                return "SHORT"
-        if self._flag(candle.get("sweep_pdl")):
-            pdl = pd.to_numeric(candle.get("pdl"), errors="coerce")
-            if not pd.isna(pdl):
-                return "LONG"
-        return None
+        hit = self.zones.detect_1m_sweep(symbol, candle)
+        if hit is None:
+            return None
+        return hit
 
-    def _arm_setup(self, st: _SymbolDayState, side: str, candle: dict) -> None:
+    def _arm_setup(
+        self, st: _SymbolDayState, side: str, zone: LiquidityZone, candle: dict
+    ) -> None:
         bar_key = self._bar_key(candle)
         st.setup_side = side
         st.phase = "idle"
@@ -184,14 +183,19 @@ class GauthamLiquiditySweep:
         st.second_rev_high = 0.0
         st.second_rev_low = 0.0
         st.sweep_bar_key = bar_key
+        st.armed_zone = zone
         if bar_key:
             st.consumed_sweeps.add(bar_key)
+        self.zones.mark_consumed(
+            str(candle.get("symbol") or ""), zone, swept_at=bar_key
+        )
         logger.info(
-            "GauthamLiquiditySweep armed %s side=%s pdh=%s pdl=%s bar=%s",
+            "GauthamLiquiditySweep armed %s side=%s zone=%.2f (%s/%s) bar=%s",
             candle.get("symbol"),
             side,
-            candle.get("pdh"),
-            candle.get("pdl"),
+            zone.price,
+            zone.side,
+            zone.source,
             bar_key,
         )
 
@@ -217,9 +221,10 @@ class GauthamLiquiditySweep:
         if self._has_open_position(symbol, ctx, strategy_name):
             return None
 
-        sweep_side = self._detect_sweep(candle, st)
-        if sweep_side and st.setup_side is None:
-            self._arm_setup(st, sweep_side, candle)
+        sweep = self._detect_sweep(symbol, candle, st)
+        if sweep and st.setup_side is None:
+            sweep_side, zone = sweep
+            self._arm_setup(st, sweep_side, zone, candle)
 
         side = st.setup_side
         if not side:
@@ -236,6 +241,7 @@ class GauthamLiquiditySweep:
                 if not self._is_red(candle):
                     st.setup_side = None
                     st.phase = "idle"
+                    st.armed_zone = None
                     return None
                 st.phase = "saw_second"
                 st.second_rev_high = float(candle["high"])
@@ -250,9 +256,11 @@ class GauthamLiquiditySweep:
                 if risk <= 0:
                     st.setup_side = None
                     st.phase = "idle"
+                    st.armed_zone = None
                     return None
                 st.setup_side = None
                 st.phase = "idle"
+                st.armed_zone = None
                 return GauthamEntrySignal(
                     side="SHORT",
                     entry_price=entry,
@@ -273,6 +281,7 @@ class GauthamLiquiditySweep:
             if not self._is_green(candle):
                 st.setup_side = None
                 st.phase = "idle"
+                st.armed_zone = None
                 return None
             st.phase = "saw_second"
             st.second_rev_high = float(candle["high"])
@@ -287,9 +296,11 @@ class GauthamLiquiditySweep:
             if risk <= 0:
                 st.setup_side = None
                 st.phase = "idle"
+                st.armed_zone = None
                 return None
             st.setup_side = None
             st.phase = "idle"
+            st.armed_zone = None
             return GauthamEntrySignal(
                 side="LONG",
                 entry_price=entry,

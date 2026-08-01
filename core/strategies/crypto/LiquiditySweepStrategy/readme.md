@@ -1,50 +1,64 @@
 # Liquidity Sweep (Delta crypto futures)
 
 Registry: `STRATEGY_MAP["LiquiditySweepStrategy"]`  
-Implementation: `LiquiditySweepStrategy.py`, `gautham_liquidity_sweep.py`  
-Engine job: add `ENGINE_JOBS` entry or run via backtest config
+Implementation: `LiquiditySweepStrategy.py`, `gautham_liquidity_sweep.py`, `four_hour_liquidity.py`  
 
 ## Overview
 
-Delta **BTCUSD** / **ETHUSD** perpetuals. Parent strategy hosts sub-strategies; first sub-strategy is **Gautham**: PDH/PDL liquidity sweep + 3-candle reversal on 1m. Brackets with 50% partial at 1:1 and swing trail.
+Delta **BTCUSD** / **ETHUSD** perpetuals. **Gautham**: 4H liquidity zones swept on **1m**, then a 2-candle reversal entry.
+
+## Candle source
+
+| TF | Path |
+|----|------|
+| Entry `1` | `logs/indicators/{SYMBOL}/1/indicator_history.jsonl` (created once strategy subscribes) |
+| Zones `4h` | `logs/indicators/{SYMBOL}/4h/indicator_history.jsonl` |
+
+Live appends closed bars to these files. Backtest prefers indicator history when present; 4H zones sync as-of each 1m bar.
 
 ## Evaluation
 
 | Item | Value |
 |------|-------|
 | Eval mode | `live_feed` |
-| Timeframe | `1` (1m) |
+| Primary TF | `1` (1m) |
+| Extra TF | `4h` |
 | Venue | `api = "DELTA"` |
-| `should_evaluate` | Sub-strategy gates (Gautham: sweep + reversal window) |
-| Exits | `should_exit` / structure hooks every closed bar |
 
 ## Rules (Gautham)
 
-- Track prior-day high/low sweeps on 1m bars.
-- Entry after sweep + reversal pattern; max **2 SL hits per day** per symbol.
-- Partial book 50% at 1:1; trail on swings; `MAIN_SL` / `MAIN_TARGET` brackets.
+1. Closed **4H** bars update liquidity zones.
+2. On **1m**, wick through a 4H zone and close back inside → arm SHORT/LONG.
+3. Entry after the 2-candle reversal; max **2 SL hits per day** per symbol.
+4. Partial book 50% at 1:1; trail on swings.
 
-## Metadata
+## Liquidity zones file (backtest + live)
 
-Legacy key: `liquidity_sweep` — see `core/strategies/meta.py`.
+Rebuild walks **all** 4H history bars (no rolling window). Swept levels are dropped;
+`liquidity_zones_active.json` keeps **only active** highs/lows.
+
+| File | Role |
+|------|------|
+| `logs/LiquiditySweepStrategy/liquidity_zones.jsonl` | Append-only rebuild/live log |
+| `logs/LiquiditySweepStrategy/liquidity_zones_active.json` | Current unswept levels for live |
+
+```bash
+python -m core.strategies.crypto.LiquiditySweepStrategy.rebuild_liquidity_zones
+```
 
 ## Indicator bootstrap
 
 ```bash
-python utils/delta/refresh_crypto_indicator_history.py --only 1
+python utils/delta/refresh_crypto_indicator_history.py --only 4h
+# 1m history is created/appended once the live strategy is subscribed to TF=1
 ```
 
 ## Run
 
 ```bash
-python -m run.main --engine-id <your_engine_id>
+# Rebuild zone reference from 4h history (also used by live)
+python -m core.strategies.crypto.LiquiditySweepStrategy.rebuild_liquidity_zones
+
+# 1m strategy backtest (engine job in run/config.py)
+python -m run.main --engine-id delta_liquidity_sweep_bt
 ```
-
-## Wiring
-
-| Item | Location |
-|------|----------|
-| Registry | `core/strategies/registry.py` |
-| Profile | `run/strategy_profiles.py` → `LiquiditySweepStrategy` |
-| Runtime spec | `core/strategies/runtime_spec.py` |
-| PDH/PDL helpers | `core/utils/structure/liquidity.py` |

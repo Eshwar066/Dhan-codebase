@@ -2,7 +2,8 @@
 Liquidity sweep strategy shell — hosts multiple sub-strategies with shared execution.
 
 Sub-strategies
-- ``GauthamLiquiditySweep``: PDH/PDL sweep + two reversal candles on 1m (see ``gautham_liquidity_sweep.py``).
+- ``GauthamLiquiditySweep``: 4H liquidity zones swept on 1m + two reversal candles
+  (see ``gautham_liquidity_sweep.py``, ``four_hour_liquidity.py``).
 
 Later sub-strategies can be registered in ``_SUBSTRATEGIES`` with their own entry/exit rules.
 """
@@ -13,7 +14,6 @@ import logging
 import math
 import uuid
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 import pandas as pd
@@ -21,6 +21,9 @@ import pandas as pd
 from core.strategies.base import BaseStrategy
 from core.strategies.IndiaMktMixins import IndiaMktMixins
 from core.strategies.market_structure_mixin import MarketStructureMixin
+from core.strategies.crypto.LiquiditySweepStrategy.four_hour_liquidity import (
+    FourHourLiquidityBook,
+)
 from core.strategies.crypto.LiquiditySweepStrategy.gautham_liquidity_sweep import (
     GauthamEntrySignal,
     GauthamLiquiditySweep,
@@ -36,6 +39,11 @@ logger = logging.getLogger(__name__)
 META_KEY = "liquidity_sweep"
 PARTIAL_BOOK_FRAC = 0.50
 DEFAULT_ORDER_QTY = 1
+_4H_TF_ALIASES = frozenset({"4h", "4", "240"})
+_4H_BAR_SECONDS = 4 * 60 * 60
+# Entry on 1m; 4H zones from logs/indicators/{SYMBOL}/4h/indicator_history.jsonl
+INDICATOR_HISTORY_ENTRY_TF = "1"
+INDICATOR_HISTORY_ZONE_TF = "4h"
 
 
 @dataclass
@@ -53,12 +61,20 @@ class _LegMeta:
 
 class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
     """
-    Delta crypto futures — liquidity sweep framework (1m entry, daily PDH/PDL levels).
+    Delta crypto futures — liquidity sweep framework.
+
+    Entry TF ``1`` (1m); liquidity zones from closed ``4h`` bars::
+
+        logs/indicators/{SYMBOL}/1/indicator_history.jsonl   (created once subscribed)
+        logs/indicators/{SYMBOL}/4h/indicator_history.jsonl
+
+    Live appends closed bars to those files; 4H zones sync as-of each 1m bar for backtest.
     """
 
     name = "LiquiditySweepStrategy"
-    underlying_symbols = ["XAUTUSD", "BTCUSD", "ETHUSD"]
-    timeframe = "1"
+    underlying_symbols = ["BTCUSD", "ETHUSD"]
+    timeframe = INDICATOR_HISTORY_ENTRY_TF
+    extra_timeframes = [INDICATOR_HISTORY_ZONE_TF]
     required_context = ["instrument_store"]
     api = "DELTA"
     market_structure_enabled = True
@@ -70,8 +86,17 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
         super().__init__(*args, **kwargs)
         self._meta_by_structure_id: Dict[str, _LegMeta] = {}
         self._evaluated_bar_keys: set[str] = set()
-        self._sl_recorded_structure_ids: set[str] = set()
-        self._gautham = GauthamLiquiditySweep()
+        self._zones = FourHourLiquidityBook(persist=True)
+        self._zones.set_persist_source("live")
+        self._zones_hydrated: set[str] = set()
+        self._4h_hist_rows: Dict[str, List[dict]] = {}
+        self._4h_applied_count: Dict[str, int] = {}
+        # Live + backtest: seed from shared zone file written by rebuild/backtest.
+        n_ref = self._zones.load_active_reference()
+        if n_ref:
+            for sym in self.underlying_symbols:
+                self._zones_hydrated.add(str(sym).upper())
+        self._gautham = GauthamLiquiditySweep(zones=self._zones)
         self._substrategies: Dict[str, Any] = {
             "GauthamLiquiditySweep": self._gautham,
         }
@@ -108,6 +133,7 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
         return keys
 
     def get_warmup_period(self) -> int:
+        # ~1 day of 1m bars for structure / swing context
         return max(50, 1440)
 
     def get_structure_lookback(self) -> int:
@@ -193,6 +219,102 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
             trail = total - book
         return book, max(trail, 0)
 
+    @staticmethod
+    def _candle_timeframe(candle: dict) -> str:
+        return str(candle.get("timeframe") or "").strip()
+
+    @classmethod
+    def _is_4h_candle(cls, candle: dict) -> bool:
+        return cls._candle_timeframe(candle).lower() in _4H_TF_ALIASES
+
+    @staticmethod
+    def _as_utc(ts: Any) -> Optional[pd.Timestamp]:
+        if ts is None:
+            return None
+        try:
+            t = pd.to_datetime(ts, utc=True)
+        except (TypeError, ValueError):
+            return None
+        if pd.isna(t):
+            return None
+        return t
+
+    def _load_4h_history_rows(self, symbol: str) -> List[dict]:
+        """Load OHLC from logs/indicators/{SYMBOL}/4h/indicator_history.jsonl."""
+        sym = str(symbol or "").strip().upper()
+        cached = self._4h_hist_rows.get(sym)
+        if cached is not None:
+            return cached
+        try:
+            rows = ind_hist.load_indicator_history_rows(
+                sym, INDICATOR_HISTORY_ZONE_TF, max_rows=0
+            )
+        except Exception as exc:
+            logger.warning(
+                "LiquiditySweepStrategy 4H history load failed %s path=%s: %s",
+                sym,
+                ind_hist.indicator_history_path(sym, INDICATOR_HISTORY_ZONE_TF),
+                exc,
+            )
+            rows = []
+        self._4h_hist_rows[sym] = rows
+        return rows
+
+    def _row_to_4h_candle(self, symbol: str, row: dict) -> dict:
+        ts = row.get("timestamp")
+        ist_key = None
+        if ts is not None:
+            try:
+                ist_key = (
+                    pd.to_datetime(ts, utc=True)
+                    .tz_convert(ind_hist.IST)
+                    .strftime("%Y-%m-%d %H:%M")
+                )
+            except (TypeError, ValueError):
+                ist_key = None
+        return {
+            "symbol": symbol,
+            "open": row.get("open"),
+            "high": row.get("high"),
+            "low": row.get("low"),
+            "close": row.get("close"),
+            "timestamp": ts,
+            "candle_timestamp_ist": ist_key,
+            "timeframe": INDICATOR_HISTORY_ZONE_TF,
+        }
+
+    def _ensure_zones_as_of(self, symbol: str, as_of: Any) -> None:
+        """
+        Apply closed 4H bars from indicator history up to ``as_of``.
+
+        Used for backtest (engine only replays primary TF) and live cold-start.
+        Live closed 4H bars also call ``on_4h_close`` directly (idempotent).
+        """
+        sym = str(symbol or "").strip().upper()
+        as_of_ts = self._as_utc(as_of)
+        if not sym or as_of_ts is None:
+            return
+
+        rows = self._load_4h_history_rows(sym)
+        applied = int(self._4h_applied_count.get(sym, 0))
+        with self._zones.suspend_persist():
+            while applied < len(rows):
+                row = rows[applied]
+                open_ts = self._as_utc(row.get("timestamp"))
+                if open_ts is None:
+                    applied += 1
+                    continue
+                close_at = open_ts + pd.Timedelta(seconds=_4H_BAR_SECONDS)
+                if close_at > as_of_ts:
+                    break
+                self._zones.on_4h_close(sym, self._row_to_4h_candle(sym, row))
+                applied += 1
+        self._4h_applied_count[sym] = applied
+        # Do not rewrite liquidity_zones_active.json on every 1m/history catch-up.
+        # Persist only on real 4H closes / rebuild / mark_consumed.
+        if applied > 0:
+            self._zones_hydrated.add(sym)
+
     def should_evaluate(self, candle: dict) -> bool:
         if candle.get("close") is None:
             return False
@@ -204,7 +326,8 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
         except (TypeError, ValueError):
             return False
         sym = str(candle.get("symbol") or "").strip().upper()
-        key = f"{sym}|{b}"
+        tf = self._candle_timeframe(candle) or self.timeframe
+        key = f"{sym}|{tf}|{b}"
         if key in self._evaluated_bar_keys:
             return False
         self._evaluated_bar_keys.add(key)
@@ -230,6 +353,22 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
         symbol = str(candle.get("symbol") or "").strip().upper()
         if not symbol:
             return None
+
+        # Closed 4H bars only update liquidity zones — never enter on HTF.
+        if self._is_4h_candle(candle):
+            self._zones.on_4h_close(symbol, candle)
+            self._zones_hydrated.add(symbol)
+            return None
+
+        # Backtest + live: zones from logs/indicators/{SYM}/4h/indicator_history.jsonl
+        self._ensure_zones_as_of(symbol, candle.get("timestamp"))
+        if symbol not in self._zones_hydrated:
+            path = ind_hist.indicator_history_path(symbol, INDICATOR_HISTORY_ZONE_TF)
+            logger.info(
+                "LiquiditySweepStrategy waiting for 4H history %s path=%s",
+                symbol,
+                path,
+            )
 
         signals = self._collect_entry_signals(candle, ctx)
         if not signals:
