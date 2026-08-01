@@ -43,6 +43,12 @@ class GauthamEntrySignal:
     target_price: float
     risk: float
     substrategy: str = SUB_NAME
+    # Sweep context for trade logs
+    zone_price: Optional[float] = None
+    zone_side: Optional[str] = None  # high | low
+    zone_source: Optional[str] = None
+    zone_bar_key: Optional[str] = None  # 4H reference candle (IST)
+    sweep_bar_key: Optional[str] = None  # 1m bar that swept the zone (IST)
 
 
 @dataclass
@@ -65,8 +71,17 @@ class GauthamLiquiditySweep:
 
     name = SUB_NAME
 
-    def __init__(self, zones: Optional[FourHourLiquidityBook] = None) -> None:
+    def __init__(
+        self,
+        zones: Optional[FourHourLiquidityBook] = None,
+        *,
+        enable_high_entries: bool = True,
+        enable_low_entries: bool = True,
+    ) -> None:
         self.zones = zones or FourHourLiquidityBook()
+        # high sweep → SHORT; low sweep → LONG
+        self.enable_high_entries = bool(enable_high_entries)
+        self.enable_low_entries = bool(enable_low_entries)
         self._day: Dict[str, _SymbolDayState] = {}
 
     @staticmethod
@@ -167,7 +182,12 @@ class GauthamLiquiditySweep:
         bar_key = self._bar_key(candle)
         if not bar_key or bar_key in st.consumed_sweeps:
             return None
-        hit = self.zones.detect_1m_sweep(symbol, candle)
+        hit = self.zones.detect_1m_sweep(
+            symbol,
+            candle,
+            enable_high=self.enable_high_entries,
+            enable_low=self.enable_low_entries,
+        )
         if hit is None:
             return None
         return hit
@@ -197,6 +217,34 @@ class GauthamLiquiditySweep:
             zone.side,
             zone.source,
             bar_key,
+        )
+
+    def _signal_from_setup(
+        self,
+        st: _SymbolDayState,
+        *,
+        side: str,
+        entry: float,
+        stop: float,
+        risk: float,
+    ) -> GauthamEntrySignal:
+        zone = st.armed_zone
+        sweep_key = st.sweep_bar_key
+        st.setup_side = None
+        st.phase = "idle"
+        st.armed_zone = None
+        target = entry - risk if side == "SHORT" else entry + risk
+        return GauthamEntrySignal(
+            side=side,
+            entry_price=entry,
+            stop_price=stop,
+            target_price=target,
+            risk=risk,
+            zone_price=float(zone.price) if zone is not None else None,
+            zone_side=str(zone.side) if zone is not None else None,
+            zone_source=str(zone.source) if zone is not None else None,
+            zone_bar_key=str(zone.bar_key) if zone is not None else None,
+            sweep_bar_key=str(sweep_key) if sweep_key else None,
         )
 
     def evaluate(
@@ -229,6 +277,16 @@ class GauthamLiquiditySweep:
         side = st.setup_side
         if not side:
             return None
+        if side == "SHORT" and not self.enable_high_entries:
+            st.setup_side = None
+            st.phase = "idle"
+            st.armed_zone = None
+            return None
+        if side == "LONG" and not self.enable_low_entries:
+            st.setup_side = None
+            st.phase = "idle"
+            st.armed_zone = None
+            return None
 
         if side == "SHORT":
             if st.phase == "idle":
@@ -258,15 +316,8 @@ class GauthamLiquiditySweep:
                     st.phase = "idle"
                     st.armed_zone = None
                     return None
-                st.setup_side = None
-                st.phase = "idle"
-                st.armed_zone = None
-                return GauthamEntrySignal(
-                    side="SHORT",
-                    entry_price=entry,
-                    stop_price=stop,
-                    target_price=entry - risk,
-                    risk=risk,
+                return self._signal_from_setup(
+                    st, side="SHORT", entry=entry, stop=stop, risk=risk
                 )
             return None
 
@@ -298,14 +349,7 @@ class GauthamLiquiditySweep:
                 st.phase = "idle"
                 st.armed_zone = None
                 return None
-            st.setup_side = None
-            st.phase = "idle"
-            st.armed_zone = None
-            return GauthamEntrySignal(
-                side="LONG",
-                entry_price=entry,
-                stop_price=stop,
-                target_price=entry + risk,
-                risk=risk,
+            return self._signal_from_setup(
+                st, side="LONG", entry=entry, stop=stop, risk=risk
             )
         return None

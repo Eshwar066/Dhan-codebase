@@ -77,6 +77,13 @@ class EngineFactory:
     @staticmethod
     def _attach_engine_context(strategies: list, config: EngineConfig) -> None:
         """Inject per-engine broker flags onto strategy instances (e.g. Delta testnet)."""
+        for s in strategies:
+            fn = getattr(s, "configure_run_mode", None)
+            if callable(fn):
+                try:
+                    fn(config.run_mode)
+                except Exception:
+                    pass
         if str(config.broker_name).upper() != "DELTA":
             return
         for s in strategies:

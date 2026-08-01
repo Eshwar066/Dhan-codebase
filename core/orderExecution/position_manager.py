@@ -307,6 +307,7 @@ class PositionManager:
             ):
                 pos.intent_id = intent_id
 
+            _pm_meta_snapshot = None
             if new_qty != 0:
                 self._merge_position_metadata(
                     sym,
@@ -317,6 +318,12 @@ class PositionManager:
                     metadata_extras=metadata_extras,
                 )
             else:
+                # Snapshot before pop — trade_log needs entry context on flat.
+                _pm_meta_snapshot = (self.position_metadata.get(sym) or {}).get(
+                    "strategy_meta"
+                )
+                if _pm_meta_snapshot is None and isinstance(metadata_extras, dict):
+                    _pm_meta_snapshot = metadata_extras
                 self.position_metadata.pop(sym, None)
 
             act_u = str(action or "").upper()
@@ -451,6 +458,37 @@ class PositionManager:
                         "exit_reason": getattr(pos, "exit_reason", None) or "",
                         "execution_source": execution_source or "",
                     }
+                    # Optional entry context from strategy_meta (LiquiditySweep etc.)
+                    _pm_meta = _pm_meta_snapshot
+                    if _pm_meta is None:
+                        _pm_meta = (self.position_metadata.get(sym) or {}).get(
+                            "strategy_meta"
+                        )
+                    if isinstance(_pm_meta, dict):
+                        ls = _pm_meta.get("liquidity_sweep")
+                        ctx_src = ls if isinstance(ls, dict) else _pm_meta
+                        if isinstance(ctx_src, dict):
+                            for _k in (
+                                "swept_level",
+                                "zone_side",
+                                "zone_source",
+                                "zone_bar_key",
+                                "sweep_bar_key",
+                            ):
+                                if _k in ctx_src and ctx_src.get(_k) is not None:
+                                    trade_row[_k] = ctx_src.get(_k)
+                            # Prefer explicit aliases from liquidity_sweep payload
+                            if isinstance(ls, dict):
+                                if ls.get("zone_price") is not None:
+                                    trade_row["swept_level"] = ls.get("zone_price")
+                                for _k in (
+                                    "zone_side",
+                                    "zone_source",
+                                    "zone_bar_key",
+                                    "sweep_bar_key",
+                                ):
+                                    if ls.get(_k) is not None:
+                                        trade_row[_k] = ls.get(_k)
                     self.logger.log_trade(trade_row)
 
                 self.logger.log(strategy=strategy, row=row)

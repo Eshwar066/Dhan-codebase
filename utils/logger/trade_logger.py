@@ -35,6 +35,12 @@ TRADE_LOG_COLUMNS = [
     "strategy",
     "exit_reason",
     "execution_source",
+    # Optional strategy context (e.g. LiquiditySweepStrategy sweep details)
+    "swept_level",
+    "zone_side",
+    "zone_source",
+    "zone_bar_key",
+    "sweep_bar_key",
 ]
 
 

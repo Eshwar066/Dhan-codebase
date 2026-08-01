@@ -16,9 +16,12 @@ broker:
     leverage: 5
 symbols:
 - BTCUSD
-- ETHUSD
 exchange: NSE
 timeframe: '1'
+params:
+  # high zone sweep → SHORT; low zone sweep → LONG
+  enable_high_entries: true
+  enable_low_entries: false
 schedule:
   eval_mode: live_feed
 data:
@@ -29,8 +32,8 @@ profile:
     exchange: DELTA
     sector: 'YES'
   backtest:
-    start_date: '2026-06-02'
-    end_date: '2026-07-03'
+    start_date: '2026-07-24'
+    end_date: '2026-08-01'
     timeframe: '1'
     exchange: DELTA
     sector: 'YES'
@@ -47,17 +50,14 @@ subscriptions:
     - 4h
     symbols:
     - BTCUSD
-    - ETHUSD
   ScheduledSlot:
     enabled: false
     symbols:
     - BTCUSD
-    - ETHUSD
   QuoteUpdated:
     enabled: false
     symbols:
     - BTCUSD
-    - ETHUSD
   IntentCreated: true
   IntentFilled: true
   PositionClosed: true

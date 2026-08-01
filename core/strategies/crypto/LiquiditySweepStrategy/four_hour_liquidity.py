@@ -651,11 +651,20 @@ class FourHourLiquidityBook:
         return low < level and close > level
 
     def detect_1m_sweep(
-        self, symbol: str, candle: dict
+        self,
+        symbol: str,
+        candle: dict,
+        *,
+        enable_high: bool = True,
+        enable_low: bool = True,
     ) -> Optional[Tuple[str, LiquidityZone]]:
         """
         Return (\"SHORT\"|\"LONG\", zone) when the 1m bar sweeps a 4H liquidity zone.
+
+        ``enable_high`` / ``enable_low`` gate high→SHORT and low→LONG candidates.
         """
+        if not enable_high and not enable_low:
+            return None
         sym = str(symbol or "").strip().upper()
         ohlc = self._ohlc(candle)
         if not sym or ohlc is None:
@@ -665,15 +674,17 @@ class FourHourLiquidityBook:
 
         # Prefer nearest swept high (bearish) / low (bullish).
         swept_hi: Optional[LiquidityZone] = None
-        for z in sorted(st.high_zones, key=lambda x: abs(x.price - c)):
-            if self._sweep_high(h, c, z.price):
-                swept_hi = z
-                break
+        if enable_high:
+            for z in sorted(st.high_zones, key=lambda x: abs(x.price - c)):
+                if self._sweep_high(h, c, z.price):
+                    swept_hi = z
+                    break
         swept_lo: Optional[LiquidityZone] = None
-        for z in sorted(st.low_zones, key=lambda x: abs(x.price - c)):
-            if self._sweep_low(l, c, z.price):
-                swept_lo = z
-                break
+        if enable_low:
+            for z in sorted(st.low_zones, key=lambda x: abs(x.price - c)):
+                if self._sweep_low(l, c, z.price):
+                    swept_lo = z
+                    break
 
         if swept_hi is not None and swept_lo is not None:
             if abs(swept_hi.price - c) <= abs(swept_lo.price - c):
