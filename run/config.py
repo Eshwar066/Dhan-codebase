@@ -377,7 +377,7 @@ ENGINE_JOBS = [
         "run_mode": "BACKTEST",
         "capital": 200_000,
         "strategies": ["LiquiditySweepStrategy"],
-        "symbols": ["BTCUSD"],
+        "symbols": ["BTCUSD","PAXGUSD"],
         "delta_india": True,
         "delta_testnet": False,
         "delta_leverage": 50,

@@ -82,7 +82,7 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
     """
 
     name = "LiquiditySweepStrategy"
-    underlying_symbols = ["BTCUSD"]
+    underlying_symbols = ["BTCUSD", "PAXGUSD"]
     timeframe = DEFAULT_ENTRY_TF
     extra_timeframes = [INDICATOR_HISTORY_ZONE_TF]
     required_context = ["instrument_store"]
