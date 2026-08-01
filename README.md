@@ -315,3 +315,4 @@ sudo systemctl start dhan-leaps-rsi.service
 sudo systemctl enable option-buildup-scheduler.service
 
 python utils/delta/refresh_crypto_indicator_history.py --only 60,4h,1d
+python -m core.strategies.crypto.LiquiditySweepStrategy.rebuild_liquidity_zones

@@ -1,9 +1,10 @@
 """
 4H liquidity zones for LiquiditySweepStrategy.
 
-Zones are built from **all** completed 4H candles (prior bar high/low + confirmed
-4H swing pivots). Levels swept by a later 4H bar are dropped. The active file
-stores only unswept levels.
+Zones are built from completed **weekday** 4H candles (prior bar high/low +
+confirmed 4H swing pivots). Saturday/Sunday 4H bars are ingested for sweep /
+fractal context but never become liquidity levels. Levels swept by a later 4H
+bar are dropped. The active file stores only unswept levels.
 
 Sweep detection for entries runs on 5m bars: wick through the level and close
 back inside.
@@ -302,6 +303,15 @@ class FourHourLiquidityBook:
             timeframe="4h",
         )
 
+    @classmethod
+    def _is_weekend_bar(cls, bar: dict) -> bool:
+        """True when bar key (IST) falls on Saturday or Sunday."""
+        ts = cls._parse_bar_key_ist(str(bar.get("key") or ""))
+        if ts is None:
+            return False
+        # Monday=0 ... Saturday=5, Sunday=6
+        return int(ts.dayofweek) >= 5
+
     def _rebuild_zones(self, symbol: str, st: _SymbolZones) -> None:
         highs: List[LiquidityZone] = []
         lows: List[LiquidityZone] = []
@@ -311,24 +321,36 @@ class FourHourLiquidityBook:
             st.low_zones = []
             return
 
-        # Prior completed 4H candle high/low (always).
-        last = bars[-1]
-        highs.append(
-            self._zone_from_bar(
-                last, price=float(last["high"]), side="high", source="prev_4h"
-            )
+        # Prior completed weekday 4H candle high/low (skip Sat/Sun as levels).
+        last_weekday = next(
+            (b for b in reversed(bars) if not self._is_weekend_bar(b)),
+            None,
         )
-        lows.append(
-            self._zone_from_bar(
-                last, price=float(last["low"]), side="low", source="prev_4h"
+        if last_weekday is not None:
+            highs.append(
+                self._zone_from_bar(
+                    last_weekday,
+                    price=float(last_weekday["high"]),
+                    side="high",
+                    source="prev_4h",
+                )
             )
-        )
+            lows.append(
+                self._zone_from_bar(
+                    last_weekday,
+                    price=float(last_weekday["low"]),
+                    side="low",
+                    source="prev_4h",
+                )
+            )
 
-        # Confirmed fractal swings on the 4H series.
+        # Confirmed fractal swings on the 4H series (weekday pivots only).
         n = len(bars)
         left, right = SWING_LEFT, SWING_RIGHT
         if n >= left + right + 1:
             for i in range(left, n - right):
+                if self._is_weekend_bar(bars[i]):
+                    continue
                 h_win = [bars[j]["high"] for j in range(i - left, i + right + 1)]
                 l_win = [bars[j]["low"] for j in range(i - left, i + right + 1)]
                 if bars[i]["high"] == max(h_win):
