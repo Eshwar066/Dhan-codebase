@@ -193,7 +193,7 @@ STRATEGY_PROFILES: dict = {
         'backtest': {
             'start_date': '2026-07-24',
             'end_date': '2026-08-01',
-            'timeframe': '1',
+            'timeframe': '5',
             'exchange': 'DELTA',
             'sector': 'YES',
         },

@@ -17,11 +17,15 @@ broker:
 symbols:
 - BTCUSD
 exchange: NSE
-timeframe: '1'
+timeframe: '5'
 params:
   # high zone sweep → SHORT; low zone sweep → LONG
   enable_high_entries: true
   enable_low_entries: false
+  # true → swing_4h only; false → prev_4h + swing_4h
+  enable_swing_mode: true
+  # entry bar size: "1" (1m) or "5" (5m) — also set top-level timeframe / backtest TF
+  entry_timeframe: '5'
 schedule:
   eval_mode: live_feed
 data:
@@ -34,7 +38,7 @@ profile:
   backtest:
     start_date: '2026-07-24'
     end_date: '2026-08-01'
-    timeframe: '1'
+    timeframe: '5'
     exchange: DELTA
     sector: 'YES'
 dependencies:
@@ -47,6 +51,7 @@ subscriptions:
     enabled: true
     timeframes:
     - '1'
+    - '5'
     - 4h
     symbols:
     - BTCUSD
@@ -65,4 +70,4 @@ subscriptions:
   FeedRecovered: true
 documentation:
   title: Liquidity Sweep
-  overview: Delta crypto 4H liquidity zones swept on 1m + reversal sub-strategies.
+  overview: Delta crypto 4H liquidity zones swept on 1m or 5m; enter when price trades back inside.

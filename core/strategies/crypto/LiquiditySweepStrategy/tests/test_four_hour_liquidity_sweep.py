@@ -46,6 +46,31 @@ def _c(
     return out
 
 
+def _seed_swing_high_120(book: FourHourLiquidityBook, symbol: str = "BTCUSD") -> None:
+    """5×4H bars → confirmed swing high at 120 (left=2, right=2)."""
+    bars = [
+        (100, 105, 98, 102, "2026-07-21T00:00:00Z", "2026-07-21 05:30"),
+        (102, 108, 100, 104, "2026-07-21T04:00:00Z", "2026-07-21 09:30"),
+        (104, 120, 103, 110, "2026-07-21T08:00:00Z", "2026-07-21 13:30"),  # swing
+        (110, 115, 105, 108, "2026-07-21T12:00:00Z", "2026-07-21 17:30"),
+        (108, 112, 104, 106, "2026-07-21T16:00:00Z", "2026-07-21 21:30"),
+    ]
+    for o, h, l, c, ts, ist in bars:
+        book.on_4h_close(
+            symbol,
+            _c(
+                o=o,
+                h=h,
+                l=l,
+                c=c,
+                timeframe="4h",
+                ts=ts,
+                candle_timestamp_ist=ist,
+            ),
+        )
+
+
+
 class TestFourHourLiquidityBook(unittest.TestCase):
     def test_prev_4h_zones_and_1m_high_sweep(self):
         book = FourHourLiquidityBook(persist=False)
@@ -251,7 +276,71 @@ class TestGauthamFourHourSweep(unittest.TestCase):
         store.get_open_positions.return_value = []
         return SimpleNamespace(position_store=store)
 
-    def test_short_entry_after_4h_sweep_and_two_reds(self):
+    def test_short_entry_on_swing_sweep_inside_zone(self):
+        book = FourHourLiquidityBook(persist=False)
+        _seed_swing_high_120(book)
+        # Confirm swing is present (not only prev_4h of last bar)
+        hi_zones = book._state("BTCUSD").high_zones
+        self.assertTrue(any(z.price == 120.0 and z.source == "swing_4h" for z in hi_zones))
+
+        g = GauthamLiquiditySweep(zones=book)
+        ctx = self._ctx()
+
+        # Sweep swing high 120 (H>120, C<120) → SHORT; SL = candle high
+        sig = g.evaluate(
+            _c(
+                o=119,
+                h=121,
+                l=118,
+                c=118.5,
+                ts="2026-07-22T10:00:00+00:00",
+                candle_timestamp_ist="2026-07-22 15:30",
+            ),
+            ctx,
+            strategy_name="LiquiditySweepStrategy",
+        )
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig.side, "SHORT")
+        self.assertEqual(sig.stop_price, 121.0)
+        self.assertAlmostEqual(sig.entry_price, 118.5)
+        self.assertEqual(sig.zone_price, 120.0)
+        self.assertEqual(sig.zone_side, "high")
+        self.assertEqual(sig.zone_source, "swing_4h")
+        self.assertEqual(sig.zone_bar_key, "2026-07-21 13:30")
+        self.assertEqual(sig.sweep_bar_key, "2026-07-22 15:30")
+
+    def test_prev_4h_sweep_does_not_enter_in_swing_mode(self):
+        book = FourHourLiquidityBook(persist=False)
+        # Single bar → only prev_4h high=120, no confirmed swing yet
+        book.on_4h_close(
+            "BTCUSD",
+            _c(
+                o=100,
+                h=120,
+                l=95,
+                c=110,
+                timeframe="4h",
+                ts="2026-07-22T04:00:00Z",
+                candle_timestamp_ist="2026-07-22 09:30",
+            ),
+        )
+        g = GauthamLiquiditySweep(zones=book, enable_swing_mode=True)
+        ctx = self._ctx()
+        sig = g.evaluate(
+            _c(
+                o=119,
+                h=121,
+                l=118,
+                c=118.5,
+                ts="2026-07-22T10:00:00+00:00",
+                candle_timestamp_ist="2026-07-22 15:30",
+            ),
+            ctx,
+            strategy_name="LiquiditySweepStrategy",
+        )
+        self.assertIsNone(sig)
+
+    def test_prev_4h_sweep_enters_when_swing_mode_off(self):
         book = FourHourLiquidityBook(persist=False)
         book.on_4h_close(
             "BTCUSD",
@@ -265,60 +354,24 @@ class TestGauthamFourHourSweep(unittest.TestCase):
                 candle_timestamp_ist="2026-07-22 09:30",
             ),
         )
-        g = GauthamLiquiditySweep(zones=book)
+        g = GauthamLiquiditySweep(zones=book, enable_swing_mode=False)
         ctx = self._ctx()
-
-        # Sweep bar (also red) arms + first reversal
-        self.assertIsNone(
-            g.evaluate(
-                _c(
-                    o=119,
-                    h=121,
-                    l=118,
-                    c=118.5,
-                    ts="2026-07-22T10:00:00+00:00",
-                    candle_timestamp_ist="2026-07-22 15:30",
-                ),
-                ctx,
-                strategy_name="LiquiditySweepStrategy",
-            )
-        )
-        # Second red records the reversal pair (entry waits for break of 2nd low)
-        self.assertIsNone(
-            g.evaluate(
-                _c(
-                    o=118,
-                    h=118.2,
-                    l=117,
-                    c=117.5,
-                    ts="2026-07-22T10:01:00+00:00",
-                    candle_timestamp_ist="2026-07-22 15:31",
-                ),
-                ctx,
-                strategy_name="LiquiditySweepStrategy",
-            )
-        )
-        # Break of 2nd red low → SHORT; SL = 2nd red high
         sig = g.evaluate(
             _c(
-                o=117,
-                h=117.1,
-                l=116,
-                c=116.5,
-                ts="2026-07-22T10:02:00+00:00",
-                candle_timestamp_ist="2026-07-22 15:32",
+                o=119,
+                h=121,
+                l=118,
+                c=118.5,
+                ts="2026-07-22T10:00:00+00:00",
+                candle_timestamp_ist="2026-07-22 15:30",
             ),
             ctx,
             strategy_name="LiquiditySweepStrategy",
         )
         self.assertIsNotNone(sig)
         self.assertEqual(sig.side, "SHORT")
-        self.assertEqual(sig.stop_price, 118.2)
-        self.assertAlmostEqual(sig.entry_price, 116.5)
+        self.assertEqual(sig.zone_source, "prev_4h")
         self.assertEqual(sig.zone_price, 120.0)
-        self.assertEqual(sig.zone_side, "high")
-        self.assertEqual(sig.zone_bar_key, "2026-07-22 09:30")
-        self.assertEqual(sig.sweep_bar_key, "2026-07-22 15:30")
 
     def test_no_entry_without_4h_zones(self):
         g = GauthamLiquiditySweep()
@@ -339,15 +392,12 @@ class TestGauthamFourHourSweep(unittest.TestCase):
 
     def test_low_entries_disabled_skips_long_setup(self):
         book = FourHourLiquidityBook(persist=False)
-        book.on_4h_close(
-            "BTCUSD",
-            _c(o=100, h=120, l=95, c=110, timeframe="4h"),
-        )
+        _seed_swing_high_120(book)
         g = GauthamLiquiditySweep(
             zones=book, enable_high_entries=True, enable_low_entries=False
         )
         ctx = self._ctx()
-        # Low sweep would normally arm LONG — must be ignored when low disabled
+        # Low sweep (prev_4h only here) ignored; also low entries disabled
         self.assertIsNone(
             g.evaluate(
                 _c(
@@ -362,22 +412,23 @@ class TestGauthamFourHourSweep(unittest.TestCase):
                 strategy_name="LiquiditySweepStrategy",
             )
         )
-        # High sweep still arms SHORT
-        self.assertIsNone(
-            g.evaluate(
-                _c(
-                    o=119,
-                    h=121,
-                    l=118,
-                    c=118.5,
-                    ts="2026-07-22T10:01:00+00:00",
-                    candle_timestamp_ist="2026-07-22 15:31",
-                ),
-                ctx,
-                strategy_name="LiquiditySweepStrategy",
-            )
+        # Swing high sweep still enters SHORT
+        sig = g.evaluate(
+            _c(
+                o=119,
+                h=121,
+                l=118,
+                c=118.5,
+                ts="2026-07-22T10:01:00+00:00",
+                candle_timestamp_ist="2026-07-22 15:31",
+            ),
+            ctx,
+            strategy_name="LiquiditySweepStrategy",
         )
-        self.assertEqual(g._state("BTCUSD").setup_side, "SHORT")
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig.side, "SHORT")
+        self.assertEqual(sig.zone_source, "swing_4h")
+        self.assertEqual(sig.stop_price, 121.0)
 
     def test_high_entries_disabled_skips_short_detect(self):
         book = FourHourLiquidityBook(persist=False)
@@ -413,10 +464,12 @@ class TestParentFourHourRouting(unittest.TestCase):
         s._4h_applied_count = {}
         s.enable_high_entries = True
         s.enable_low_entries = True
+        s.enable_swing_mode = True
         s._gautham = GauthamLiquiditySweep(
             zones=s._zones,
             enable_high_entries=True,
             enable_low_entries=True,
+            enable_swing_mode=True,
         )
         s._substrategies = {"GauthamLiquiditySweep": s._gautham}
         s.enabled_substrategies = ["GauthamLiquiditySweep"]

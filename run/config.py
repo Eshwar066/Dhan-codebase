@@ -380,12 +380,14 @@ ENGINE_JOBS = [
         "symbols": ["BTCUSD"],
         "delta_india": True,
         "delta_testnet": False,
-        "delta_leverage": 5,
-        "ORDER_QTY_LOTS": 1,
+        "delta_leverage": 50,
+        "ORDER_QTY_LOTS": 5,
         "backtest": {
-            "start_date": "2026-07-24",
+            "start_date": "2026-07-19",
             "end_date": "2026-08-01",
-            "timeframe": "1",
+            # Omit timeframe to use strategy entry_timeframe (params.entry_timeframe).
+            # Or set explicitly to "1" / "5" to match strategy.yaml.
+            "timeframe": "5",
             "exchange": "DELTA",
             "sector": "YES",
         },

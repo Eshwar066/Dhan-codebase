@@ -2,7 +2,7 @@
 Liquidity sweep strategy shell — hosts multiple sub-strategies with shared execution.
 
 Sub-strategies
-- ``GauthamLiquiditySweep``: 4H liquidity zones swept on 1m + two reversal candles
+- ``GauthamLiquiditySweep``: 4H liquidity zones swept on 1m/5m + inside-zone entry
   (see ``gautham_liquidity_sweep.py``, ``four_hour_liquidity.py``).
 
 Later sub-strategies can be registered in ``_SUBSTRATEGIES`` with their own entry/exit rules.
@@ -39,11 +39,14 @@ logger = logging.getLogger(__name__)
 
 META_KEY = "liquidity_sweep"
 PARTIAL_BOOK_FRAC = 0.50
-DEFAULT_ORDER_QTY = 1
+# Book 50% at this R-multiple; trail the remainder after partial.
+PARTIAL_TARGET_RR = 2.0
+DEFAULT_ORDER_QTY = 5
 _4H_TF_ALIASES = frozenset({"4h", "4", "240"})
 _4H_BAR_SECONDS = 4 * 60 * 60
-# Entry on 1m; 4H zones from logs/indicators/{SYMBOL}/4h/indicator_history.jsonl
-INDICATOR_HISTORY_ENTRY_TF = "1"
+ALLOWED_ENTRY_TFS = frozenset({"1", "5"})
+# Default entry TF; override via strategy.yaml ``params.entry_timeframe`` ("1" or "5").
+DEFAULT_ENTRY_TF = "5"
 INDICATOR_HISTORY_ZONE_TF = "4h"
 
 
@@ -69,17 +72,18 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
     """
     Delta crypto futures — liquidity sweep framework.
 
-    Entry TF ``1`` (1m); liquidity zones from closed ``4h`` bars::
+    Entry TF ``1`` or ``5`` (see ``entry_timeframe`` / strategy.yaml params);
+    liquidity zones from closed ``4h`` bars::
 
-        logs/indicators/{SYMBOL}/1/indicator_history.jsonl   (created once subscribed)
+        logs/indicators/{SYMBOL}/{1|5}/indicator_history.jsonl
         logs/indicators/{SYMBOL}/4h/indicator_history.jsonl
 
-    Live appends closed bars to those files; 4H zones sync as-of each 1m bar for backtest.
+    Live appends closed bars to those files; 4H zones sync as-of each entry bar.
     """
 
     name = "LiquiditySweepStrategy"
     underlying_symbols = ["BTCUSD"]
-    timeframe = INDICATOR_HISTORY_ENTRY_TF
+    timeframe = DEFAULT_ENTRY_TF
     extra_timeframes = [INDICATOR_HISTORY_ZONE_TF]
     required_context = ["instrument_store"]
     api = "DELTA"
@@ -90,6 +94,11 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
     # high zone sweep → SHORT; low zone sweep → LONG (live + backtest)
     enable_high_entries: bool = True
     enable_low_entries: bool = False
+    # True → only swing_4h; False → prev_4h + swing_4h (legacy)
+    # Also set the same key in strategy.yaml ``params`` (yaml overrides class).
+    enable_swing_mode: bool = True
+    # Entry bar size: "1" (1m) or "5" (5m). Yaml ``params.entry_timeframe`` overrides.
+    entry_timeframe: str = DEFAULT_ENTRY_TF
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -107,10 +116,12 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
         # that were still active mid-window. Zones are rebuilt chronologically
         # via ``_ensure_zones_as_of`` from 4h indicator history (backtest + live).
         self._load_entry_side_flags()
+        self._apply_entry_timeframe()
         self._gautham = GauthamLiquiditySweep(
             zones=self._zones,
             enable_high_entries=self.enable_high_entries,
             enable_low_entries=self.enable_low_entries,
+            enable_swing_mode=self.enable_swing_mode,
         )
         self._substrategies: Dict[str, Any] = {
             "GauthamLiquiditySweep": self._gautham,
@@ -127,8 +138,23 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
             self._zones.persist = False
             self._zones.set_persist_source("backtest")
 
+    @staticmethod
+    def _normalize_entry_tf(raw: Any) -> str:
+        tf = str(raw or "").strip().lower().replace("m", "")
+        if tf in ALLOWED_ENTRY_TFS:
+            return tf
+        return DEFAULT_ENTRY_TF
+
+    def _apply_entry_timeframe(self) -> None:
+        self.entry_timeframe = self._normalize_entry_tf(self.entry_timeframe)
+        self.timeframe = self.entry_timeframe
+
+    def entry_timeframe_minutes(self) -> int:
+        """Used by run.main when engine backtest.timeframe is omitted."""
+        return int(self._normalize_entry_tf(self.timeframe))
+
     def _load_entry_side_flags(self) -> None:
-        """Optional overrides from strategy.yaml ``params``."""
+        """Load toggles from strategy.yaml ``params`` (overrides class defaults)."""
         yaml_path = Path(__file__).resolve().parent / "strategy.yaml"
         if not yaml_path.is_file():
             return
@@ -149,10 +175,17 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
             self.enable_high_entries = bool(params["enable_high_entries"])
         if "enable_low_entries" in params:
             self.enable_low_entries = bool(params["enable_low_entries"])
+        if "enable_swing_mode" in params:
+            self.enable_swing_mode = bool(params["enable_swing_mode"])
+        if "entry_timeframe" in params:
+            self.entry_timeframe = self._normalize_entry_tf(params["entry_timeframe"])
         logger.info(
-            "LiquiditySweepStrategy entry sides high=%s low=%s",
+            "LiquiditySweepStrategy flags high=%s low=%s swing_mode=%s entry_tf=%s "
+            "(from strategy.yaml params when present)",
             self.enable_high_entries,
             self.enable_low_entries,
+            self.enable_swing_mode,
+            self.entry_timeframe,
         )
 
     def _entry_side_allowed(self, side: str) -> bool:
@@ -195,11 +228,14 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
         return keys
 
     def get_warmup_period(self) -> int:
-        # ~1 day of 1m bars for structure / swing context
-        return max(50, 1440)
+        # ~1 day of entry bars for structure / swing context
+        tf = self._normalize_entry_tf(getattr(self, "timeframe", DEFAULT_ENTRY_TF))
+        if tf == "1":
+            return max(50, 1440)
+        return max(50, 288)
 
     def get_structure_lookback(self) -> int:
-        return max(400, self.get_warmup_period() + 50)
+        return max(100, self.get_warmup_period() + 50)
 
     def _strategy_meta(self, meta: _LegMeta) -> dict:
         return {
@@ -400,7 +436,7 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
                 self._zones.on_4h_close(sym, self._row_to_4h_candle(sym, row))
                 applied += 1
         self._4h_applied_count[sym] = applied
-        # Do not rewrite liquidity_zones_active.json on every 1m/history catch-up.
+        # Do not rewrite liquidity_zones_active.json on every 5m/history catch-up.
         # Persist only on real 4H closes / rebuild / mark_consumed.
         if applied > 0:
             self._zones_hydrated.add(sym)
@@ -448,6 +484,13 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
         if self._is_4h_candle(candle):
             self._zones.on_4h_close(symbol, candle)
             self._zones_hydrated.add(symbol)
+            return None
+
+        # Only evaluate entries on the configured entry TF (1 or 5).
+        candle_tf = self._normalize_entry_tf(
+            self._candle_timeframe(candle) or self.timeframe
+        )
+        if candle_tf != self._normalize_entry_tf(self.timeframe):
             return None
 
         # Backtest + live: zones from logs/indicators/{SYM}/4h/indicator_history.jsonl
@@ -561,11 +604,12 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
 
         fill_px = float(price if price is not None else meta.entry_price)
         meta.entry_price = fill_px
+        rr = float(PARTIAL_TARGET_RR)
         if meta.side == "LONG":
-            meta.target_price = fill_px + meta.risk
+            meta.target_price = fill_px + meta.risk * rr
             meta.stop_price = fill_px - meta.risk
         else:
-            meta.target_price = fill_px - meta.risk
+            meta.target_price = fill_px - meta.risk * rr
             meta.stop_price = fill_px + meta.risk
 
         total_qty = self._normalize_order_qty(instrument, kwargs.get("qty"))

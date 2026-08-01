@@ -5,40 +5,43 @@ Implementation: `LiquiditySweepStrategy.py`, `gautham_liquidity_sweep.py`, `four
 
 ## Overview
 
-Delta **BTCUSD** perpetual. **Gautham**: 4H liquidity zones swept on **1m**, then a 2-candle reversal entry.
+Delta **BTCUSD** perpetual. **Gautham**: 4H liquidity zones swept on **5m**, entry when price trades back inside the zone.
 
 ## Candle source
 
 | TF | Path |
 |----|------|
-| Entry `1` | `logs/indicators/{SYMBOL}/1/indicator_history.jsonl` (created once strategy subscribes) |
+| Entry `5` | `logs/indicators/{SYMBOL}/5/indicator_history.jsonl` |
 | Zones `4h` | `logs/indicators/{SYMBOL}/4h/indicator_history.jsonl` |
 
-Live appends closed bars to these files. Backtest prefers indicator history when present; 4H zones sync as-of each 1m bar.
+Live appends closed bars to these files. Backtest prefers indicator history when present; 4H zones sync as-of each 5m bar.
 
 ## Evaluation
 
 | Item | Value |
 |------|-------|
 | Eval mode | `live_feed` |
-| Primary TF | `1` (1m) |
+| Primary TF | `5` (5m) |
 | Extra TF | `4h` |
 | Venue | `api = "DELTA"` |
 
 ## Rules (Gautham)
 
-1. Closed **4H** bars update liquidity zones.
-2. On **1m**, wick through a 4H zone and close back inside → arm SHORT/LONG.
-3. Entry after the 2-candle reversal; max **2 SL hits per day** per symbol.
-4. Partial book 50% at 1:1; trail on swings.
+1. Closed **4H** bars update liquidity zones (prior bar + confirmed fractal swings).
+2. On **5m**, zone filter via `enable_swing_mode`: **true** = `swing_4h` only; **false** = `prev_4h` + `swing_4h`.
+3. When the candle trades inside the zone → enter at close; **SL = candle high** (SHORT) or **candle low** (LONG). Max **2 SL hits per day** per symbol.
+4. Partial book 50% at **1:2**; trail remainder on swings (BE after partial).
 
-Toggle sides in `strategy.yaml` → `params` (applies to live + backtest):
+Toggle sides / swing mode in `strategy.yaml` → `params` (applies to live + backtest):
 
 | Param | Default | Meaning |
 |-------|---------|---------|
 | `enable_high_entries` | `true` | High-zone sweeps → SHORT |
 | `enable_low_entries` | `true` | Low-zone sweeps → LONG |
+| `enable_swing_mode` | `true` | `true` = swing_4h only; `false` = also prev_4h |
+| `entry_timeframe` | `5` | Entry bar size: `1` (1m) or `5` (5m) |
 
+Set `entry_timeframe: "1"` for 1m entries (also set top-level `timeframe` / backtest TF / engine job to match).
 Set `enable_low_entries: false` to run high/SHORT only.
 
 ## Liquidity zones file (backtest + live)
@@ -63,6 +66,7 @@ python -m core.strategies.crypto.LiquiditySweepStrategy.rebuild_liquidity_zones
 
 ```bash
 python utils/delta/refresh_crypto_indicator_history.py --only 4h
+# 5m history: python utils/delta/refresh_crypto_indicator_history.py --symbol BTCUSD --only 5
 # 1m history is created/appended once the live strategy is subscribed to TF=1
 ```
 
@@ -72,6 +76,6 @@ python utils/delta/refresh_crypto_indicator_history.py --only 4h
 # Rebuild zone reference from 4h history (also used by live)
 python -m core.strategies.crypto.LiquiditySweepStrategy.rebuild_liquidity_zones
 
-# 1m strategy backtest (engine job in run/config.py)
+# 5m strategy backtest (engine job in run/config.py)
 python -m run.main --engine-id delta_liquidity_sweep_bt
 ```

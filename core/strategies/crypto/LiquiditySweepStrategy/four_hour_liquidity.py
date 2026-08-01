@@ -5,7 +5,7 @@ Zones are built from **all** completed 4H candles (prior bar high/low + confirme
 4H swing pivots). Levels swept by a later 4H bar are dropped. The active file
 stores only unswept levels.
 
-Sweep detection for entries runs on 1m bars: wick through the level and close
+Sweep detection for entries runs on 5m bars: wick through the level and close
 back inside.
 
 Persistence (shared backtest + live reference)
@@ -657,11 +657,14 @@ class FourHourLiquidityBook:
         *,
         enable_high: bool = True,
         enable_low: bool = True,
+        allowed_sources: Optional[Any] = None,
     ) -> Optional[Tuple[str, LiquidityZone]]:
         """
-        Return (\"SHORT\"|\"LONG\", zone) when the 1m bar sweeps a 4H liquidity zone.
+        Return (\"SHORT\"|\"LONG\", zone) when the entry-TF bar sweeps a 4H liquidity zone.
 
         ``enable_high`` / ``enable_low`` gate high→SHORT and low→LONG candidates.
+        ``allowed_sources`` when set (e.g. ``{\"swing_4h\"}``) only matches those
+        zone sources — skip ``prev_4h`` etc.
         """
         if not enable_high and not enable_low:
             return None
@@ -671,17 +674,29 @@ class FourHourLiquidityBook:
             return None
         _o, h, l, c = ohlc
         st = self._state(sym)
+        src_ok = None
+        if allowed_sources is not None:
+            src_ok = {str(s).strip().lower() for s in allowed_sources if s}
+
+        def _src_allowed(z: LiquidityZone) -> bool:
+            if src_ok is None:
+                return True
+            return str(z.source or "").strip().lower() in src_ok
 
         # Prefer nearest swept high (bearish) / low (bullish).
         swept_hi: Optional[LiquidityZone] = None
         if enable_high:
             for z in sorted(st.high_zones, key=lambda x: abs(x.price - c)):
+                if not _src_allowed(z):
+                    continue
                 if self._sweep_high(h, c, z.price):
                     swept_hi = z
                     break
         swept_lo: Optional[LiquidityZone] = None
         if enable_low:
             for z in sorted(st.low_zones, key=lambda x: abs(x.price - c)):
+                if not _src_allowed(z):
+                    continue
                 if self._sweep_low(l, c, z.price):
                     swept_lo = z
                     break
