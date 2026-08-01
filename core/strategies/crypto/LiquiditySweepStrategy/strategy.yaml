@@ -16,6 +16,7 @@ broker:
     leverage: 5
 symbols:
 - BTCUSD
+- PAXGUSD
 exchange: NSE
 timeframe: '5'
 params:
@@ -55,14 +56,17 @@ subscriptions:
     - 4h
     symbols:
     - BTCUSD
+    - PAXGUSD
   ScheduledSlot:
     enabled: false
     symbols:
     - BTCUSD
+    - PAXGUSD
   QuoteUpdated:
     enabled: false
     symbols:
     - BTCUSD
+    - PAXGUSD
   IntentCreated: true
   IntentFilled: true
   PositionClosed: true
