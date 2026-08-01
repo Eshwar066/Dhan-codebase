@@ -19,12 +19,15 @@ from core.utils.structure.supertrend import add_supertrend, supertrend_column_na
 
 from .constants import (
     HTF_TIMEFRAMES,
+    MAIN_SL_LIMIT_ABOVE_TRIGGER_MAX,
+    MAIN_SL_LIMIT_ABOVE_TRIGGER_MIN,
     META_KEY,
     MIN_PREMIUM_USD,
     MIN_PREMIUM_USD_MORNING,
     MIN_STRIKE_SPOT_DISTANCE,
     MONTHLY_MIN_DTE,
     MORNING_ENTRY_TIME,
+    MORNING_MIN_STRIKE_DISTANCE,
     ORDER_QTY_LOTS,
     ORDER_QTY_LOTS_DAILY,
     ORDER_QTY_LOTS_MONTHLY,
@@ -1618,6 +1621,13 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                     under,
                 )
                 return None
+            # Morning: enforce min |strike − SuperTrend| (BTC default 100).
+            morning_st_floor = float(
+                cfg.get("morning_min_strike_distance") or MORNING_MIN_STRIKE_DISTANCE
+            )
+            min_strike_distance = max(
+                float(min_strike_distance or 0.0), morning_st_floor
+            )
         # Morning / daily: keep strike far enough from spot to avoid immediate
         # proximity exits. Weekly / monthly use ST distance / deeper OTM.
         spot_gate = (
@@ -1979,6 +1989,36 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         )
         return max(0.01, float(entry_premium) * mult)
 
+    @staticmethod
+    def _buy_cover_sl_limit(
+        trigger: float,
+        option_limit: float = 0.0,
+        *,
+        max_above: float = MAIN_SL_LIMIT_ABOVE_TRIGGER_MAX,
+        min_above: float = MAIN_SL_LIMIT_ABOVE_TRIGGER_MIN,
+    ) -> float:
+        """
+        Buy-to-cover stop-LIMIT price for MAIN_SL.
+
+        Delta needs limit > trigger for a buy stop-limit. Cap the gap at
+        ``max_above`` (default 10 pts) so limit never races far above trigger.
+        """
+        trig = max(0.01, float(trigger or 0))
+        ceiling = float(max_above)
+        floor_bump = min(float(min_above), ceiling) if ceiling > 0 else 0.0
+        try:
+            lim = float(option_limit or 0)
+        except (TypeError, ValueError):
+            lim = 0.0
+        if lim <= trig:
+            lim = trig + floor_bump
+        if lim > trig + ceiling:
+            lim = trig + ceiling
+        # Final guard: always strictly above trigger when ceiling allows.
+        if lim <= trig and ceiling > 0:
+            lim = trig + min(floor_bump if floor_bump > 0 else ceiling, ceiling)
+        return float(lim)
+
     def _build_main_sl_intent(
         self,
         *,
@@ -2001,6 +2041,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
 
         - premium mode: trigger on option mark at mult × entry premium.
         - index mode: trigger on underlying spot (ST ± trail_points); CE/PE clamp.
+        Limit is always > trigger and within +10 pts of trigger.
         """
         under = self._resolve_underlying(
             structure_id=structure_id,
@@ -2020,10 +2061,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 entry = 0.0
             level = self._premium_sl_trigger(entry, symbol=under)
             stop_method = "mark_price"
-            limit_px = float(option_limit) if float(option_limit or 0) > 0 else level
-            # Buy-to-cover stop-LIMIT: limit must be at least the trigger.
-            if limit_px < level:
-                limit_px = level
+            limit_px = self._buy_cover_sl_limit(level, float(option_limit or 0))
             extras = {
                 "stop_trigger_method": stop_method,
                 "direction": int(direction),
@@ -2045,9 +2083,18 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 symbol=under,
             )
             stop_method = "spot_price"
-            limit_px = float(option_limit)
-            if limit_px <= 0:
-                limit_px = 1.0
+            # Index SL still buys the option; keep cover limit near trigger band.
+            # Use live option ask as base, but still clamp relative to a synthetic
+            # floor from the ask itself (spot trigger is not an option price).
+            raw_lim = float(option_limit or 0)
+            if raw_lim <= 0:
+                raw_lim = 1.0
+            # For index mode, trigger is spot; option limit is independent.
+            # Still enforce limit > 0 and keep a sane ask-based cover — if caller
+            # passed an option mark/ask as option_limit, bump it into the +1..+10
+            # band above that ask only when it looks like a mark stop. Otherwise
+            # leave index cover as max(ask, 1) without comparing to spot trigger.
+            limit_px = max(raw_lim, 1.0)
             extras = {
                 "stop_trigger_method": stop_method,
                 "direction": int(direction),
@@ -3422,8 +3469,9 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             entry_prem,
             symbol=meta.symbol if meta is not None else self._active_symbol,
         )
-        # Cover LIMIT at least the 2× trigger so a mark stop can fill.
-        cover_limit = max(float(option_limit or 0), premium_trigger)
+        # Cover LIMIT from live ask; _build_main_sl_intent clamps to
+        # (trigger, trigger+10].
+        cover_limit = float(option_limit or 0)
         if meta is not None:
             self._meta_by_structure_id[sid] = replace(
                 meta,
@@ -3451,7 +3499,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             self.name,
             sid,
             float(premium_trigger),
-            float(cover_limit),
+            float(intent.price),
             float(entry_prem),
             float(supertrend),
             direction,

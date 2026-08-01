@@ -642,6 +642,20 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             65501,
         )
 
+    def test_buy_cover_sl_limit_band(self):
+        """Premium MAIN_SL limit must be > trigger and <= trigger+10."""
+        fn = DirectionalOptionSelling._buy_cover_sl_limit
+        # Ask below trigger → bump +1
+        self.assertEqual(fn(816.0, 417.0), 817.0)
+        # Ask equal trigger → bump +1
+        self.assertEqual(fn(816.0, 816.0), 817.0)
+        # Ask within band → keep ask
+        self.assertEqual(fn(816.0, 820.0), 820.0)
+        # Ask above +10 → cap at trigger+10
+        self.assertEqual(fn(816.0, 900.0), 826.0)
+        # Missing ask → trigger+1
+        self.assertEqual(fn(816.0, 0.0), 817.0)
+
     def test_morning_pe_sl_clamped_above_strike_64800(self):
         """Live bug: ST=64813.39 → ST-100=64713.39 was placed below PE strike 64800."""
         level = self.strategy._trail_sl_level(
@@ -687,6 +701,9 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertEqual(len(intents), 1)
         sl = intents[0]
         self.assertEqual(sl.trigger_price, 68.0)  # 2× entry premium
+        self.assertEqual(sl.price, 69.0)  # limit = trigger + 1 (ask below trigger)
+        self.assertGreater(sl.price, sl.trigger_price)
+        self.assertLessEqual(sl.price - sl.trigger_price, 10.0)
         self.assertEqual(sl.metadata_extras["stop_trigger_method"], "mark_price")
         self.assertEqual(sl.metadata_extras["sl_mode"], SL_MODE_PREMIUM)
         self.assertEqual(
@@ -1210,7 +1227,10 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertEqual(sl.tag, "MAIN_SL")
         self.assertEqual(sl.order_type, "SL")
         self.assertEqual(sl.trigger_price, 700.0)  # 2× entry
-        self.assertEqual(sl.price, 700.0)  # cover LIMIT >= trigger
+        # Limit must be > trigger and <= trigger+10 (ask was below trigger → +1).
+        self.assertEqual(sl.price, 701.0)
+        self.assertGreater(sl.price, sl.trigger_price)
+        self.assertLessEqual(sl.price - sl.trigger_price, 10.0)
         self.assertEqual(sl.metadata_extras["stop_trigger_method"], "mark_price")
         self.assertEqual(sl.metadata_extras["sl_mode"], SL_MODE_PREMIUM)
         self.assertEqual(sl.metadata_extras["direction"], 1)
@@ -2675,8 +2695,11 @@ class DirectionalOptionSellingTests(unittest.TestCase):
                                     )
         self.assertIsNotNone(intent)
         daily_htf.assert_not_called()
-        self.assertEqual(intent.qty, 10)
+        self.assertEqual(intent.qty, 100)
         self.assertEqual(select.call_args.kwargs.get("target_expiry"), "220726")
+        self.assertEqual(
+            select.call_args.kwargs.get("min_strike_distance"), 100.0
+        )
         sid = next(iter(s._meta_by_structure_id))
         self.assertEqual(s._meta_by_structure_id[sid].sleeve, "morning")
 

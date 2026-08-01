@@ -26,6 +26,10 @@ MORNING_ENTRY_TIME = time(9, 30)
 TRAIL_SL_MODIFY_ATTEMPTS = 3
 TRAIL_SL_IMMEDIATE_RETRY_SLEEP_SEC = 0.35
 TRAIL_SL_PENDING_RETRY_GAP_SEC = 5.0
+# Buy-to-cover stop-LIMIT: limit must be above trigger, but not more than this.
+MAIN_SL_LIMIT_ABOVE_TRIGGER_MAX = 10.0
+# Default bump when live ask is at/below trigger (strictly limit > trigger).
+MAIN_SL_LIMIT_ABOVE_TRIGGER_MIN = 1.0
 
 # ---------------------------------------------------------------------------
 # Per-underlying knobs (BTC vs ETH differ in $ premium / absolute point scales).
@@ -36,13 +40,15 @@ _SYMBOL_CONFIG_BTC: Dict[str, Any] = {
     "min_premium_usd": 120.0,
     "min_premium_usd_morning": 20.0,
     "min_strike_spot_distance": 400.0,
+    # Morning 0DTE: strike must be at least this far from 1H SuperTrend.
+    "morning_min_strike_distance": 100.0,
     "rollover_min_strike_distance": 200.0,
     "trail_sl_points": 100.0,
     "force_exit_points": 300.0,
     "strike_proximity_exit_points": 50.0,
     "premium_sl_mult": 2.0,
-    "order_qty_lots_weekly": 10,
-    "order_qty_lots_monthly": 10,
+    "order_qty_lots_weekly": 1,
+    "order_qty_lots_monthly": 1,
     "order_qty_lots_daily": 10,
     "order_qty_lots_morning": 100,
     "weekly_min_dte": 3,
@@ -61,6 +67,8 @@ _SYMBOL_CONFIG_ETH: Dict[str, Any] = {
     "min_premium_usd": 8.0,
     "min_premium_usd_morning": 2.0,
     "min_strike_spot_distance": 20.0,
+    # ~BTC 100 scaled by spot (~1/20).
+    "morning_min_strike_distance": 5.0,
     "rollover_min_strike_distance": 10.0,
     "trail_sl_points": 5.0,
     "force_exit_points": 15.0,
@@ -94,6 +102,9 @@ PREMIUM_SL_MULT = float(_SYMBOL_CONFIG_BTC["premium_sl_mult"])
 FORCE_EXIT_POINTS = float(_SYMBOL_CONFIG_BTC["force_exit_points"])
 STRIKE_PROXIMITY_EXIT_POINTS = float(_SYMBOL_CONFIG_BTC["strike_proximity_exit_points"])
 MIN_STRIKE_SPOT_DISTANCE = float(_SYMBOL_CONFIG_BTC["min_strike_spot_distance"])
+MORNING_MIN_STRIKE_DISTANCE = float(
+    _SYMBOL_CONFIG_BTC["morning_min_strike_distance"]
+)
 ROLLOVER_MIN_STRIKE_DISTANCE = float(_SYMBOL_CONFIG_BTC["rollover_min_strike_distance"])
 ORDER_QTY_LOTS_WEEKLY = int(_SYMBOL_CONFIG_BTC["order_qty_lots_weekly"])
 ORDER_QTY_LOTS_MONTHLY = int(_SYMBOL_CONFIG_BTC["order_qty_lots_monthly"])
