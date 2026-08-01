@@ -179,7 +179,6 @@ STRATEGY_PROFILES: dict = {
     'LiquiditySweepStrategy': {
         'symbols': [
             'BTCUSD',
-            'ETHUSD',
         ],
         'exchange': 'NSE',
         'delta': {
@@ -192,8 +191,8 @@ STRATEGY_PROFILES: dict = {
             'sector': 'YES',
         },
         'backtest': {
-            'start_date': '2026-06-02',
-            'end_date': '2026-07-03',
+            'start_date': '2026-07-24',
+            'end_date': '2026-08-01',
             'timeframe': '1',
             'exchange': 'DELTA',
             'sector': 'YES',

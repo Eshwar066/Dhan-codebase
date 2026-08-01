@@ -14,6 +14,7 @@ import logging
 import math
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 import pandas as pd
@@ -57,6 +58,11 @@ class _LegMeta:
     substrategy: str
     partial_booked: bool = False
     trail_stop: Optional[float] = None
+    zone_price: Optional[float] = None
+    zone_side: Optional[str] = None
+    zone_source: Optional[str] = None
+    zone_bar_key: Optional[str] = None
+    sweep_bar_key: Optional[str] = None
 
 
 class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
@@ -72,7 +78,7 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
     """
 
     name = "LiquiditySweepStrategy"
-    underlying_symbols = ["BTCUSD", "ETHUSD"]
+    underlying_symbols = ["BTCUSD"]
     timeframe = INDICATOR_HISTORY_ENTRY_TF
     extra_timeframes = [INDICATOR_HISTORY_ZONE_TF]
     required_context = ["instrument_store"]
@@ -81,25 +87,81 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
     bracket_leg_tags = ["MAIN_SL", "MAIN_TARGET"]
 
     enabled_substrategies: List[str] = ["GauthamLiquiditySweep"]
+    # high zone sweep → SHORT; low zone sweep → LONG (live + backtest)
+    enable_high_entries: bool = True
+    enable_low_entries: bool = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._meta_by_structure_id: Dict[str, _LegMeta] = {}
         self._evaluated_bar_keys: set[str] = set()
-        self._zones = FourHourLiquidityBook(persist=True)
+        self._sl_recorded_structure_ids: set[str] = set()
+        # Persist off until live attach — backtest must not rewrite active.json.
+        self._zones = FourHourLiquidityBook(persist=False)
         self._zones.set_persist_source("live")
         self._zones_hydrated: set[str] = set()
         self._4h_hist_rows: Dict[str, List[dict]] = {}
         self._4h_applied_count: Dict[str, int] = {}
-        # Live + backtest: seed from shared zone file written by rebuild/backtest.
-        n_ref = self._zones.load_active_reference()
-        if n_ref:
-            for sym in self.underlying_symbols:
-                self._zones_hydrated.add(str(sym).upper())
-        self._gautham = GauthamLiquiditySweep(zones=self._zones)
+        # Do NOT seed from liquidity_zones_active.json here.
+        # That file is an end-state snapshot; its ``consumed`` set hides levels
+        # that were still active mid-window. Zones are rebuilt chronologically
+        # via ``_ensure_zones_as_of`` from 4h indicator history (backtest + live).
+        self._load_entry_side_flags()
+        self._gautham = GauthamLiquiditySweep(
+            zones=self._zones,
+            enable_high_entries=self.enable_high_entries,
+            enable_low_entries=self.enable_low_entries,
+        )
         self._substrategies: Dict[str, Any] = {
             "GauthamLiquiditySweep": self._gautham,
         }
+
+    def configure_run_mode(self, run_mode: Any) -> None:
+        """Engine factory hook: enable zone disk persist for live/paper only."""
+        mode = getattr(run_mode, "value", None) or str(run_mode or "")
+        mode_u = str(mode).strip().upper()
+        if mode_u in ("LIVE", "PAPER"):
+            self._zones.persist = True
+            self._zones.set_persist_source("live")
+        else:
+            self._zones.persist = False
+            self._zones.set_persist_source("backtest")
+
+    def _load_entry_side_flags(self) -> None:
+        """Optional overrides from strategy.yaml ``params``."""
+        yaml_path = Path(__file__).resolve().parent / "strategy.yaml"
+        if not yaml_path.is_file():
+            return
+        try:
+            import yaml
+        except ImportError:
+            return
+        try:
+            raw = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
+        except Exception as exc:
+            logger.warning(
+                "LiquiditySweepStrategy: could not read strategy.yaml params: %s",
+                exc,
+            )
+            return
+        params = raw.get("params") or {}
+        if "enable_high_entries" in params:
+            self.enable_high_entries = bool(params["enable_high_entries"])
+        if "enable_low_entries" in params:
+            self.enable_low_entries = bool(params["enable_low_entries"])
+        logger.info(
+            "LiquiditySweepStrategy entry sides high=%s low=%s",
+            self.enable_high_entries,
+            self.enable_low_entries,
+        )
+
+    def _entry_side_allowed(self, side: str) -> bool:
+        s = str(side or "").upper()
+        if s == "SHORT":
+            return bool(self.enable_high_entries)
+        if s == "LONG":
+            return bool(self.enable_low_entries)
+        return False
 
     def _entry_order_qty(self, inst) -> int:
         engine_lots = getattr(self, "order_qty_lots", None)
@@ -151,6 +213,11 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
                 "substrategy": meta.substrategy,
                 "partial_booked": meta.partial_booked,
                 "trail_stop": meta.trail_stop,
+                "zone_price": meta.zone_price,
+                "zone_side": meta.zone_side,
+                "zone_source": meta.zone_source,
+                "zone_bar_key": meta.zone_bar_key,
+                "sweep_bar_key": meta.sweep_bar_key,
             }
         }
 
@@ -170,6 +237,29 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
                 trail_stop=(
                     float(raw["trail_stop"])
                     if raw.get("trail_stop") is not None
+                    else None
+                ),
+                zone_price=(
+                    float(raw["zone_price"])
+                    if raw.get("zone_price") is not None
+                    else None
+                ),
+                zone_side=(
+                    str(raw["zone_side"]) if raw.get("zone_side") is not None else None
+                ),
+                zone_source=(
+                    str(raw["zone_source"])
+                    if raw.get("zone_source") is not None
+                    else None
+                ),
+                zone_bar_key=(
+                    str(raw["zone_bar_key"])
+                    if raw.get("zone_bar_key") is not None
+                    else None
+                ),
+                sweep_bar_key=(
+                    str(raw["sweep_bar_key"])
+                    if raw.get("sweep_bar_key") is not None
                     else None
                 ),
             )
@@ -375,6 +465,15 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
             return None
 
         sig = signals[0]
+        if not self._entry_side_allowed(sig.side):
+            logger.debug(
+                "LiquiditySweepStrategy skip %s %s (high=%s low=%s)",
+                symbol,
+                sig.side,
+                self.enable_high_entries,
+                self.enable_low_entries,
+            )
+            return None
         exchange = str(candle.get("exchange") or "DELTA")
         inst = ctx.instrument_store.futures_intent_creation_details(
             symbol, exchange, expiry=None
@@ -398,6 +497,11 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
             target_price=sig.target_price,
             risk=sig.risk,
             substrategy=sig.substrategy,
+            zone_price=sig.zone_price,
+            zone_side=sig.zone_side,
+            zone_source=sig.zone_source,
+            zone_bar_key=sig.zone_bar_key,
+            sweep_bar_key=sig.sweep_bar_key,
         )
         self._meta_by_structure_id[structure_id] = meta
 
@@ -417,13 +521,19 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
             metadata_extras=self._strategy_meta(meta),
         )
         logger.info(
-            "LiquiditySweepStrategy ENTRY %s %s [%s] entry=%.2f stop=%.2f target=%.2f",
+            "LiquiditySweepStrategy ENTRY %s %s [%s] entry=%.2f stop=%.2f target=%.2f "
+            "swept_%s=%.2f zone_bar=%s sweep_bar=%s source=%s",
             symbol,
             sig.side,
             sig.substrategy,
             sig.entry_price,
             sig.stop_price,
             sig.target_price,
+            sig.zone_side or "level",
+            float(sig.zone_price or 0.0),
+            sig.zone_bar_key or "-",
+            sig.sweep_bar_key or "-",
+            sig.zone_source or "-",
         )
         return [intent]
 

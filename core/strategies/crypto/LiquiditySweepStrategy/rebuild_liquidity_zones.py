@@ -35,8 +35,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--symbols",
         nargs="+",
-        default=["BTCUSD", "ETHUSD"],
-        help="Symbols to rebuild (default: BTCUSD ETHUSD)",
+        default=["BTCUSD"],
+        help="Symbols to rebuild (default: BTCUSD)",
     )
     p.add_argument(
         "--keep-log",
