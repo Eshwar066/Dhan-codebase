@@ -291,6 +291,7 @@ GENERATED_STRATEGY_SUBSCRIPTIONS: dict = {
             'enabled': True,
             'timeframes': [
                 '1',
+                '5',
                 '4h',
             ],
             'symbols': [

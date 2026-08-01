@@ -1,14 +1,16 @@
 """
-Gautham liquidity sweep — 4H liquidity sweep + two-candle reversal entry on 1m.
+Gautham liquidity sweep — 4H liquidity sweep + inside-zone entry on 5m.
 
 Rules
-- Levels: active 4H liquidity zones from ``logs/indicators/{SYM}/4h/indicator_history.jsonl``.
-- SHORT: 4H high zone swept on 1m → 1st red bar → 2nd red breaks 1st red low → enter;
-  SL = 1st red high.
-- LONG: 4H low zone swept on 1m → 1st green bar → 2nd green breaks 1st green high → enter;
-  SL = 1st green low.
+- Levels: active 4H liquidity zones from indicator history.
+- When ``enable_swing_mode`` is True: only confirmed ``swing_4h`` fractal highs/lows.
+  When False: also trade prior-bar ``prev_4h`` highs/lows (legacy behaviour).
+- SHORT: high zone swept on 5m → when candle trades back inside the zone, enter;
+  SL = that candle's high (entry near the liquidation level).
+- LONG: low zone swept on 5m → when candle trades back inside the zone, enter;
+  SL = that candle's low.
 - Max 2 stop-outs per day; after each SL, require a fresh 4H-zone sweep before re-entry.
-- Parent handles 1:1 partial (50%) + trail on remainder.
+- Parent handles 1:2 partial (50%) + trail on remainder.
 """
 
 from __future__ import annotations
@@ -33,6 +35,8 @@ logger = logging.getLogger(__name__)
 
 MAX_SL_PER_DAY = 2
 SUB_NAME = "GauthamLiquiditySweep"
+# Used when enable_swing_mode is True.
+SWING_ZONE_SOURCES = frozenset({"swing_4h"})
 
 
 @dataclass
@@ -48,7 +52,7 @@ class GauthamEntrySignal:
     zone_side: Optional[str] = None  # high | low
     zone_source: Optional[str] = None
     zone_bar_key: Optional[str] = None  # 4H reference candle (IST)
-    sweep_bar_key: Optional[str] = None  # 1m bar that swept the zone (IST)
+    sweep_bar_key: Optional[str] = None  # entry-TF bar that swept the zone (IST)
 
 
 @dataclass
@@ -56,18 +60,13 @@ class _SymbolDayState:
     ist_date: Optional[date] = None
     sl_hits: int = 0
     setup_side: Optional[str] = None
-    phase: str = "idle"
-    first_rev_high: float = 0.0
-    first_rev_low: float = 0.0
-    second_rev_high: float = 0.0
-    second_rev_low: float = 0.0
     sweep_bar_key: Optional[str] = None
     armed_zone: Optional[LiquidityZone] = None
     consumed_sweeps: set = field(default_factory=set)
 
 
 class GauthamLiquiditySweep:
-    """Sub-strategy: 4H zone sweep on 1m + dual reversal candle entries."""
+    """Sub-strategy: 4H zone sweep on 5m + inside-zone entry (SL = candle extreme)."""
 
     name = SUB_NAME
 
@@ -77,12 +76,20 @@ class GauthamLiquiditySweep:
         *,
         enable_high_entries: bool = True,
         enable_low_entries: bool = True,
+        enable_swing_mode: bool = True,
     ) -> None:
         self.zones = zones or FourHourLiquidityBook()
         # high sweep → SHORT; low sweep → LONG
         self.enable_high_entries = bool(enable_high_entries)
         self.enable_low_entries = bool(enable_low_entries)
+        # True → swing_4h only; False → prev_4h + swing_4h
+        self.enable_swing_mode = bool(enable_swing_mode)
         self._day: Dict[str, _SymbolDayState] = {}
+
+    def _allowed_zone_sources(self) -> Optional[frozenset]:
+        if self.enable_swing_mode:
+            return SWING_ZONE_SOURCES
+        return None
 
     @staticmethod
     def _ist_date(candle: dict) -> Optional[date]:
@@ -120,32 +127,14 @@ class GauthamLiquiditySweep:
         st.ist_date = d
         st.sl_hits = 0
         st.setup_side = None
-        st.phase = "idle"
-        st.first_rev_high = 0.0
-        st.first_rev_low = 0.0
-        st.second_rev_high = 0.0
-        st.second_rev_low = 0.0
         st.sweep_bar_key = None
         st.armed_zone = None
         st.consumed_sweeps = set()
 
-    @staticmethod
-    def _is_red(candle: dict) -> bool:
-        try:
-            o = float(candle.get("open"))
-            c = float(candle.get("close"))
-        except (TypeError, ValueError):
-            return False
-        return c < o
-
-    @staticmethod
-    def _is_green(candle: dict) -> bool:
-        try:
-            o = float(candle.get("open"))
-            c = float(candle.get("close"))
-        except (TypeError, ValueError):
-            return False
-        return c > o
+    def _clear_setup(self, st: _SymbolDayState) -> None:
+        st.setup_side = None
+        st.sweep_bar_key = None
+        st.armed_zone = None
 
     def on_sl_hit(self, symbol: str, candle: dict) -> None:
         """Reset sweep arm after SL; count toward daily SL budget."""
@@ -157,10 +146,7 @@ class GauthamLiquiditySweep:
         if d is not None:
             self._roll_day(st, d)
         st.sl_hits += 1
-        st.setup_side = None
-        st.phase = "idle"
-        st.sweep_bar_key = None
-        st.armed_zone = None
+        self._clear_setup(st)
         logger.info(
             "GauthamLiquiditySweep SL hit %s sl_hits=%s/%s — await fresh 4H liquidity sweep",
             sym,
@@ -187,6 +173,7 @@ class GauthamLiquiditySweep:
             candle,
             enable_high=self.enable_high_entries,
             enable_low=self.enable_low_entries,
+            allowed_sources=self._allowed_zone_sources(),
         )
         if hit is None:
             return None
@@ -197,11 +184,6 @@ class GauthamLiquiditySweep:
     ) -> None:
         bar_key = self._bar_key(candle)
         st.setup_side = side
-        st.phase = "idle"
-        st.first_rev_high = 0.0
-        st.first_rev_low = 0.0
-        st.second_rev_high = 0.0
-        st.second_rev_low = 0.0
         st.sweep_bar_key = bar_key
         st.armed_zone = zone
         if bar_key:
@@ -219,21 +201,54 @@ class GauthamLiquiditySweep:
             bar_key,
         )
 
-    def _signal_from_setup(
+    @staticmethod
+    def _trades_inside_zone(candle: dict, zone: LiquidityZone, side: str) -> bool:
+        """
+        True when the entry-TF bar trades back inside the swept liquidity level.
+
+        High zone (SHORT): wick/range reaches the level and close is at/below it.
+        Low zone (LONG): wick/range reaches the level and close is at/above it.
+        """
+        try:
+            h = float(candle["high"])
+            l = float(candle["low"])
+            c = float(candle["close"])
+            z = float(zone.price)
+        except (KeyError, TypeError, ValueError):
+            return False
+        if side == "SHORT":
+            return l <= z and c <= z
+        if side == "LONG":
+            return h >= z and c >= z
+        return False
+
+    def _signal_from_candle(
         self,
         st: _SymbolDayState,
+        candle: dict,
         *,
         side: str,
-        entry: float,
-        stop: float,
-        risk: float,
-    ) -> GauthamEntrySignal:
+    ) -> Optional[GauthamEntrySignal]:
+        try:
+            entry = float(candle["close"])
+            if side == "SHORT":
+                stop = float(candle["high"])
+                risk = stop - entry
+            else:
+                stop = float(candle["low"])
+                risk = entry - stop
+        except (KeyError, TypeError, ValueError):
+            self._clear_setup(st)
+            return None
+        if risk <= 0:
+            self._clear_setup(st)
+            return None
+
         zone = st.armed_zone
         sweep_key = st.sweep_bar_key
-        st.setup_side = None
-        st.phase = "idle"
-        st.armed_zone = None
-        target = entry - risk if side == "SHORT" else entry + risk
+        self._clear_setup(st)
+        # Provisional 1:2 target; parent recalculates from fill + PARTIAL_TARGET_RR.
+        target = entry - 2.0 * risk if side == "SHORT" else entry + 2.0 * risk
         return GauthamEntrySignal(
             side=side,
             entry_price=entry,
@@ -275,81 +290,17 @@ class GauthamLiquiditySweep:
             self._arm_setup(st, sweep_side, zone, candle)
 
         side = st.setup_side
-        if not side:
+        zone = st.armed_zone
+        if not side or zone is None:
             return None
         if side == "SHORT" and not self.enable_high_entries:
-            st.setup_side = None
-            st.phase = "idle"
-            st.armed_zone = None
+            self._clear_setup(st)
             return None
         if side == "LONG" and not self.enable_low_entries:
-            st.setup_side = None
-            st.phase = "idle"
-            st.armed_zone = None
+            self._clear_setup(st)
             return None
 
-        if side == "SHORT":
-            if st.phase == "idle":
-                if self._is_red(candle):
-                    st.phase = "saw_first"
-                    st.first_rev_high = float(candle["high"])
-                    st.first_rev_low = float(candle["low"])
-                return None
-            if st.phase == "saw_first":
-                if not self._is_red(candle):
-                    st.setup_side = None
-                    st.phase = "idle"
-                    st.armed_zone = None
-                    return None
-                st.phase = "saw_second"
-                st.second_rev_high = float(candle["high"])
-                st.second_rev_low = float(candle["low"])
-                return None
-            if st.phase == "saw_second":
-                if float(candle["low"]) >= st.second_rev_low:
-                    return None
-                entry = float(candle["close"])
-                stop = float(st.second_rev_high)
-                risk = stop - entry
-                if risk <= 0:
-                    st.setup_side = None
-                    st.phase = "idle"
-                    st.armed_zone = None
-                    return None
-                return self._signal_from_setup(
-                    st, side="SHORT", entry=entry, stop=stop, risk=risk
-                )
+        if not self._trades_inside_zone(candle, zone, side):
             return None
 
-        # LONG
-        if st.phase == "idle":
-            if self._is_green(candle):
-                st.phase = "saw_first"
-                st.first_rev_high = float(candle["high"])
-                st.first_rev_low = float(candle["low"])
-            return None
-        if st.phase == "saw_first":
-            if not self._is_green(candle):
-                st.setup_side = None
-                st.phase = "idle"
-                st.armed_zone = None
-                return None
-            st.phase = "saw_second"
-            st.second_rev_high = float(candle["high"])
-            st.second_rev_low = float(candle["low"])
-            return None
-        if st.phase == "saw_second":
-            if float(candle["high"]) <= st.second_rev_high:
-                return None
-            entry = float(candle["close"])
-            stop = float(st.second_rev_low)
-            risk = entry - stop
-            if risk <= 0:
-                st.setup_side = None
-                st.phase = "idle"
-                st.armed_zone = None
-                return None
-            return self._signal_from_setup(
-                st, side="LONG", entry=entry, stop=stop, risk=risk
-            )
-        return None
+        return self._signal_from_candle(st, candle, side=side)
