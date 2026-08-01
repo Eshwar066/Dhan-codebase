@@ -2,6 +2,7 @@
 Description=Dhan LEAPS_RSI engine (LIVE) — python -m run.main --engine-id dhan_leaps_rsi
 After=network-online.target
 Wants=network-online.target
+Conflicts=dhan-trading.service
 StartLimitIntervalSec=86400
 StartLimitBurst=5
 

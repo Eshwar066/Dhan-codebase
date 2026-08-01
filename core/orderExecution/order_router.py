@@ -1,6 +1,7 @@
 import json
 import logging
 import time
+import uuid
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
@@ -19,7 +20,19 @@ except ImportError:
 
 from core.broker.internal.dhan.mappings import dhan_correlation_id, format_broker_failure_for_log
 from core.orderExecution.bracket_orders import BRACKET_TAGS, BracketLegRegistry
+from core.orderExecution.gtt_fallback_book import GttFallbackBook, GttFallbackWatch
+from core.orderExecution.reentry_at_cost_book import ReentryAtCostBook
+from core.orderExecution.execution_validator import (
+    ExecutionValidator,
+    ExecutionValidatorConfig,
+    MarketSnapshot,
+    ValidationResult,
+    config_from_mapping,
+    planned_sl_trigger_from_intent,
+    snapshot_from_ticker,
+)
 from core.orderExecution.intent_store import IntentStatus, IntentStore
+from core.models.order_intent import OrderIntent
 
 
 class OrderState(str, Enum):
@@ -77,6 +90,7 @@ class OrderRouter:
         self.circuit_breaker_threshold = circuit_breaker_threshold
         self.slippage_threshold_pct = slippage_threshold_pct
         self.engine_id = engine_id
+        self.event_bus = None
         self.strategy_id = strategy_id
         self._known_strategies: List[str] = []
         seen_strats: Set[str] = set()
@@ -122,6 +136,184 @@ class OrderRouter:
         # Fills before this instant are ignored for orphan EXTERNAL_CLOSE / LIQUIDATION / ADL paths.
         self._oms_session_start_unix = time.time()
         self.bracket_registry = BracketLegRegistry()
+        self.gtt_fallback_book = GttFallbackBook(
+            self,
+            instrument_store=instrument_store,
+            engine_logger=engine_logger,
+        )
+        self.reentry_at_cost_book = ReentryAtCostBook(
+            self,
+            instrument_store=instrument_store,
+            engine_logger=engine_logger,
+        )
+        # Optional: (bundle_item, intents, price_map) -> None; refreshes limit prices from live depth.
+        self.bundle_price_refresher: Optional[
+            Callable[[Dict[str, Any], List[Any], Dict[str, float]], None]
+        ] = None
+        # Optional: broker reports no_open_position on bracket/SL placement (manual exit sync).
+        self.on_broker_no_open_position: Optional[
+            Callable[..., None]
+        ] = None
+        # Delta execution validator (mark/mid/spread/stop gates). Wired by LiveEngine.
+        self.venue: Optional[str] = None
+        self.execution_validator: Optional[ExecutionValidator] = None
+        self.market_snapshot_provider: Optional[
+            Callable[[str], Optional[MarketSnapshot]]
+        ] = None
+        # Called when MAIN_SL fails mark validation: (intent, ValidationResult) -> None
+        self.on_invalid_stop: Optional[
+            Callable[[Any, ValidationResult], None]
+        ] = None
+
+    def configure_execution_validator(
+        self,
+        *,
+        venue: Optional[str] = None,
+        config: Optional[Any] = None,
+        snapshot_provider: Optional[
+            Callable[[str], Optional[MarketSnapshot]]
+        ] = None,
+        on_invalid_stop: Optional[Callable[[Any, ValidationResult], None]] = None,
+    ) -> None:
+        """Attach Delta OMS execution validator (no-op when disabled / non-Delta)."""
+        if venue is not None:
+            self.venue = str(venue).upper()
+        if snapshot_provider is not None:
+            self.market_snapshot_provider = snapshot_provider
+        if on_invalid_stop is not None:
+            self.on_invalid_stop = on_invalid_stop
+        if isinstance(config, ExecutionValidatorConfig):
+            cfg = config
+        elif isinstance(config, dict):
+            cfg = config_from_mapping(config)
+        else:
+            cfg = ExecutionValidatorConfig(
+                enabled=str(self.venue or "").upper() == "DELTA"
+            )
+        if self.venue:
+            cfg.venue = str(self.venue).upper()
+        self.execution_validator = ExecutionValidator(
+            cfg,
+            snapshot_provider=self.market_snapshot_provider,
+            venue=self.venue,
+        )
+
+    def _reject_execution_validation(
+        self,
+        intent: Any,
+        result: ValidationResult,
+        *,
+        intent_strategy_id: Any,
+        exec_price: Any = None,
+        qty: Any = None,
+    ) -> Dict[str, Any]:
+        reason = str(result.reason or "execution_validation_failed")
+        details = result.details or {}
+        msg = (
+            f"ExecutionValidator rejected: {reason} "
+            f"symbol={details.get('symbol')} mark={details.get('mark')} "
+            f"mid={details.get('mid')} trigger={details.get('trigger') or details.get('planned_sl_trigger')}"
+        )
+        self._log_oms_step(
+            "execution_validator",
+            intent,
+            ok=False,
+            message=msg,
+            intent_strategy_id=intent_strategy_id,
+            exec_price=exec_price,
+            qty=qty,
+            reason=reason,
+            **{k: details[k] for k in details if k not in ("symbol",)},
+        )
+        if self.engine_logger:
+            self.engine_logger.log(
+                "order_failed",
+                f"ORDER_FAILED intent_id={getattr(intent, 'intent_id', None)} "
+                f"reason={reason} | {msg}",
+                intent_id=getattr(intent, "intent_id", None),
+                strategy_id=intent_strategy_id,
+                symbol=details.get("symbol"),
+                side=getattr(intent, "side", None),
+                qty=qty,
+                reason=reason,
+                mark=details.get("mark"),
+                mid=details.get("mid"),
+                spread_pct=details.get("spread_pct"),
+                mark_mid_pct=details.get("mark_mid_pct"),
+                trigger=details.get("trigger") or details.get("planned_sl_trigger"),
+            )
+        try:
+            if getattr(intent, "intent_id", None) and self.intent_store:
+                self.intent_store.update(
+                    intent.intent_id,
+                    IntentStatus.REJECTED,
+                    order_state=OrderState.REJECTED,
+                )
+            if getattr(intent, "intent_id", None):
+                self._set_order_state(
+                    intent.intent_id,
+                    OrderState.REJECTED,
+                    action="execution_validator",
+                    message=msg,
+                )
+        except Exception as exc:
+            logger.warning("execution_validator reject bookkeeping failed: %s", exc)
+        return {"ok": False, "retryable": False, "reason": reason, "details": details}
+
+    def _validate_intent_execution(
+        self,
+        intent: Any,
+        *,
+        exec_price: Any = None,
+        planned_sl_trigger: Optional[float] = None,
+        intent_strategy_id: Any = None,
+        qty: Any = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Run ExecutionValidator when configured for this venue.
+        Returns a reject dict on failure, else None (ok / skipped).
+        """
+        validator = getattr(self, "execution_validator", None)
+        if validator is None:
+            return None
+        venue = str(getattr(self, "venue", None) or "").upper()
+        if not validator.applies_to_venue(venue):
+            return None
+        result = validator.validate_intent(
+            intent,
+            venue=venue,
+            exec_price=exec_price,
+            planned_sl_trigger=planned_sl_trigger,
+        )
+        if result.ok:
+            action = str(getattr(intent, "action", "") or "").upper()
+            tag = str(getattr(intent, "tag", "") or "").upper()
+            if action == "ENTRY" or tag == "MAIN_SL":
+                self._log_oms_step(
+                    "execution_validator",
+                    intent,
+                    ok=True,
+                    message=f"ExecutionValidator ok reason={result.reason or 'pass'}",
+                    intent_strategy_id=intent_strategy_id,
+                    exec_price=exec_price,
+                    qty=qty,
+                    mark=(result.details or {}).get("mark"),
+                    mid=(result.details or {}).get("mid"),
+                )
+            return None
+        tag_u = str(getattr(intent, "tag", "") or "").upper()
+        if tag_u == "MAIN_SL" and callable(getattr(self, "on_invalid_stop", None)):
+            try:
+                self.on_invalid_stop(intent, result)
+            except Exception as exc:
+                logger.warning("on_invalid_stop callback failed: %s", exc)
+        return self._reject_execution_validation(
+            intent,
+            result,
+            intent_strategy_id=intent_strategy_id,
+            exec_price=exec_price,
+            qty=qty,
+        )
 
     def reset_oms_session_boundary(self) -> None:
         """Call when starting a new trading session (same process) to tighten orphan fill acceptance."""
@@ -159,7 +351,13 @@ class OrderRouter:
         return str(payload.get("execution_mode") or "").strip().upper()
 
     def _intent_is_gtt(self, intent_rec: Dict[str, Any]) -> bool:
-        return self._intent_execution_mode(intent_rec) == "GTT"
+        return self._intent_execution_mode(intent_rec) in ("GTT", "HYBRID_GTT")
+
+    def _intent_is_hybrid_gtt(self, intent: Any) -> bool:
+        extras = getattr(intent, "metadata_extras", None) or {}
+        if isinstance(extras, dict):
+            return str(extras.get("execution_mode") or "").upper() == "HYBRID_GTT"
+        return False
 
     def _intent_trading_symbol(self, intent_rec: Dict[str, Any]) -> str:
         if not isinstance(intent_rec, dict):
@@ -274,6 +472,9 @@ class OrderRouter:
             "execution_source": "GTT_RECON",
         }
         if self.process_trade(trade):
+            book = getattr(self, "gtt_fallback_book", None)
+            if book is not None:
+                book.on_fill(intent_id)
             if self.engine_logger:
                 self.engine_logger.log(
                     "oms",
@@ -382,6 +583,150 @@ class OrderRouter:
                 applied += 1
         return applied
 
+    @staticmethod
+    def _alnum_symbol_key(value: Any) -> str:
+        return "".join(ch for ch in str(value or "").upper() if ch.isalnum())
+
+    def _intent_symbol_aliases(self, intent_rec: Dict[str, Any]) -> set:
+        aliases: set = set()
+        sym = self._intent_trading_symbol(intent_rec)
+        if sym:
+            aliases.add(self._alnum_symbol_key(sym))
+        payload = intent_rec.get("payload") or {}
+        for key in ("symbol", "trading_symbol", "tradingsymbol"):
+            aliases.add(self._alnum_symbol_key(payload.get(key)))
+        inst = intent_rec.get("instrument")
+        if inst is not None:
+            aliases.add(self._alnum_symbol_key(getattr(inst, "trading_symbol", "")))
+            aliases.add(self._alnum_symbol_key(getattr(inst, "custom_symbol", "")))
+            place_symbol = getattr(inst, "place_order_symbol", None)
+            if callable(place_symbol):
+                try:
+                    aliases.add(self._alnum_symbol_key(place_symbol()))
+                except Exception:
+                    pass
+        aliases.discard("")
+        return aliases
+
+    def _broker_position_row_for_intent(
+        self, intent_rec: Dict[str, Any], broker_positions: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Match broker position row to intent (engine symbol or Dhan place-order name)."""
+        if not broker_positions:
+            return None
+        aliases = self._intent_symbol_aliases(intent_rec)
+        if not aliases:
+            return None
+        from core.utils.expiry_resolver import ExpiryResolver
+
+        sym = self._intent_trading_symbol(intent_rec)
+        intent_ids = set()
+        for key in (
+            sym,
+            (intent_rec.get("payload") or {}).get("symbol"),
+            (intent_rec.get("payload") or {}).get("trading_symbol"),
+        ):
+            ik = ExpiryResolver.option_identity_key(str(key or ""))
+            if ik:
+                intent_ids.add(ik)
+        inst = intent_rec.get("instrument")
+        if inst is not None:
+            for attr in ("trading_symbol", "custom_symbol"):
+                ik = ExpiryResolver.option_identity_key(
+                    str(getattr(inst, attr, "") or "")
+                )
+                if ik:
+                    intent_ids.add(ik)
+            place_symbol = getattr(inst, "place_order_symbol", None)
+            if callable(place_symbol):
+                try:
+                    ik = ExpiryResolver.option_identity_key(str(place_symbol() or ""))
+                    if ik:
+                        intent_ids.add(ik)
+                except Exception:
+                    pass
+
+        if sym and sym in broker_positions:
+            return broker_positions.get(sym)
+        for b_sym, row in broker_positions.items():
+            if str(b_sym).strip().upper() == str(sym or "").strip().upper():
+                return row
+            if self._alnum_symbol_key(b_sym) in aliases:
+                return row
+            bik = ExpiryResolver.option_identity_key(str(b_sym))
+            if bik and bik in intent_ids:
+                return row
+        return None
+
+    def adopt_gtt_intent_from_broker_positions(
+        self,
+        intent_rec: Dict[str, Any],
+        broker_positions: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """
+        Adopt a single pending GTT ENTRY fill from broker position truth.
+        Used when Forever status lags but the contract is already open on the broker.
+        """
+        if not intent_rec or not self.intent_store:
+            return False
+        if not self._intent_is_gtt(intent_rec):
+            return False
+        payload = intent_rec.get("payload") or {}
+        if str(payload.get("action") or intent_rec.get("action") or "").upper() != "ENTRY":
+            return False
+        intent_id = str(intent_rec.get("intent_id") or "")
+        if intent_id and self._order_state.get(intent_id) in _TERMINAL_ORDER_STATES:
+            return True
+        positions = broker_positions
+        if positions is None:
+            broker = self.broker
+            getter = getattr(broker, "get_positions_for_recon", None)
+            if not callable(getter):
+                return False
+            try:
+                positions = getter() or {}
+            except Exception:
+                return False
+        bp = self._broker_position_row_for_intent(intent_rec, positions or {})
+        if not bp:
+            return False
+        try:
+            broker_units = int(bp.get("qty") or 0)
+        except (TypeError, ValueError):
+            return False
+        if broker_units == 0:
+            return False
+        side = str(intent_rec.get("side") or payload.get("side") or "BUY").upper()
+        if side == "BUY" and broker_units <= 0:
+            return False
+        if side == "SELL" and broker_units >= 0:
+            return False
+        inst = intent_rec.get("instrument")
+        lot_size = max(
+            1,
+            int(
+                getattr(inst, "lot_size", 0)
+                or bp.get("lot_size")
+                or payload.get("lot_size")
+                or 1
+            ),
+        )
+        qty_lots = max(1, abs(broker_units) // lot_size)
+        price = float(
+            bp.get("avg_price")
+            or intent_rec.get("price")
+            or payload.get("price")
+            or 0
+        )
+        return bool(
+            self._apply_gtt_fill_from_intent(
+                intent_rec,
+                price=price,
+                qty_lots=qty_lots,
+                order_id=intent_rec.get("broker_order_id"),
+            )
+        )
+
     def adopt_pending_entries_from_broker_positions(
         self, broker_positions: Dict[str, Any]
     ) -> int:
@@ -391,63 +736,133 @@ class OrderRouter:
         """
         if not broker_positions or not self.intent_store:
             return 0
-        local_pending = self.intent_store.list_by_status(
-            IntentStatus.SENT
-        ) + self.intent_store.list_by_status(IntentStatus.VALIDATED)
+        local_pending = (
+            list(self.intent_store.list_by_status(IntentStatus.SENT))
+            + list(self.intent_store.list_by_status(IntentStatus.VALIDATED))
+            + list(self.intent_store.list_by_status(IntentStatus.ACKED))
+        )
         applied = 0
+        seen: set = set()
         for rec in local_pending:
-            if not self._intent_is_gtt(rec):
+            iid = str(rec.get("intent_id") or "")
+            if iid and iid in seen:
                 continue
-            payload = rec.get("payload") or {}
-            if str(payload.get("action") or rec.get("action") or "").upper() != "ENTRY":
-                continue
-            sym = self._intent_trading_symbol(rec)
-            if not sym:
-                continue
-            bp = broker_positions.get(sym)
-            if not bp:
-                for b_sym, row in broker_positions.items():
-                    if str(b_sym).strip().upper() == sym.upper():
-                        bp = row
-                        break
-            if not bp:
-                continue
-            try:
-                broker_units = int(bp.get("qty") or 0)
-            except (TypeError, ValueError):
-                continue
-            if broker_units == 0:
-                continue
-            side = str(rec.get("side") or payload.get("side") or "BUY").upper()
-            if side == "BUY" and broker_units <= 0:
-                continue
-            if side == "SELL" and broker_units >= 0:
-                continue
-            inst = rec.get("instrument")
-            lot_size = max(
-                1,
-                int(
-                    getattr(inst, "lot_size", 0)
-                    or bp.get("lot_size")
-                    or payload.get("lot_size")
-                    or 1
-                ),
-            )
-            qty_lots = max(1, abs(broker_units) // lot_size)
-            price = float(
-                bp.get("avg_price")
-                or rec.get("price")
-                or payload.get("price")
-                or 0
-            )
-            if self._apply_gtt_fill_from_intent(
-                rec,
-                price=price,
-                qty_lots=qty_lots,
-                order_id=rec.get("broker_order_id"),
-            ):
+            if iid:
+                seen.add(iid)
+            if self.adopt_gtt_intent_from_broker_positions(rec, broker_positions):
                 applied += 1
         return applied
+
+    def _promote_seeded_intent_to_filled(self, intent_id: str) -> None:
+        """Move a CSV-seeded intent through VALIDATED → SENT → FILLED."""
+        rec = self.intent_store.get(intent_id)
+        if not rec:
+            return
+        cur = rec.get("status")
+        if isinstance(cur, str):
+            cur = IntentStatus(cur)
+        if cur == IntentStatus.FILLED:
+            return
+        if cur == IntentStatus.CREATED:
+            self.intent_store.update(intent_id, IntentStatus.VALIDATED)
+            cur = IntentStatus.VALIDATED
+        if cur == IntentStatus.VALIDATED:
+            self.intent_store.update(intent_id, IntentStatus.SENT)
+            cur = IntentStatus.SENT
+        if cur in (IntentStatus.SENT, IntentStatus.ACKED):
+            self.intent_store.update(
+                intent_id, IntentStatus.FILLED, order_state=OrderState.FILLED
+            )
+
+    def seed_filled_intents_from_open_positions_csv(
+        self, csv_path: Optional[str] = None
+    ) -> int:
+        """
+        Create FILLED ENTRY intents from open-positions CSV rows (manual / recovered legs).
+        Enables structure_id + tag linkage for LEAPS after restart.
+        """
+        path = csv_path or getattr(self.position_manager, "open_positions_csv_path", None)
+        if not path or not self.intent_store:
+            return 0
+        try:
+            from utils.logger.open_positions_logger import read_open_positions_snapshot
+        except ImportError:
+            return 0
+        snap = read_open_positions_snapshot(path)
+        if not snap:
+            return 0
+        seeded = 0
+        for sym, row in snap.items():
+            strategy = (row.get("strategy") or self.strategy_id or "").strip()
+            structure_id = (row.get("structure_id") or "").strip()
+            tag = (row.get("tag") or "MAIN").strip().upper()
+            if not strategy or not structure_id:
+                continue
+            try:
+                nq = int(float(row.get("net_qty") or 0))
+            except (TypeError, ValueError):
+                continue
+            if nq == 0:
+                continue
+            intent_id = (row.get("intent_id") or "").strip()
+            if not intent_id:
+                intent_id = f"seed_{tag.lower()}_{sym[-12:].replace('-', '')}"[:30]
+            if self.intent_store.exists(intent_id):
+                self._promote_seeded_intent_to_filled(intent_id)
+                if self._order_state.get(intent_id) != OrderState.FILLED:
+                    self._set_order_state(
+                        intent_id,
+                        OrderState.FILLED,
+                        action="seed_from_csv",
+                        message="Open position CSV seed",
+                    )
+                seeded += 1
+                continue
+            side = "SELL" if nq < 0 else "BUY"
+            qty = abs(nq)
+            try:
+                avg = float(row.get("avg_price") or 0)
+            except (TypeError, ValueError):
+                avg = 0.0
+            inst = None
+            if self.instrument_store:
+                from core.orderExecution.position_manager import PositionManager
+
+                opt, strike = PositionManager._extract_option_hint(sym, structure_id)
+                inst = self.instrument_store.intent_creation_details(
+                    sym, "NSE", None, opt, strike
+                )
+            payload = {
+                "symbol": sym,
+                "side": side,
+                "qty": qty,
+                "price": avg,
+                "action": "ENTRY",
+                "strategy": strategy,
+                "strategy_id": strategy,
+                "structure_id": structure_id,
+                "tag": tag,
+                "engine_id": self.engine_id,
+            }
+            self.intent_store.create(payload=payload, intent_id=intent_id)
+            self.intent_store.update(intent_id, IntentStatus.VALIDATED)
+            self._promote_seeded_intent_to_filled(intent_id)
+            rec = self.intent_store.get(intent_id)
+            if rec and inst is not None:
+                rec["instrument"] = inst
+                rec["side"] = side
+                rec["qty"] = qty
+                rec["tag"] = tag
+                rec["structure_id"] = structure_id
+                rec["action"] = "ENTRY"
+            self._set_order_state(
+                intent_id,
+                OrderState.FILLED,
+                action="seed_from_csv",
+                message=f"Seeded FILLED {tag} from open-positions CSV",
+            )
+            seeded += 1
+        return seeded
 
     @staticmethod
     def _broker_tag_matches_intent(intent_id: str, broker_tag: str) -> bool:
@@ -731,6 +1146,69 @@ class OrderRouter:
             self._order_state_log = log
         self._persist_order_state()
 
+    def prune_terminal_order_states(
+        self, *, keep_recent_seconds: float = 6 * 3600, max_terminal: int = 2_000
+    ) -> int:
+        """Drop old terminal order-state entries to bound RAM/JSON growth."""
+        now = time.time()
+        # Prefer timestamps from the rolling state log when available.
+        last_ts: Dict[str, float] = {}
+        for entry in getattr(self, "_order_state_log", []) or []:
+            iid = entry.get("intent_id")
+            if not iid:
+                continue
+            ts_raw = entry.get("timestamp")
+            try:
+                if isinstance(ts_raw, str) and ts_raw.endswith("Z"):
+                    dt = datetime.datetime.strptime(ts_raw[:19], "%Y-%m-%dT%H:%M:%S")
+                    last_ts[str(iid)] = dt.replace(tzinfo=datetime.timezone.utc).timestamp()
+            except (TypeError, ValueError):
+                continue
+
+        to_drop: List[str] = []
+        terminal_ids = [
+            iid
+            for iid, st in list(self._order_state.items())
+            if st in _TERMINAL_ORDER_STATES
+        ]
+        for iid in terminal_ids:
+            ts = last_ts.get(iid, 0.0)
+            if keep_recent_seconds > 0 and ts and (now - ts) < keep_recent_seconds:
+                continue
+            if not ts:
+                # No timestamp — still candidates once over soft cap.
+                continue
+            to_drop.append(iid)
+
+        if len(terminal_ids) > max_terminal:
+            # Force-drop oldest unknown-ts terminals beyond soft cap.
+            surplus = [
+                iid for iid in terminal_ids if iid not in to_drop and iid not in last_ts
+            ]
+            surplus.extend(
+                sorted(
+                    [iid for iid in terminal_ids if iid in last_ts],
+                    key=lambda i: last_ts.get(i, 0.0),
+                )
+            )
+            need = len(terminal_ids) - max_terminal
+            for iid in surplus:
+                if need <= 0:
+                    break
+                if iid not in to_drop:
+                    to_drop.append(iid)
+                    need -= 1
+
+        for iid in to_drop:
+            self._order_state.pop(iid, None)
+            filled_map = getattr(self, "_last_applied_filled_by_intent", None)
+            if isinstance(filled_map, dict):
+                filled_map.pop(iid, None)
+        if to_drop:
+            self._persist_order_state()
+            logger.info("OrderRouter pruned %s terminal order-state entr(y/ies)", len(to_drop))
+        return len(to_drop)
+
     def _rebuild_order_state_cache(self) -> None:
         """Merge IntentStore order states into _order_state (e.g. after restart). Then persist."""
         if not hasattr(self.intent_store, "get_all_order_states"):
@@ -762,7 +1240,166 @@ class OrderRouter:
             self._order_state_log = log[-self._order_state_log_max :]
         else:
             self._order_state_log = log
+        self._reconcile_stale_bracket_order_states_on_startup()
         self._persist_order_state()
+
+    def _persisted_sent_has_filled_bracket_sibling(self, sent_intent_id: str) -> bool:
+        """True when another bracket leg from the same bundle is FILLED in persisted state."""
+        log = getattr(self, "_order_state_log", [])
+        sent_ts = None
+        for entry in log:
+            if (
+                entry.get("intent_id") == sent_intent_id
+                and entry.get("action") == "order_placed"
+            ):
+                sent_ts = str(entry.get("timestamp") or "")
+                break
+        if not sent_ts:
+            return False
+        try:
+            sent_epoch = datetime.datetime.fromisoformat(
+                sent_ts.replace("Z", "+00:00")
+            ).timestamp()
+        except (TypeError, ValueError):
+            return False
+        for entry in log:
+            if entry.get("action") != "order_placed":
+                continue
+            other_id = str(entry.get("intent_id") or "")
+            if not other_id or other_id == sent_intent_id:
+                continue
+            other_ts = str(entry.get("timestamp") or "")
+            try:
+                other_epoch = datetime.datetime.fromisoformat(
+                    other_ts.replace("Z", "+00:00")
+                ).timestamp()
+            except (TypeError, ValueError):
+                continue
+            if abs(other_epoch - sent_epoch) > 30.0:
+                continue
+            if self._order_state.get(other_id) == OrderState.FILLED:
+                return True
+        return False
+
+    def _reconcile_stale_bracket_order_states_on_startup(self) -> None:
+        """Clear stale SENT bracket legs after restart when sibling already FILLED."""
+        if self.intent_store:
+            for status in (IntentStatus.SENT, IntentStatus.VALIDATED):
+                for rec in self.intent_store.list_by_status(status):
+                    self._try_resolve_cancelled_bracket_sibling(rec)
+        for sent_id in list(self._order_state.keys()):
+            if self._order_state.get(sent_id) != OrderState.SENT:
+                continue
+            if self.intent_store and self.intent_store.exists(sent_id):
+                rec = self.intent_store.get(sent_id)
+                if rec and self._try_resolve_cancelled_bracket_sibling(rec):
+                    continue
+            if self._persisted_sent_has_filled_bracket_sibling(sent_id):
+                self._mark_intent_cancelled(
+                    sent_id,
+                    action="startup_sibling_filled_oco",
+                    message="Persisted SENT bracket leg; sibling already FILLED",
+                )
+
+    def _mark_intent_cancelled(
+        self, intent_id: str, *, action: str, message: str
+    ) -> None:
+        self._set_order_state(
+            intent_id, OrderState.CANCELLED, action=action, message=message
+        )
+        if self.intent_store:
+            self.intent_store.update(
+                intent_id, IntentStatus.CANCELLED, order_state=OrderState.CANCELLED
+            )
+
+    def _intent_is_terminal_filled(self, intent_id: str) -> bool:
+        if self._order_state.get(intent_id) == OrderState.FILLED:
+            return True
+        rec = self.intent_store.get(intent_id) if self.intent_store else None
+        if not rec:
+            return False
+        st = rec.get("status")
+        return str(getattr(st, "value", st)).upper() == "FILLED"
+
+    def _maybe_cancel_bracket_sibling_after_exit(
+        self,
+        position_closed: bool,
+        tag_fill: str,
+        structure_id: Optional[str],
+    ) -> None:
+        tag_u = str(tag_fill or "").upper()
+        stid = str(structure_id or "").strip()
+        if not position_closed or not stid or tag_u not in BRACKET_TAGS:
+            return
+        self.bracket_registry.cancel_sibling(
+            stid,
+            tag_u,
+            broker=self.broker,
+            order_router=self,
+            reason="sibling_fill",
+        )
+        self.bracket_registry.clear_structure(stid)
+
+    def _try_resolve_cancelled_bracket_sibling(
+        self, intent_record: Dict[str, Any]
+    ) -> bool:
+        """Resolve missing bracket leg when sibling filled and exchange OCO removed it."""
+        intent_id = str(intent_record.get("intent_id") or "")
+        if not intent_id:
+            return False
+        payload = intent_record.get("payload") or {}
+        tag_u = str(intent_record.get("tag") or payload.get("tag") or "").upper()
+        if tag_u not in BRACKET_TAGS:
+            return False
+        stid = intent_record.get("structure_id") or payload.get("structure_id")
+        if not stid:
+            return False
+        other_tag = "MAIN_TARGET" if tag_u == "MAIN_SL" else "MAIN_SL"
+        sibling_filled = False
+        sib = self.bracket_registry.get_sibling(str(stid), tag_u)
+        if sib and sib.get("intent_id"):
+            sibling_filled = self._intent_is_terminal_filled(str(sib["intent_id"]))
+        if not sibling_filled and self.intent_store:
+            for rec in self.intent_store.list_by_status(IntentStatus.FILLED):
+                rec_stid = rec.get("structure_id") or (rec.get("payload") or {}).get(
+                    "structure_id"
+                )
+                if str(rec_stid or "") != str(stid):
+                    continue
+                rec_tag = str(
+                    rec.get("tag") or (rec.get("payload") or {}).get("tag") or ""
+                ).upper()
+                if rec_tag == other_tag:
+                    sibling_filled = True
+                    break
+        if not sibling_filled:
+            return False
+        self._mark_intent_cancelled(
+            intent_id,
+            action="sibling_filled_oco",
+            message=f"Bracket sibling {other_tag} filled; leg removed on exchange",
+        )
+        return True
+
+    def _find_broker_order_for_intent(
+        self, intent_record: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        intent_id = str(intent_record.get("intent_id") or "")
+        order = None
+        if intent_id and hasattr(self.broker, "find_order_by_client_id"):
+            try:
+                order = self.broker.find_order_by_client_id(intent_id)
+            except Exception:
+                order = None
+        broker_oid = intent_record.get("broker_order_id")
+        if not order and broker_oid:
+            find_by_id = getattr(self.broker, "find_order_by_id", None)
+            if callable(find_by_id):
+                try:
+                    order = find_by_id(str(broker_oid))
+                except Exception:
+                    order = None
+        return order
 
     @staticmethod
     def _is_retryable_broker_error(exc: Exception) -> bool:
@@ -801,6 +1438,236 @@ class OrderRouter:
         }
 
     @staticmethod
+    def _failure_is_no_open_position(
+        fail: Optional[Dict[str, Any]], message: str = ""
+    ) -> bool:
+        parts = [
+            str((fail or {}).get("error_code") or ""),
+            str((fail or {}).get("reason") or ""),
+            str((fail or {}).get("message") or ""),
+            message,
+        ]
+        return "no_open_position" in " ".join(parts).lower()
+
+    @staticmethod
+    def _intent_trading_symbol(intent: Any) -> str:
+        inst = getattr(intent, "instrument", None)
+        return str(getattr(inst, "trading_symbol", None) or "").strip()
+
+    def _intent_is_broker_flat_sync_candidate(self, intent: Any) -> bool:
+        action_u = str(getattr(intent, "action", "") or "").upper()
+        tag_u = str(getattr(intent, "tag", "") or "").upper()
+        return action_u in ("FORCE_EXIT", "EXIT") or tag_u in (
+            "MAIN_SL",
+            "MAIN_TARGET",
+        )
+
+    def _handle_broker_no_open_position(
+        self,
+        intents: List[Any],
+        *,
+        message: str,
+        bundle_item: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Position already flat at broker; sync PM and stop bracket/reentry retries."""
+        primary = intents[0] if intents else None
+        trading_sym = self._intent_trading_symbol(primary) if primary else ""
+        structure_id = getattr(primary, "structure_id", None) if primary else None
+        strategy_id = (
+            getattr(primary, "strategy_id", None)
+            or (bundle_item or {}).get("strategy_id")
+            or self.strategy_id
+        )
+        for intent in intents:
+            self.intent_store.update(
+                intent.intent_id,
+                IntentStatus.CANCELLED,
+                order_state=OrderState.CANCELLED,
+            )
+            self._set_order_state(
+                intent.intent_id,
+                OrderState.CANCELLED,
+                action="broker_flat_sync",
+                message=message,
+            )
+        handler = self.on_broker_no_open_position
+        if callable(handler):
+            try:
+                handler(
+                    trading_symbol=trading_sym,
+                    structure_id=structure_id,
+                    strategy_id=strategy_id,
+                    message=message,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "on_broker_no_open_position failed symbol=%s sid=%s: %s",
+                    trading_sym,
+                    structure_id,
+                    exc,
+                )
+        if self.engine_logger:
+            self.engine_logger.log(
+                "reconciliation",
+                (
+                    f"BROKER_FLAT_SYNC trading_symbol={trading_sym} "
+                    f"structure_id={structure_id} reason=no_open_position "
+                    f"detail={message}"
+                ),
+                symbol=trading_sym or None,
+                structure_id=structure_id,
+                strategy_id=strategy_id,
+            )
+        return {
+            "ok": True,
+            "retryable": False,
+            "reason": "broker_flat_synced",
+        }
+
+    def sync_local_after_manual_broker_flat(
+        self,
+        *,
+        trading_symbol: str,
+        structure_id: Optional[str] = None,
+        strategy_id: Optional[str] = None,
+        reason: str = "manual_broker_exit",
+    ) -> int:
+        """
+        Manual Dhan exit: cancel resting local intents/orders for this leg and
+        drop GTT fallback watches. Returns number of intents cancelled.
+        """
+        from core.utils.expiry_resolver import ExpiryResolver
+
+        sym = str(trading_symbol or "").strip()
+        sid = str(structure_id or "").strip()
+        strat = str(strategy_id or "").strip()
+        if not sym and not sid:
+            return 0
+        store = self.intent_store
+        if store is None:
+            return 0
+
+        want_keys = set()
+        if sym:
+            want_keys.add(sym.upper())
+            want_keys.add(self._alnum_symbol_key(sym))
+            ik = ExpiryResolver.option_identity_key(sym)
+            if ik:
+                want_keys.add(ik)
+        want_keys.discard("")
+
+        pending = (
+            list(store.list_by_status(IntentStatus.CREATED))
+            + list(store.list_by_status(IntentStatus.VALIDATED))
+            + list(store.list_by_status(IntentStatus.SENT))
+            + list(store.list_by_status(IntentStatus.ACKED))
+        )
+        cancelled = 0
+        for rec in pending:
+            payload = rec.get("payload") or {}
+            rec_sid = str(
+                rec.get("structure_id") or payload.get("structure_id") or ""
+            ).strip()
+            rec_strat = str(
+                rec.get("strategy")
+                or payload.get("strategy_id")
+                or ""
+            ).strip()
+            if sid and rec_sid and rec_sid != sid:
+                continue
+            if strat and rec_strat and rec_strat != strat:
+                continue
+            if want_keys:
+                aliases = self._intent_symbol_aliases(rec)
+                if isinstance(rec, dict):
+                    rec_sym = str(
+                        (rec.get("payload") or {}).get("symbol")
+                        or rec.get("trading_symbol")
+                        or ""
+                    ).strip()
+                    inst = rec.get("instrument")
+                    if not rec_sym and inst is not None:
+                        rec_sym = str(
+                            getattr(inst, "trading_symbol", "") or ""
+                        ).strip()
+                else:
+                    rec_sym = self._intent_trading_symbol(rec)
+                if rec_sym:
+                    aliases.add(self._alnum_symbol_key(rec_sym))
+                    from core.utils.expiry_resolver import ExpiryResolver
+
+                    ik = ExpiryResolver.option_identity_key(rec_sym)
+                    if ik:
+                        aliases.add(ik)
+                if not (aliases & want_keys) and not (
+                    sid and rec_sid and rec_sid == sid
+                ):
+                    continue
+            tag_u = str(rec.get("tag") or payload.get("tag") or "").upper()
+            action_u = str(rec.get("action") or payload.get("action") or "").upper()
+            # Cancel protective/exit/entry leftovers for this closed leg.
+            if action_u not in ("FORCE_EXIT", "EXIT", "ENTRY") and tag_u not in (
+                "MAIN_SL",
+                "MAIN_TARGET",
+                "MAIN_EXIT",
+                "MAIN",
+            ):
+                continue
+            intent_id = str(rec.get("intent_id") or "")
+            if not intent_id:
+                continue
+            broker_order_id = rec.get("broker_order_id")
+            if broker_order_id and self.broker and hasattr(
+                self.broker, "cancel_order_by_id"
+            ):
+                try:
+                    self.broker.cancel_order_by_id(
+                        str(broker_order_id),
+                        intent_id=intent_id,
+                        reason=reason,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "manual flat: broker cancel failed intent=%s order=%s: %s",
+                        intent_id,
+                        broker_order_id,
+                        exc,
+                    )
+            try:
+                book = getattr(self, "gtt_fallback_book", None)
+                if book is not None:
+                    watch = getattr(book, "_watches", {}).get(intent_id)
+                    if watch is not None:
+                        self.cancel_gtt_fallback_watch(watch, reason=reason)
+            except Exception:
+                pass
+            store.update(
+                intent_id,
+                IntentStatus.CANCELLED,
+                order_state=OrderState.CANCELLED,
+            )
+            self._set_order_state(
+                intent_id,
+                OrderState.CANCELLED,
+                action="manual_broker_flat",
+                message=reason,
+            )
+            cancelled += 1
+
+        if self.engine_logger and cancelled:
+            self.engine_logger.log(
+                "reconciliation",
+                (
+                    f"MANUAL_FLAT_SYNC cancelled={cancelled} "
+                    f"trading_symbol={sym} structure_id={sid} reason={reason}"
+                ),
+                symbol=sym or None,
+                structure_id=sid or None,
+                strategy_id=strat or None,
+            )
+        return cancelled
+
+    @staticmethod
     def _coerce_positive_exec_price(price: Any) -> Optional[float]:
         if price is None:
             return None
@@ -811,6 +1678,48 @@ class OrderRouter:
         if p != p or p <= 0:
             return None
         return p
+
+    @staticmethod
+    def _lookup_price_map(
+        price_map: Optional[Dict[str, Any]], intent: Any, trading_sym: str = ""
+    ) -> Optional[float]:
+        """Resolve price from map using trading_symbol and/or place_order_symbol keys."""
+        if not price_map:
+            return None
+        keys: List[str] = []
+        if trading_sym:
+            keys.append(str(trading_sym).strip())
+        inst = getattr(intent, "instrument", None)
+        if inst is not None:
+            ts = getattr(inst, "trading_symbol", None)
+            if ts:
+                keys.append(str(ts).strip())
+            if hasattr(inst, "place_order_symbol"):
+                try:
+                    pos = inst.place_order_symbol()
+                except Exception:
+                    pos = None
+                if pos:
+                    keys.append(str(pos).strip())
+            custom = getattr(inst, "custom_symbol", None)
+            if custom:
+                keys.append(str(custom).strip())
+        seen: Set[str] = set()
+        for key in keys:
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            val = price_map.get(key)
+            if val is None:
+                # Case-insensitive fallback for Dhan custom symbols.
+                for mk, mv in price_map.items():
+                    if str(mk).strip().upper() == key.upper():
+                        val = mv
+                        break
+            coerced = OrderRouter._coerce_positive_exec_price(val)
+            if coerced is not None:
+                return coerced
+        return None
 
     def process_intent(
         self,
@@ -919,11 +1828,12 @@ class OrderRouter:
                     )
                     return {"ok": True, "retryable": False, "reason": "duplicate_exit"}
 
-        # Resolve execution price: always prefer price_map (engine updates it with best bid/ask)
+        # Resolve execution price: always prefer price_map (engine updates it with best bid/ask).
+        # Engine may key by place_order_symbol (Dhan SEM_CUSTOM_SYMBOL) while intent.instrument
+        # uses compact trading_symbol — try both.
         exec_price = None
-
-        if price_map and sym:
-            exec_price = price_map.get(sym)
+        if price_map:
+            exec_price = self._lookup_price_map(price_map, intent, sym)
         if exec_price is None:
             exec_price = intent.price
         exec_price = self._coerce_positive_exec_price(exec_price)
@@ -1067,6 +1977,7 @@ class OrderRouter:
                 "side": side,
                 "qty": qty,
                 "action": getattr(intent, "action", "ENTRY"),
+                "order_type": getattr(intent, "order_type", None),
                 "engine_id": intent_engine_id,
                 "strategy_id": intent_strategy_id,
                 "structure_id": getattr(intent, "structure_id", None),
@@ -1100,9 +2011,11 @@ class OrderRouter:
             rec["structure_id"] = getattr(intent, "structure_id", None)
             rec["tag"] = getattr(intent, "tag", None)
             rec["action"] = getattr(intent, "action", "ENTRY")
+            rec["order_type"] = getattr(intent, "order_type", None)
             if hasattr(intent, "instrument"):
                 rec["instrument"] = intent.instrument
             pay = rec.get("payload") or {}
+            pay["order_type"] = getattr(intent, "order_type", None)
             if getattr(intent, "structure_id", None) is not None:
                 pay["structure_id"] = intent.structure_id
             if getattr(intent, "tag", None) is not None:
@@ -1122,6 +2035,16 @@ class OrderRouter:
             exec_price=exec_price,
             qty=qty,
         )
+
+        # Delta ExecutionValidator: mark/mid/spread + stop-vs-mark (ENTRY + MAIN_SL).
+        reject = self._validate_intent_execution(
+            intent,
+            exec_price=exec_price,
+            intent_strategy_id=intent_strategy_id,
+            qty=qty,
+        )
+        if reject is not None:
+            return reject
 
         self._log_oms_step(
             "place_order_start",
@@ -1201,6 +2124,19 @@ class OrderRouter:
                     broker_error_message=fail_fields.get("broker_error_message"),
                     broker_error_type=fail_fields.get("broker_error_type"),
                 )
+            # Always terminalize before any raise so order-state checks do not
+            # treat this intent as forever-missing on the broker open book.
+            self.intent_store.update(
+                intent.intent_id,
+                IntentStatus.REJECTED,
+                order_state=OrderState.REJECTED,
+            )
+            self._set_order_state(
+                intent.intent_id,
+                OrderState.REJECTED,
+                action="broker_error",
+                message=f"place_order failed: {e}",
+            )
             if retryable and raise_on_retryable_failure:
                 raise RuntimeError(
                     f"retryable_broker_error: {fail_fields['fail_detail']}"
@@ -1214,15 +2150,6 @@ class OrderRouter:
                     self.engine_logger.broker_circuit_breaker_triggered(
                         "broker_failure"
                     )
-            self.intent_store.update(
-                intent.intent_id, "REJECTED", order_state=OrderState.REJECTED
-            )
-            self._set_order_state(
-                intent.intent_id,
-                OrderState.REJECTED,
-                action="broker_error",
-                message=f"place_order failed: {e}",
-            )
             return {"ok": False, "retryable": retryable, "reason": "broker_error"}
 
         if order_id is None:
@@ -1234,6 +2161,13 @@ class OrderRouter:
             if fail_payload:
                 fail_msg = f"{fail_msg} | payload={fail_payload}"
             retryable = bool(fail_fields.get("retryable", True))
+            if self._failure_is_no_open_position(
+                broker_fail, fail_msg
+            ) and self._intent_is_broker_flat_sync_candidate(intent):
+                return self._handle_broker_no_open_position(
+                    [intent],
+                    message=fail_msg,
+                )
             self._log_oms_step(
                 "place_order",
                 intent,
@@ -1274,6 +2208,19 @@ class OrderRouter:
                     qty,
                     fail_fields["fail_detail"],
                 )
+            # Terminalize first: no_order_id must not linger as SENT/VALIDATED
+            # (that caused perpetual order_state_mismatch + reconcile spam).
+            self.intent_store.update(
+                intent.intent_id,
+                IntentStatus.REJECTED,
+                order_state=OrderState.REJECTED,
+            )
+            self._set_order_state(
+                intent.intent_id,
+                OrderState.REJECTED,
+                action="broker_no_order_id",
+                message=fail_fields["fail_detail"],
+            )
             if retryable and raise_on_retryable_failure:
                 raise RuntimeError(
                     f"retryable_broker_error: {fail_fields['reason']}"
@@ -1287,15 +2234,6 @@ class OrderRouter:
                     self.engine_logger.broker_circuit_breaker_triggered(
                         "broker_failure"
                     )
-            self.intent_store.update(
-                intent.intent_id, "REJECTED", order_state=OrderState.REJECTED
-            )
-            self._set_order_state(
-                intent.intent_id,
-                OrderState.REJECTED,
-                action="broker_no_order_id",
-                message=fail_fields["fail_detail"],
-            )
             return {
                 "ok": False,
                 "retryable": retryable,
@@ -1352,6 +2290,10 @@ class OrderRouter:
                 broker_order_id=order_id,
                 order_state=OrderState.SENT,
             )
+            if self._intent_is_hybrid_gtt(intent):
+                self.gtt_fallback_book.register_from_intent(
+                    intent, broker_order_id=order_id
+                )
             if getattr(intent, "action", "") == "EXIT":
                 sent_rec = self.intent_store.get(intent.intent_id)
                 if sent_rec:
@@ -1380,6 +2322,820 @@ class OrderRouter:
             "reason": "order_placed",
             "broker_sent_ts": broker_sent_ts,
         }
+
+    def _broker_hedge_fill_gate_enabled(self) -> bool:
+        return bool(getattr(self.broker, "supports_hedge_fill_gated_bundles", False))
+
+    @staticmethod
+    def _partition_hedge_gated_legs(
+        resolved: List[Tuple[Any, float]],
+    ) -> Tuple[List[Tuple[Any, float]], List[Tuple[Any, float]]]:
+        hedge_legs: List[Tuple[Any, float]] = []
+        follow_legs: List[Tuple[Any, float]] = []
+        for intent, exec_price in resolved:
+            tag_u = str(getattr(intent, "tag", "") or "").upper()
+            if tag_u == "HEDGE":
+                hedge_legs.append((intent, exec_price))
+            else:
+                follow_legs.append((intent, exec_price))
+        return hedge_legs, follow_legs
+
+    @staticmethod
+    def _should_use_dhan_hedge_fill_gate(
+        resolved: List[Tuple[Any, float]],
+        actions: Set[str],
+    ) -> bool:
+        if len(resolved) < 2 or not actions <= {"ENTRY"}:
+            return False
+        tags = {str(getattr(i, "tag", "") or "").upper() for i, _ in resolved}
+        return "HEDGE" in tags and bool(tags - {"HEDGE"})
+
+    def _reject_bundle_legs(
+        self,
+        legs: List[Tuple[Any, float]],
+        *,
+        reason: str,
+        message: str,
+        bundle_item: Dict[str, Any],
+    ) -> None:
+        for intent, _ in legs:
+            self.intent_store.update(
+                intent.intent_id,
+                IntentStatus.REJECTED,
+                order_state=OrderState.REJECTED,
+            )
+            self._set_order_state(
+                intent.intent_id,
+                OrderState.REJECTED,
+                action=reason,
+                message=message,
+            )
+            if self.engine_logger:
+                self.engine_logger.log(
+                    "order_failed",
+                    (
+                        f"ORDER_FAILED intent_id={intent.intent_id} "
+                        f"reason={reason} bundle=true | {message}"
+                    ),
+                    intent_id=intent.intent_id,
+                    strategy_id=bundle_item.get("strategy_id"),
+                    structure_id=bundle_item.get("structure_id"),
+                )
+
+    def _log_bundle_margin_check(
+        self,
+        *,
+        bundle_item: Dict[str, Any],
+        resolved: List[Tuple[Any, float]],
+        bundle_margin: Optional[Dict[str, Any]],
+        label: str,
+    ) -> bool:
+        if bundle_margin is None:
+            return True
+        margin_ok = bool(bundle_margin.get("ok", True))
+        primary = resolved[0][0]
+        self._log_oms_step(
+            "margin_check",
+            primary,
+            ok=margin_ok,
+            message=bundle_margin.get("message")
+            or (f"{label} margin_ok" if margin_ok else "insufficient_funds"),
+            intent_strategy_id=getattr(primary, "strategy_id", None)
+            or bundle_item.get("strategy_id"),
+            required_margin=bundle_margin.get("required_margin"),
+            available=bundle_margin.get("available"),
+            shortfall=bundle_margin.get("shortfall"),
+            span_margin=bundle_margin.get("span_margin"),
+            reason="insufficient_funds" if not margin_ok else None,
+        )
+        if self.engine_logger:
+            self.engine_logger.log(
+                "oms",
+                (
+                    f"Bundle margin_check {label} legs={len(resolved)} "
+                    f"ok={margin_ok} required={bundle_margin.get('required_margin')} "
+                    f"available={bundle_margin.get('available')} "
+                    f"hedge_benefit={bundle_margin.get('hedge_benefit')}"
+                ),
+                strategy_id=bundle_item.get("strategy_id"),
+                structure_id=bundle_item.get("structure_id"),
+            )
+        return margin_ok
+
+    def _poll_and_sync_intent_terminal(
+        self, intent_record: Dict[str, Any]
+    ) -> Optional[OrderState]:
+        """Poll broker for one intent; sync fill/reject into intent_store when terminal."""
+        tag = intent_record.get("intent_id")
+        if not tag:
+            return None
+        cached = self._order_state.get(tag)
+        if cached in _TERMINAL_ORDER_STATES:
+            return cached
+
+        order = self._find_broker_order_for_intent(intent_record)
+        if not order:
+            return None
+        order = self._normalize_broker_order_for_recon(order)
+        status = (order.get("status") or "").lower()
+        filled = float(order.get("filled_size") or 0)
+        size = float(order.get("size") or 0)
+        avg_px = float(
+            order.get("average_fill_price")
+            or order.get("averageTradedPrice")
+            or order.get("average_traded_price")
+            or intent_record.get("price")
+            or 0
+        )
+
+        if status in ("cancelled", "rejected", "expired"):
+            ost = (
+                OrderState.CANCELLED
+                if status == "cancelled"
+                else OrderState.EXPIRED
+                if status == "expired"
+                else OrderState.REJECTED
+            )
+            intent_st = (
+                IntentStatus.CANCELLED
+                if status == "cancelled"
+                else IntentStatus.EXPIRED
+                if status == "expired"
+                else IntentStatus.REJECTED
+            )
+            self._set_order_state(
+                tag,
+                ost,
+                action=f"sync_{status}",
+                message=f"Polling discovered {status}",
+            )
+            self.intent_store.update(
+                tag,
+                intent_st,
+                broker_order_id=order.get("order_id"),
+                order_state=ost,
+            )
+            return ost
+
+        is_filled = status in ("filled", "traded", "complete", "completed") or (
+            size > 0 and filled >= size
+        )
+        if is_filled:
+            payload = intent_record.get("payload") or {}
+            action_eff = intent_record.get("action") or payload.get("action")
+            fill_qty = filled if filled > 0 else size
+            if self.position_manager and fill_qty > 0:
+                stid0 = intent_record.get("structure_id") or payload.get("structure_id")
+                if not self._terminal_fill_reflected_in_pm(
+                    intent_record.get("instrument"),
+                    intent_record.get("side"),
+                    int(fill_qty),
+                    str(action_eff or ""),
+                    tag,
+                    structure_id=stid0,
+                ):
+                    self.process_fill(
+                        instrument=intent_record.get("instrument"),
+                        side=intent_record.get("side"),
+                        qty=fill_qty,
+                        price=avg_px,
+                        order_id=order.get("order_id"),
+                        intent_id=tag,
+                        strategy=intent_record.get("strategy"),
+                        structure_id=stid0,
+                        tag=intent_record.get("tag"),
+                        candle_ts=intent_record.get("candle_ts"),
+                        action=action_eff,
+                    )
+            self._set_order_state(
+                tag,
+                OrderState.FILLED,
+                action="sync_filled",
+                message="Polling discovered fill",
+            )
+            self.intent_store.update(
+                tag,
+                IntentStatus.FILLED,
+                broker_order_id=order.get("order_id"),
+                order_state=OrderState.FILLED,
+            )
+            self._last_applied_filled_by_intent[tag] = float(fill_qty)
+            return OrderState.FILLED
+
+        if size > 0 and filled > 0 and filled < size:
+            self._set_order_state(
+                tag,
+                OrderState.PARTIAL,
+                action="sync_partial",
+                message=f"Polling: partial fill filled={filled} size={size}",
+            )
+            self.intent_store.update(
+                tag,
+                IntentStatus.SENT,
+                broker_order_id=order.get("order_id"),
+                order_state=OrderState.PARTIAL,
+            )
+        return None
+
+    def _await_intent_terminal(
+        self,
+        intent_id: str,
+        *,
+        timeout_sec: float,
+        poll_interval: float,
+    ) -> Dict[str, Any]:
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            rec = self.intent_store.get(intent_id)
+            if not rec:
+                return {
+                    "ok": False,
+                    "status": "missing",
+                    "reason": "intent_not_found",
+                    "retryable": False,
+                }
+            ost = self._order_state.get(intent_id)
+            if ost == OrderState.FILLED:
+                return {"ok": True, "status": "filled", "reason": "filled", "retryable": False}
+            if ost in (
+                OrderState.REJECTED,
+                OrderState.CANCELLED,
+                OrderState.EXPIRED,
+            ):
+                return {
+                    "ok": False,
+                    "status": str(ost.value).lower(),
+                    "reason": str(ost.value).lower(),
+                    "retryable": False,
+                }
+            synced = self._poll_and_sync_intent_terminal(rec)
+            if synced == OrderState.FILLED:
+                return {"ok": True, "status": "filled", "reason": "filled", "retryable": False}
+            if synced in (
+                OrderState.REJECTED,
+                OrderState.CANCELLED,
+                OrderState.EXPIRED,
+            ):
+                return {
+                    "ok": False,
+                    "status": str(synced.value).lower(),
+                    "reason": str(synced.value).lower(),
+                    "retryable": False,
+                }
+            time.sleep(max(0.05, float(poll_interval)))
+        return {
+            "ok": False,
+            "status": "timeout",
+            "reason": "hedge_fill_timeout",
+            "retryable": False,
+        }
+
+    def _hedge_fill_retry_enabled(self, bundle_item: Dict[str, Any]) -> bool:
+        if not self._broker_hedge_fill_gate_enabled():
+            return False
+        if not bool(getattr(self.broker, "hedge_fill_retry_enabled", True)):
+            return False
+        sid = str(bundle_item.get("strategy_id") or "").strip()
+        allowed = getattr(self.broker, "hedge_fill_retry_strategy_ids", None)
+        if allowed is None:
+            return True
+        if isinstance(allowed, (set, frozenset, list, tuple)):
+            if not allowed:
+                return True
+            return sid in allowed
+        return False
+
+    def _mark_hedge_intent_cancelled(
+        self,
+        hedge_intent: Any,
+        *,
+        reason: str,
+        message: str,
+        bundle_item: Dict[str, Any],
+    ) -> None:
+        intent_id = str(getattr(hedge_intent, "intent_id", "") or "")
+        if not intent_id:
+            return
+        self.intent_store.update(
+            intent_id,
+            IntentStatus.CANCELLED,
+            order_state=OrderState.CANCELLED,
+        )
+        self._set_order_state(
+            intent_id,
+            OrderState.CANCELLED,
+            action=reason,
+            message=message,
+        )
+        if self.engine_logger:
+            self.engine_logger.log(
+                "order_failed",
+                (
+                    f"ORDER_CANCELLED intent_id={intent_id} "
+                    f"reason={reason} bundle=true | {message}"
+                ),
+                intent_id=intent_id,
+                strategy_id=bundle_item.get("strategy_id"),
+                structure_id=bundle_item.get("structure_id"),
+            )
+
+    def _cancel_hedge_intent_and_verify(
+        self,
+        hedge_intent: Any,
+        *,
+        bundle_item: Dict[str, Any],
+        timeout_sec: float,
+        poll_interval: float,
+    ) -> Dict[str, Any]:
+        """
+        Cancel a resting hedge limit after fill timeout; poll broker until terminal.
+
+        Returns ``filled=True`` if the hedge filled during cancel (caller may continue MAIN).
+        """
+        intent_id = str(getattr(hedge_intent, "intent_id", "") or "")
+        if not intent_id:
+            return {"ok": True, "filled": False, "cancelled": False}
+
+        ost = self._order_state.get(intent_id)
+        if ost == OrderState.FILLED:
+            return {"ok": True, "filled": True, "cancelled": False}
+
+        rec = self.intent_store.get(intent_id) if self.intent_store else None
+        broker_oid = (rec or {}).get("broker_order_id")
+        cancel_fn = getattr(self.broker, "cancel_order_by_id", None)
+        is_open_fn = getattr(self.broker, "order_is_open", None)
+
+        if broker_oid and callable(is_open_fn) and is_open_fn(str(broker_oid)):
+            if callable(cancel_fn):
+                cancel_fn(
+                    str(broker_oid),
+                    intent_id=intent_id,
+                    reason="hedge_fill_timeout",
+                )
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "oms",
+                        (
+                            f"Hedge cancel on bundle fail intent_id={intent_id} "
+                            f"order_id={broker_oid}"
+                        ),
+                        intent_id=intent_id,
+                        strategy_id=bundle_item.get("strategy_id"),
+                        structure_id=bundle_item.get("structure_id"),
+                    )
+            deadline = time.time() + max(1.0, float(timeout_sec))
+            while time.time() < deadline:
+                rec = self.intent_store.get(intent_id) if self.intent_store else rec
+                if rec:
+                    synced = self._poll_and_sync_intent_terminal(rec)
+                    if synced == OrderState.FILLED:
+                        return {"ok": True, "filled": True, "cancelled": False}
+                    if synced in (
+                        OrderState.CANCELLED,
+                        OrderState.REJECTED,
+                        OrderState.EXPIRED,
+                    ):
+                        return {"ok": True, "filled": False, "cancelled": True}
+                ost = self._order_state.get(intent_id)
+                if ost == OrderState.FILLED:
+                    return {"ok": True, "filled": True, "cancelled": False}
+                if ost in (
+                    OrderState.CANCELLED,
+                    OrderState.REJECTED,
+                    OrderState.EXPIRED,
+                ):
+                    return {"ok": True, "filled": False, "cancelled": True}
+                if (
+                    broker_oid
+                    and callable(is_open_fn)
+                    and not is_open_fn(str(broker_oid))
+                ):
+                    remaining = max(0.05, deadline - time.time())
+                    wait = self._await_intent_terminal(
+                        intent_id,
+                        timeout_sec=remaining,
+                        poll_interval=poll_interval,
+                    )
+                    if wait.get("ok"):
+                        return {"ok": True, "filled": True, "cancelled": False}
+                    return {"ok": True, "filled": False, "cancelled": True}
+                time.sleep(max(0.05, float(poll_interval)))
+            return {
+                "ok": False,
+                "filled": False,
+                "cancelled": False,
+                "reason": "cancel_verify_timeout",
+            }
+
+        if rec:
+            synced = self._poll_and_sync_intent_terminal(rec)
+            if synced == OrderState.FILLED:
+                return {"ok": True, "filled": True, "cancelled": False}
+        return {"ok": True, "filled": False, "cancelled": False}
+
+    def _refresh_bundle_entry_prices(
+        self,
+        bundle_item: Dict[str, Any],
+        intents: List[Any],
+        price_map: Dict[str, float],
+    ) -> bool:
+        refresher = self.bundle_price_refresher
+        if not callable(refresher):
+            return False
+        try:
+            refresher(bundle_item, intents, price_map)
+            return True
+        except Exception as exc:
+            logger.warning("bundle_price_refresher failed: %s", exc)
+            return False
+
+    def _reprice_resolved_list(
+        self,
+        resolved: List[Tuple[Any, float]],
+        price_map: Dict[str, float],
+    ) -> List[Tuple[Any, float]]:
+        out: List[Tuple[Any, float]] = []
+        for intent, _ in resolved:
+            sym = (
+                getattr(intent.instrument, "trading_symbol", None)
+                if getattr(intent, "instrument", None)
+                else ""
+            )
+            exec_price = self._lookup_price_map(price_map, intent, sym)
+            if exec_price is None:
+                exec_price = getattr(intent, "price", None)
+            exec_price = self._coerce_positive_exec_price(exec_price)
+            if exec_price is not None:
+                exec_price = self.slippage_model(exec_price)
+                if sym:
+                    price_map[sym] = exec_price
+                try:
+                    intent.price = exec_price
+                except Exception:
+                    pass
+            out.append((intent, exec_price))
+        return out
+
+    def _prepare_intent_reorder(self, intent_id: str) -> None:
+        if self.intent_store and self.intent_store.prepare_reorder(intent_id):
+            self._order_state[intent_id] = OrderState.NEW
+            self._last_applied_filled_by_intent.pop(intent_id, None)
+
+    def _submit_hedge_with_retry_price(
+        self,
+        intent: Any,
+        exec_price: Optional[float],
+        price_map: Dict[str, float],
+        *,
+        attempt: int,
+        idempotency_key: Optional[str],
+        raise_on_retryable_failure: bool,
+        skip_margin_check: bool,
+        bundle_item: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        intent_id = str(getattr(intent, "intent_id", "") or "")
+        rec = self.intent_store.get(intent_id) if self.intent_store else None
+        broker_oid = (rec or {}).get("broker_order_id")
+        ost = self._order_state.get(intent_id)
+
+        if ost == OrderState.FILLED:
+            return {"ok": True, "retryable": False, "reason": "already_filled"}
+
+        modify_fn = getattr(self.broker, "modify_order_price", None)
+        is_open_fn = getattr(self.broker, "order_is_open", None)
+        cancel_fn = getattr(self.broker, "cancel_order_by_id", None)
+
+        if attempt > 1:
+            if broker_oid and callable(is_open_fn) and is_open_fn(str(broker_oid)):
+                if (
+                    exec_price is not None
+                    and callable(modify_fn)
+                    and modify_fn(intent, str(broker_oid), exec_price)
+                ):
+                    if self.engine_logger:
+                        self.engine_logger.log(
+                            "oms",
+                            (
+                                f"Hedge retry modify attempt={attempt} "
+                                f"intent_id={intent_id} price={exec_price}"
+                            ),
+                            intent_id=intent_id,
+                            strategy_id=bundle_item.get("strategy_id"),
+                            structure_id=bundle_item.get("structure_id"),
+                        )
+                    return {"ok": True, "retryable": False, "reason": "hedge_modified"}
+                if callable(cancel_fn):
+                    cancel_fn(
+                        str(broker_oid),
+                        intent_id=intent_id,
+                        reason="hedge_retry_requote",
+                    )
+                self._prepare_intent_reorder(intent_id)
+            elif ost in (
+                OrderState.REJECTED,
+                OrderState.CANCELLED,
+                OrderState.EXPIRED,
+                OrderState.SENT,
+                OrderState.PARTIAL,
+                OrderState.OPEN,
+            ):
+                if broker_oid and callable(cancel_fn):
+                    cancel_fn(
+                        str(broker_oid),
+                        intent_id=intent_id,
+                        reason="hedge_retry_requote",
+                    )
+                self._prepare_intent_reorder(intent_id)
+
+        if exec_price is None:
+            return {"ok": False, "retryable": False, "reason": "no_price"}
+
+        return self.process_intent(
+            intent,
+            price_map,
+            idempotency_key=idempotency_key,
+            raise_on_retryable_failure=raise_on_retryable_failure,
+            skip_margin_check=skip_margin_check,
+        )
+
+    def _process_dhan_hedge_gated_bundle(
+        self,
+        bundle_item: Dict[str, Any],
+        resolved: List[Tuple[Any, float]],
+        *,
+        raise_on_retryable_failure: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Dhan: place HEDGE BUY, wait for fill, re-check margin with open positions,
+        then place MAIN / follow legs so RMS sees the hedge in portfolio.
+        """
+        price_map = dict(bundle_item.get("price_map") or {})
+        idempotency_key = bundle_item.get("idempotency_key")
+        hedge_legs, follow_legs = self._partition_hedge_gated_legs(resolved)
+        if not hedge_legs or not follow_legs:
+            return {"ok": False, "retryable": False, "reason": "invalid_hedge_bundle"}
+
+        retry_enabled = self._hedge_fill_retry_enabled(bundle_item)
+        max_attempts = (
+            int(getattr(self.broker, "hedge_fill_retry_max_attempts", 3) or 3)
+            if retry_enabled
+            else 1
+        )
+        per_attempt_sec = float(
+            getattr(self.broker, "hedge_fill_retry_per_attempt_sec", 40.0) or 40.0
+            if retry_enabled
+            else getattr(self.broker, "hedge_fill_wait_timeout_sec", 120.0) or 120.0
+        )
+        poll_interval = float(
+            getattr(self.broker, "hedge_fill_poll_interval_sec", 0.5) or 0.5
+        )
+        multi_check = getattr(self.broker, "check_funds_before_orders", None)
+
+        if multi_check and hedge_legs:
+            hedge_margin = multi_check(hedge_legs)
+            if not self._log_bundle_margin_check(
+                bundle_item=bundle_item,
+                resolved=hedge_legs,
+                bundle_margin=hedge_margin,
+                label="hedge_pre",
+            ):
+                msg = (hedge_margin or {}).get("message") or "Insufficient funds for hedge"
+                self._reject_bundle_legs(
+                    hedge_legs + follow_legs,
+                    reason="insufficient_funds",
+                    message=msg,
+                    bundle_item=bundle_item,
+                )
+                return {"ok": False, "retryable": False, "reason": "insufficient_funds"}
+
+        broker_sent_ts = None
+        all_intents = [i for i, _ in hedge_legs + follow_legs]
+        for hedge_intent, _ in hedge_legs:
+            hedge_filled = False
+            last_wait: Dict[str, Any] = {"ok": False, "reason": "hedge_fill_failed"}
+            for attempt in range(1, max_attempts + 1):
+                if retry_enabled:
+                    self._refresh_bundle_entry_prices(
+                        bundle_item, all_intents, price_map
+                    )
+                    resolved = self._reprice_resolved_list(resolved, price_map)
+                    hedge_legs, follow_legs = self._partition_hedge_gated_legs(resolved)
+                    hedge_intent, hedge_price = hedge_legs[0]
+                else:
+                    hedge_price = hedge_legs[0][1]
+
+                result = self._submit_hedge_with_retry_price(
+                    hedge_intent,
+                    hedge_price,
+                    price_map,
+                    attempt=attempt,
+                    idempotency_key=idempotency_key,
+                    raise_on_retryable_failure=raise_on_retryable_failure,
+                    skip_margin_check=bool(multi_check),
+                    bundle_item=bundle_item,
+                )
+                if not result.get("ok", True):
+                    last_wait = {
+                        "ok": False,
+                        "status": "place_failed",
+                        "reason": str(result.get("reason") or "hedge_place_failed"),
+                    }
+                    if attempt >= max_attempts:
+                        self._reject_bundle_legs(
+                            follow_legs,
+                            reason=last_wait["reason"],
+                            message="Hedge leg failed; follow legs not sent",
+                            bundle_item=bundle_item,
+                        )
+                        return result
+                    time.sleep(max(0.05, poll_interval))
+                    continue
+
+                broker_sent_ts = result.get("broker_sent_ts") or broker_sent_ts
+                wait = self._await_intent_terminal(
+                    hedge_intent.intent_id,
+                    timeout_sec=per_attempt_sec,
+                    poll_interval=poll_interval,
+                )
+                last_wait = wait
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "oms",
+                        (
+                            f"Hedge fill_gate attempt={attempt}/{max_attempts} "
+                            f"intent_id={hedge_intent.intent_id} ok={wait.get('ok')} "
+                            f"status={wait.get('status')} reason={wait.get('reason')}"
+                        ),
+                        intent_id=hedge_intent.intent_id,
+                        strategy_id=bundle_item.get("strategy_id"),
+                        structure_id=bundle_item.get("structure_id"),
+                    )
+                if wait.get("ok"):
+                    hedge_filled = True
+                    break
+                if attempt < max_attempts and retry_enabled:
+                    continue
+
+            if not hedge_filled:
+                cancel_on_fail = bool(
+                    getattr(self.broker, "hedge_fill_cancel_on_failure", True)
+                )
+                verify_sec = float(
+                    getattr(self.broker, "hedge_fill_cancel_verify_sec", 15.0) or 15.0
+                )
+                if cancel_on_fail:
+                    for hedge_intent, _ in hedge_legs:
+                        cr = self._cancel_hedge_intent_and_verify(
+                            hedge_intent,
+                            bundle_item=bundle_item,
+                            timeout_sec=verify_sec,
+                            poll_interval=poll_interval,
+                        )
+                        if cr.get("filled"):
+                            hedge_filled = True
+                            if self.engine_logger:
+                                self.engine_logger.log(
+                                    "oms",
+                                    (
+                                        f"Hedge filled during cancel verify "
+                                        f"intent_id={hedge_intent.intent_id}; "
+                                        "continuing with MAIN"
+                                    ),
+                                    intent_id=hedge_intent.intent_id,
+                                    strategy_id=bundle_item.get("strategy_id"),
+                                    structure_id=bundle_item.get("structure_id"),
+                                )
+                            break
+                        fail_reason = str(
+                            last_wait.get("reason") or "hedge_fill_failed"
+                        )
+                        if cr.get("cancelled"):
+                            self._mark_hedge_intent_cancelled(
+                                hedge_intent,
+                                reason=fail_reason,
+                                message=(
+                                    "Hedge order cancelled after fill timeout; "
+                                    "follow legs not sent"
+                                ),
+                                bundle_item=bundle_item,
+                            )
+                        elif not cr.get("ok"):
+                            logger.warning(
+                                "Hedge cancel verify failed intent_id=%s reason=%s; "
+                                "order may still be live at broker",
+                                hedge_intent.intent_id,
+                                cr.get("reason"),
+                            )
+                            if self.engine_logger:
+                                self.engine_logger.log(
+                                    "oms",
+                                    (
+                                        f"Hedge cancel verify failed "
+                                        f"intent_id={hedge_intent.intent_id} "
+                                        f"reason={cr.get('reason')}"
+                                    ),
+                                    intent_id=hedge_intent.intent_id,
+                                    strategy_id=bundle_item.get("strategy_id"),
+                                    structure_id=bundle_item.get("structure_id"),
+                                )
+
+            if not hedge_filled:
+                msg = (
+                    f"Hedge leg did not fill (status={last_wait.get('status')}); "
+                    "follow legs not sent"
+                )
+                self._reject_bundle_legs(
+                    follow_legs,
+                    reason=str(last_wait.get("reason") or "hedge_fill_failed"),
+                    message=msg,
+                    bundle_item=bundle_item,
+                )
+                return {
+                    "ok": False,
+                    "retryable": False,
+                    "reason": last_wait.get("reason") or "hedge_fill_failed",
+                }
+
+        settle_sec = float(
+            getattr(self.broker, "hedge_fill_margin_settle_sec", 0.5) or 0.0
+        )
+        if settle_sec > 0:
+            time.sleep(settle_sec)
+
+        if retry_enabled:
+            self._refresh_bundle_entry_prices(bundle_item, all_intents, price_map)
+            resolved = self._reprice_resolved_list(resolved, price_map)
+            hedge_legs, follow_legs = self._partition_hedge_gated_legs(resolved)
+
+        follow_margin: Optional[Dict[str, Any]] = None
+        if multi_check and follow_legs:
+            # After hedge fill: MAIN-only check MUST include open positions so Dhan
+            # applies hedge benefit (Final Margin), not standalone short margin.
+            follow_margin = multi_check(
+                follow_legs,
+                include_position=True,
+                include_orders=True,
+            )
+            if follow_margin is None:
+                # Fallback: theoretical combined structure margin (matches strategy builder).
+                follow_margin = multi_check(
+                    hedge_legs + follow_legs,
+                    include_position=False,
+                    include_orders=False,
+                )
+            if not self._log_bundle_margin_check(
+                bundle_item=bundle_item,
+                resolved=follow_legs,
+                bundle_margin=follow_margin,
+                label="post_hedge",
+            ):
+                msg = (
+                    (follow_margin or {}).get("message")
+                    or "Insufficient funds for main leg after hedge fill"
+                )
+                self._reject_bundle_legs(
+                    follow_legs,
+                    reason="insufficient_funds",
+                    message=msg,
+                    bundle_item=bundle_item,
+                )
+                return {"ok": False, "retryable": False, "reason": "insufficient_funds"}
+            if follow_margin is None:
+                # Do not fall through to standalone MAIN margin (ignores hedge).
+                self._reject_bundle_legs(
+                    follow_legs,
+                    reason="margin_check_unavailable",
+                    message="Post-hedge margin check unavailable; MAIN not sent",
+                    bundle_item=bundle_item,
+                )
+                return {
+                    "ok": False,
+                    "retryable": True,
+                    "reason": "margin_check_unavailable",
+                }
+
+        last_result: Dict[str, Any] = {
+            "ok": True,
+            "retryable": False,
+            "reason": "bundle_placed",
+        }
+        for intent, _ in follow_legs:
+            result = self.process_intent(
+                intent,
+                price_map,
+                idempotency_key=idempotency_key,
+                raise_on_retryable_failure=raise_on_retryable_failure,
+                skip_margin_check=bool(follow_margin),
+                bundle_margin_result=follow_margin,
+            )
+            last_result = result
+            if not result.get("ok", True):
+                return result
+            broker_sent_ts = result.get("broker_sent_ts") or broker_sent_ts
+
+        if broker_sent_ts is not None:
+            last_result["broker_sent_ts"] = broker_sent_ts
+        return last_result
 
     def process_intent_bundle(
         self,
@@ -1410,7 +3166,7 @@ class OrderRouter:
                 if getattr(intent, "instrument", None)
                 else ""
             )
-            exec_price = price_map.get(sym) if sym else None
+            exec_price = self._lookup_price_map(price_map, intent, sym)
             if exec_price is None:
                 exec_price = getattr(intent, "price", None)
             exec_price = self._coerce_positive_exec_price(exec_price)
@@ -1428,6 +3184,16 @@ class OrderRouter:
         actions = {
             str(getattr(i, "action", "ENTRY") or "ENTRY").upper() for i, _ in resolved
         }
+        if (
+            self._broker_hedge_fill_gate_enabled()
+            and self._should_use_dhan_hedge_fill_gate(resolved, actions)
+        ):
+            return self._process_dhan_hedge_gated_bundle(
+                bundle_item,
+                resolved,
+                raise_on_retryable_failure=raise_on_retryable_failure,
+            )
+
         bundle_margin: Optional[Dict[str, Any]] = None
         if actions <= {"ENTRY"} and len(resolved) > 1:
             multi_check = getattr(
@@ -1546,7 +3312,7 @@ class OrderRouter:
                 if getattr(intent, "instrument", None)
                 else ""
             )
-            exec_price = price_map.get(sym) if sym else None
+            exec_price = self._lookup_price_map(price_map, intent, sym)
             if exec_price is None:
                 exec_price = getattr(intent, "price", None)
             exec_price = self._coerce_positive_exec_price(exec_price)
@@ -1596,6 +3362,35 @@ class OrderRouter:
 
         sl_intent, sl_price = resolved[0]
         tgt_intent, tgt_price = resolved[1]
+        # Re-validate SL vs live mark immediately before bracket submit (post-fill safety net).
+        sl_reject = self._validate_intent_execution(
+            sl_intent,
+            exec_price=sl_price,
+            intent_strategy_id=getattr(sl_intent, "strategy", None)
+            or getattr(sl_intent, "strategy_id", None)
+            or bundle_item.get("strategy_id"),
+            qty=getattr(sl_intent, "qty", None),
+        )
+        if sl_reject is not None:
+            # Reject companion TARGET as well — do not leave a one-sided bracket.
+            for intent, _ in resolved:
+                if intent is sl_intent:
+                    continue
+                try:
+                    self.intent_store.update(
+                        intent.intent_id,
+                        IntentStatus.REJECTED,
+                        order_state=OrderState.REJECTED,
+                    )
+                    self._set_order_state(
+                        intent.intent_id,
+                        OrderState.REJECTED,
+                        action="execution_validator",
+                        message="Companion MAIN_SL rejected by ExecutionValidator",
+                    )
+                except Exception:
+                    pass
+            return sl_reject
         combo = place_fn(
             sl_intent,
             tgt_intent,
@@ -1603,7 +3398,18 @@ class OrderRouter:
             target_execution_price=tgt_price,
         )
         if not combo.get("ok"):
-            fail_msg = str(combo.get("message") or combo.get("reason") or "combined bracket failed")
+            fail_msg = str(
+                combo.get("message") or combo.get("reason") or "combined bracket failed"
+            )
+            broker_fail = getattr(broker, "_last_place_order_failure", None) or {}
+            if self._failure_is_no_open_position(combo, fail_msg) or self._failure_is_no_open_position(
+                broker_fail, fail_msg
+            ):
+                return self._handle_broker_no_open_position(
+                    [i for i, _ in resolved],
+                    message=fail_msg,
+                    bundle_item=bundle_item,
+                )
             for intent, _ in resolved:
                 self.intent_store.update(
                     intent.intent_id,
@@ -1723,7 +3529,7 @@ class OrderRouter:
 
         pending = list(self.intent_store.list_by_status(IntentStatus.SENT)) + list(
             self.intent_store.list_by_status(IntentStatus.VALIDATED)
-        )
+        ) + list(self.intent_store.list_by_status(IntentStatus.ACKED))
         cancelled = 0
         for rec in pending:
             payload = rec.get("payload") or {}
@@ -1752,6 +3558,19 @@ class OrderRouter:
             intent_id = rec.get("intent_id")
             if not intent_id:
                 continue
+            # GTT/Forever status can lag: if broker already holds the contract,
+            # adopt the fill (and arm SL) instead of cancelling as "unfilled".
+            if self._intent_is_gtt(rec):
+                try:
+                    if self._try_sync_gtt_intent_fill(rec):
+                        continue
+                except Exception:
+                    pass
+                try:
+                    if self.adopt_gtt_intent_from_broker_positions(rec):
+                        continue
+                except Exception:
+                    pass
             broker_order_id = rec.get("broker_order_id")
             if broker_order_id and self.broker and hasattr(
                 self.broker, "cancel_order_by_id"
@@ -1762,6 +3581,13 @@ class OrderRouter:
                     reason=f"{strategy_id}_cutoff_cancel",
                 )
                 if not ok:
+                    # Cancel rejected (often already traded) — try adopt once more.
+                    if self._intent_is_gtt(rec):
+                        try:
+                            if self.adopt_gtt_intent_from_broker_positions(rec):
+                                continue
+                        except Exception:
+                            pass
                     continue
             self.intent_store.update(
                 intent_id,
@@ -1786,29 +3612,181 @@ class OrderRouter:
             cancelled += 1
         return cancelled
 
+    def cancel_gtt_fallback_watch(
+        self, watch: GttFallbackWatch, *, reason: str = "fallback"
+    ) -> bool:
+        """Cancel the broker Forever order for a hybrid GTT watch (this leg only)."""
+        store = self.intent_store
+        if not store or not watch.gtt_intent_id:
+            return False
+        rec = store.get(watch.gtt_intent_id)
+        if not rec:
+            return False
+        if rec.get("status") == IntentStatus.FILLED:
+            return True
+        broker_order_id = rec.get("broker_order_id") or watch.broker_order_id
+        forever = None
+        # Resolve Forever order id from broker if local id missing (avoids
+        # marking CANCELLED locally while Forever stays live → duplicate LIMITs).
+        if self.broker and hasattr(self.broker, "find_forever_order_by_client_id"):
+            try:
+                forever = self.broker.find_forever_order_by_client_id(watch.gtt_intent_id)
+            except Exception:
+                forever = None
+            if isinstance(forever, dict):
+                oid = forever.get("order_id") or forever.get("id")
+                if oid and not broker_order_id:
+                    broker_order_id = oid
+                    watch.broker_order_id = str(broker_order_id)
+                # Already TRIGGERED/TRADED — do not mark CANCELLED or stack a LIMIT.
+                status = str(forever.get("status") or "").lower()
+                filled = float(forever.get("filled_size") or 0)
+                size = float(forever.get("size") or 0)
+                if status in (
+                    "filled",
+                    "traded",
+                    "complete",
+                    "completed",
+                    "triggered",
+                ) or (size > 0 and filled >= size):
+                    logger.info(
+                        "GTT cancel skipped — Forever already fired intent=%s status=%s",
+                        watch.gtt_intent_id,
+                        status,
+                    )
+                    return False
+        if not broker_order_id:
+            logger.warning(
+                "GTT cancel skipped — no broker_order_id intent=%s reason=%s",
+                watch.gtt_intent_id,
+                reason,
+            )
+            return False
+        if self.broker and hasattr(self.broker, "cancel_order_by_id"):
+            ok = self.broker.cancel_order_by_id(
+                str(broker_order_id),
+                intent_id=str(watch.gtt_intent_id),
+                reason=reason,
+            )
+            if not ok:
+                return False
+        store.update(
+            watch.gtt_intent_id,
+            IntentStatus.CANCELLED,
+            order_state=OrderState.CANCELLED,
+        )
+        self._set_order_state(
+            watch.gtt_intent_id,
+            OrderState.CANCELLED,
+            action="gtt_fallback_cancel",
+            message=reason,
+        )
+        return True
+
+    def place_gtt_fallback_order(
+        self, watch: GttFallbackWatch, *, price: Optional[float] = None
+    ) -> Optional[str]:
+        """Place resting LIMIT fallback after GTT trigger; returns new intent_id."""
+        store = self.intent_store
+        if store is None or watch.instrument is None:
+            return None
+        limit = float(price) if price is not None and float(price) > 0 else float(watch.limit_price)
+        cap = getattr(watch, "max_fallback_price", None)
+        if cap is not None:
+            try:
+                if float(limit) >= float(cap):
+                    logger.warning(
+                        "GTT fallback LIMIT blocked by price cap intent=%s price=%s max=%s",
+                        watch.gtt_intent_id,
+                        limit,
+                        cap,
+                    )
+                    return None
+            except (TypeError, ValueError):
+                pass
+        meta = dict(watch.metadata_extras or {})
+        meta["execution_mode"] = "LIMIT"
+        meta["gtt_fallback_parent"] = watch.gtt_intent_id
+        fallback = OrderIntent(
+            intent_id=uuid.uuid4().hex,
+            instrument=watch.instrument,
+            side=watch.side,
+            qty=int(watch.qty or 1),
+            price=limit,
+            order_type="LIMIT",
+            strategy=watch.strategy_id,
+            structure_id=watch.structure_id,
+            trade_type="MARGIN",
+            tag="MAIN",
+            symbol=watch.symbol,
+            action="ENTRY",
+            candle_ts=watch.candle_ts or datetime.datetime.utcnow(),
+            parent_intent_id=watch.gtt_intent_id,
+            metadata_extras=meta,
+            trigger_price=None,
+        )
+        sym = watch.trading_symbol
+        result = self.process_intent(fallback, {sym: limit})
+        if not isinstance(result, dict) or not result.get("ok"):
+            return None
+        return fallback.intent_id
+
     # working
     def refresh_stale_exit_orders(
         self,
         get_bid_ask: Callable[[str], Tuple[float, float]],
-        stale_seconds: float = 60,
+        stale_seconds: float = 30,
     ) -> None:
-        """
-        If an open EXIT order has been sitting unfilled for >= stale_seconds,
-        update its limit price to near bid (SELL) or near ask (BUY) and repeat until fill.
-        Only runs when broker supports update_order_price (e.g. Delta).
-        """
+        """Re-quote open EXIT / FORCE_EXIT limits at best bid (SELL) or ask (BUY)."""
+        self._refresh_stale_limit_orders(
+            get_bid_ask=get_bid_ask,
+            stale_seconds=stale_seconds,
+            action="EXIT",
+            label="exit",
+        )
+        self._refresh_stale_limit_orders(
+            get_bid_ask=get_bid_ask,
+            stale_seconds=stale_seconds,
+            action="FORCE_EXIT",
+            label="force_exit",
+        )
+
+    def refresh_stale_entry_orders(
+        self,
+        get_bid_ask: Callable[[str], Tuple[float, float]],
+        stale_seconds: float = 30,
+    ) -> None:
+        """Re-quote open ENTRY limits at best bid for SELL / best ask for BUY."""
+        self._refresh_stale_limit_orders(
+            get_bid_ask=get_bid_ask,
+            stale_seconds=stale_seconds,
+            action="ENTRY",
+            label="entry",
+        )
+
+    def _refresh_stale_limit_orders(
+        self,
+        *,
+        get_bid_ask: Callable[[str], Tuple[float, float]],
+        stale_seconds: float,
+        action: str,
+        label: str,
+    ) -> None:
+        """Modify matching open limit orders in place; never cancel or duplicate them."""
         if not hasattr(self.broker, "update_order_price"):
             return
         now = time.time()
-        sent_exits = [
+        action_u = str(action or "").upper()
+        sent_orders = [
             i
             for i in self.intent_store.list_by_status(IntentStatus.SENT)
-            if (i.get("payload") or {}).get("action") == "EXIT"
+            if str((i.get("payload") or {}).get("action") or "").upper() == action_u
         ]
-        for rec in sent_exits:
+        for rec in sent_orders:
             intent_id = rec.get("intent_id")
             if not intent_id:
                 continue
+            payload = rec.get("payload") or {}
 
             # Use last_price_update_ts so only re-quote interval matters. Fallback to updated_at only when missing (not when 0).
             # Explicit 0 = "always stale" (adopted EXIT orphan from yesterday) so we must not fall back to updated_at.
@@ -1830,17 +3808,24 @@ class OrderRouter:
             symbol = self._instrument_trading_symbol(rec.get("instrument")) or (
                 (rec.get("payload") or {}).get("symbol") or ""
             )
+            # FORCE_EXIT MAIN_SL payload.symbol is often the underlying; always prefer
+            # the option trading symbol from the attached instrument.
+            if action_u == "FORCE_EXIT":
+                inst_sym = self._instrument_trading_symbol(rec.get("instrument"))
+                if inst_sym:
+                    symbol = inst_sym
             if not symbol:
                 if self.engine_logger:
                     self.engine_logger.log(
-                        "oms", f"Refresh exit skip {intent_id}: no symbol"
+                        "oms", f"Refresh {label} skip {intent_id}: no symbol"
                     )
                 continue
             order_id = rec.get("broker_order_id")
             if not order_id:
                 if self.engine_logger:
                     self.engine_logger.log(
-                        "oms", f"Refresh exit skip {intent_id}: no broker_order_id"
+                        "oms",
+                        f"Refresh {label} skip {intent_id}: no broker_order_id",
                     )
                 continue
             broker_order = None
@@ -1850,23 +3835,62 @@ class OrderRouter:
                 if self.engine_logger:
                     self.engine_logger.log(
                         "oms",
-                        f"Refresh exit skip {intent_id}: order not found at broker",
+                        f"Refresh {label} skip {intent_id}: order not found at broker",
                     )
                 continue
             status = (broker_order.get("status") or "").lower()
-            open_states = {"open", "pending", "placed", "trigger pending"}
+            open_states = {
+                "open",
+                "pending",
+                "placed",
+                "trigger pending",
+                "live",
+                "untriggered",
+            }
             if status not in open_states:
                 if self.engine_logger:
                     self.engine_logger.log(
                         "oms",
-                        f"Refresh exit skip {intent_id}: broker status={status} (not open)",
+                        f"Refresh {label} skip {intent_id}: "
+                        f"broker status={status} (not open)",
                     )
                 continue
+            broker_order_id = broker_order.get("order_id")
+            if not broker_order_id or str(broker_order_id) != str(order_id):
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "oms",
+                        f"Refresh {label} skip {intent_id}: broker order id mismatch",
+                    )
+                continue
+            remaining_qty = broker_order.get("remaining_qty")
+            if remaining_qty is not None:
+                try:
+                    if float(remaining_qty) <= 0:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            if action_u == "ENTRY":
+                order_type = str(
+                    payload.get("order_type") or rec.get("order_type") or ""
+                ).upper()
+                if order_type:
+                    if order_type != "LIMIT":
+                        continue
+                else:
+                    # Backward compatibility for intents created before order_type
+                    # was persisted: require broker evidence of a plain limit.
+                    try:
+                        broker_limit = float(broker_order.get("price") or 0)
+                    except (TypeError, ValueError):
+                        broker_limit = 0
+                    if broker_limit <= 0 or broker_order.get("stop_order_type"):
+                        continue
             product_id = broker_order.get("product_id")
             if product_id is None:
                 if self.engine_logger:
                     self.engine_logger.log(
-                        "oms", f"Refresh exit skip {intent_id}: no product_id"
+                        "oms", f"Refresh {label} skip {intent_id}: no product_id"
                     )
                 continue
             bid, ask = get_bid_ask(symbol)
@@ -1878,19 +3902,21 @@ class OrderRouter:
             if new_price is None or new_price <= 0:
                 if self.engine_logger:
                     self.engine_logger.log(
-                        "oms", f"Refresh exit skip {intent_id}: no bid/ask for {symbol}"
+                        "oms",
+                        f"Refresh {label} skip {intent_id}: no bid/ask for {symbol}",
                     )
                 continue
             try:
                 ok = self.broker.update_order_price(
                     product_id=int(product_id),
-                    order_id=str(order_id),
+                    order_id=str(broker_order_id),
                     new_limit_price=float(new_price),
                 )
                 if ok and self.engine_logger:
                     self.engine_logger.log(
                         "oms",
-                        f"Refreshed exit order {intent_id} at {new_price} (near {'bid' if side == 'SELL' else 'ask'})",
+                        f"Refreshed {label} order {intent_id} at {new_price} "
+                        f"(best {'bid' if side == 'SELL' else 'ask'})",
                     )
                 if ok:
                     self.intent_store.update(intent_id, IntentStatus.SENT)
@@ -1899,7 +3925,9 @@ class OrderRouter:
                         rec["last_price_update_ts"] = now
             except Exception as e:
                 if self.engine_logger:
-                    self.engine_logger.log("oms", f"Refresh exit order failed: {e}")
+                    self.engine_logger.log(
+                        "oms", f"Refresh {label} order failed: {e}"
+                    )
 
     def verify_open_orders_with_broker(self) -> Tuple[bool, Dict]:
         """
@@ -1929,6 +3957,13 @@ class OrderRouter:
         local_pending = self.intent_store.list_by_status(
             IntentStatus.SENT
         ) + self.intent_store.list_by_status(IntentStatus.VALIDATED)
+        # Drop intents already terminal in local order-state cache (e.g. place
+        # failed / REJECTED but IntentStatus briefly lagged).
+        local_pending = [
+            i
+            for i in local_pending
+            if self._order_state.get(i.get("intent_id")) not in _TERMINAL_ORDER_STATES
+        ]
 
         # GTT fills may not appear on regular open-order book; poll Forever + fills API.
         self._sync_gtt_pending_fills(local_pending)
@@ -1957,8 +3992,9 @@ class OrderRouter:
         resolved_missing: Set[str] = set()
         now_ts = time.time()
         for o in broker_open:
-            tag = o.get("tag")
-            if not tag:
+            tag = str(o.get("tag") or "").strip()
+            # Dhan returns literal "NA" for manual / untagged open orders.
+            if not tag or tag.upper() in {"NA", "NONE", "NULL", "N/A"}:
                 continue
             matched_intent = tag if tag in local_intent_ids else None
             if not matched_intent:
@@ -1970,83 +4006,96 @@ class OrderRouter:
                 matched_intent and self.intent_store.exists(matched_intent)
             ):
                 orphans.append(o)
-                # Orphan Adoption: Create local record for pre-existing broker order
-                b_sym = o.get("symbol") or o.get("product_symbol")
-                product_id = o.get("product_id")
+                try:
+                    b_sym = o.get("symbol") or o.get("product_symbol")
+                    product_id = o.get("product_id")
 
-                engine_sym = b_sym
-                instr = None
-                if self.instrument_store and b_sym:
-                    inst = None
-                    if hasattr(self.instrument_store, "get_by_symbol"):
-                        inst = self.instrument_store.get_by_symbol(b_sym)
-                    if (
-                        not inst
-                        and product_id
-                        and hasattr(self.instrument_store, "get_by_product_id")
-                    ):
-                        inst = self.instrument_store.get_by_product_id(product_id)
-                    if not inst and hasattr(
-                        self.instrument_store, "intent_creation_details"
-                    ):
-                        inst = self.instrument_store.intent_creation_details(
-                            b_sym, None, None, None, None
-                        )
-                    if not inst and hasattr(
-                        self.instrument_store, "futures_intent_creation_details"
-                    ):
-                        inst = self.instrument_store.futures_intent_creation_details(
-                            b_sym, "DELTA", None
-                        )
-                    if inst:
-                        engine_sym = inst.trading_symbol
-                        instr = inst
+                    engine_sym = b_sym
+                    instr = None
+                    if self.instrument_store and b_sym:
+                        inst = None
+                        if hasattr(self.instrument_store, "get_by_symbol"):
+                            inst = self.instrument_store.get_by_symbol(b_sym)
+                        if (
+                            not inst
+                            and product_id
+                            and hasattr(self.instrument_store, "get_by_product_id")
+                        ):
+                            inst = self.instrument_store.get_by_product_id(product_id)
+                        if not inst and hasattr(
+                            self.instrument_store, "intent_creation_details"
+                        ):
+                            inst = self.instrument_store.intent_creation_details(
+                                b_sym, None, None, None, None
+                            )
+                        if not inst and hasattr(
+                            self.instrument_store, "futures_intent_creation_details"
+                        ):
+                            inst = self.instrument_store.futures_intent_creation_details(
+                                b_sym, "DELTA", None
+                            )
+                        if inst:
+                            engine_sym = inst.trading_symbol
+                            instr = inst
 
-                # Detect EXIT vs ENTRY from broker (e.g. Delta reduce_only)
-                is_reduce = o.get("reduce_only") in (True, "true", "yes", 1)
-                action = "EXIT" if is_reduce else "ENTRY"
-                stub_payload = {
-                    "symbol": engine_sym,
-                    "side": (o.get("side") or "").upper(),
-                    "qty": int(o.get("qty") or 0),
-                    "action": action,
-                    "strategy": "recovery",
-                    "structure_id": f"recovered:{engine_sym}",
-                    "candle_ts": None,
-                    "engine_id": self.engine_id,
-                    "strategy_id": self.strategy_id,
-                }
+                    is_reduce = o.get("reduce_only") in (True, "true", "yes", 1)
+                    action = "EXIT" if is_reduce else "ENTRY"
+                    stub_payload = {
+                        "symbol": engine_sym,
+                        "side": (o.get("side") or "").upper(),
+                        "qty": int(o.get("qty") or 0),
+                        "action": action,
+                        "strategy": "recovery",
+                        "structure_id": f"recovered:{engine_sym}",
+                        "candle_ts": None,
+                        "engine_id": self.engine_id,
+                        "strategy_id": self.strategy_id,
+                    }
 
-                # Register in store
-                self.intent_store.create(payload=stub_payload, intent_id=tag)
-                self.intent_store.update(
-                    tag,
-                    IntentStatus.SENT,
-                    broker_order_id=o.get("order_id"),
-                    order_state=OrderState.OPEN,
-                )
-                self._set_order_state(
-                    tag,
-                    OrderState.OPEN,
-                    action="adopt_orphan",
-                    message="Order seen on broker open list; adopted as local intent",
-                )
-
-                # Augment record for process_fill
-                intent_record = self.intent_store.get(tag)
-                intent_record["instrument"] = instr
-                intent_record["side"] = (o.get("side") or "").upper()
-                intent_record["qty"] = int(o.get("qty") or 0)
-                intent_record["action"] = stub_payload["action"]
-                # EXIT orphans (e.g. open from yesterday): set last_price_update_ts=0 so next refresh run re-quotes immediately
-                if action == "EXIT":
-                    intent_record["last_price_update_ts"] = 0
-
-                if self.engine_logger:
-                    self.engine_logger.log(
-                        "oms", f"Adopted orphan order {tag} for {engine_sym}"
+                    self.intent_store.create(payload=stub_payload, intent_id=tag)
+                    self.intent_store.update(tag, IntentStatus.VALIDATED)
+                    self.intent_store.update(
+                        tag,
+                        IntentStatus.SENT,
+                        broker_order_id=o.get("order_id"),
+                        order_state=OrderState.OPEN,
                     )
-                resolved_orphans.add(str(tag))
+                    self._set_order_state(
+                        tag,
+                        OrderState.OPEN,
+                        action="adopt_orphan",
+                        message="Order seen on broker open list; adopted as local intent",
+                    )
+
+                    intent_record = self.intent_store.get(tag)
+                    if intent_record is None:
+                        continue
+                    intent_record["instrument"] = instr
+                    intent_record["side"] = (o.get("side") or "").upper()
+                    intent_record["qty"] = int(o.get("qty") or 0)
+                    intent_record["action"] = stub_payload["action"]
+                    if action == "EXIT":
+                        intent_record["last_price_update_ts"] = 0
+
+                    if self.engine_logger:
+                        self.engine_logger.log(
+                            "oms", f"Adopted orphan order {tag} for {engine_sym}"
+                        )
+                    resolved_orphans.add(str(tag))
+                except Exception as exc:
+                    logger.exception(
+                        "Orphan adopt failed tag=%s order_id=%s: %s",
+                        tag,
+                        o.get("order_id"),
+                        exc,
+                    )
+                    if self.engine_logger:
+                        self.engine_logger.log(
+                            "oms",
+                            f"Orphan adopt failed tag={tag}: {exc}",
+                            severity="error",
+                        )
+                    continue
 
             elif matched_intent and matched_intent in local_intent_ids:
                 # Local thinks it's pending, broker confirms it's open. Sync order ID and persist OPEN.
@@ -2089,25 +4138,56 @@ class OrderRouter:
             if action == "FORCE_EXIT":
                 sym = payload.get("symbol") or i.get("symbol")
                 tag = str(payload.get("tag") or i.get("tag") or "").upper()
-                if i.get("broker_order_id"):
-                    if hasattr(self.broker, "find_order_by_client_id"):
-                        try:
-                            order = self.broker.find_order_by_client_id(str(intent_id))
-                        except Exception:
-                            order = None
-                        if order:
-                            resolved_missing.add(str(intent_id))
-                            continue
-                    has_leg = getattr(self.broker, "has_bracket_leg_on_exchange", None)
-                    if sym and callable(has_leg) and has_leg(sym, tag):
-                        resolved_missing.add(str(intent_id))
-                        continue
+                # Never got a broker order id → place never succeeded. Do not leave
+                # these as perpetual "missing local" mismatches across strategies.
+                if not i.get("broker_order_id"):
                     created_at = float(i.get("created_at") or 0.0)
-                    if created_at > 0 and (
-                        now_ts - created_at
-                    ) < self._force_exit_pending_max_wait_sec:
+                    grace = min(
+                        60.0, float(getattr(self, "_force_exit_pending_max_wait_sec", 300) or 300)
+                    )
+                    if created_at <= 0 or (now_ts - created_at) >= grace:
+                        self._set_order_state(
+                            str(intent_id),
+                            OrderState.REJECTED,
+                            action="force_exit_no_broker_id",
+                            message="FORCE_EXIT never received broker_order_id; marking REJECTED",
+                        )
+                        try:
+                            self.intent_store.update(
+                                str(intent_id),
+                                IntentStatus.REJECTED,
+                                order_state=OrderState.REJECTED,
+                            )
+                        except Exception:
+                            pass
+                        if self.engine_logger:
+                            self.engine_logger.log(
+                                "oms",
+                                f"FORCE_EXIT {intent_id}: no broker_order_id after "
+                                f"{grace:.0f}s; marked REJECTED",
+                                strategy_id=self._intent_strategy_id(str(intent_id)),
+                                intent_id=str(intent_id),
+                            )
+                    resolved_missing.add(str(intent_id))
+                    continue
+                if hasattr(self.broker, "find_order_by_client_id"):
+                    try:
+                        order = self.broker.find_order_by_client_id(str(intent_id))
+                    except Exception:
+                        order = None
+                    if order:
                         resolved_missing.add(str(intent_id))
                         continue
+                has_leg = getattr(self.broker, "has_bracket_leg_on_exchange", None)
+                if sym and callable(has_leg) and has_leg(sym, tag):
+                    resolved_missing.add(str(intent_id))
+                    continue
+                created_at = float(i.get("created_at") or 0.0)
+                if created_at > 0 and (
+                    now_ts - created_at
+                ) < self._force_exit_pending_max_wait_sec:
+                    resolved_missing.add(str(intent_id))
+                    continue
             # GTT: still poll Forever/fills when missing from regular open book (not blind trust).
             if self._intent_is_gtt(i) and i.get("broker_order_id"):
                 if self._try_sync_gtt_intent_fill(i):
@@ -2127,181 +4207,173 @@ class OrderRouter:
             tag = i.get("intent_id")
             if self._order_state.get(tag) in _TERMINAL_ORDER_STATES:
                 continue  # Already resolved locally; no broker call
-            if hasattr(self.broker, "find_order_by_client_id"):
+            order = self._find_broker_order_for_intent(i)
+            if order:
                 try:
-                    order = self.broker.find_order_by_client_id(tag)
-                    if order:
-                        order = self._normalize_broker_order_for_recon(order)
-                        status = (order.get("status") or "").lower()
-                        filled = float(order.get("filled_size") or 0.0)
-                        size = float(order.get("size") or 0.0)
+                    order = self._normalize_broker_order_for_recon(order)
+                    status = (order.get("status") or "").lower()
+                    filled = float(order.get("filled_size") or 0.0)
+                    size = float(order.get("size") or 0.0)
 
-                        # Partial fill: filled > 0 and unfilled > 0 (filled < size)
-                        if size > 0 and filled > 0 and filled < size:
-                            prev_cum = float(
-                                self._last_applied_filled_by_intent.get(tag, 0.0)
+                    # Partial fill: filled > 0 and unfilled > 0 (filled < size)
+                    if size > 0 and filled > 0 and filled < size:
+                        prev_cum = float(
+                            self._last_applied_filled_by_intent.get(tag, 0.0)
+                        )
+                        delta = float(filled) - prev_cum
+                        self._set_order_state(
+                            tag,
+                            OrderState.PARTIAL,
+                            action="sync_partial",
+                            message=f"Polling: filled={filled} delta={delta} size={size}",
+                        )
+                        self.intent_store.update(
+                            tag,
+                            IntentStatus.SENT,  # Still in flight
+                            broker_order_id=order.get("order_id"),
+                            order_state=OrderState.PARTIAL,
+                        )
+                        if delta > 0 and self.position_manager:
+                            self.process_fill(
+                                instrument=i.get("instrument"),
+                                side=i.get("side"),
+                                qty=delta,
+                                price=float(
+                                    order.get("average_fill_price")
+                                    or i.get("price", 0)
+                                ),
+                                order_id=order.get("order_id"),
+                                intent_id=tag,
+                                strategy=i.get("strategy"),
+                                structure_id=i.get("structure_id"),
+                                tag=i.get("tag"),
+                                candle_ts=i.get("candle_ts"),
+                                action=i.get("action"),
                             )
-                            delta = float(filled) - prev_cum
-                            self._set_order_state(
-                                tag,
-                                OrderState.PARTIAL,
-                                action="sync_partial",
-                                message=f"Polling: filled={filled} delta={delta} size={size}",
+                            self._last_applied_filled_by_intent[tag] = float(filled)
+                        resolved_missing.add(str(tag))
+                    elif status == "filled" or (size > 0 and filled >= size):
+                        if self.engine_logger:
+                            self.engine_logger.log(
+                                "oms",
+                                f"Syncing fill for {tag} discovered via polling",
                             )
-                            self.intent_store.update(
-                                tag,
-                                IntentStatus.SENT,  # Still in flight
-                                broker_order_id=order.get("order_id"),
-                                order_state=OrderState.PARTIAL,
-                            )
-                            if delta > 0 and self.position_manager:
-                                self.process_fill(
-                                    instrument=i.get("instrument"),
-                                    side=i.get("side"),
-                                    qty=delta,
-                                    price=float(
-                                        order.get("average_fill_price")
-                                        or i.get("price", 0)
-                                    ),
-                                    order_id=order.get("order_id"),
-                                    intent_id=tag,
-                                    strategy=i.get("strategy"),
-                                    structure_id=i.get("structure_id"),
-                                    tag=i.get("tag"),
-                                    candle_ts=i.get("candle_ts"),
-                                    action=i.get("action"),
-                                )
-                                self._last_applied_filled_by_intent[tag] = float(filled)
-                            resolved_missing.add(str(tag))
-                        elif status == "filled" or (size > 0 and filled >= size):
-                            if self.engine_logger:
-                                self.engine_logger.log(
-                                    "oms",
-                                    f"Syncing fill for {tag} discovered via polling",
-                                )
 
-                            # Reconstruct fill from broker data and intent record
-                            # Note: In a real system, we'd ideally have the original OrderIntent object.
-                            # Since we don't have it here easily (intent_store stores dicts),
-                            # we'll use the values from the dict.
-                            payload = i.get("payload", {})
-                            instr = i.get(
-                                "instrument"
-                            )  # If stored in dict; depends on intent_store implementation
+                        if self.position_manager:
+                            self.process_fill(
+                                instrument=i.get("instrument"),
+                                side=i.get("side"),
+                                qty=filled,
+                                price=float(
+                                    order.get("average_fill_price")
+                                    or i.get("price", 0)
+                                ),
+                                order_id=order.get("order_id"),
+                                intent_id=tag,
+                                strategy=i.get("strategy"),
+                                structure_id=i.get("structure_id"),
+                                tag=i.get("tag"),
+                                candle_ts=i.get("candle_ts"),
+                                action=i.get("action"),
+                            )
+                        self._set_order_state(
+                            tag,
+                            OrderState.FILLED,
+                            action="sync_filled",
+                            message="Syncing fill discovered via polling",
+                        )
+                        self.intent_store.update(
+                            tag,
+                            IntentStatus.FILLED,
+                            broker_order_id=order.get("order_id"),
+                            order_state=OrderState.FILLED,
+                        )
+                        self._last_applied_filled_by_intent[tag] = float(size or filled)
+                        resolved_missing.add(str(tag))
 
-                            # Apply fill FIRST. Do not mark intent FILLED before process_fill:
-                            # process_fill used to see FILLED + skip, so on_fill never ran (no PM, no SL).
-                            if self.position_manager:
-                                self.process_fill(
-                                    instrument=i.get("instrument"),
-                                    side=i.get("side"),
-                                    qty=filled,
-                                    price=float(
-                                        order.get("average_fill_price")
-                                        or i.get("price", 0)
-                                    ),
-                                    order_id=order.get("order_id"),
-                                    intent_id=tag,
-                                    strategy=i.get("strategy"),
-                                    structure_id=i.get("structure_id"),
-                                    tag=i.get("tag"),
-                                    candle_ts=i.get("candle_ts"),
-                                    action=i.get("action"),
-                                )
-                            self._set_order_state(
-                                tag,
-                                OrderState.FILLED,
-                                action="sync_filled",
-                                message="Syncing fill discovered via polling",
+                    elif status in ("cancelled", "rejected", "expired"):
+                        ost = (
+                            OrderState.CANCELLED
+                            if status == "cancelled"
+                            else (
+                                OrderState.REJECTED
+                                if status == "rejected"
+                                else OrderState.EXPIRED
                             )
-                            self.intent_store.update(
-                                tag,
-                                IntentStatus.FILLED,
-                                broker_order_id=order.get("order_id"),
-                                order_state=OrderState.FILLED,
-                            )
-                            self._last_applied_filled_by_intent[tag] = float(size or filled)
-                            resolved_missing.add(str(tag))
-
-                        elif status in ("cancelled", "rejected", "expired"):
-                            ost = (
-                                OrderState.CANCELLED
-                                if status == "cancelled"
-                                else (
-                                    OrderState.REJECTED
-                                    if status == "rejected"
-                                    else OrderState.EXPIRED
-                                )
-                            )
-                            self._set_order_state(
-                                tag,
-                                ost,
-                                action="sync_terminal",
-                                message=f"Broker status={status!r}",
-                            )
-                            self.intent_store.update(
-                                tag, IntentStatus.REJECTED, order_state=ost
-                            )
-                            resolved_missing.add(str(tag))
-                    else:
-                        # Trade-led: order missing from open list. Resolve fill by client_order_id first,
-                        # then by broker order_id (fills API often returns only order_id, not client_order_id).
-                        fill_info = None
-                        if hasattr(self.broker, "get_fill_for_client_order_id"):
-                            try:
-                                fill_info = self.broker.get_fill_for_client_order_id(tag)
-                            except Exception:
-                                pass
-                        if not fill_info and i.get("broker_order_id") and hasattr(self.broker, "get_fill_by_order_id"):
-                            try:
-                                fill_info = self.broker.get_fill_by_order_id(str(i["broker_order_id"]))
-                            except Exception:
-                                pass
-                        if fill_info and float(fill_info.get("price") or 0) > 0:
-                            # Only apply trade if not already FILLED (e.g. by sync_trades)
-                            if self._order_state.get(tag) not in _TERMINAL_ORDER_STATES:
-                                trade = {
-                                    "trade_id": f"fill_{tag}_{fill_info.get('order_id', '')}",
-                                    "order_id": fill_info.get("order_id"),
-                                    "intent_id": tag,
-                                    "client_order_id": tag,
-                                    "tag": tag,
-                                    "price": float(fill_info["price"]),
-                                    "size": float(fill_info.get("size") or 0),
-                                    "side": (fill_info.get("side") or i.get("side") or "").upper(),
-                                }
-                                if self.process_trade(trade):
-                                    if self.engine_logger:
-                                        self.engine_logger.log(
-                                            "oms",
-                                            f"Missing order {tag}: applied trade from /v2/fills (trade-led)",
-                                        )
-                                    resolved_missing.add(str(tag))
-                            else:
-                                self._set_order_state(
-                                    tag,
-                                    OrderState.FILLED,
-                                    action="assume_filled",
-                                    message="Fill from API; trade already applied by sync_trades",
-                                )
-                                self.intent_store.update(
-                                    tag, IntentStatus.FILLED, order_state=OrderState.FILLED
-                                )
-                                resolved_missing.add(str(tag))
-                        else:
-                            # No trade found: do not update position or mark FILLED (trade-led: no trade → no position change)
-                            if self.engine_logger:
-                                self.engine_logger.log(
-                                    "oms",
-                                    f"Missing order {tag}: no fill in API; leaving state unchanged (trade-led OMS)",
-                                    strategy_id=self._intent_strategy_id(str(tag)),
-                                    intent_id=str(tag),
-                                )
+                        )
+                        ist = (
+                            IntentStatus.CANCELLED
+                            if status == "cancelled"
+                            else IntentStatus.REJECTED
+                        )
+                        self._set_order_state(
+                            tag,
+                            ost,
+                            action="sync_terminal",
+                            message=f"Broker status={status!r}",
+                        )
+                        self.intent_store.update(tag, ist, order_state=ost)
+                        resolved_missing.add(str(tag))
                 except Exception as e:
                     if self.engine_logger:
                         self.engine_logger.log(
                             "oms", f"Failed to sync status for {tag}: {e}"
                         )
+            else:
+                fill_info = None
+                if hasattr(self.broker, "get_fill_for_client_order_id"):
+                    try:
+                        fill_info = self.broker.get_fill_for_client_order_id(tag)
+                    except Exception:
+                        pass
+                if not fill_info and i.get("broker_order_id") and hasattr(
+                    self.broker, "get_fill_by_order_id"
+                ):
+                    try:
+                        fill_info = self.broker.get_fill_by_order_id(
+                            str(i["broker_order_id"])
+                        )
+                    except Exception:
+                        pass
+                if fill_info and float(fill_info.get("price") or 0) > 0:
+                    if self._order_state.get(tag) not in _TERMINAL_ORDER_STATES:
+                        trade = {
+                            "trade_id": f"fill_{tag}_{fill_info.get('order_id', '')}",
+                            "order_id": fill_info.get("order_id"),
+                            "intent_id": tag,
+                            "client_order_id": tag,
+                            "tag": tag,
+                            "price": float(fill_info["price"]),
+                            "size": float(fill_info.get("size") or 0),
+                            "side": (fill_info.get("side") or i.get("side") or "").upper(),
+                        }
+                        if self.process_trade(trade):
+                            if self.engine_logger:
+                                self.engine_logger.log(
+                                    "oms",
+                                    f"Missing order {tag}: applied trade from /v2/fills (trade-led)",
+                                )
+                            resolved_missing.add(str(tag))
+                    else:
+                        self._set_order_state(
+                            tag,
+                            OrderState.FILLED,
+                            action="assume_filled",
+                            message="Fill from API; trade already applied by sync_trades",
+                        )
+                        self.intent_store.update(
+                            tag, IntentStatus.FILLED, order_state=OrderState.FILLED
+                        )
+                        resolved_missing.add(str(tag))
+                elif self._try_resolve_cancelled_bracket_sibling(i):
+                    resolved_missing.add(str(tag))
+                elif self.engine_logger:
+                    self.engine_logger.log(
+                        "oms",
+                        f"Missing order {tag}: no fill in API; leaving state unchanged (trade-led OMS)",
+                        strategy_id=self._intent_strategy_id(str(tag)),
+                        intent_id=str(tag),
+                    )
 
         unresolved_orphan_tags = [
             str(o.get("tag"))
@@ -2659,6 +4731,11 @@ class OrderRouter:
         _ir = self.intent_store.get(intent_id) if intent_id and self.intent_store else None
         if _ir:
             metadata_extras = (_ir.get("payload") or {}).get("strategy_meta")
+        if metadata_extras is None and self.position_manager:
+            sym_meta = self._instrument_trading_symbol(instrument)
+            if sym_meta:
+                pm_bucket = self.position_manager.position_metadata.get(sym_meta) or {}
+                metadata_extras = pm_bucket.get("strategy_meta")
         if self.position_manager and intent_id and _ir:
             pay_pf = _ir.get("payload") or {}
             act_pf = str(
@@ -2685,10 +4762,14 @@ class OrderRouter:
                 if self.engine_logger:
                     self.engine_logger.log(
                         "oms",
-                        f"Skipping duplicate MAIN ENTRY fill callback structure_id={stid_pf}",
+                        f"Skipping duplicate MAIN ENTRY fill structure_id={stid_pf}",
                     )
                 return
-        
+
+        # REST fill paths often omit candle_ts; stamp wall clock so trades.csv / trade_log get times.
+        if candle_ts is None:
+            candle_ts = datetime.datetime.now(tz=datetime.timezone.utc)
+
         position_closed, realized_pnl = self.position_manager.on_fill(
             instrument=instrument,
             side=side,
@@ -2714,19 +4795,9 @@ class OrderRouter:
             stid_fill = _rec_fill.get("structure_id") or (_rec_fill.get("payload") or {}).get(
                 "structure_id"
             )
-        if (
-            position_closed
-            and stid_fill
-            and tag_fill in BRACKET_TAGS
-        ):
-            self.bracket_registry.cancel_sibling(
-                str(stid_fill),
-                tag_fill,
-                broker=self.broker,
-                order_router=self,
-                reason="sibling_fill",
-            )
-            self.bracket_registry.clear_structure(str(stid_fill))
+        self._maybe_cancel_bracket_sibling_after_exit(
+            bool(position_closed), tag_fill, stid_fill
+        )
         sym = self._instrument_trading_symbol(instrument)
         self.report_fill(
             sym,
@@ -2753,6 +4824,77 @@ class OrderRouter:
             )
         if self.position_manager and sym:
             self.position_manager.note_trade_led_fill(sym)
+        self._emit_bus_fill_events(
+            intent_id=intent_id,
+            strategy=strategy,
+            instrument=instrument,
+            side=side,
+            qty=qty,
+            price=price,
+            position_closed=bool(position_closed),
+            realized_pnl=realized_pnl,
+            structure_id=structure_id,
+            tag=tag,
+            action=action,
+            metadata_extras=metadata_extras,
+        )
+
+    def _emit_bus_fill_events(
+        self,
+        *,
+        intent_id: Any,
+        strategy: Any,
+        instrument: Any,
+        side: Any,
+        qty: Any,
+        price: Any,
+        position_closed: bool,
+        realized_pnl: Any,
+        structure_id: Any,
+        tag: Any,
+        action: Any = None,
+        metadata_extras: Any = None,
+    ) -> None:
+        bus = getattr(self, "event_bus", None)
+        if bus is None:
+            return
+        from core.events.types import EventType, make_event
+
+        sym = self._instrument_trading_symbol(instrument)
+        engine_id = str(getattr(self, "engine_id", None) or "live")
+        bus.publish(
+            make_event(
+                EventType.INTENT_FILLED,
+                {
+                    "intent_id": intent_id,
+                    "strategy": strategy,
+                    "symbol": sym,
+                    "side": side,
+                    "qty": qty,
+                    "price": price,
+                    "structure_id": structure_id,
+                    "tag": tag,
+                    "action": action,
+                    "instrument": instrument,
+                    "metadata_extras": metadata_extras,
+                    "position_closed": bool(position_closed),
+                },
+                engine_id=engine_id,
+            )
+        )
+        if position_closed:
+            bus.publish(
+                make_event(
+                    EventType.POSITION_CLOSED,
+                    {
+                        "strategy": strategy,
+                        "symbol": sym,
+                        "realized_pnl": realized_pnl,
+                        "structure_id": structure_id,
+                    },
+                    engine_id=engine_id,
+                )
+            )
 
     def process_trade(self, trade: Dict[str, Any]) -> bool:
         """
@@ -2804,8 +4946,11 @@ class OrderRouter:
         instrument = trade.get("instrument") or intent.get("instrument")
         if not instrument:
             return False
+        position_closed = False
+        realized_pnl = None
+        payload = intent.get("payload") or {}
+        meta_extras = payload.get("strategy_meta")
         if self.position_manager:
-            payload = intent.get("payload") or {}
             action_to_apply = intent.get("action") or payload.get("action") or trade.get("action")
             action_upper = str(action_to_apply or "").upper()
             sym = self._instrument_trading_symbol(instrument)
@@ -2917,6 +5062,11 @@ class OrderRouter:
                 return True
 
             execution_source = trade.get("execution_source") or "INTENT"
+            # SL/TARGET intents often omit strategy_meta; use open-position meta
+            # (entry_premium / qty_lots / reentry_at_cost) captured before close.
+            if meta_extras is None and sym:
+                pm_bucket = self.position_manager.position_metadata.get(sym) or {}
+                meta_extras = pm_bucket.get("strategy_meta")
             position_closed, realized_pnl = self.position_manager.on_fill(
                 instrument=instrument,
                 side=side,
@@ -2937,11 +5087,22 @@ class OrderRouter:
                 tag=intent.get("tag") or trade.get("tag"),
                 candle_ts=intent.get("candle_ts") or trade.get("candle_ts"),
                 action=intent.get("action") or payload.get("action") or trade.get("action"),
-                metadata_extras=payload.get("strategy_meta"),
+                metadata_extras=meta_extras,
                 execution_source=execution_source,
             )
             if position_closed and realized_pnl is not None:
                 self.risk.record_realized_pnl(realized_pnl)
+            tag_fill = str(
+                intent.get("tag") or payload.get("tag") or trade.get("tag") or ""
+            ).upper()
+            stid_fill = (
+                intent.get("structure_id")
+                or payload.get("structure_id")
+                or trade.get("structure_id")
+            )
+            self._maybe_cancel_bracket_sibling_after_exit(
+                bool(position_closed), tag_fill, stid_fill
+            )
         sym = self._instrument_trading_symbol(instrument)
         self.report_fill(
             sym, side, int(size), trade.get("expected_price"), price,
@@ -2960,11 +5121,47 @@ class OrderRouter:
             broker_order_id=order_id,
             order_state=OrderState.FILLED,
         )
+        payload_done = intent.get("payload") or {}
+        act_done = str(
+            intent.get("action") or payload_done.get("action") or trade.get("action") or ""
+        ).upper()
+        tag_done = str(
+            intent.get("tag") or payload_done.get("tag") or trade.get("tag") or ""
+        ).upper()
+        if act_done == "ENTRY" and tag_done == "MAIN":
+            book = getattr(self, "gtt_fallback_book", None)
+            if book is not None:
+                book.on_fill(intent_id)
         self._processed_trade_ids.add(trade_id)
         if len(self._processed_trade_ids) > getattr(self, "_processed_trade_ids_max", 10000):
             self._processed_trade_ids = set(list(self._processed_trade_ids)[-self._processed_trade_ids_max // 2 :])
         if self.position_manager and sym:
             self.position_manager.note_trade_led_fill(sym)
+        # Same bus IntentFilled / PositionClosed as process_fill — required for
+        # reentry-at-cost when bus is wired (PM hooks are XOR-skipped).
+        emit_meta = payload_done.get("strategy_meta") or meta_extras
+        self._emit_bus_fill_events(
+            intent_id=intent_id,
+            strategy=(
+                intent.get("strategy")
+                or payload_done.get("strategy_id")
+                or trade.get("strategy")
+            ),
+            instrument=instrument,
+            side=side,
+            qty=int(size),
+            price=price,
+            position_closed=bool(position_closed),
+            realized_pnl=realized_pnl,
+            structure_id=(
+                intent.get("structure_id")
+                or payload_done.get("structure_id")
+                or trade.get("structure_id")
+            ),
+            tag=intent.get("tag") or payload_done.get("tag") or trade.get("tag"),
+            action=intent.get("action") or payload_done.get("action") or trade.get("action"),
+            metadata_extras=emit_meta,
+        )
         return True
 
     @staticmethod

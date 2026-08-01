@@ -1,8 +1,8 @@
 """
 Per-strategy defaults: symbols, live/backtest venue settings, eval mode, Delta flags.
 
-Engine jobs in ``run/config.py`` list only which strategies run together; this module
-supplies strategy-level settings merged by ``resolve_engine_job``.
+Profiles are generated from ``core/strategies/**/strategy.yaml``.
+Regenerate: ``python -m tools.strategy_manifest generate``
 """
 
 from __future__ import annotations
@@ -10,166 +10,10 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
+from core.strategies._generated.profiles import STRATEGY_PROFILES as _GENERATED_PROFILES
 from core.strategies.registry import STRATEGY_MAP
 
-# Registry key -> strategy-level profile (not engine/process settings).
-STRATEGY_PROFILES: Dict[str, Dict[str, Any]] = {
-    "LEAPS_RSI": {
-        "symbols": ["NIFTY"],
-        "exchange": "NSE",
-        "eval_mode": "live_feed",
-        "live": {"exchange": "INDEX", "sector": "YES", "rsi": "YES"},
-        "backtest": {
-            "start_date": "2026-01-01",
-            "end_date": "2026-05-24",
-            "timeframe": "60",
-            "exchange": "INDEX",
-            "sector": "YES",
-        },
-    },
-    "BankNiftyBTST": {
-        "symbols": ["BANKNIFTY"],
-        "exchange": "NSE",
-        "eval_mode": "scheduled",
-        "live": {"exchange": "INDEX", "sector": "YES"},
-        "backtest": {
-            "start_date": "2026-01-02",
-            "end_date": "2026-02-19",
-            "timeframe": "5",
-            "exchange": "INDEX",
-            "sector": "YES",
-        },
-    },
-    "OIPositionalBuy": {
-        "symbols": ["NIFTY"],
-        "exchange": "NSE",
-        "live": {"exchange": "INDEX", "sector": "YES"},
-        "backtest": {
-            "start_date": "2026-04-01",
-            "end_date": "2026-04-28",
-            "timeframe": "15",
-            "exchange": "INDEX",
-            "sector": "YES",
-        },
-    },
-    "NiftyIntradayMagicalLine": {
-        "symbols": ["NIFTY"],
-        "exchange": "NSE",
-        "live": {"exchange": "INDEX", "sector": "YES"},
-        "backtest": {
-            "start_date": "2026-01-02",
-            "end_date": "2026-02-19",
-            "timeframe": "15",
-            "exchange": "INDEX",
-            "sector": "YES",
-        },
-    },
-    "FuturesEMAHighLow": {
-        "symbols": ["NIFTY"],
-        "exchange": "NSE",
-        "live": {"exchange": "INDEX", "sector": "YES"},
-        "backtest": {
-            "start_date": "2024-02-01",
-            "end_date": "2026-03-02",
-            "timeframe": "60",
-            "exchange": "INDEX",
-            "sector": "YES",
-        },
-    },
-    "MagicalLines": {
-        "symbols": ["NIFTY"],
-        "exchange": "NSE",
-        "live": {"exchange": "INDEX", "sector": "YES"},
-        "backtest": {
-            "start_date": "2026-01-01",
-            "end_date": "2026-02-19",
-            "timeframe": "DAY",
-            "exchange": "INDEX",
-            "sector": "YES",
-        },
-    },
-    "IPOBreakout": {
-        "symbols": None,
-        "exchange": "NSE",
-        "live": {
-            "exchange": "NSE",
-            "sector": "NO",
-            "ipo_days": 365,
-            "ipo_filter": {"price_above": 200, "volume_above": 500000},
-            "ipo_max_symbols": 50,
-        },
-        "backtest": {
-            "start_date": "2022-01-01",
-            "end_date": "2026-02-20",
-            "timeframe": "DAY",
-            "exchange": "NSE",
-            "sector": "NO",
-            "ipo_days": 365,
-            "ipo_filter": {"price_above": 200, "volume_above": 500000},
-            "ipo_max_symbols": 50,
-            "ipo_fallback_symbols": ["RELIANCE"],
-        },
-    },
-    "SignalFloodTest": {
-        "live": {"exchange": "INDEX", "sector": "YES"},
-        "backtest": {
-            "start_date": "2024-03-20",
-            "end_date": "2024-03-25",
-            "timeframe": "1",
-            "exchange": "INDEX",
-            "sector": "YES",
-        },
-    },
-    "OneDayMagicalLine": {
-        "symbols": ["BTCUSD"],
-        "exchange": "NSE",
-        "delta": {"india": True, "testnet": False, "leverage": 10},
-        "live": {"exchange": "DELTA", "sector": "YES"},
-        "backtest": {
-            "start_date": "2026-02-01",
-            "end_date": "2026-02-26",
-            "timeframe": "60",
-            "exchange": "DELTA",
-            "sector": "YES",
-        },
-    },
-    "Futures_EMA_Momentum": {
-        "symbols": ["BTCUSD"],
-        "delta": {"india": True, "testnet": False, "leverage": 1},
-        "live": {"exchange": "INDEX", "sector": "YES"},
-        "backtest": {
-            "start_date": "2024-09-01",
-            "end_date": "2026-03-13",
-            "timeframe": "60",
-            "exchange": "INDEX",
-            "sector": "YES",
-        },
-    },
-    "RSIBreadAndButter": {
-        "symbols": ["BTCUSD"], # ,"ETHUSD"
-        "delta": {"india": True, "testnet": False, "leverage": 5},
-        "live": {"exchange": "DELTA", "sector": "YES"},
-        "backtest": {
-            "start_date": "2026-07-02",
-            "end_date": "2026-07-03",
-            "timeframe": "1",
-            "exchange": "DELTA",
-            "sector": "YES",
-        },
-    },
-    "LiquiditySweepStrategy": {
-        "symbols": ["PAXGUSD"],
-        "delta": {"india": True, "testnet": False, "leverage": 5},
-        "live": {"exchange": "DELTA", "sector": "YES"},
-        "backtest": {
-            "start_date": "2026-06-01",
-            "end_date": "2026-07-05",
-            "timeframe": "1",
-            "exchange": "DELTA",
-            "sector": "YES",
-        },
-    },
-}
+STRATEGY_PROFILES: Dict[str, Dict[str, Any]] = dict(_GENERATED_PROFILES)
 
 
 def get_strategy_profile(strategy_name: str) -> Dict[str, Any]:
@@ -229,7 +73,7 @@ def _merge_live_dicts(dicts: List[Optional[Dict[str, Any]]]) -> Dict[str, Any]:
 
 
 def _merge_backtest_dicts(
-  primary: Dict[str, Any], overrides: Optional[Dict[str, Any]]
+    primary: Dict[str, Any], overrides: Optional[Dict[str, Any]]
 ) -> Dict[str, Any]:
     base = dict(primary or {})
     if isinstance(overrides, dict):

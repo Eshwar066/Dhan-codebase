@@ -7,7 +7,9 @@ from typing import Any, List, Optional
 from core.utils.structure import (
     MarketStructureConfig,
     add_market_structure,
+    add_sma,
     market_structure_column_names,
+    sma_column_names,
     structure_signature,
 )
 
@@ -49,6 +51,20 @@ def default_persisted_keys_for_rsi() -> List[str]:
 
 def default_persisted_keys_for_ema_high_low() -> List[str]:
     return ["ema_high", "ema_low"]
+
+
+def default_persisted_keys_for_sma(
+    period: Optional[int] = None,
+    *,
+    periods: Optional[list] = None,
+    column: Optional[str] = None,
+) -> List[str]:
+    """Persist keys matching ``add_sma`` / strategy ``sma_period`` / ``sma_periods``."""
+    if periods is not None:
+        return sma_column_names(periods)
+    if period is not None:
+        return sma_column_names(period, column=column)
+    return ["sma"]
 
 
 def default_persisted_keys_for_bollinger(prefix: str = "bb") -> List[str]:

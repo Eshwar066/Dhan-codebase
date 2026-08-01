@@ -1,0 +1,97 @@
+id: NiftySMA9Weekly
+implementation:
+  module: core.strategies.IBBM.SMA9Weekly.NiftySMA9Weekly
+  class: NiftySMA9Weekly
+instrument: OPTION
+allowed_modes:
+- BACKTEST
+- PAPER
+- LIVE
+broker:
+  venue: DHAN
+  api: DHAN
+symbols:
+- NIFTY
+exchange: NSE
+timeframe: '120'
+schedule:
+  eval_mode: live_feed
+data:
+  backtest:
+    data:
+      option_chain:
+        exchange: NSE
+        interval: '120'
+        segment: OPT
+        api: DHAN
+        expiry_flag: WEEK
+  paper:
+    data:
+      option_chain:
+        exchange: NSE
+        interval: '120'
+        segment: OPT
+        api: DHAN
+        expiry_flag: WEEK
+  live:
+    data:
+      option_chain:
+        exchange: NSE
+        interval: '1'
+        segment: OPT
+        api: DHAN
+        expiry_flag: WEEK
+profile:
+  live:
+    exchange: INDEX
+    sector: 'YES'
+  backtest:
+    start_date: '2026-01-01'
+    end_date: '2026-05-24'
+    timeframe: '120'
+    exchange: INDEX
+    sector: 'YES'
+dependencies:
+  mixins:
+  - IndiaMktMixins
+  required_context:
+  - option_chain
+  expiry_type: WEEKLY
+  meta_key: nifty_sma9_weekly
+
+params:
+  sma_period: 9
+  premium_min: 80
+  premium_max: 100
+  hedge_distance_points: 500
+  weekly_expiry_weekday: 1
+  hedge_rollover_days_before_expiry: 1
+
+# Extra no-trade calendar dates (ISO). NSE holidays are always blocked via SessionManager.
+event_no_trade_dates: []
+# - '2026-02-01'  # example Budget day
+
+documentation:
+  title: Nifty SMA9 Weekly
+  overview: >
+    NIFTY 2h SMA(9) crossover weekly option selling with OTM premium 80–100,
+    weekly hedge 500 points OTM from MAIN, rollover 1 day before weekly expiry,
+    and event no-trade zone.
+    If current weekly has no OTM in 80–100, MAIN rolls to the next weekly expiry.
+  rules: |
+    - Timeframe: 120m (2 hours), closed-bar eval
+    - Study: SMA 9 on close
+    - Cross above SMA → sell OTM PUT; cross below → sell OTM CALL
+    - Main premium band: 80–100 (OTM only); else next weekly same band
+    - Hedge: same side, same weekly expiry, 500 points OTM from MAIN
+      (CALL K → K+500; PUT K → K−500)
+    - Rollover: 1 trading day before weekly expiry
+    - No new entries on NSE holidays, event_no_trade_dates, or weekly expiry day
+  run_command: python -m run.main --engine-id dhan_sma9_weekly
+  generate_readme: false
+
+subscriptions:
+  BarClosed:
+    enabled: true
+    timeframes: ['120']
+    symbols: [NIFTY]

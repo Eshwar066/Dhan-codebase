@@ -36,6 +36,37 @@ class SessionManager:
         d = date.strftime("%Y-%m-%d")
         return d in HOLIDAYS.get(exchange, set())
 
+    @staticmethod
+    def is_trading_day(day, exchange="NSE_INDEX"):
+        """True when ``day`` is a weekday and not an exchange holiday."""
+        exchange = SessionManager.normalize_exchange(exchange)
+        if isinstance(day, dt.datetime):
+            d = day.date()
+        else:
+            d = day
+        if d.weekday() >= 5:
+            return False
+        probe = dt.datetime.combine(d, dt.time.min)
+        return not SessionManager.is_holiday(probe, exchange)
+
+    @staticmethod
+    def hedge_rollover_target_date(
+        year: int,
+        month: int,
+        *,
+        rollover_day: int = 18,
+        exchange: str = "NSE_INDEX",
+    ) -> dt.date:
+        """
+        Nominal hedge roll calendar day (default 18th), adjusted backward for
+        weekends and NSE holidays — roll on the prior session if 18th is closed.
+        """
+        exchange = SessionManager.normalize_exchange(exchange)
+        target = dt.date(int(year), int(month), int(rollover_day))
+        while not SessionManager.is_trading_day(target, exchange):
+            target -= dt.timedelta(days=1)
+        return target
+
     # ---------- Market Open ----------
     @staticmethod
     def is_market_open(exchange):

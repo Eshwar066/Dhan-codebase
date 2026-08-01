@@ -3,7 +3,7 @@ import os
 import threading
 import time
 from collections import defaultdict
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import pandas as pd
 from utils.logger.trade_logger import TradeLogger
@@ -113,10 +113,17 @@ class Position:
             self.entry_price = price
             if fill_ts is not None:
                 self.entry_clock = _fill_clock_for_trade_log(fill_ts)
-                self.entry_time = float(pd.Timestamp(fill_ts).timestamp())
+                try:
+                    self.entry_time = float(pd.Timestamp(fill_ts).timestamp())
+                except (TypeError, ValueError):
+                    self.entry_time = time.time()
             else:
-                self.entry_clock = None
+                # REST / broker fills often omit candle_ts — still stamp wall clock so
+                # trade_log rows always have entry_time.
                 self.entry_time = time.time()
+                self.entry_clock = _fill_clock_for_trade_log(
+                    datetime.now(tz=timezone.utc)
+                )
             self.mae = 0.0
             self.mfe = 0.0
 
@@ -241,6 +248,14 @@ class PositionManager:
         assert instrument.custom_symbol, "Instrument must have custom_symbol"
         if not isinstance(instrument, Instrument):
             raise TypeError(f"on_fill expects Instrument, got {type(instrument)}")
+        try:
+            missing_candle_ts = candle_ts is None or bool(pd.isna(candle_ts))
+        except (TypeError, ValueError):
+            missing_candle_ts = candle_ts is None
+        if missing_candle_ts:
+            # REST fills can carry pandas.NaT. Hooks require a real timestamp for
+            # slot keys, expiry selection, and deferred/re-entry intent creation.
+            candle_ts = datetime.now(timezone.utc)
 
         hook_main_entry = None
         hook_main_exit = None
@@ -348,15 +363,20 @@ class PositionManager:
                 _exit_like = trade_type in ("EXIT", "FORCE_EXIT")
                 pnl_val = pos.realized_pnl if _exit_like else ""
                 cumulative_val = pos.cumulative_pnl if _exit_like else ""
-                # CSV timestamps are rendered in IST (naive UTC inputs are converted)
-                candle_ts_ist = _fill_clock_for_trade_log(candle_ts)
+                # CSV timestamps are rendered in IST (naive UTC inputs are converted).
+                # Fallback to wall clock so REST fills without candle_ts still stamp a time.
+                candle_ts_eff = candle_ts
+                if candle_ts_eff is None:
+                    candle_ts_eff = datetime.now(tz=timezone.utc)
+                candle_ts_ist = _fill_clock_for_trade_log(candle_ts_eff)
+                ts_str = (
+                    candle_ts_ist.strftime("%Y-%m-%d %H:%M")
+                    if candle_ts_ist is not None
+                    else ""
+                )
                 row = {
-                    "candle_timestamp": (
-                        candle_ts_ist.strftime("%Y-%m-%d %H:%M")
-                        if candle_ts_ist is not None
-                        else (candle_ts if candle_ts is not None else "")
-                    ),
-                    "tag": tag,
+                    "candle_timestamp": ts_str,
+                    "tag": tag or "",
                     "symbol": sym,
                     "trade_type": trade_type,
                     "side": side,
@@ -366,22 +386,18 @@ class PositionManager:
                     "cumulative_pnl": cumulative_val,
                     "net_qty_after": new_qty,
                     "execution_source": execution_source or "",
-                    # "order_id": order_id,
-                    # "intent_id": intent_id,
-                    # "trade_id": pos.trade_id,
-                    # "execution_timestamp": datetime.now().isoformat(),
-                    # "strategy": strategy,
+                    # Always present so ENTRY/EXIT share one fixed TRADES_COLUMNS schema.
+                    "mae": pos.mae if _exit_like else "",
+                    "mfe": pos.mfe if _exit_like else "",
+                    "exit_reason": (
+                        (getattr(pos, "exit_reason", None) or "") if _exit_like else ""
+                    ),
                 }
 
                 if _exit_like:
-                    row["mae"] = pos.mae
-                    row["mfe"] = pos.mfe
-                    if getattr(pos, "exit_reason", None):
-                        row["exit_reason"] = pos.exit_reason
-                    if execution_source:
-                        row["execution_source"] = execution_source
-
-                    # Log complete trade for performance analytics (trade log) — all timestamps in IST
+                    # Ensure identity fields exist even for positions adopted via reconcile.
+                    if not getattr(pos, "trade_id", None):
+                        pos.trade_id = f"T-{uuid.uuid4().hex[:10]}"
                     if getattr(pos, "entry_clock", None) is not None:
                         # entry_clock is already IST-naive (see _fill_clock_for_trade_log)
                         entry_time_str = pos.entry_clock.strftime("%Y-%m-%d %H:%M:%S")
@@ -423,7 +439,9 @@ class PositionManager:
                         "entry_time": entry_time_str,
                         "exit_time": exit_time_str,
                         "side": entry_side,
-                        "entry_price": entry_price_for_log if entry_price_for_log is not None else "",
+                        "entry_price": entry_price_for_log
+                        if entry_price_for_log is not None
+                        else "",
                         "exit_price": price,
                         "qty": qty,
                         "pnl": pos.realized_pnl,
@@ -720,6 +738,87 @@ class PositionManager:
                     cur[k] = v
             self.position_metadata[sym] = cur
 
+    def merge_ownership_from_all_strategy_open_positions_csvs(
+        self, *, engine_id: Optional[str] = None, logs_root: str = "logs"
+    ) -> int:
+        """
+        Multi-strategy engines store ownership in logs/{strategy}/{engine_id}_open_positions.csv
+        while PM's primary path is usually the primary strategy dir. Merge ownership from
+        every strategy CSV that shares this engine_id so overnight legs keep strategy/tag.
+        """
+        try:
+            from utils.logger.open_positions_logger import (
+                load_position_metadata_from_csv,
+            )
+        except ImportError as exc:
+            logger.warning("open_positions_logger import failed: %s", exc)
+            return 0
+
+        eid = str(
+            engine_id
+            or (os.path.basename(self.open_positions_csv_path or "").replace(
+                "_open_positions.csv", ""
+            ))
+            or ""
+        ).strip()
+        if not eid:
+            return 0
+        root = logs_root
+        if not os.path.isdir(root):
+            return 0
+        merged = 0
+        for name in os.listdir(root):
+            strat_dir = os.path.join(root, name)
+            if not os.path.isdir(strat_dir):
+                continue
+            path = os.path.join(strat_dir, f"{eid}_open_positions.csv")
+            if not os.path.isfile(path):
+                continue
+            if self.open_positions_csv_path and os.path.abspath(
+                path
+            ) == os.path.abspath(self.open_positions_csv_path):
+                continue
+            file_meta = load_position_metadata_from_csv(path)
+            if not file_meta:
+                continue
+            before = len(self.position_metadata)
+            self._merge_open_positions_csv_dict(file_meta)
+            merged += max(0, len(file_meta))
+            _ = before
+        # Also re-apply ownership onto any already-open positions that lost meta.
+        applied = 0
+        with self._lock:
+            for sym, pos in list(self.positions.items()):
+                if int(getattr(pos, "net_qty", 0) or 0) == 0:
+                    continue
+                meta = self.position_metadata.get(sym) or {}
+                if not meta:
+                    continue
+                changed = False
+                if not getattr(pos, "strategy", None) and meta.get("strategy"):
+                    pos.strategy = meta.get("strategy")
+                    changed = True
+                if not getattr(pos, "structure_id", None) and meta.get("structure_id"):
+                    pos.structure_id = meta.get("structure_id")
+                    changed = True
+                if not getattr(pos, "tag", None) and meta.get("tag"):
+                    pos.tag = meta.get("tag")
+                    changed = True
+                if not getattr(pos, "intent_id", None) and meta.get("intent_id"):
+                    pos.intent_id = meta.get("intent_id")
+                    changed = True
+                if changed:
+                    applied += 1
+                    if pos.strategy:
+                        self.strategy_pos[pos.strategy][sym] = int(pos.net_qty)
+        if applied:
+            logger.info(
+                "Restored ownership on %s open position(s) from strategy CSVs (engine=%s)",
+                applied,
+                eid,
+            )
+        return applied
+
     def rebuild_position_metadata_from_open_positions_csv(self) -> None:
         """Merge metadata from logs/{engine_id}_open_positions.csv (strategy_meta, etc.)."""
         path = self.open_positions_csv_path
@@ -877,6 +976,77 @@ class PositionManager:
                 return True
         return False
 
+    def has_open_main_leg(
+        self,
+        strategy: str,
+        *,
+        underlying: Optional[str] = None,
+        structure_id: Optional[str] = None,
+    ) -> bool:
+        """
+        True if an open MAIN already blocks a new entry for this LEAPS leg family.
+
+        Exact ``structure_id`` match always blocks. Otherwise:
+        - mini (no ``:QTR`` suffix): any non-QTR MAIN on the underlying, or a
+          short MAIN with missing ``structure_id`` after broker reconcile
+        - quarterly (``:QTR``): any MAIN whose structure ends with ``:QTR``, or
+          a short MAIN with missing ``structure_id`` (safe after restart)
+
+        Also matches broker-adopted shorts with empty strategy/tag/structure_id
+        (common when reconcile runs with ``strategy=None`` and no open-positions CSV).
+
+        Long legs without structure_id are treated as hedges and ignored.
+        """
+        sid_want = str(structure_id or "").strip()
+        want_qtr = sid_want.endswith(":QTR")
+        strat = str(strategy or "").strip()
+        if sid_want and self.has_open_structure(
+            strategy=strat, structure_id=sid_want, tag="MAIN"
+        ):
+            return True
+
+        und = str(underlying or "").strip().upper()
+        # Include strategy-owned legs and unowned broker-adopted legs for this underlying.
+        candidates = list(self.get_open_positions(underlying=und or None, strategy=strat or None))
+        if und:
+            seen = {id(p) for p in candidates}
+            for pos in self.get_open_positions(underlying=und, strategy=None):
+                if id(pos) in seen:
+                    continue
+                pos_strat = str(getattr(pos, "strategy", None) or "").strip()
+                if pos_strat and pos_strat != strat:
+                    continue
+                candidates.append(pos)
+
+        for pos in candidates:
+            if int(getattr(pos, "net_qty", 0) or 0) == 0:
+                continue
+            tag_u = str(getattr(pos, "tag", None) or "").upper()
+            if tag_u.startswith("HEDGE"):
+                continue
+            if tag_u and tag_u != "MAIN" and not tag_u.startswith("MAIN_"):
+                continue
+
+            sid = str(getattr(pos, "structure_id", None) or "").strip()
+            if sid:
+                pos_strat = str(getattr(pos, "strategy", None) or "").strip()
+                if pos_strat and strat and pos_strat != strat:
+                    continue
+                if sid_want and sid == sid_want:
+                    return True
+                is_qtr = sid.endswith(":QTR")
+                if want_qtr and is_qtr:
+                    return True
+                if not want_qtr and not is_qtr:
+                    return True
+                continue
+
+            # Broker-reconciled MAIN often loses strategy/structure_id after restart.
+            # Short option = MAIN sell; long without sid = likely mis-tagged hedge.
+            if int(pos.net_qty) < 0:
+                return True
+        return False
+
     # Used while exiting positions
     def get_hedge_for(self, main_position):
         """
@@ -938,8 +1108,90 @@ class PositionManager:
         with self._lock:
             if file_meta:
                 self._merge_open_positions_csv_dict(file_meta)
+            # Multi-strategy: ownership often lives under logs/{strategy}/…, not
+            # the primary LEAPS csv path. Merge before adopting bare broker legs.
+            pass
+        # Outside lock: scans filesystem then takes its own lock to apply.
+        try:
+            self.merge_ownership_from_all_strategy_open_positions_csvs()
+        except Exception as exc:
+            logger.warning("strategy open-positions CSV ownership merge failed: %s", exc)
+
+        with self._lock:
             self.last_recon_time = time.time()
+            # Empty broker book: zero local qty but KEEP ownership metadata.
+            # LiveEngine only clears metadata on empty books during NSE hours
+            # (09:15–15:30). Outside that window an empty/ambiguous response must
+            # not make the strategy forget an overnight carry.
+            if not broker_positions:
+                open_local = [
+                    s
+                    for s, p in self.positions.items()
+                    if int(getattr(p, "net_qty", 0) or 0) != 0
+                ]
+                if open_local:
+                    logger.warning(
+                        "Reconcile: empty broker book with %s open local leg(s); "
+                        "zeroing local qty (retaining ownership metadata)",
+                        len(open_local),
+                    )
+                    for sym in open_local:
+                        pos = self.positions.get(sym)
+                        if pos is None:
+                            continue
+                        self._merge_position_metadata(
+                            sym,
+                            strategy=getattr(pos, "strategy", None),
+                            structure_id=getattr(pos, "structure_id", None),
+                            tag=getattr(pos, "tag", None),
+                            intent_id=getattr(pos, "intent_id", None),
+                        )
+                        strategy = getattr(pos, "strategy", None)
+                        self.positions.pop(sym, None)
+                        if strategy and strategy in self.strategy_pos:
+                            self.strategy_pos[strategy].pop(sym, None)
+                    return
+
+            from core.utils.expiry_resolver import ExpiryResolver
+
+            def _identity(sym: str) -> str:
+                return ExpiryResolver.option_identity_key(sym)
+
+            # Remap broker keys onto local engine symbols when compact vs
+            # space-separated Dhan names differ but strike/side match.
+            remapped: Dict[str, Any] = {}
+            local_by_id: Dict[str, str] = {}
+            for loc_sym in self.positions.keys():
+                ik = _identity(loc_sym)
+                if ik and ik not in local_by_id:
+                    local_by_id[ik] = loc_sym
+            for meta_sym in list(self.position_metadata.keys()):
+                ik = _identity(meta_sym)
+                if ik and ik not in local_by_id:
+                    local_by_id[ik] = meta_sym
+
+            for b_sym, bp in broker_positions.items():
+                engine_sym = b_sym
+                ik = _identity(b_sym)
+                if ik and ik in local_by_id:
+                    engine_sym = local_by_id[ik]
+                if engine_sym in remapped and engine_sym != b_sym:
+                    # Prefer non-zero qty if both forms appear.
+                    try:
+                        if abs(int(bp.get("qty") or 0)) <= abs(
+                            int(remapped[engine_sym].get("qty") or 0)
+                        ):
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                remapped[engine_sym] = bp
+            broker_positions = remapped
+
             broker_symbols = set(broker_positions.keys())
+            # Also treat identity-matched broker symbols as present.
+            broker_identities = {
+                _identity(s) for s in broker_symbols if _identity(s)
+            }
             local_symbols = set(self.positions.keys())
 
             for sym, bp in broker_positions.items():
@@ -971,10 +1223,20 @@ class PositionManager:
                     pos.net_qty = bqty
                     pos.avg_price = float(bp.get("avg_price", 0))
                     pos.strategy = meta_strategy or strategy
-                    pos.tag = tag_m
+                    pos.tag = tag_m or ("MAIN" if meta_strategy or strategy else None)
                     pos.structure_id = structure_id_m
                     pos.intent_id = intent_id_m
+                    # Adopted broker legs must still produce complete trade_log rows on exit.
+                    if bqty != 0:
+                        pos.trade_id = f"T-{uuid.uuid4().hex[:10]}"
+                        pos.entry_price = float(bp.get("avg_price", 0) or 0) or None
+                        pos.entry_time = time.time()
+                        pos.entry_clock = _fill_clock_for_trade_log(
+                            datetime.now(tz=timezone.utc)
+                        )
                     self.positions[sym] = pos
+                    if pos.strategy:
+                        self.strategy_pos[pos.strategy][sym] = int(bqty)
                     continue
 
                 local = self.positions[sym]
@@ -999,6 +1261,21 @@ class PositionManager:
                     local.net_qty != bqty
                     or abs(local.avg_price - float(bp.get("avg_price", 0))) > 0.5
                 ):
+                    # Broker flat: keep ownership metadata (cleared only on fill CLOSE).
+                    if int(bqty) == 0 and int(local.net_qty or 0) != 0:
+                        self._merge_position_metadata(
+                            sym,
+                            strategy=getattr(local, "strategy", None),
+                            structure_id=getattr(local, "structure_id", None),
+                            tag=getattr(local, "tag", None),
+                            intent_id=getattr(local, "intent_id", None),
+                        )
+                        logger.warning(
+                            "Reconcile: broker flat for %s (was qty=%s); "
+                            "zeroing local qty but retaining ownership metadata",
+                            sym,
+                            local.net_qty,
+                        )
                     local.net_qty = bqty
                     local.avg_price = float(bp.get("avg_price", 0))
                     local.last_updated = time.time()
@@ -1016,17 +1293,132 @@ class PositionManager:
                     )
 
                 if not getattr(local, "tag", None):
-                    local.tag = tag_m
+                    local.tag = tag_m or (
+                        "MAIN" if (meta_strategy or strategy or local.strategy) else None
+                    )
                 if not getattr(local, "structure_id", None):
                     local.structure_id = structure_id_m
                 if not getattr(local, "intent_id", None):
                     local.intent_id = intent_id_m
                 if not getattr(local, "strategy", None):
                     local.strategy = meta_strategy or strategy
+                if int(local.net_qty or 0) != 0:
+                    if not getattr(local, "trade_id", None):
+                        local.trade_id = f"T-{uuid.uuid4().hex[:10]}"
+                    if getattr(local, "entry_price", None) is None:
+                        local.entry_price = float(bp.get("avg_price", 0) or 0) or None
+                    if getattr(local, "entry_time", None) is None:
+                        local.entry_time = time.time()
+                    if getattr(local, "entry_clock", None) is None:
+                        local.entry_clock = _fill_clock_for_trade_log(
+                            datetime.now(tz=timezone.utc)
+                        )
+                if getattr(local, "strategy", None):
+                    self.strategy_pos[local.strategy][sym] = int(local.net_qty)
 
+            # Broker book omitted this symbol (or transient API hole). Drop local qty
+            # tracking but NEVER clear ownership metadata — that is only removed on
+            # fill CLOSE (on_fill → position_metadata.pop). Otherwise a false flat
+            # + SYNC rewrite permanently loses structure_id and allows duplicate entries.
             for sym in local_symbols - broker_symbols:
+                if _identity(sym) and _identity(sym) in broker_identities:
+                    continue
+                pos = self.positions.get(sym)
+                if pos is not None:
+                    self._merge_position_metadata(
+                        sym,
+                        strategy=getattr(pos, "strategy", None),
+                        structure_id=getattr(pos, "structure_id", None),
+                        tag=getattr(pos, "tag", None),
+                        intent_id=getattr(pos, "intent_id", None),
+                    )
+                    logger.warning(
+                        "Reconcile: symbol %s absent from broker book "
+                        "(local_qty=%s); removing local position but retaining "
+                        "ownership metadata until fill close",
+                        sym,
+                        getattr(pos, "net_qty", None),
+                    )
                 self.positions.pop(sym, None)
+
+    def sync_symbol_flat_at_broker(
+        self, trading_symbol: str, *, reason: str = "", clear_metadata: bool = False
+    ) -> bool:
+        """
+        Broker confirms no open position (manual exit / no_open_position).
+        Drop local qty. When ``clear_metadata=True`` (confirmed manual close),
+        also drop ownership metadata so restart will not re-arm SL / restore CSV ghosts.
+        """
+        sym = str(trading_symbol or "").strip()
+        if not sym:
+            return False
+        with self._lock:
+            pos = self.positions.get(sym)
+            meta = dict(self.position_metadata.get(sym) or {})
+            had_qty = pos is not None and int(getattr(pos, "net_qty", 0) or 0) != 0
+            if not had_qty and not meta:
+                return False
+            if pos is not None and not clear_metadata:
+                self._merge_position_metadata(
+                    sym,
+                    strategy=getattr(pos, "strategy", None),
+                    structure_id=getattr(pos, "structure_id", None),
+                    tag=getattr(pos, "tag", None),
+                    intent_id=getattr(pos, "intent_id", None),
+                )
+            qty_was = int(getattr(pos, "net_qty", 0) or 0) if pos is not None else 0
+            strategy = (
+                getattr(pos, "strategy", None) if pos is not None else meta.get("strategy")
+            )
+            if pos is not None:
+                self.positions.pop(sym, None)
+            self._structure_slices.pop(sym, None)
+            if strategy:
+                self.strategy_pos[strategy][sym] = 0
+            if clear_metadata:
                 self.position_metadata.pop(sym, None)
+                logger.warning(
+                    "Reconcile: broker flat for %s (was qty=%s); "
+                    "removed local position and cleared ownership metadata%s",
+                    sym,
+                    qty_was,
+                    f" ({reason})" if reason else "",
+                )
+            else:
+                logger.warning(
+                    "Reconcile: broker flat for %s (was qty=%s); "
+                    "removing local position but retaining ownership metadata%s",
+                    sym,
+                    qty_was,
+                    f" ({reason})" if reason else "",
+                )
+            return True
+
+    def clear_ownership_metadata(self, trading_symbol: str) -> Optional[Dict[str, Any]]:
+        """Drop ownership metadata for ``trading_symbol``; return the prior bucket."""
+        sym = str(trading_symbol or "").strip()
+        if not sym:
+            return None
+        with self._lock:
+            return self.position_metadata.pop(sym, None)
+
+    def ownership_snapshot(self, trading_symbol: str) -> Dict[str, Any]:
+        sym = str(trading_symbol or "").strip()
+        if not sym:
+            return {}
+        with self._lock:
+            out = dict(self.position_metadata.get(sym) or {})
+            pos = self.positions.get(sym)
+            if pos is not None:
+                if not out.get("strategy"):
+                    out["strategy"] = getattr(pos, "strategy", None)
+                if not out.get("structure_id"):
+                    out["structure_id"] = getattr(pos, "structure_id", None)
+                if not out.get("tag"):
+                    out["tag"] = getattr(pos, "tag", None)
+                if not out.get("intent_id"):
+                    out["intent_id"] = getattr(pos, "intent_id", None)
+            return {k: v for k, v in out.items() if v not in (None, "")}
 
     # ---------------------
     # POSITION CHECKS
@@ -1116,19 +1508,29 @@ class PositionManager:
 
                 # Prefix match for India-style symbols:
                 # e.g. "NIFTY 30 JAN 24000 CALL" should match underlying "NIFTY".
-                by_prefix = trading_upper.startswith(f"{underlying_norm} ") or custom_upper.startswith(
-                    f"{underlying_norm} "
+                # Dhan compact: "BANKNIFTY-Jul2026-59700-CE" (hyphen, not space).
+                by_prefix = (
+                    trading_upper.startswith(f"{underlying_norm} ")
+                    or trading_upper.startswith(f"{underlying_norm}-")
+                    or custom_upper.startswith(f"{underlying_norm} ")
+                    or custom_upper.startswith(f"{underlying_norm}-")
                 )
 
                 # Handle option format: C-BTC-78000-270326 / P-BTC-...
+                # Also Dhan: BANKNIFTY-Jul2026-59700-CE → underlying is parts[0].
                 if "-" in custom_symbol:
                     parts = custom_symbol.split("-")
                     if len(parts) >= 2:
-                        underlying_from_symbol = parts[1].strip().upper()  # BTC
-
-                        # Compare with passed underlying (BTCUSD → BTC)
+                        # Delta crypto: C-BTC-... / P-BTC-...
+                        if parts[0].strip().upper() in {"C", "P"} and len(parts) >= 2:
+                            underlying_from_symbol = parts[1].strip().upper()
+                        else:
+                            underlying_from_symbol = parts[0].strip().upper()
                         base_underlying = underlying_norm.replace("USD", "").strip()
-                        by_custom = underlying_from_symbol == base_underlying
+                        by_custom = underlying_from_symbol in {
+                            underlying_norm,
+                            base_underlying,
+                        }
 
                 if not (by_trading or by_custom):
                     if not by_prefix:

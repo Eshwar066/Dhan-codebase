@@ -1,0 +1,59 @@
+id: OptionBuildup
+implementation:
+  module: core.strategies.OpenIntrest.optionbuildup.optionbuildup
+  class: OptionBuildup
+instrument: OPTION
+allowed_modes:
+- BACKTEST
+- PAPER
+- LIVE
+broker:
+  venue: DHAN
+  api: DHAN
+symbols:
+- NIFTY
+exchange: NSE
+timeframe: '15'
+schedule:
+  eval_mode: live_feed
+data:
+  backtest:
+    data:
+      option_chain:
+        exchange: NSE
+        interval: '15'
+        segment: OPT
+        api: DHAN
+        expiry_flag: MONTHLY
+  paper:
+    data:
+      option_chain:
+        exchange: NSE
+        interval: '15'
+        segment: OPT
+        api: DHAN
+        expiry_flag: MONTHLY
+  live:
+    data:
+      option_chain:
+        exchange: NSE
+        interval: '15'
+        segment: OPT
+        api: DHAN
+        expiry_flag: MONTHLY
+profile:
+  live:
+    exchange: INDEX
+    sector: 'YES'
+  backtest:
+    start_date: '2026-04-01'
+    end_date: '2026-04-28'
+    timeframe: '15'
+    exchange: INDEX
+    sector: 'YES'
+dependencies:
+  mixins:
+  - IndiaMktMixins
+documentation:
+  title: Option Buildup
+  overview: NIFTY OI buildup scanner.

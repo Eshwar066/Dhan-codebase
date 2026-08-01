@@ -1,0 +1,45 @@
+id: OneDayMagicalLine
+implementation:
+  module: core.strategies.crypto.oneDayMagicalLine.oneDayMagicalLine
+  class: OneDayMagicalLine
+instrument: OPTION
+allowed_modes:
+- BACKTEST
+- PAPER
+- LIVE
+broker:
+  venue: DELTA
+  api: DELTA
+  delta:
+    india: true
+    testnet: false
+    leverage: 10
+symbols:
+- BTCUSD
+exchange: NSE
+timeframe: '60'
+schedule:
+  eval_mode: live_feed
+data:
+  default:
+    data: {}
+profile:
+  live:
+    exchange: DELTA
+    sector: 'YES'
+  backtest:
+    start_date: '2026-02-01'
+    end_date: '2026-02-26'
+    timeframe: '60'
+    exchange: DELTA
+    sector: 'YES'
+dependencies:
+  mixins:
+  - IndiaMktMixins
+  meta_key: one_day_magical_line
+  meta_aliases:
+    one_day_ml1: one_day_magical_line
+documentation:
+  title: One Day Magical Line
+  overview: Delta BTCUSD hourly magical-line positional strategy.
+  run_command: python -m run.main --engine-id delta_oneday_magicalline

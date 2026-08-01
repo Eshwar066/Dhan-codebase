@@ -941,8 +941,8 @@ class Tradehull:
         tradingsymbol: str,
         exchange: str,
         quantity: int,
-        price: int,
-        trigger_price: int,
+        price: float,
+        trigger_price: float,
         order_type: str,
         transaction_type: str,
         trade_type: str,
@@ -977,6 +977,10 @@ class Tradehull:
                 "MARKET": self.Dhan.MARKET,
                 "STOPLIMIT": self.Dhan.SL,
                 "STOPMARKET": self.Dhan.SLM,
+                # Aliases — Tradehull KeyError if raw "SL" / "SL-M" slip through.
+                "SL": self.Dhan.SL,
+                "SL-M": self.Dhan.SLM,
+                "SLM": self.Dhan.SLM,
             }
             product = {
                 "MIS": self.Dhan.INTRA,
@@ -1161,6 +1165,10 @@ class Tradehull:
                 "MARKET": self.Dhan.MARKET,
                 "STOPLIMIT": self.Dhan.SL,
                 "STOPMARKET": self.Dhan.SLM,
+                # Aliases — Tradehull KeyError if raw "SL" / "SL-M" slip through.
+                "SL": self.Dhan.SL,
+                "SL-M": self.Dhan.SLM,
+                "SLM": self.Dhan.SLM,
             }
             product = {
                 "MIS": self.Dhan.INTRA,
@@ -1247,6 +1255,10 @@ class Tradehull:
                 "MARKET": self.Dhan.MARKET,
                 "STOPLIMIT": self.Dhan.SL,
                 "STOPMARKET": self.Dhan.SLM,
+                # Aliases — Tradehull KeyError if raw "SL" / "SL-M" slip through.
+                "SL": self.Dhan.SL,
+                "SL-M": self.Dhan.SLM,
+                "SLM": self.Dhan.SLM,
             }
             product = {
                 "MIS": self.Dhan.INTRA,
@@ -1430,6 +1442,10 @@ class Tradehull:
                 "MARKET": self.Dhan.MARKET,
                 "STOPLIMIT": self.Dhan.SL,
                 "STOPMARKET": self.Dhan.SLM,
+                # Aliases — Tradehull KeyError if raw "SL" / "SL-M" slip through.
+                "SL": self.Dhan.SL,
+                "SL-M": self.Dhan.SLM,
+                "SLM": self.Dhan.SLM,
             }
             product = {
                 "MIS": self.Dhan.INTRA,

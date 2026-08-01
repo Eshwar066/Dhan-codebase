@@ -1,0 +1,28 @@
+# Delta-only: block NEW ENTRY (and SL re-entry ENTRY) around high-impact USD releases.
+# Exits / FORCE_EXIT / MAIN_SL / trails / rolls are never blocked by this file.
+#
+# Manual events always merge on top of logs/calendars/delta_economic_events.json
+# (refreshed offline via: python -m utils.delta.refresh_economic_calendar).
+
+enabled: true
+blackout_minutes_before: 60
+blackout_minutes_after: 60
+
+# Same-session HIGH event (IST): no 0DTE after cutoff; no 1DTE until event done.
+# Weekly/monthly (DTE>=2) still allowed outside the ±60m window.
+short_dte_rules_enabled: true
+zero_dte_cutoff_ist: "17:30"
+block_1dte_until_event_done: true
+
+# Optional absolute overrides / extras (ISO UTC).
+# Use this for CPI / NFP when the BLS scrape is blocked from the host, e.g.:
+# events:
+#   - event: US CPI
+#     time: "2026-08-12T12:30:00Z"
+#     impact: HIGH
+#     currency: USD
+#   - event: US NFP
+#     time: "2026-08-07T12:30:00Z"
+#     impact: HIGH
+#     currency: USD
+events: []

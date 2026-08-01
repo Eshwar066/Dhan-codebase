@@ -14,7 +14,9 @@ flowchart TD
     D --> H["Optional tick_queue + CandleAggregator"]
     D --> I["LiveEngine.start()"]
 
-    I --> J["Main loop: feed health, memory/risk checks, order-state checks"]
+    I --> J["Main loop: feed health, memory/risk checks, order-state checks, GttFallbackBook.tick()"]
+    J --> SCH["scheduled_times strategies: wall-clock IST slots (synthetic candle)"]
+    SCH --> O
     J --> K{"tick_queue + aggregator available?"}
     K -- yes --> L["drain tick_queue -> CandleAggregator.on_tick()"]
     L --> M["get last closed candle per symbol"]
@@ -52,7 +54,10 @@ flowchart TD
 
 - **Candle delivery** is feed- or aggregator-driven (`DhanWebSocketFeed` / `DeltaWebSocketFeed`, optional `tick_queue` + `CandleAggregator`). `core/data/feeds/dummy_feed.py` is used by `run/dummy_live.py`.
 - **`IndicatorManager`** (live) bootstraps history from engine `*_candles.log` when valid; if logs are missing, short, or invalid it may call **`IDataProvider.get_intraday`** (REST / broker historical path) before the first live bar — separate from the tick loop.
-- Optional **log-only bootstrap** for LEAPS-style setups: regenerate `logs/...` via `utils/seed_leaps_bootstrap_logs.py` (frozen Yahoo tail in `utils/leaps_bootstrap_yf_reference.py`); `utils/yfinance_nifty_rsi.py` is a manual fetch helper, not imported by the engine.
+- Optional **offline indicator seed**: `utils/yfinance/nifty_yahoo.py` + `utils/yfinance/refresh_nifty_indicator_history.py` write `logs/indicators/NIFTY/{tf}/` (manual — not imported by the engine).
 - **`PAPER`** uses the live data path with simulated execution.
 - **Multi-strategy** live mode runs one worker thread per strategy.
+- **Scheduled strategies** (e.g. BankNiftyBTST) use `strategy.scheduled_times` — no candle aggregator for that strategy; engine builds a synthetic candle from spot at the slot.
+- **HYBRID_GTT** (`GttFallbackBook`): after Forever order placement, main loop polls quotes (WS + REST fallback) until ask/bid trigger → cancel GTT → resting LIMIT.
+- **LEAPS exits/rollover** run on every closed 60m bar via `_run_exits_and_rollover`; entries remain gated on `should_evaluate` (RSI crossover).
 - Queue growth is bounded at strategy, intent, and account-symbol stages.

@@ -42,8 +42,9 @@ class IndicatorManager:
         self._live_sector = "NO"
         self._base_candle_state: Dict[str, Dict[str, Any]] = {}
         self._strategy_indicator_state: Dict[str, Dict[str, Any]] = {}
-        # Optional shared indicator cache for explicitly compatible strategies.
-        # key: (symbol, timeframe, shared_signature, base_sig)
+        # Shared indicator cache for compatible strategies.
+        # key: (symbol, timeframe, shared_signature) → (base_sig, df)
+        # Overwrites in place so update_seq changes do not accumulate DF copies.
         self._indicator_cache: Dict[Any, Any] = {}
         self._startup_logged: bool = False
         self._rsi_logged_keys = set()
@@ -55,6 +56,9 @@ class IndicatorManager:
         self._log_bootstrap_buffer = 50
         # (symbol, timeframe, ist_bar) → fingerprint of last persisted live_append row.
         self._live_persist_fingerprints: Dict[Tuple[str, str, str], tuple] = {}
+        # Bound in-memory dedupe maps (disk JSONL remains source of truth).
+        self._rsi_logged_keys_max = 8_000
+        self._live_persist_fingerprints_max = 4_000
 
     def set_runtime_context(self, exchange: str, sector: str) -> None:
         self._live_exchange = str(exchange or "INDEX")
@@ -68,6 +72,20 @@ class IndicatorManager:
     def _key_strategy_symbol_tf(strategy: Any, symbol: str, tf: str) -> str:
         strategy_id = str(getattr(strategy, "name", "unknown_strategy"))
         return f"{strategy_id}|{symbol}|{tf}"
+
+    @staticmethod
+    def _should_sanitize_delta_ohlc(timeframe: Optional[str] = None) -> bool:
+        """
+        Wick clamping is only for fine crypto bars (1m/5m tick noise).
+
+        Applying it to 60 / 4h / 1d truncates real range and drifts ATR / SuperTrend
+        away from Delta REST / TradingView (delta_refresh path).
+        """
+        raw = str(timeframe or "").strip().lower()
+        if not raw:
+            # Unknown TF: keep legacy clamp only when caller omits TF on 1m-style paths.
+            return True
+        return raw in {"1", "1m", "5", "5m"}
 
     @staticmethod
     def _sanitize_delta_ohlc_row(
@@ -104,10 +122,14 @@ class IndicatorManager:
         out["open"], out["high"], out["low"], out["close"] = o, h, l, c
         return out
 
-    def _sanitize_delta_ohlc_df(self, df: Any) -> Any:
+    def _sanitize_delta_ohlc_df(
+        self, df: Any, *, timeframe: Optional[str] = None
+    ) -> Any:
         if df is None or len(df) == 0:
             return df
         if str(self._live_exchange or "").upper() != "DELTA":
+            return df
+        if not self._should_sanitize_delta_ohlc(timeframe):
             return df
         out = df.copy()
         for col in ("open", "high", "low", "close"):
@@ -129,25 +151,32 @@ class IndicatorManager:
 
     @staticmethod
     def _structure_confirm_delay_bars(strategy: Any) -> int:
-        """Bars to wait after close before persisting (fractal ``swing_right``)."""
-        fn = getattr(strategy, "market_structure_config", None)
+        """
+        Bars after close before writing ``live_append`` history.
+
+        Only strategies that opt in (RSIBreadAndButter via
+        ``indicator_persist_delay_bars`` / fractal ``swing_right``) use a lag.
+        LEAPS and other RSI/EMA strategies persist on the closed bar (delay=0).
+        """
+        fn = getattr(strategy, "indicator_persist_delay_bars", None)
         if callable(fn):
             try:
-                return max(0, int(fn().swing_right))
+                return max(0, int(fn()))
             except Exception:
                 pass
-        return 2
+        return 0
 
     @staticmethod
     def _structure_confirm_tail_rows(strategy: Any) -> int:
-        """Bars to re-persist after each close (swing_right + 1 for fractal confirmation lag)."""
-        fn = getattr(strategy, "market_structure_config", None)
+        """Lag window for confirmed structure flags on the eval candle."""
+        fn = getattr(strategy, "indicator_persist_tail_rows", None)
         if callable(fn):
             try:
-                return max(1, int(fn().swing_right) + 1)
+                return max(1, int(fn()))
             except Exception:
                 pass
-        return 3
+        delay = IndicatorManager._structure_confirm_delay_bars(strategy)
+        return max(1, delay + 1) if delay > 0 else 1
 
     @staticmethod
     def _ist_bar_key_from_row(row: Any) -> Optional[str]:
@@ -296,10 +325,89 @@ class IndicatorManager:
         return df
 
     @staticmethod
+    def _compute_sma_columns(
+        df: Any,
+        period: Optional[int] = None,
+        *,
+        periods: Optional[List[int]] = None,
+        source_col: str = "close",
+        column: Optional[str] = None,
+    ) -> Any:
+        """Compute SMA column(s); length(s) come from the strategy (``sma_period`` / ``sma_periods``)."""
+        from core.utils.structure.sma import add_sma
+
+        return add_sma(
+            df,
+            period=period,
+            periods=periods,
+            source_col=source_col,
+            column=column,
+        )
+
+    @staticmethod
+    def _strategy_sma_lengths(strategy: Any) -> tuple:
+        """Return ``(period, periods)`` from strategy attrs; either may be None."""
+        periods = getattr(strategy, "sma_periods", None)
+        period = getattr(strategy, "sma_period", None)
+        if periods is not None:
+            try:
+                periods = [int(p) for p in list(periods) if p is not None]
+            except Exception:
+                periods = None
+            if not periods:
+                periods = None
+        if period is not None:
+            try:
+                period = int(period)
+            except Exception:
+                period = None
+        return period, periods
+
+    @staticmethod
+    def _compute_supertrend_columns(
+        df: Any,
+        *,
+        length: int,
+        factor: float,
+    ) -> Any:
+        """Compute Supertrend using parameters declared by the strategy."""
+        from core.utils.structure.supertrend import add_supertrend
+
+        return add_supertrend(df, length=length, factor=factor)
+
+    @staticmethod
+    def _strategy_supertrend_params(strategy: Any) -> tuple:
+        """
+        Return strategy ``(supertrend_length, supertrend_factor)``.
+
+        Both attributes are required; a strategy that declares neither does not
+        pay the Supertrend computation cost.
+        """
+        length = getattr(strategy, "supertrend_length", None)
+        factor = getattr(strategy, "supertrend_factor", None)
+        if length is None or factor is None:
+            return None, None
+        try:
+            length = int(length)
+            factor = float(factor)
+        except (TypeError, ValueError):
+            return None, None
+        if length < 1 or factor <= 0:
+            return None, None
+        return length, factor
+
+    @staticmethod
     def _timeframe_to_seconds(tf: str) -> int:
         raw = str(tf or "").strip().lower()
         if not raw:
             return 60
+        try:
+            from core.data.candle_aggregator import TIMEFRAME_SECONDS
+
+            if raw in TIMEFRAME_SECONDS:
+                return int(TIMEFRAME_SECONDS[raw])
+        except Exception:
+            pass
         try:
             return max(60, int(raw) * 60)
         except Exception:
@@ -314,7 +422,42 @@ class IndicatorManager:
                 return max(60, int(raw[:-1]) * 3600)
             except Exception:
                 return 3600
+        if raw.endswith("d"):
+            try:
+                days = int(raw[:-1] or "1")
+            except Exception:
+                days = 1
+            return max(86400, days * 86400)
+        if raw in ("day", "1day"):
+            return 86400
         return 60
+
+    @staticmethod
+    def _strategy_owns_timeframe(strategy: Any, timeframe: str) -> bool:
+        """True when ``timeframe`` is the strategy primary TF or an ``extra_timeframes`` entry."""
+        tf_s = str(timeframe or "").strip()
+        if not tf_s or strategy is None:
+            return False
+        if str(getattr(strategy, "timeframe", "") or "").strip() == tf_s:
+            return True
+        for extra in getattr(strategy, "extra_timeframes", None) or []:
+            if str(extra or "").strip() == tf_s:
+                return True
+        return False
+
+    @classmethod
+    def _resolve_enrich_timeframe(
+        cls, strategy: Any, candle: Dict[str, Any], timeframe: Optional[str] = None
+    ) -> str:
+        """
+        Prefer the closed-bar TF when the strategy owns it (primary or extra_timeframes).
+        This lets live_append write 4h/1d history for strategies whose primary TF is 60.
+        """
+        primary = str(getattr(strategy, "timeframe", "") or "").strip()
+        bar_tf = str(timeframe or candle.get("timeframe") or "").strip()
+        if bar_tf and cls._strategy_owns_timeframe(strategy, bar_tf):
+            return bar_tf
+        return primary
 
     @staticmethod
     def _shared_indicator_signature(strategy: Any) -> str:
@@ -428,6 +571,28 @@ class IndicatorManager:
         out.sort(key=lambda r: r["timestamp"])
         return out
 
+    def _prune_rsi_logged_keys(self) -> None:
+        max_n = int(getattr(self, "_rsi_logged_keys_max", 8000) or 8000)
+        keys = self._rsi_logged_keys
+        if keys is None or len(keys) <= max_n:
+            return
+        # Sets are unordered; drop an arbitrary excess chunk (disk remains source of truth).
+        overflow = len(keys) - max_n
+        for i, key in enumerate(list(keys)):
+            if i >= overflow:
+                break
+            keys.discard(key)
+
+    def _prune_live_persist_fingerprints(self) -> None:
+        max_n = int(getattr(self, "_live_persist_fingerprints_max", 4000) or 4000)
+        fps = self._live_persist_fingerprints
+        if len(fps) <= max_n:
+            return
+        # Drop oldest by IST bar key lexicographic order (YYYY-MM-DD HH:MM sorts well).
+        ordered = sorted(fps.keys(), key=lambda k: k[2] if len(k) > 2 else "")
+        for key in ordered[: len(fps) - max_n]:
+            fps.pop(key, None)
+
     def _hydrate_rsi_session_state_from_disk(
         self, strategy_id: str, symbol: str, tf: str
     ) -> None:
@@ -443,7 +608,9 @@ class IndicatorManager:
             self._rsi_logged_keys,
             self._rsi_seeded_streams,
             log_root=self._rsi_log_root,
+            max_keys=int(getattr(self, "_rsi_logged_keys_max", 8000) or 8000),
         )
+        self._prune_rsi_logged_keys()
         if found <= 0:
             self._rsi_session_hydrated.discard(stream_key)
 
@@ -527,7 +694,7 @@ class IndicatorManager:
         merged = pd.concat([hdf, base], ignore_index=True)
         merged = merged.sort_values("timestamp")
         if str(self._live_exchange or "").upper() == "DELTA":
-            merged = self._sanitize_delta_ohlc_df(merged)
+            merged = self._sanitize_delta_ohlc_df(merged, timeframe=tf)
             # Prefer seeded history OHLC over live-appended rows for the same bar.
             merged = merged.drop_duplicates(subset=["timestamp"], keep="first")
         else:
@@ -707,8 +874,9 @@ class IndicatorManager:
             if abs(delta - tf_sec) <= tol:
                 continue
             if d1 == d2:
-                if strict_nse_index_session and delta > tf_sec * 1.5 and delta < 48 * 3600:
-                    return False, f"intra_session_gap row={i} delta_sec={delta:.0f}"
+                # Missing in-session bars (feed gaps / lunch holes) are common in candle
+                # logs; allow bootstrap so live_append can keep chaining. Reject only
+                # compressed bars (sub-timeframe) that break RSI sequencing.
                 if delta < tf_sec - tol:
                     return False, f"sub_tf_delta row={i} delta_sec={delta:.0f}"
             else:
@@ -743,7 +911,8 @@ class IndicatorManager:
             return
         source = "live_append" if seeded else "historical_seed"
         if seeded:
-            # Persist each bar once, after fractal confirmation lag (not on close + backfill).
+            # Default delay=0 (persist the just-closed bar). RSIBreadAndButter opts into
+            # fractal confirmation lag via ``indicator_persist_delay_bars``.
             delay = self._structure_confirm_delay_bars(strategy)
             persist_idx = len(df) - 1 - delay
             if persist_idx < 0:
@@ -790,6 +959,8 @@ class IndicatorManager:
             )
             if seeded and ist_key and wrote:
                 self._live_persist_fingerprints[(sym_u, tf_s, ist_key)] = fp
+                self._prune_live_persist_fingerprints()
+                self._prune_rsi_logged_keys()
         self._rsi_seeded_streams.add(stream_key)
 
     def _load_today_live_candles(
@@ -856,7 +1027,24 @@ class IndicatorManager:
         if str(self._live_exchange or "").upper() == "DELTA":
             live_df = self._load_today_from_indicator_history(symbol, tf)
         else:
-            live_df = self._load_today_live_candles(symbol, tf, strategy_id=strategy_id)
+            # Prefer today's closed candles; also stitch any log bars after last hist
+            # (covers multi-day downtime when bootstrap came from indicator_history).
+            today_df = self._load_today_live_candles(symbol, tf, strategy_id=strategy_id)
+            hist_ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+            last_hist = hist_ts.max() if len(hist_ts) else pd.NaT
+            tail_df = pd.DataFrame()
+            if not pd.isna(last_hist):
+                all_log = self._load_candles_from_logs(
+                    symbol, tf, tail_rows=500, strategy_id=strategy_id
+                )
+                if all_log is not None and len(all_log) > 0:
+                    ats = pd.to_datetime(all_log["timestamp"], utc=True, errors="coerce")
+                    tail_df = all_log.loc[ats > last_hist].reset_index(drop=True)
+            parts = [p for p in (today_df, tail_df) if p is not None and len(p) > 0]
+            if not parts:
+                return df
+            live_df = pd.concat(parts, ignore_index=True)
+            live_df = live_df.drop_duplicates(subset=["timestamp"], keep="last")
         if live_df is None or len(live_df) == 0:
             return df
 
@@ -864,7 +1052,7 @@ class IndicatorManager:
         hist["timestamp"] = pd.to_datetime(hist["timestamp"], utc=True, errors="coerce")
         hist = hist.dropna(subset=["timestamp"])
 
-        # Live closed-candle log is source of truth for current-day candles.
+        # Closed-candle log is source of truth for bars after bootstrap history.
         merged = hist.set_index("timestamp")
         live = live_df.set_index("timestamp")
         merged.update(live)
@@ -874,19 +1062,24 @@ class IndicatorManager:
         merged = merged.reset_index().sort_values("timestamp")
         merged = merged.drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
         if str(self._live_exchange or "").upper() == "DELTA":
-            merged = self._sanitize_delta_ohlc_df(merged)
+            merged = self._sanitize_delta_ohlc_df(merged, timeframe=tf)
         return merged
 
-    def _finalize_delta_base_df(self, base_state: Dict[str, Any]) -> None:
-        """Re-sanitize rolling OHLC and invalidate indicator cache after bar append."""
+    def _finalize_delta_base_df(
+        self, base_state: Dict[str, Any], *, timeframe: Optional[str] = None
+    ) -> None:
+        """Re-sanitize rolling OHLC (1m/5m only) and bump update_seq after bar append."""
         if str(self._live_exchange or "").upper() != "DELTA":
             return
         df = base_state.get("df")
         if df is None or len(df) == 0:
             return
-        cleaned = self._sanitize_delta_ohlc_df(df)
+        tf = timeframe or base_state.get("timeframe")
+        cleaned = self._sanitize_delta_ohlc_df(df, timeframe=tf)
         base_state["df"] = cleaned
         base_state["update_seq"] = int(base_state.get("update_seq", 0)) + 1
+        if tf:
+            base_state["timeframe"] = str(tf)
 
     @staticmethod
     def _strip_same_day_bars(df: Any) -> Any:
@@ -1043,7 +1236,7 @@ class IndicatorManager:
             df["exchange"] = exchange
         if len(df) > window:
             df = df.iloc[-window:].reset_index(drop=True)
-        df = self._sanitize_delta_ohlc_df(df)
+        df = self._sanitize_delta_ohlc_df(df, timeframe=tf)
 
         boot_ist = dt.datetime.now(IST).isoformat()
         prev_state = self._base_candle_state.get(key) or {}
@@ -1054,6 +1247,7 @@ class IndicatorManager:
             "df": df,
             "last_bucket": prev_state.get("last_bucket") if prev_live else None,
             "window": window,
+            "timeframe": str(tf),
             "bootstrap_source": source,
             "bootstrap_at_ist": boot_ist,
             "update_seq": int(prev_state.get("update_seq", 0)) if prev_live else 0,
@@ -1088,10 +1282,19 @@ class IndicatorManager:
         candle_bucket_fn: Any,
         out_meta: Optional[Dict[str, Any]] = None,
         allow_live_persist: bool = True,
+        timeframe: Optional[str] = None,
     ) -> Dict[str, Any]:
         import pandas as pd
 
-        tf = str(getattr(strategy, "timeframe", "") or "")
+        # Engine passes the closed-bar TF. If this strategy does not own it
+        # (primary or extra_timeframes), skip — never fold HTF OHLC into the
+        # primary stream (e.g. 4h into 60).
+        if timeframe is not None:
+            bar_tf = str(timeframe or "").strip()
+            if bar_tf and not self._strategy_owns_timeframe(strategy, bar_tf):
+                return dict(candle)
+
+        tf = self._resolve_enrich_timeframe(strategy, candle, timeframe)
         if not tf:
             return dict(candle)
 
@@ -1113,7 +1316,7 @@ class IndicatorManager:
             return dict(candle)
 
         if str(exchange).upper() == "DELTA" and not base_state.get("delta_resanitized"):
-            self._finalize_delta_base_df(base_state)
+            self._finalize_delta_base_df(base_state, timeframe=tf)
             base_state["delta_resanitized"] = True
             base_df = base_state.get("df")
 
@@ -1139,7 +1342,7 @@ class IndicatorManager:
                 "symbol": symbol,
                 "exchange": exchange,
             }
-            if str(exchange).upper() == "DELTA":
+            if str(exchange).upper() == "DELTA" and self._should_sanitize_delta_ohlc(tf):
                 ref_close = None
                 if len(base_df) > 0:
                     try:
@@ -1254,7 +1457,7 @@ class IndicatorManager:
                     out_meta["bar_closed_for_append"] = True
 
             if str(exchange).upper() == "DELTA":
-                self._finalize_delta_base_df(base_state)
+                self._finalize_delta_base_df(base_state, timeframe=tf)
                 base_df = base_state.get("df")
 
         strategy_key = self._key_strategy_symbol_tf(strategy, symbol, tf)
@@ -1274,17 +1477,24 @@ class IndicatorManager:
                 return dict(candle)
             df = df.copy()
             shared_sig = self._shared_indicator_signature(strategy)
-            cache_key = (symbol, tf, shared_sig, base_sig) if shared_sig else None
+            # Stable key (no update_seq) — one DF slot per shared stream.
+            cache_key = (symbol, tf, shared_sig) if shared_sig else None
             cache_hit = False
             if cache_key is not None:
-                cached_df = self._indicator_cache.get(cache_key)
-                if cached_df is not None:
-                    df = cached_df.copy()
+                cached_entry = self._indicator_cache.get(cache_key)
+                if (
+                    cached_entry is not None
+                    and isinstance(cached_entry, tuple)
+                    and len(cached_entry) == 2
+                    and cached_entry[0] == base_sig
+                    and cached_entry[1] is not None
+                ):
+                    df = cached_entry[1].copy()
                     cache_hit = True
 
             if not cache_hit:
                 compute_start = time.time()
-                work_df = self._sanitize_delta_ohlc_df(df.copy())
+                work_df = self._sanitize_delta_ohlc_df(df.copy(), timeframe=tf)
                 merge_cap = max(400, int(window or 0))
                 if self._strategy_uses_indicator_history(strategy):
                     work_df = self._merge_rsi_history_into_base_df(
@@ -1301,6 +1511,28 @@ class IndicatorManager:
                     work_df = strategy.prepare_indicators(work_df)
                 except Exception:
                     pass
+                sma_period, sma_periods = self._strategy_sma_lengths(strategy)
+                if sma_period is not None or sma_periods is not None:
+                    try:
+                        work_df = self._compute_sma_columns(
+                            work_df,
+                            period=sma_period,
+                            periods=sma_periods,
+                        )
+                    except Exception:
+                        pass
+                supertrend_length, supertrend_factor = (
+                    self._strategy_supertrend_params(strategy)
+                )
+                if supertrend_length is not None and supertrend_factor is not None:
+                    try:
+                        work_df = self._compute_supertrend_columns(
+                            work_df,
+                            length=supertrend_length,
+                            factor=supertrend_factor,
+                        )
+                    except Exception:
+                        pass
                 df = work_df
                 compute_ms = (time.time() - compute_start) * 1000.0
                 if self.engine_logger:
@@ -1316,7 +1548,7 @@ class IndicatorManager:
                     except Exception:
                         pass
                 if cache_key is not None:
-                    self._indicator_cache[cache_key] = df.copy()
+                    self._indicator_cache[cache_key] = (base_sig, df.copy())
             elif self.engine_logger:
                 try:
                     self.engine_logger.latency(

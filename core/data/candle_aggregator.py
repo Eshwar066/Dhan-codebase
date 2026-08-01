@@ -32,10 +32,16 @@ TIMEFRAME_SECONDS = {
     "30": 1800,
     "1h": 3600,
     "60": 3600,
+    "60m": 3600,
     "2h": 7200,
     "2": 7200,
+    # Strategy timeframe strings use minutes ("120"), not only "2h".
+    "120": 7200,
+    "120m": 7200,
     "4h": 14400,
     "4": 14400,
+    "240": 14400,
+    "240m": 14400,
     "1d": 86400,
     "d": 86400,
     "3m": 180,
@@ -59,10 +65,34 @@ MCX_DEFAULT_SESSION_END_SEC = (23 * 3600) + (30 * 60)
 
 
 def _resolution_to_seconds(resolution: Optional[str]) -> int:
+    """
+    Map engine timeframe labels to seconds.
+
+    Accepts aliases like ``60`` / ``1h`` / ``120`` / ``2h``. Bare integer strings
+    are treated as **minutes** (so ``\"120\"`` → 7200). Unknown labels must not
+    silently fall back to 1m — that made NiftySMA9Weekly emit every 1-minute bar
+    as ``tf=120``.
+    """
     if resolution is None:
         return SECONDS_1M
     r = str(resolution).strip().lower()
-    return TIMEFRAME_SECONDS.get(r, TIMEFRAME_SECONDS.get("1m", 60))
+    if not r:
+        return SECONDS_1M
+    if r in TIMEFRAME_SECONDS:
+        return TIMEFRAME_SECONDS[r]
+    if r.endswith("m") and r[:-1].isdigit():
+        minutes = int(r[:-1])
+        if minutes > 0:
+            return minutes * 60
+    if r.endswith("h") and r[:-1].isdigit():
+        hours = int(r[:-1])
+        if hours > 0:
+            return hours * 3600
+    if r.isdigit():
+        minutes = int(r)
+        if minutes > 0:
+            return minutes * 60
+    return TIMEFRAME_SECONDS.get("1m", 60)
 
 
 def _bucket_ts(

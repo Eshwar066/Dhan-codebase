@@ -39,6 +39,47 @@ from core.utils.lag_diag import (
 
 logger = logging.getLogger(__name__)
 
+# Keep only top-of-book depth in RAM — full L2 messages are large and arrive often.
+_L2_DEPTH_LEVELS = 5
+_L2_MAX_SYMBOLS = 64
+
+
+def _slim_l2_side(levels: Any, *, n: int = _L2_DEPTH_LEVELS) -> List[Any]:
+    if not isinstance(levels, list):
+        return []
+    return levels[:n]
+
+
+def _slim_l2_orderbook(msg: Dict[str, Any]) -> Dict[str, Any]:
+    """Store a compact L2 snapshot (symbol + top N bids/asks only)."""
+    if not isinstance(msg, dict):
+        return {}
+    out: Dict[str, Any] = {
+        "type": msg.get("type") or "l2_orderbook",
+        "symbol": msg.get("symbol"),
+        "timestamp": msg.get("timestamp") or msg.get("ts"),
+    }
+    for bid_key in ("bids", "buy"):
+        if bid_key in msg:
+            out["bids"] = _slim_l2_side(msg.get(bid_key))
+            break
+    for ask_key in ("asks", "sell"):
+        if ask_key in msg:
+            out["asks"] = _slim_l2_side(msg.get(ask_key))
+            break
+    return out
+
+
+def _cap_l2_map(store: Dict[str, Dict], *, max_symbols: int = _L2_MAX_SYMBOLS) -> None:
+    if len(store) <= max_symbols:
+        return
+    # Drop arbitrary excess (option symbols accumulate; underlyings re-subscribe).
+    overflow = len(store) - max_symbols
+    for i, key in enumerate(list(store.keys())):
+        if i >= overflow:
+            break
+        store.pop(key, None)
+
 
 def _is_delta_ticker_message(msg: dict) -> bool:
     """
@@ -631,7 +672,8 @@ class DeltaWebSocket:
             sym = msg.get("symbol")
             if sym:
                 with self._lock:
-                    self._last_l2[sym] = msg
+                    self._last_l2[sym] = _slim_l2_orderbook(msg)
+                    _cap_l2_map(self._last_l2)
             if self.on_message:
                 self.on_message(msg)
             return
@@ -640,7 +682,8 @@ class DeltaWebSocket:
             sym = msg.get("symbol")
             if sym:
                 with self._lock:
-                    self._last_orderbook_l2[sym] = msg
+                    self._last_orderbook_l2[sym] = _slim_l2_orderbook(msg)
+                    _cap_l2_map(self._last_orderbook_l2)
             if self.on_message:
                 self.on_message(msg)
             return

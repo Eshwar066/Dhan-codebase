@@ -77,6 +77,18 @@ class IndiaMktMixins:
         """Dhan option chain / rolling-option expiry flag (``MONTH`` or ``WEEK``)."""
         return str(getattr(self, "dhan_expiry_flag", "MONTH") or "MONTH")
 
+    def _option_data_interval(self) -> str:
+        """
+        Interval for Dhan option OHLC / expired-chain APIs.
+
+        Must be a Dhan-native bar size (1/5/15/25/60). Strategies on non-native
+        underlyings TFs (e.g. 120) should set ``option_chain_interval``.
+        """
+        raw = getattr(self, "option_chain_interval", None)
+        if raw is not None and str(raw).strip():
+            return str(raw).strip()
+        return str(self.timeframe)
+
     @staticmethod
     def _order_qty_in_lots(inst, qty: Any) -> int:
         """Normalize qty to whole lots: values ≥ lot_size that divide evenly are treated as units."""
@@ -314,7 +326,7 @@ class IndiaMktMixins:
 
         params = {
             "exchange": ctx.exchange,
-            "interval": self.timeframe,
+            "interval": self._option_data_interval(),
             "expiry_code": expiry,
             "strike": [str(int(float(strike)))],
             "option_type": option_type,
@@ -342,7 +354,22 @@ class IndiaMktMixins:
             if not filt.empty:
                 df = filt
             elif len(df) > 1:
-                return None
+                # Non-native strategy TF (e.g. 120) vs option bars (e.g. 60): use
+                # the latest option bar at or before the candle wall-clock.
+                ts_c = pd.Timestamp(candle["timestamp"])
+                if ts_c.tzinfo is None:
+                    ts_c = ts_c.tz_localize(IST)
+                else:
+                    ts_c = ts_c.tz_convert(IST)
+                chain_ts = pd.to_datetime(df["datetime"])
+                if getattr(chain_ts.dt, "tz", None) is not None:
+                    chain_ts = chain_ts.dt.tz_convert(IST)
+                else:
+                    chain_ts = chain_ts.dt.tz_localize(IST)
+                before = df.loc[chain_ts <= ts_c]
+                if before.empty:
+                    return None
+                df = before.iloc[[-1]]
 
         otp = option_type.upper()
         if otp in ("PUT", "PE"):
@@ -707,8 +734,9 @@ class IndiaMktMixins:
         out["abs_delta"] = d_abs
         return out
 
-    def fetch_option_chain(self, candle, ctx, option_type):
+    def fetch_option_chain(self, candle, ctx, option_type, expiry_pref=None):
         ocs = ctx.option_chain_service
+        pref = str(expiry_pref or getattr(self, "expiryType", "") or "").strip().upper()
 
         if self.api == "NSE":
             ctx.expiry_list = ocs.get_expiries(
@@ -716,7 +744,7 @@ class IndiaMktMixins:
             )
 
         rollover = getattr(self, "dhan_monthly_rollover_after_calendar_day", None)
-        if str(getattr(self, "expiryType", "") or "").upper() != "MONTHLY":
+        if pref != "MONTHLY":
             rollover = None
         weekly_wd = getattr(self, "weekly_expiry_weekday", None)
         days_before_exp = getattr(self, "dhan_monthly_rollover_days_before_expiry", None)
@@ -725,7 +753,7 @@ class IndiaMktMixins:
             expiry_list=ctx.get_expiry_list(),
             trade_date=ctx.timestamp,
             api=self.api,
-            expiry_pref=self.expiryType,
+            expiry_pref=pref,
             dhan_calendar_rollover_day=rollover,
             weekly_expiry_weekday=weekly_wd,
             days_before_expiry_rollover=days_before_exp,
@@ -755,6 +783,49 @@ class IndiaMktMixins:
             return pd.Timestamp(exp).date()
         except (TypeError, ValueError):
             return None
+
+    def _selected_expiry_calendar_date(self, ctx) -> Optional[date]:
+        sel = getattr(ctx, "selected_expiry", None)
+        if sel is None:
+            return None
+        if ExpiryResolver.is_calendar_expiry(sel):
+            return ExpiryResolver.as_calendar_date(sel)
+        try:
+            trade_d = pd.Timestamp(getattr(ctx, "timestamp")).date()
+            return ExpiryResolver.dhan_expiry_index_to_date(trade_d, sel)
+        except (TypeError, ValueError):
+            return None
+
+    def _can_reuse_cached_option_chain(self, ctx, expiry_pref=None) -> bool:
+        """
+        Reuse DHAN chain cache when safe.
+
+        - Explicit ``expiry_pref`` (e.g. QUARTERLY override): never reuse — force fresh fetch.
+        - Default callers (``expiry_pref is None``): reuse non-empty cache when expiry
+          matches, or when expiry cannot be compared (preserves prior optimization).
+        """
+        if expiry_pref is not None:
+            return False
+        cached = getattr(self, "_last_option_chain", None)
+        if cached is None:
+            return False
+        if isinstance(cached, dict):
+            inner = cached.get("chain")
+            if isinstance(inner, pd.DataFrame):
+                if inner.empty:
+                    return False
+            elif not cached:
+                return False
+        elif isinstance(cached, pd.DataFrame):
+            if cached.empty:
+                return False
+        else:
+            return False
+        cached_exp = self._expiry_from_option_chain(cached)
+        want_exp = self._selected_expiry_calendar_date(ctx)
+        if cached_exp is None or want_exp is None:
+            return True
+        return cached_exp == want_exp
 
     @staticmethod
     def _coerce_backtest_option_chain_df(
@@ -969,7 +1040,7 @@ class IndiaMktMixins:
             return None
         params = {
             "exchange": ctx.exchange,
-            "interval": self.timeframe,
+            "interval": self._option_data_interval(),
             "expiry_code": ctx.selected_expiry,
             "instrument": "OPTIDX",
             "expiry_flag": self._dhan_expiry_flag(),
@@ -1019,8 +1090,11 @@ class IndiaMktMixins:
         max_prem=400,
         delta_min=None,
         delta_max=None,
+        expiry_pref=None,
     ):
-        otm_strikes = self.fetch_option_chain(candle, ctx, option_type)
+        otm_strikes = self.fetch_option_chain(
+            candle, ctx, option_type, expiry_pref=expiry_pref
+        )
 
         if not otm_strikes:
             return None
@@ -1052,11 +1126,16 @@ class IndiaMktMixins:
         if strike_param and isinstance(strike_param[0], (int, float)):
             strike_param = [str(int(s)) for s in otm_strikes]
 
-        if snapshot_mode and str(self.api or "").upper() == "DHAN":
+        if (
+            snapshot_mode
+            and str(self.api or "").upper() == "DHAN"
+            and RUN_MODE != RunMode.BACKTEST
+        ):
             # Log ±60 strikes around ATM from Dhan (not the 4-strike OTM ladder).
+            # Backtest historical chain requires strike/securityId — use strike path below.
             params = {
                 "exchange": ctx.exchange,
-                "interval": self.timeframe,
+                "interval": self._option_data_interval(),
                 "expiry_code": ctx.selected_expiry,
                 "instrument": "OPTIDX",
                 "expiry_flag": self._dhan_expiry_flag(),
@@ -1066,7 +1145,7 @@ class IndiaMktMixins:
         else:
             params = {
                 "exchange": ctx.exchange,
-                "interval": self.timeframe,
+                "interval": self._option_data_interval(),
                 "expiry_code": ctx.selected_expiry,
                 "strike": strike_param,
                 "option_type": option_type,
@@ -1078,14 +1157,11 @@ class IndiaMktMixins:
             if isinstance(extra_snapshot_params, dict) and extra_snapshot_params:
                 params.update(extra_snapshot_params)
 
-        reuse_cached_chain = False
-        if not snapshot_mode and str(self.api or "").upper() == "DHAN":
-            cached = getattr(self, "_last_option_chain", None)
-            if isinstance(cached, dict):
-                inner = cached.get("chain")
-                reuse_cached_chain = isinstance(inner, pd.DataFrame) and not inner.empty
-            elif isinstance(cached, pd.DataFrame):
-                reuse_cached_chain = not cached.empty
+        reuse_cached_chain = (
+            not snapshot_mode
+            and str(self.api or "").upper() == "DHAN"
+            and self._can_reuse_cached_option_chain(ctx, expiry_pref)
+        )
 
         if reuse_cached_chain:
             chain = getattr(self, "_last_option_chain", None)
@@ -1483,9 +1559,16 @@ class IndiaMktMixins:
         )
 
     def calculate_hedge_strike(self, sold_strike, option_type):
-        if option_type == "CALL":
-            return int(round((sold_strike * 1.02) / 500) * 500)
-        return int(round((sold_strike * 0.98) / 500) * 500)
+        step = 500
+        sold = int(sold_strike)
+        opt = str(option_type or "").upper()
+        if opt in ("CE", "CALL"):
+            target = sold * 1.02
+        elif opt in ("PE", "PUT"):
+            target = sold * 0.98
+        else:
+            target = sold * 1.02
+        return int(round(target / step) * step)
 
     def resolve_hedge_entry_price(
         self,
@@ -1544,7 +1627,7 @@ class IndiaMktMixins:
             hedge_expiry,
             parent_sell_intent.instrument.option_type,
             hedge_strike,
-            prefer_monthly=True,
+            prefer_monthly=bool(getattr(self, "hedge_prefer_monthly", True)),
         )
         if inst is None:
             return None
@@ -1613,15 +1696,19 @@ class IndiaMktMixins:
         )
 
         if price is None:
-            print(
-                f"⚠️ No exit price for hedge {hedge.instrument.symbol} at {candle['timestamp']}"
-            )
-            return None
+            if RUN_MODE == RunMode.BACKTEST:
+                print(
+                    f"⚠️ No exit price for hedge {hedge.instrument.symbol} at {candle['timestamp']}"
+                )
+                return None
+            # Live: engine resolves executable price from depth at enqueue time.
+            price = 0
 
+        qty_lots = self._order_qty_in_lots(hedge.instrument, abs(int(hedge.net_qty or 0)))
         return self.create_order_intent(
             inst=hedge.instrument,
             side="BUY" if hedge.net_qty < 0 else "SELL",
-            qty=abs(hedge.net_qty),
+            qty=qty_lots,
             price=price,
             order_type="LIMIT",
             strategy=self.name,
@@ -1644,12 +1731,19 @@ class IndiaMktMixins:
         if expiry <= current:
             return False
 
-        target = date(current.year, current.month, 18)
-        if target.weekday() == 5:
-            target -= timedelta(days=1)
-        elif target.weekday() == 6:
-            target -= timedelta(days=2)
+        from core.utils.session.session_manager import SessionManager
 
+        exchange = (
+            getattr(self, "session_exchange", None)
+            or getattr(self, "market_exchange", None)
+            or "INDEX"
+        )
+        target = SessionManager.hedge_rollover_target_date(
+            current.year,
+            current.month,
+            rollover_day=18,
+            exchange=str(exchange),
+        )
         return current >= target
 
     def on_candle_rollover(self, open_positions, candle, ctx):
@@ -1679,13 +1773,21 @@ class IndiaMktMixins:
             if roll_key in self.rolled_hedges:
                 continue
 
+            # Buy next-month hedge first, then exit current-month hedge.
+            # Exiting first can spike margin (short MAIN briefly unhedged).
+            new_hedge = self.create_hedge_intent(parent, candle, ctx)
+            if not new_hedge:
+                logger.warning(
+                    "Hedge rollover skipped (no new hedge) structure=%s ts=%s",
+                    hedge.structure_id,
+                    ts,
+                )
+                continue
+
+            intents.append(new_hedge)
             hedge_exit = self.create_hedge_exit_intent(parent, candle, ctx)
             if hedge_exit:
                 intents.append(hedge_exit)
-
-            new_hedge = self.create_hedge_intent(parent, candle, ctx)
-            if new_hedge:
-                intents.append(new_hedge)
 
             self.rolled_hedges.add(roll_key)
 

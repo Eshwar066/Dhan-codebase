@@ -22,11 +22,11 @@ from dotenv import load_dotenv
 logger = logging.getLogger(__name__)
 
 # Temporary headroom while main-loop drain/stall ordering is improved (see utils/cursor.md).
-TICK_QUEUE_MAXSIZE = 500000
+TICK_QUEUE_MAXSIZE = 5000
 
 from run.config import RunMode
 from run.engine_config import EngineConfig, configure_process_logging
-from core.strategies.registry import STRATEGY_MAP
+from core.strategies.registry import get_strategy_config, resolve_registry_key
 from core.engine.base_engine import BaseEngine
 from core.engine.backtest_engine import BacktestEngine
 from core.engine.live_engine import LiveEngine
@@ -113,7 +113,7 @@ class EngineFactory:
         """
         Build BacktestEngine with isolated stack for config.broker_name.
         """
-        cfg = STRATEGY_MAP.get(config.strategy_name)
+        cfg = get_strategy_config(config.strategy_name)
         if not cfg:
             raise ValueError(f"Unknown strategy: {config.strategy_name}")
         if config.run_mode.value not in [m.value for m in cfg["allowed_modes"]]:
@@ -201,7 +201,7 @@ class EngineFactory:
         LIVE + Delta: DeltaDataProvider, DeltaBroker, DeltaWebSocketFeed when credentials set.
         """
         load_dotenv()
-        cfg = STRATEGY_MAP.get(config.strategy_name)
+        cfg = get_strategy_config(config.strategy_name)
         if not cfg:
             raise ValueError(f"Unknown strategy: {config.strategy_name}")
         if config.run_mode.value not in [m.value for m in cfg["allowed_modes"]]:
@@ -217,7 +217,7 @@ class EngineFactory:
         for strategy_name in extra_names:
             if strategy_name == config.strategy_name:
                 continue
-            extra_cfg = STRATEGY_MAP.get(strategy_name)
+            extra_cfg = get_strategy_config(strategy_name)
             if not extra_cfg:
                 raise ValueError(f"Unknown strategy in strategy_names: {strategy_name}")
             if config.run_mode.value not in [m.value for m in extra_cfg["allowed_modes"]]:
@@ -283,6 +283,16 @@ class EngineFactory:
             known_strategies=_loaded_strategies,
             debug_mode=bool(getattr(config, "debug_mode", False)),
         )
+        event_blackout_guard = None
+        if str(getattr(config, "broker_name", "") or "").upper() == "DELTA":
+            from core.utils.calendar.economic_events import EventBlackoutGuard
+
+            event_blackout_guard = EventBlackoutGuard.from_config(
+                getattr(config, "event_blackout", None),
+                venue=config.broker_name,
+                engine_logger=engine_logger,
+                base_dir=getattr(config, "base_dir", None),
+            )
         risk_manager = RiskManager(
             position_manager=position_manager,
             capital=config.capital,
@@ -293,6 +303,7 @@ class EngineFactory:
             or 10000000,
             cooldown_seconds=getattr(config, "cooldown_seconds", None) or 5,
             engine_logger=engine_logger,
+            event_blackout_guard=event_blackout_guard,
         )
 
         # ---------- Instruments (needed by OrderRouter) ----------
@@ -429,7 +440,7 @@ class EngineFactory:
                         engine_logger=engine_logger,
                         telegram_alert=telegram_alert,
                     )
-                    if LiveEngine.needs_candle_aggregator(strategies, eval_modes):
+                    if LiveEngine.needs_tick_queue(strategies, eval_modes):
                         tick_queue = queue.Queue(maxsize=TICK_QUEUE_MAXSIZE)
                         candle_queue = queue.Queue(maxsize=5000)
                         candle_aggregator = CandleAggregator(
@@ -489,7 +500,7 @@ class EngineFactory:
                             config, "market_ws_stall_timeout_seconds", None
                         ),
                     )
-                    if LiveEngine.needs_candle_aggregator(strategies, eval_modes):
+                    if LiveEngine.needs_tick_queue(strategies, eval_modes):
                         tick_queue = queue.Queue(maxsize=TICK_QUEUE_MAXSIZE)
                         if is_nse_like:
                             candle_aggregator = CandleAggregator(
@@ -572,6 +583,8 @@ class EngineFactory:
                 config, "account_circuit_breaker_threshold", 5
             ),
             feed_stall_seconds=getattr(config, "feed_stall_seconds", 60.0),
+            execution_validator=getattr(config, "execution_validator", None),
+            event_blackout_guard=event_blackout_guard,
         )
 
     @staticmethod
@@ -635,7 +648,7 @@ class EngineFactory:
         """
         if config.broker_name != "DHAN":
             return None
-        cfg = STRATEGY_MAP.get(config.strategy_name)
+        cfg = get_strategy_config(config.strategy_name)
         if not cfg or cfg.get("instrument") != "EQUITY":
             return None
         if EquityUniverseService is None:

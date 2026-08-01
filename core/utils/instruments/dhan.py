@@ -59,6 +59,8 @@ class DhanInstrumentStore(BaseInstrumentStore):
 
     INSTRUMENT_EXCHANGE = {
         # Strategy/config uses INDEX for Nifty/BankNifty spot feed; scrip master rows use NSE for F&O.
+        # Engine venue is often "DHAN" — map to NSE so overnight reconcile / GTT adopt resolve.
+        "DHAN": "NSE",
         "INDEX": "NSE",
         "NSE": "NSE",
         "BSE": "BSE",
@@ -218,6 +220,10 @@ class DhanInstrumentStore(BaseInstrumentStore):
             return pd.DataFrame()
         exp_dt = self._sem_expiry_to_date(expiry)
         if exp_dt is None:
+            # Exact SEM_CUSTOM_SYMBOL / SEM_TRADING_SYMBOL hits are already unique;
+            # accept the single row when caller has no expiry (broker place-order name).
+            if len(df) == 1:
+                return df
             return pd.DataFrame()
 
         def _row_expiry(row) -> Optional[date]:
@@ -324,8 +330,19 @@ class DhanInstrumentStore(BaseInstrumentStore):
     ) -> Optional[Instrument]:
         ex = self.INSTRUMENT_EXCHANGE.get(exchange, exchange)
 
+        exp_dt = self._sem_expiry_to_date(expiry)
+        if exp_dt is None:
+            exp_dt = ExpiryResolver.parse_compact_trading_symbol_expiry(trading_symbol)
+        if exp_dt is None:
+            space = ExpiryResolver.parse_dhan_space_option_symbol(trading_symbol)
+            if space is not None:
+                _root, exp_dt, space_strike, space_opt = space
+                if strike is None:
+                    strike = space_strike
+                if option_type is None:
+                    option_type = space_opt
+
         if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
-            exp_dt = self._sem_expiry_to_date(expiry)
             root = self._underlying_root_from_option_trading_symbol(trading_symbol)
             lookup_symbols: list[str] = [str(trading_symbol).strip()]
             if exp_dt is not None and root:
@@ -338,6 +355,11 @@ class DhanInstrumentStore(BaseInstrumentStore):
                     lookup_symbols.append(
                         ExpiryResolver.build_option_symbol(
                             root, exp_dt, strike, option_type, include_year=True
+                        )
+                    )
+                    lookup_symbols.append(
+                        ExpiryResolver.build_option_symbol(
+                            root, exp_dt, strike, option_type, include_year=False
                         )
                     )
                 except (TypeError, ValueError):
@@ -361,7 +383,7 @@ class DhanInstrumentStore(BaseInstrumentStore):
                 if hit.empty:
                     continue
                 narrowed = self._pick_option_row_for_expiry(
-                    hit, expiry, prefer_monthly=prefer_monthly
+                    hit, exp_dt, prefer_monthly=prefer_monthly
                 )
                 if not narrowed.empty:
                     df = narrowed
@@ -371,7 +393,7 @@ class DhanInstrumentStore(BaseInstrumentStore):
                 df = self._resolve_option_row_fallback(
                     ex,
                     trading_symbol,
-                    expiry,
+                    exp_dt,
                     option_type,
                     strike,
                     prefer_monthly=prefer_monthly,

@@ -1,0 +1,40 @@
+id: Futures_EMA_Momentum
+implementation:
+  module: core.strategies.Futures.Futures_EMA_Momentum.Futures_EMA_Momentum
+  class: FuturesEMAMomentum
+instrument: FUTURE
+allowed_modes:
+- BACKTEST
+- PAPER
+- LIVE
+broker:
+  venue: DELTA
+  api: DELTA
+  delta:
+    india: true
+    testnet: false
+    leverage: 1
+symbols:
+- BTCUSD
+exchange: NSE
+timeframe: '60'
+schedule:
+  eval_mode: live_feed
+data:
+  default:
+    data: {}
+profile:
+  live:
+    exchange: INDEX
+    sector: 'YES'
+  backtest:
+    start_date: '2024-09-01'
+    end_date: '2026-03-13'
+    timeframe: '60'
+    exchange: INDEX
+    sector: 'YES'
+dependencies: {}
+documentation:
+  title: Futures EMA Momentum
+  overview: Delta crypto futures EMA momentum.
+  run_command: python -m run.main --engine-id delta_futures_ema_momentum

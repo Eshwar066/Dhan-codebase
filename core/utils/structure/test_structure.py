@@ -73,8 +73,42 @@ def test_pipeline_liquidity_can_disable() -> None:
     assert "liq_sweep_bull" not in df.columns
 
 
+def test_add_sma_strategy_defined_length() -> None:
+    from core.utils.structure import add_sma, sma_column_names
+
+    df = _sample_ohlc(80)
+    out = add_sma(df, period=20)
+    assert "sma_20" in out.columns
+    assert out["sma_20"].iloc[19:].notna().all()
+    assert out["sma_20"].iloc[:19].isna().all()
+
+    multi = add_sma(_sample_ohlc(80), periods=[9, 21])
+    assert sma_column_names([9, 21]) == ["sma_9", "sma_21"]
+    assert "sma_9" in multi.columns and "sma_21" in multi.columns
+    custom = add_sma(_sample_ohlc(40), period=10, column="sma_fast")
+    assert "sma_fast" in custom.columns
+
+
+def test_add_supertrend_strategy_defined_length_and_factor() -> None:
+    from core.utils.structure import add_supertrend, supertrend_column_names
+
+    df = _sample_ohlc(100)
+    out = add_supertrend(df, length=10, factor=3.0)
+    for column in supertrend_column_names():
+        assert column in out.columns, column
+    assert out["supertrend"].iloc[:9].isna().all()
+    assert out["supertrend"].iloc[9:].notna().all()
+    assert set(out["supertrend_direction"].dropna().unique()).issubset({-1.0, 1.0})
+    assert (
+        out["supertrend_is_bullish"].dropna().astype(bool)
+        == (out["supertrend_direction"].dropna() > 0)
+    ).all()
+
+
 if __name__ == "__main__":
     test_pipeline_runs_and_columns()
     test_liquidity_sweep_detects_pdh_wick()
     test_pipeline_liquidity_can_disable()
+    test_add_sma_strategy_defined_length()
+    test_add_supertrend_strategy_defined_length_and_factor()
     print("ok")

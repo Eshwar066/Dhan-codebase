@@ -77,14 +77,27 @@ class SimulatedBroker(BaseBroker):
             )
             strat = getattr(intent, "strategy", None) or "GLOBAL"
             side_u = str(getattr(intent, "side", "") or "").upper()
-            # Short option cover: BUY SL when premium >= trigger. Long exit: SELL SL when premium <= trigger.
-            trigger_when = "lte" if side_u == "SELL" else "gte"
+            extras = getattr(intent, "metadata_extras", None) or {}
+            if not isinstance(extras, dict):
+                extras = {}
+            # Spot-index SL (e.g. SuperTrend trail): compare against underlying, not option LTP.
+            if str(extras.get("stop_trigger_method") or "").lower() == "spot_price":
+                direction = int(extras.get("direction") or 0)
+                trigger_when = "lte" if direction > 0 else "gte"
+                trigger_symbol = str(
+                    extras.get("trigger_symbol") or getattr(intent, "symbol", "") or ""
+                ).upper() or "BTCUSD"
+            else:
+                # Short option cover: BUY SL when premium >= trigger. Long exit: SELL SL when premium <= trigger.
+                trigger_when = "lte" if side_u == "SELL" else "gte"
+                trigger_symbol = instrument.trading_symbol
             self._pending_sl[stid] = {
                 "intent": intent,
                 "trigger_price": trig,
                 "instrument": instrument,
                 "strategy": strat,
                 "trigger_when": trigger_when,
+                "trigger_symbol": trigger_symbol,
             }
             ts = getattr(intent, "candle_ts", None)
             ts_s = (
@@ -232,6 +245,51 @@ class SimulatedBroker(BaseBroker):
             except Exception:
                 pass
 
+    def update_pending_sl_trigger(
+        self, structure_id: str, new_stop_price: float
+    ) -> bool:
+        """Trail a resting simulated MAIN_SL trigger price."""
+        rec = self._pending_sl.get(str(structure_id))
+        if not rec:
+            return False
+        try:
+            trig = float(new_stop_price)
+        except (TypeError, ValueError):
+            return False
+        if trig <= 0:
+            return False
+        rec["trigger_price"] = trig
+        intent = rec.get("intent")
+        if intent is not None and self.intent_store and getattr(intent, "intent_id", None):
+            try:
+                store_rec = self.intent_store.get(intent.intent_id) or {}
+                payload = dict(store_rec.get("payload") or {})
+                payload["trigger_price"] = trig
+                payload["price"] = trig
+                store_rec["payload"] = payload
+            except Exception:
+                pass
+        return True
+
+    def update_order_stop_price(
+        self,
+        product_id: int,
+        order_id: str,
+        new_stop_price: float,
+        *,
+        size: int,
+    ) -> bool:
+        """Paper/backtest path: update resting MAIN_SL by structure via order id lookup."""
+        for stid, rec in self._pending_sl.items():
+            intent = rec.get("intent")
+            if str(getattr(intent, "intent_id", "") or "") == str(order_id):
+                return self.update_pending_sl_trigger(stid, new_stop_price)
+        # Fallback: only one pending SL — update it.
+        if len(self._pending_sl) == 1:
+            stid = next(iter(self._pending_sl))
+            return self.update_pending_sl_trigger(stid, new_stop_price)
+        return False
+
     def evaluate_pending_stops(
         self,
         order_router: Any,
@@ -277,8 +335,10 @@ class SimulatedBroker(BaseBroker):
             return
         for stid, rec in list(book.items()):
             inst = rec["instrument"]
-            sym = inst.trading_symbol
+            sym = str(rec.get("trigger_symbol") or inst.trading_symbol or "")
             ltp = price_map.get(sym)
+            if ltp is None and sym:
+                ltp = price_map.get(sym.upper())
             if ltp is None:
                 continue
             trig = float(rec["trigger_price"])

@@ -1,0 +1,77 @@
+id: BTCZeroDTE
+implementation:
+  module: core.strategies.crypto.BTCZeroDteThreeFifteen.BTCZeroDTE
+  class: BTCZeroDTE
+instrument: OPTION
+allowed_modes:
+- BACKTEST
+- PAPER
+- LIVE
+broker:
+  venue: DELTA
+  api: DELTA
+  delta:
+    india: true
+    testnet: false
+    leverage: 10
+symbols:
+- BTCUSD
+- ETHUSD
+exchange: NSE
+timeframe: null
+schedule:
+  eval_mode: scheduled
+  times:
+  - '15:15'
+  - '15:30'
+  - '17:15'
+backtest_timeframe: '5'
+data:
+  default:
+    data: {}
+profile:
+  live:
+    exchange: DELTA
+    sector: 'YES'
+  backtest:
+    start_date: '2026-02-01'
+    end_date: '2026-02-28'
+    timeframe: '5'
+    exchange: DELTA
+    sector: 'YES'
+dependencies:
+  mixins:
+  - IndiaMktMixins
+  - DeltaMktMixins
+  required_context:
+  - option_chain
+  expiry_type: Daily
+  meta_key: btc_zero_dte
+documentation:
+  title: BTC/ETH Zero DTE
+  overview: >
+    Three independently configurable Delta entries: BTC premium-band and BTC OTM2
+    at 15:15, then ETH OTM2 at 15:30. Each leg has a 100% stop. SL re-entry at cost
+    is declared via reentry_at_cost and executed by OMS ReentryAtCostBook.
+  rules: |
+    - 15:15 IST: BTC premium-band CE + PE (target ~$100)
+    - 15:15 IST: BTC OTM2 CE + PE
+    - 15:30 IST: ETH OTM2 CE + PE
+    - After MAIN fill: broker SL at 2x entry premium (100% stop)
+    - Declare reentry_at_cost on entry meta; OMS polls every 5m until expiry
+    - Once that strike is open again, OMS stops the retry
+    - One same-contract re-entry per leg
+    - 17:15 IST: exit all remaining MAIN positions
+  run_command: python -m run.main --engine-id delta_engine_one
+  generate_readme: false
+subscriptions:
+  BarClosed: false
+  ScheduledSlot:
+    enabled: true
+    symbols:
+    - BTCUSD
+    - ETHUSD
+execution:
+  bracket_leg_tags:
+  - MAIN_SL
+  - MAIN_TARGET

@@ -6,6 +6,7 @@ Product id / symbol, Delta API schema, backtest dummy rows.
 import logging
 from pathlib import Path
 from datetime import datetime
+from threading import Lock
 from typing import Optional
 
 import pandas as pd
@@ -55,6 +56,9 @@ class DeltaInstrumentStore(BaseInstrumentStore):
         cache_path: Optional[Path] = None,
     ):
         cache = Path(cache_path).resolve() if cache_path else None
+        self.cache_path = cache
+        self._provider = DeltaInstrumentProvider(base_url)
+        self._refresh_lock = Lock()
         today = datetime.now().date()
         cache_stale = False
         if cache and cache.exists():
@@ -68,8 +72,7 @@ class DeltaInstrumentStore(BaseInstrumentStore):
         if cache and cache.exists() and not cache_stale:
             self.df = pd.read_csv(cache, low_memory=False)
         else:
-            provider = DeltaInstrumentProvider(base_url)
-            self.df = provider.load()
+            self.df = self._provider.load()
             if cache and not self.df.empty:
                 cache.parent.mkdir(parents=True, exist_ok=True)
                 # Remove previous Delta instrument files so only the new one remains
@@ -79,9 +82,13 @@ class DeltaInstrumentStore(BaseInstrumentStore):
                     except OSError:
                         pass
                 self.df.to_csv(cache, index=False, float_format="%.2f")
+        self._rebuild_symbol_lookup()
+
+    def _rebuild_symbol_lookup(self) -> None:
+        """Rebuild symbol/product-id lookups after loading or refreshing products."""
         self._symbol_to_row = {}
         if not self.df.empty and "symbol" in self.df.columns:
-            for idx, row in self.df.iterrows():
+            for _, row in self.df.iterrows():
                 sym = row.get("symbol") or row.get("short_name", "")
                 self._symbol_to_row[str(sym).upper()] = row
                 pid = row.get("id")
@@ -93,6 +100,34 @@ class DeltaInstrumentStore(BaseInstrumentStore):
                             self._symbol_to_row[str(int(num))] = row
                         except (ValueError, OverflowError):
                             pass
+
+    def refresh_products(self) -> bool:
+        """Redownload products, atomically replace cache, and rebuild lookup."""
+        with self._refresh_lock:
+            try:
+                refreshed = self._provider.load()
+                if refreshed.empty or "symbol" not in refreshed.columns:
+                    logger.warning(
+                        "Delta instrument refresh returned no usable products"
+                    )
+                    return False
+                if self.cache_path is not None:
+                    self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = self.cache_path.with_suffix(
+                        self.cache_path.suffix + ".tmp"
+                    )
+                    refreshed.to_csv(tmp, index=False, float_format="%.2f")
+                    tmp.replace(self.cache_path)
+                self.df = refreshed
+                self._rebuild_symbol_lookup()
+                logger.info(
+                    "Refreshed Delta instrument master (%s products)",
+                    len(refreshed),
+                )
+                return True
+            except Exception:
+                logger.exception("Failed to refresh Delta instrument master")
+                return False
 
     def _row_for_contract_key(self, trading_symbol) -> Optional[pd.Series]:
         """Resolve CSV row by contract symbol or numeric product id (string)."""
@@ -189,6 +224,17 @@ class DeltaInstrumentStore(BaseInstrumentStore):
             return self._row_to_instrument(row)
 
         if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
+            logger.warning(
+                "Delta instrument %s missing; refreshing product master once",
+                trading_symbol,
+            )
+            if self.refresh_products():
+                row = self._row_for_contract_key(trading_symbol)
+                if row is not None:
+                    logger.info(
+                        "Delta instrument %s found after refresh", trading_symbol
+                    )
+                    return self._row_to_instrument(row)
             logger.warning("No Delta instrument found for %s", trading_symbol)
             return None
 
@@ -215,6 +261,18 @@ class DeltaInstrumentStore(BaseInstrumentStore):
             return self._row_to_instrument(row)
 
         if RUN_MODE in (RunMode.LIVE, RunMode.PAPER):
+            logger.warning(
+                "Delta FUT instrument %s missing; refreshing product master once",
+                trading_symbol,
+            )
+            if self.refresh_products():
+                row = self._row_for_contract_key(trading_symbol)
+                if row is not None:
+                    logger.info(
+                        "Delta FUT instrument %s found after refresh",
+                        trading_symbol,
+                    )
+                    return self._row_to_instrument(row)
             logger.warning("No Delta FUT instrument found for %s", trading_symbol)
             return None
 

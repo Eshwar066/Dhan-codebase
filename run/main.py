@@ -97,6 +97,8 @@ def job_to_engine_config(job: dict) -> EngineConfig:
         root_log_level=str(job.get("log_level") or DEFAULT_ROOT_LOG_LEVEL),
         library_log_level=str(job.get("library_log_level") or DEFAULT_LIBRARY_LOG_LEVEL),
         strategy_eval=job.get("strategy_eval"),
+        execution_validator=job.get("execution_validator"),
+        event_blackout=job.get("event_blackout"),
     )
 
 
@@ -105,6 +107,11 @@ def run_engine(config: EngineConfig) -> None:
     if not config.enabled:
         print(f"[WARN] {config.strategy_name} ({config.broker_name}) is disabled. Skipping.")
         return
+
+    if config.run_mode == RunMode.LIVE and config.engine_id:
+        from run.engine_lock import acquire_engine_lock
+
+        acquire_engine_lock(config.engine_id)
 
     loaded_strategies = [config.strategy_name] + list(config.strategy_names or [])
     logger.info(

@@ -21,7 +21,11 @@ def _quantize_order_prices(
     instrument_store: Any = None,
     side: str = "",
 ) -> Dict[str, Any]:
-    """Ensure limit/trigger prices are valid multiples of exchange tick size."""
+    """Ensure limit/trigger prices are valid multiples of exchange tick size.
+
+    Dhan STOPLIMIT (DH-906): SELL requires trigger > price; BUY requires trigger < price.
+    After tick rounding those can collapse to equal — nudge limit by one tick.
+    """
     sym = str(payload.get("tradingsymbol") or "").strip()
     if not sym:
         return payload
@@ -47,6 +51,37 @@ def _quantize_order_prices(
         rounded = round_by_tick_size(val, tick, floor_or_ceil=mode)
         if rounded is not None:
             out[key] = rounded
+
+    # Protective stop-limit only (STOPLIMIT / SL). SL-M has no resting limit.
+    is_stop_limit = order_type in {
+        "STOPLIMIT",
+        "STOP-LIMIT",
+        "SL",
+        "STOP",
+    }
+    if is_stop_limit:
+        try:
+            price = float(out.get("price") or 0)
+            trigger = float(out.get("trigger_price") or 0)
+        except (TypeError, ValueError):
+            price, trigger = 0.0, 0.0
+        if price > 0 and trigger > 0:
+            tick_f = float(tick) if tick and float(tick) > 0 else 0.05
+            if side_u == "SELL" and trigger <= price:
+                # Limit must sit strictly below trigger for a sell stop.
+                adj = round_by_tick_size(
+                    trigger - tick_f, tick, floor_or_ceil="floor"
+                )
+                if adj is None or adj <= 0 or adj >= trigger:
+                    adj = max(tick_f, trigger - tick_f)
+                out["price"] = float(adj)
+            elif side_u == "BUY" and trigger >= price:
+                adj = round_by_tick_size(
+                    trigger + tick_f, tick, floor_or_ceil="ceil"
+                )
+                if adj is None or adj <= trigger:
+                    adj = trigger + tick_f
+                out["price"] = float(adj)
     return out
 
 
@@ -57,22 +92,52 @@ def _order_intent_to_payload(intent, execution_price=None, instrument_store=None
     exchange = dhan_mappings.internal_segment_to_exchange_arg(
         str(segment) if segment is not None else "NFO"
     )
-    price = execution_price if execution_price is not None else (intent.price or 0)
+    extras = getattr(intent, "metadata_extras", None) or {}
+    execution_mode = str(extras.get("execution_mode") or "").strip().upper()
+    intent_price = float(getattr(intent, "price", 0) or 0)
+    trigger = float(getattr(intent, "trigger_price", 0) or 0)
+    raw_ot = getattr(intent, "order_type", "MARKET")
+    raw_ot_u = str(raw_ot or "").strip().upper().replace("_", "-")
+    is_stop_order = raw_ot_u in {
+        "SL",
+        "SL-M",
+        "SLM",
+        "STOP",
+        "STOPLIMIT",
+        "STOP-LIMIT",
+        "STOPMARKET",
+        "STOP-MARKET",
+    }
+    # Forever / HYBRID_GTT must keep strategy limit+trigger. Do NOT overwrite with
+    # live ask from price_map (that placed Forever @ ~100 instead of GTT @ ~150).
+    if execution_mode in ("GTT", "HYBRID_GTT"):
+        price = intent_price if intent_price > 0 else float(execution_price or 0)
+        if trigger <= 0:
+            trigger = price
+        # Dhan Forever BUY: trigger activates the order; price is the resting limit.
+        if price <= 0:
+            price = trigger
+    elif is_stop_order and intent_price > 0:
+        # Protective stop-limit prices are strategy-defined. A live bid/ask supplied
+        # by the engine is only market context and must not overwrite the SL limit.
+        price = intent_price
+    else:
+        price = (
+            float(execution_price)
+            if execution_price is not None
+            else intent_price
+        )
     qty = getattr(intent, "qty", inst.lot_size)
     lot_size = int(getattr(inst, "lot_size", 1))
     total_qty = int(qty) * lot_size
-    extras = getattr(intent, "metadata_extras", None) or {}
-    execution_mode = str(extras.get("execution_mode") or "").strip().upper()
-    trigger = float(getattr(intent, "trigger_price", 0) or 0)
-    if execution_mode == "GTT" and trigger <= 0:
-        trigger = float(price or 0)
+    order_type = dhan_mappings.normalize_order_type(raw_ot)
     payload = {
         "tradingsymbol": inst.place_order_symbol(),
         "exchange": exchange,
         "quantity": total_qty,
         "price": float(price),
         "trigger_price": trigger,
-        "order_type": getattr(intent, "order_type", "MARKET"),
+        "order_type": order_type,
         "transaction_type": intent.side,
         "trade_type": getattr(intent, "trade_type", "MARGIN"),
         "disclosed_quantity": 0,
@@ -100,6 +165,18 @@ class DhanBroker(BaseBroker):
 
     # Dhan docs: max 25 modifications per order — switch to cancel + re-place before hard failure.
     DHAN_MODIFY_WARN_THRESHOLD = 20
+    supports_hedge_fill_gated_bundles = True
+    hedge_fill_wait_timeout_sec = 120.0
+    hedge_fill_poll_interval_sec = 0.5
+    hedge_fill_margin_settle_sec = 2.0
+    # Hedge chase: place → wait → refresh price → modify → repeat; then cancel before abort.
+    hedge_fill_retry_enabled = True
+    hedge_fill_retry_max_attempts = 5
+    hedge_fill_retry_per_attempt_sec = 40.0
+    # None = all strategies using hedge-gated bundles (LEAPS, NiftySMA9Weekly, …).
+    hedge_fill_retry_strategy_ids = None
+    hedge_fill_cancel_on_failure = True
+    hedge_fill_cancel_verify_sec = 15.0
 
     def __init__(self, api, position_manager=None, intent_store=None):
         super().__init__(position_manager=position_manager, intent_store=intent_store)
@@ -131,7 +208,9 @@ class DhanBroker(BaseBroker):
             "quantity": total_qty,
             "price": price,
             "trigger_price": float(intent.get("trigger_price", 0) or 0),
-            "order_type": intent.get("order_type", "MARKET"),
+            "order_type": dhan_mappings.normalize_order_type(
+                intent.get("order_type", "MARKET")
+            ),
             "transaction_type": intent["side"],
             "trade_type": intent.get("trade_type", "MARGIN"),
             "disclosed_quantity": int(intent.get("disclosed_quantity", 0)),
@@ -297,11 +376,13 @@ class DhanBroker(BaseBroker):
         """
         Multi-leg margin (hedge benefit) for same-structure ENTRY legs.
         ``legs``: list of (intent, execution_price).
+
+        Even a single follow-leg (MAIN after hedge fill) must use the multi
+        calculator with ``includePosition=True`` so Dhan applies hedge benefit
+        from open positions. Plain ``margin_calculator`` ignores portfolio hedge.
         """
         if not legs:
             return None
-        if len(legs) == 1:
-            return self.check_funds_before_order(legs[0][0], legs[0][1])
 
         payloads: List[Dict[str, Any]] = []
         for intent, execution_price in legs:
@@ -315,7 +396,16 @@ class DhanBroker(BaseBroker):
             return None
 
         tsl = getattr(getattr(self.api, "_source", None), "tsl", None)
-        if not tsl or not getattr(tsl, "margin_calculator_multi", None):
+        # Prefer multi calculator whenever positions/orders should be included,
+        # including the post-hedge single-MAIN check.
+        use_multi = bool(
+            tsl
+            and getattr(tsl, "margin_calculator_multi", None)
+            and (len(legs) > 1 or include_position or include_orders)
+        )
+        if not use_multi:
+            if len(legs) == 1:
+                return self.check_funds_before_order(legs[0][0], legs[0][1])
             total_required = 0.0
             for intent, execution_price in legs:
                 single = self.check_funds_before_order(intent, execution_price)
@@ -347,6 +437,9 @@ class DhanBroker(BaseBroker):
             )
         except Exception as exc:
             logger.warning("margin_calculator_multi failed: %s", exc)
+            # Fallback: without include_position, single-leg check is wrong after hedge.
+            if len(legs) == 1 and not include_position:
+                return self.check_funds_before_order(legs[0][0], legs[0][1])
             return None
 
         if not isinstance(oc, dict):
@@ -363,7 +456,7 @@ class DhanBroker(BaseBroker):
         ok, shortfall = self._parse_margin_shortfall(available, required_margin, 0)
         msg = (
             f"Multi-leg margin: available={available:.2f} required={required_margin:.2f} "
-            f"legs={len(legs)}"
+            f"legs={len(legs)} include_position={include_position}"
         )
         if hedge_benefit not in (None, ""):
             msg += f" hedge_benefit={hedge_benefit}"
@@ -380,6 +473,65 @@ class DhanBroker(BaseBroker):
             "leg_count": len(legs),
             "message": msg,
         }
+
+    def modify_order_price(
+        self,
+        intent,
+        broker_order_id: str,
+        execution_price: Optional[float] = None,
+    ) -> bool:
+        """Modify a pending Dhan limit order to a new price (hedge retry)."""
+        oid = str(broker_order_id or "").strip()
+        if not oid:
+            return False
+        if not self.note_dhan_modify(oid):
+            return False
+        try:
+            payload = self._build_payload(intent, execution_price)
+        except Exception as exc:
+            logger.warning("modify_order_price build_payload failed: %s", exc)
+            return False
+        source = getattr(self.api, "_source", None)
+        tsl = getattr(source, "tsl", None) if source is not None else None
+        if tsl is None or not getattr(tsl, "modify_order", None):
+            return False
+        try:
+            GlobalRateLimiter.instance().acquire(DHAN_ORDER_API, 0.11)
+            result = tsl.modify_order(
+                order_id=oid,
+                order_type=str(payload.get("order_type") or "LIMIT"),
+                quantity=int(payload.get("quantity") or 0),
+                price=float(payload.get("price") or 0),
+                trigger_price=float(payload.get("trigger_price") or 0),
+                disclosed_quantity=int(payload.get("disclosed_quantity") or 0),
+                validity=str(payload.get("validity") or "DAY"),
+            )
+            return bool(result)
+        except Exception as exc:
+            logger.warning(
+                "Dhan modify_order_price failed order_id=%s intent_id=%s: %s",
+                oid,
+                getattr(intent, "intent_id", None),
+                exc,
+            )
+            return False
+
+    def order_is_open(self, broker_order_id: str) -> bool:
+        row = self.find_order_by_id(broker_order_id)
+        if not isinstance(row, dict):
+            return False
+        status = str(row.get("orderStatus") or row.get("status") or "").lower()
+        closed = {
+            "filled",
+            "traded",
+            "complete",
+            "completed",
+            "cancelled",
+            "rejected",
+            "expired",
+            "trigger cancelled",
+        }
+        return status not in closed
 
     def cancel_order_by_id(
         self,
@@ -421,7 +573,7 @@ class DhanBroker(BaseBroker):
                 logger.warning("Dhan cancel_order failed order_id=%s: %s", order_id, exc)
                 return False
 
-        if execution_mode == "GTT":
+        if execution_mode in ("GTT", "HYBRID_GTT"):
             return _cancel_forever() or _cancel_regular()
         if _cancel_regular():
             return True
@@ -492,8 +644,8 @@ class DhanBroker(BaseBroker):
                     "message": fail_msg,
                     "display_message": fail_msg,
                     "error_code": parsed.get("error_code"),
-                    "error_type": parsed.get("error_type"),
-                    "error_message": parsed.get("error_message"),
+                    "error_type": parsed.get("error_type") or type(e).__name__,
+                    "error_message": parsed.get("error_message") or str(e),
                     "payload": order_payload,
                     "response": (
                         e.args[0]
@@ -501,6 +653,7 @@ class DhanBroker(BaseBroker):
                         else None
                     ),
                     "attempt": attempt + 1,
+                    "retryable": not isinstance(e, (KeyError, TypeError, ValueError)),
                 }
                 logger.warning(
                     "Dhan place_forever_order exception intent_id=%s attempt=%s payload=%s error=%s",
@@ -531,7 +684,7 @@ class DhanBroker(BaseBroker):
         order_payload = self._build_payload(intent, execution_price)
         intent_id = order_payload["intent_id"]
         self._last_place_order_failure = None
-        if str(order_payload.get("execution_mode") or "").upper() == "GTT":
+        if str(order_payload.get("execution_mode") or "").upper() in ("GTT", "HYBRID_GTT"):
             return self._place_forever_order(order_payload, intent_id, retries)
         for attempt in range(retries + 1):
             try:
@@ -609,8 +762,8 @@ class DhanBroker(BaseBroker):
                     "message": fail_msg,
                     "display_message": fail_msg,
                     "error_code": parsed.get("error_code"),
-                    "error_type": parsed.get("error_type"),
-                    "error_message": parsed.get("error_message"),
+                    "error_type": parsed.get("error_type") or type(e).__name__,
+                    "error_message": parsed.get("error_message") or str(e),
                     "payload": order_payload,
                     "response": (
                         e.args[0]
@@ -618,6 +771,7 @@ class DhanBroker(BaseBroker):
                         else None
                     ),
                     "attempt": attempt + 1,
+                    "retryable": not isinstance(e, (KeyError, TypeError, ValueError)),
                 }
                 logger.warning(
                     "Dhan place_order exception intent_id=%s attempt=%s payload=%s error=%s",
@@ -660,7 +814,10 @@ class DhanBroker(BaseBroker):
             )
         except (TypeError, ValueError):
             filled = 0.0
-        traded_statuses = {"traded", "complete", "completed"}
+        # Dhan Forever: TRIGGERED means the GTT fired (child LIMIT placed). Treat as
+        # filled for OMS adopt — status often stays TRIGGERED while the child is TRADED
+        # with correlationId=NR, so client-id fill lookup alone will miss the entry.
+        traded_statuses = {"traded", "complete", "completed", "triggered"}
         if status in traded_statuses and filled <= 0 and qty > 0:
             filled = qty
         if filled <= 0 and status in traded_statuses:
@@ -706,6 +863,24 @@ class DhanBroker(BaseBroker):
                 return self._normalize_forever_order_for_recon(o)
         return None
 
+    def find_order_by_id(self, broker_order_id: str) -> Optional[Dict[str, Any]]:
+        """Lookup order by Dhan orderId (REST GET /orders/{id})."""
+        oid = str(broker_order_id or "").strip()
+        if not oid:
+            return None
+        fn = getattr(self.api, "get_order_by_id", None)
+        if callable(fn):
+            try:
+                row = fn(oid)
+                if isinstance(row, dict) and row:
+                    return row
+            except Exception as exc:
+                logger.warning("Dhan find_order_by_id failed order_id=%s: %s", oid, exc)
+        for o in self.api.get_order_list() or []:
+            if str(o.get("orderId") or o.get("order_id") or "") == oid:
+                return o
+        return None
+
     def find_order_by_client_id(self, client_order_id):
         orders = self.api.get_order_list() or []
         cid = str(client_order_id or "").strip()
@@ -723,6 +898,7 @@ class DhanBroker(BaseBroker):
         """Pending Forever (GTT) orders for reconciliation (not in regular order book)."""
         closed_statuses = {
             "traded",
+            "triggered",
             "cancelled",
             "rejected",
             "expired",
@@ -907,6 +1083,73 @@ class DhanBroker(BaseBroker):
                 "status": status or "open",
             })
         return out
+
+    def cancel_open_day_orders_for_symbol(
+        self,
+        trading_symbol: str,
+        *,
+        side: Optional[str] = None,
+        exclude_order_ids: Optional[set] = None,
+    ) -> int:
+        """
+        Cancel resting day orders on ``trading_symbol`` (Forever child LIMITs often
+        land with correlationId=NR and would otherwise stack under a fallback LIMIT).
+        """
+        want = "".join(ch for ch in str(trading_symbol or "").upper() if ch.isalnum())
+        if not want:
+            return 0
+        side_u = str(side or "").upper()
+        exclude = {str(x) for x in (exclude_order_ids or set()) if x}
+        closed = {
+            "filled",
+            "cancelled",
+            "rejected",
+            "complete",
+            "completed",
+            "trigger cancelled",
+            "traded",
+            "expired",
+        }
+        cancelled = 0
+        try:
+            orders = self.api.get_order_list() or []
+        except Exception as exc:
+            logger.warning("Dhan get_order_list for child cancel failed: %s", exc)
+            return 0
+        for o in orders if isinstance(orders, list) else []:
+            if not isinstance(o, dict):
+                continue
+            status = str(o.get("orderStatus") or o.get("status") or "").lower()
+            if status in closed:
+                continue
+            sym = str(
+                o.get("tradingSymbol")
+                or o.get("trading_symbol")
+                or o.get("securityId")
+                or ""
+            )
+            key = "".join(ch for ch in sym.upper() if ch.isalnum())
+            if key != want:
+                continue
+            txn = str(
+                o.get("transactionType")
+                or o.get("transaction_type")
+                or o.get("side")
+                or ""
+            ).upper()
+            if side_u and txn and side_u not in txn and txn not in side_u:
+                # Dhan uses BUY/SELL; tolerate B/S abbreviations.
+                if not (
+                    (side_u == "BUY" and txn.startswith("B"))
+                    or (side_u == "SELL" and txn.startswith("S"))
+                ):
+                    continue
+            oid = str(o.get("orderId") or o.get("order_id") or "").strip()
+            if not oid or oid in exclude:
+                continue
+            if self.cancel_order_by_id(oid, reason="gtt_fallback_child"):
+                cancelled += 1
+        return cancelled
 
     def note_dhan_modify(self, broker_order_id: str) -> bool:
         """

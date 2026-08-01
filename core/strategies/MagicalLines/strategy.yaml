@@ -1,0 +1,58 @@
+id: MagicalLines
+implementation:
+  module: core.strategies.MagicalLines.MagicalLines
+  class: MagicalLines
+instrument: OPTION
+allowed_modes:
+- BACKTEST
+- PAPER
+- LIVE
+broker:
+  venue: DHAN
+  api: DHAN
+symbols:
+- NIFTY
+exchange: NSE
+timeframe: DAY
+schedule:
+  eval_mode: live_feed
+data:
+  backtest:
+    data:
+      option_chain:
+        exchange: NSE
+        interval: DAY
+        segment: OPT
+        api: DHAN
+        expiry_flag: MONTHLY
+  paper:
+    data:
+      option_chain:
+        exchange: NSE
+        interval: DAY
+        segment: OPT
+        api: DHAN
+        expiry_flag: MONTHLY
+  live:
+    data:
+      option_chain:
+        exchange: NSE
+        interval: '1'
+        segment: OPT
+profile:
+  live:
+    exchange: INDEX
+    sector: 'YES'
+  backtest:
+    start_date: '2026-01-01'
+    end_date: '2026-02-19'
+    timeframe: DAY
+    exchange: INDEX
+    sector: 'YES'
+dependencies:
+  mixins:
+  - IndiaMktMixins
+  expiry_type: MONTHLY
+documentation:
+  title: Magical Lines
+  overview: NIFTY daily magical-line options.

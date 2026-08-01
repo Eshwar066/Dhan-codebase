@@ -60,7 +60,7 @@ ENGINE_JOBS = [
         "ORDER_QTY_LOTS": 1,
         "market_ws_stall_timeout_seconds": 0,
         "strategy_timeout_seconds": 60,
-        "strategies": ["LEAPS_RSI", "BankNiftyBTST"],
+        "strategies": ["LEAPS_RSI", "BankNiftyBTST"], #"NiftySMA9Weekly"
         "telegram": {
             "bot_token": os.getenv(
                 "TELEGRAM_LEAPS_BOT_TOKEN",
@@ -68,7 +68,83 @@ ENGINE_JOBS = [
             ),
             "chat_id": os.getenv("TELEGRAM_LEAPS_CHAT_ID", "1021479950"),
         },
+        # Factory default is 150ms; Dhan LIMIT round-trips are ~1s and were
+        # leaving entries paused all session after the morning spike.
+        "latency_critical_ms": 6000,
+        "latency_critical_cycles": 6,
 
+    },
+    {
+        "engine_id": "delta_engine_one",
+        "venue": "DELTA",
+        "enabled": True,
+        "run_mode": "LIVE",
+        "capital": 200000,
+        "strategies": [
+            # "BTCZeroDTE",
+            # "BTCZeroDTEElevenPM",
+            "DirectionalOptionSelling",
+            # "RSIBreadAndButter",
+        ],
+        "max_open_positions": 15,
+        "check_short_option_margin_enabled": True,
+        # "ORDER_QTY_LOTS": 10,
+        "delta_leverage": 100,
+        "strategy_timeout_seconds": 60,
+        "latency_critical_ms": 6000,
+        "latency_critical_cycles": 6,
+        # Delta OMS: reject ENTRY / MAIN_SL when book or mark is unsafe.
+        "execution_validator": {
+            "enabled": True,
+            "max_spread_pct": 0.10,
+            "max_mark_mid_pct": 0.50,
+            "max_quote_age_sec": 30.0,
+            "require_bid_ask": True,
+            "require_mark": True,
+            "allow_mark_fallback_to_mid": True,
+            "default_sl_premium_mult": 2.0,
+            "infer_entry_sl_from_default_mult": False,
+            "min_stop_mark_ratio": 1.0,
+            "validate_entry": True,
+            "validate_stop": True,
+        },
+        # Block NEW ENTRY around high-impact USD macro events (±60m default).
+        # Exits / FORCE_EXIT / MAIN_SL remain allowed. No network on trade path.
+        "event_blackout": {
+            "enabled": True,
+            "minutes_before": 60,
+            "minutes_after": 60,
+            # On same-session HIGH events (e.g. FOMC ~23:30 IST): no 0DTE after
+            # 17:30 IST; no 1DTE until the event blackout ends. DTE>=2 still OK
+            # outside the ±60m window.
+            "short_dte_rules_enabled": True,
+            "zero_dte_cutoff_ist": "17:30",
+            "block_1dte_until_event_done": True,
+            "manual_yaml": "run/calendars/delta_event_blackout.yaml",
+            "cache_json": "logs/calendars/delta_economic_events.json",
+        },
+        "telegram": {
+            "bot_token": "8389724629:AAHY_CGcBF8HZCexedsEJFw80Mf6SxH5Bkk",
+            "chat_id": "1021479950",
+        },
+    },
+    {
+        "engine_id": "dhan_sma9_weekly",
+        "venue": "DHAN",
+        "enabled": False,
+        "run_mode": "LIVE",
+        "capital": 200_000,
+        "ORDER_QTY_LOTS": 1,
+        "market_ws_stall_timeout_seconds": 0,
+        "strategy_timeout_seconds": 60,
+        "strategies": ["NiftySMA9Weekly"],
+        "telegram": {
+            "bot_token": os.getenv(
+                "TELEGRAM_LEAPS_BOT_TOKEN",
+                "8663481671:AAHY-OnE8OiaJmkOfXbwqoe4InosJVblAtM",
+            ),
+            "chat_id": os.getenv("TELEGRAM_LEAPS_CHAT_ID", "1021479950"),
+        },
     },
     {
         "engine_id": "dhan_oi_positional_buy",
@@ -230,22 +306,7 @@ ENGINE_JOBS = [
 
     },
 
-    {
-        "engine_id": "delta_rsi_bread_butter",
-        "venue": "DELTA",
-        "enabled": True,
-
-        "run_mode": "BACKTEST",
-
-        "capital": 200000,
-        "ORDER_QTY_LOTS": 1,
-        "strategies": ["LiquiditySweepStrategy"], #,"RSIBreadAndButter"
-        "delta_leverage": 10,
-        "telegram": {
-            "bot_token": "8389724629:AAHY_CGcBF8HZCexedsEJFw80Mf6SxH5Bkk",
-            "chat_id": "1021479950",
-        },
-    },
+   
 
     {
 
@@ -305,7 +366,7 @@ ENGINE_JOBS = [
 
         "live": {"exchange": "DELTA", "sector": "YES"},
 
-        "symbols": ["BTCUSD"],
+        "symbols": ["BTCUSD", "ETHUSD"],
 
     },
 

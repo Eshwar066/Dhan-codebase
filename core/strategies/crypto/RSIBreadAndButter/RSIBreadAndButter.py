@@ -29,6 +29,7 @@ from core.utils.structure import MarketStructureConfig
 from core.utils.structure.rsi_divergence import add_rsi_divergence
 from core.utils.structure.swings import add_swing_points
 from core.utils import indicator_history as ind_hist
+from core.strategies.crypto.RSIBreadAndButter import indicator_persist as bb_persist
 
 if TYPE_CHECKING:
     from core.models.strategy_context import StrategyContext
@@ -63,7 +64,7 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
     """
 
     name = "RSIBreadAndButter"
-    underlying_symbols = ["BTCUSD"] #, "ETHUSD"
+    underlying_symbols = ["BTCUSD"]
     timeframe = "1"
     required_context = ["instrument_store"]
     api = "DELTA"
@@ -81,7 +82,19 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
         # symbol|bucket_ts — one on_candle eval per closed bar (no re-eval on missing bucket_ts).
         self._evaluated_bar_keys: set[str] = set()
         self._divergence_logged_keys: set[str] = set()
+        self._evaluated_bar_keys_max = 5_000
+        self._divergence_logged_keys_max = 2_000
         self._sync_entry_timeframe()
+
+    @staticmethod
+    def _prune_str_set(store: set, max_n: int) -> None:
+        if max_n <= 0 or len(store) <= max_n:
+            return
+        overflow = len(store) - max_n
+        for i, key in enumerate(sorted(store)):
+            if i >= overflow:
+                break
+            store.discard(key)
 
     @staticmethod
     def _timeframe_minutes(tf: Any) -> int:
@@ -128,6 +141,13 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
             liquidity_session_exchange=ex,
             rsi_period=14,
         )
+
+    def indicator_persist_delay_bars(self) -> int:
+        """Fractal confirmation lag for shared indicator_history live_append."""
+        return bb_persist.persist_delay_bars(self)
+
+    def indicator_persist_tail_rows(self) -> int:
+        return bb_persist.persist_tail_rows(self)
 
     def get_warmup_period(self) -> int:
         sig = self.signal_timeframe_minutes_resolved()
@@ -381,6 +401,7 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
         if key in self._evaluated_bar_keys:
             return False
         self._evaluated_bar_keys.add(key)
+        self._prune_str_set(self._evaluated_bar_keys, self._evaluated_bar_keys_max)
         return True
 
     def on_candle(
@@ -419,6 +440,9 @@ class RSIBreadAndButter(MarketStructureMixin, IndiaMktMixins, BaseStrategy):
             div_key = f"{symbol}|{sig_side}|{bucket}"
             if div_key not in self._divergence_logged_keys:
                 self._divergence_logged_keys.add(div_key)
+                self._prune_str_set(
+                    self._divergence_logged_keys, self._divergence_logged_keys_max
+                )
                 last = recent[-1] if recent else candle
                 logger.info(
                     "RSIBreadAndButter divergence %s %s rsi=%s rsi_div_bull=%s "

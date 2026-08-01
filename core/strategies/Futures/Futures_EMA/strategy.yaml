@@ -1,0 +1,35 @@
+id: FuturesEMAHighLow
+implementation:
+  module: core.strategies.Futures.Futures_EMA.Futures_EMA
+  class: FuturesEMAHighLow
+instrument: FUTURE
+allowed_modes:
+- BACKTEST
+- PAPER
+- LIVE
+broker:
+  venue: DHAN
+  api: DHAN
+symbols:
+- NIFTY
+exchange: NSE
+timeframe: '60'
+schedule:
+  eval_mode: live_feed
+data:
+  default:
+    data: {}
+profile:
+  live:
+    exchange: INDEX
+    sector: 'YES'
+  backtest:
+    start_date: '2024-02-01'
+    end_date: '2026-03-02'
+    timeframe: '60'
+    exchange: INDEX
+    sector: 'YES'
+dependencies: {}
+documentation:
+  title: Futures EMA High/Low
+  overview: NIFTY index futures EMA band strategy.

@@ -24,20 +24,20 @@ python -m run.dummy_live
 
 On **Debian/Ubuntu**, the system Python is [PEP 668](https://peps.python.org/pep-0668/) *externally managed*: use a **virtualenv** (as above) and `pip install` **inside** the activated venv — not `pip install` globally. Use **`python3`** if the `python` command is missing (`sudo apt install python-is-python3` is optional).
 
-### Yahoo NIFTY hourly + RSI (optional)
+### Yahoo NIFTY indicator history (optional)
 
 ```bash
 cd ~/Dhan-codebase
 source .venv/bin/activate   # create .venv first with: python3 -m venv .venv
 pip install yfinance pandas numpy TA-Lib
-python3 utils/yfinance_nifty_rsi.py
+# Preview Yahoo OHLC helpers
+python3 utils/yfinance/nifty_yahoo.py
+# Seed logs/indicators/NIFTY/{60,15,120}/ (LEAPS RSI, Bollinger, SMA9 weekly, …)
+python3 utils/yfinance/refresh_nifty_indicator_history.py --only 60
+python3 utils/yfinance/refresh_nifty_indicator_history.py --only 120
 ```
 
-To **rebuild LEAPS bootstrap logs** (150+ ``dhan_leaps_rsi_candles.log`` rows + RSI history tail aligned to Yahoo) so live startup skips intraday API::
-
-    python3 utils/seed_leaps_bootstrap_logs.py
-
-Keep a backup of ``logs/LEAPS_RSI/`` first; the seed script preserves RSI history lines **before** ``2026-05-12 09:15`` and replaces from that timestamp onward.
+Live bootstrap uses those shared indicator files plus engine ``*_candles.log`` rows; if history is missing or short, ``IndicatorManager`` may fall back to the intraday API.
 
 ## Core Runtime Modes
 
@@ -62,8 +62,8 @@ Current live path is feed-first and queue-isolated:
 
 1. WebSocket feed (`DhanWebSocketFeed` / `DeltaWebSocketFeed`)
 2. Tick queue (engine-owned)
-3. `CandleAggregator` (closed bars only)
-4. Main engine loop
+3. `CandleAggregator` (closed bars only) **or** `scheduled_times` wall-clock eval (e.g. BankNiftyBTST)
+4. Main engine loop (~1s) — feed health, `GttFallbackBook.tick()` when HYBRID_GTT watches active
 5. Per-strategy worker threads (deterministic per strategy)
 6. Bounded global intent queue
 7. Account router
@@ -73,7 +73,17 @@ Current live path is feed-first and queue-isolated:
    - token-bucket throttling (per account)
    - per-account circuit breaker
    - watchdog supervision
-10. Broker API
+10. Broker API (LIMIT / SL-M / Forever GTT / **HYBRID_GTT** via `GttFallbackBook`)
+
+### Execution modes (opt-in per intent)
+
+| Mode | Use case |
+|------|----------|
+| *(default)* | Resting LIMIT / SL-M |
+| `GTT` | Dhan Forever order; fill polled by OrderRouter |
+| `HYBRID_GTT` | GTT + engine watches LTP/ask → cancel GTT → resting LIMIT when trigger fires (BankNiftyBTST live) |
+
+See `core/orderExecution/README.md` and `core/strategies/BTST/BankNiftyBTST/readme.md`.
 
 ## Safety and Reliability Features
 
@@ -138,6 +148,7 @@ core/engine/
 
 core/orderExecution/
   order_router.py
+  gtt_fallback_book.py   # HYBRID_GTT watch + fallback
   intent_store.py
   account_router.py
   risk_manager.py
@@ -161,7 +172,7 @@ core/data/
 
 ## Systemd services
 
-Unit files live in `utils/systemd/`. They assume the repo at `/root/Dhan-codebase`, a `.env` in that directory, and Python in `.venv` (except `delta.service`, which uses `venv`).
+Unit files live in `utils/systemd/`. They assume the repo at `/root/Dhan-codebase`, a `.env` in that directory, and Python in **`.venv`** (single shared venv for Dhan and Delta).
 
 ### One-time install
 
@@ -175,11 +186,13 @@ sudo cp utils/systemd/option-buildup-scheduler.service /etc/systemd/system/
 # Optional / legacy:
 sudo cp utils/systemd/dhan-trading.service /etc/systemd/system/
 sudo cp utils/systemd/delta.service /etc/systemd/system/
+sudo cp utils/systemd/delta-instrument-refresh.service /etc/systemd/system/
+sudo cp utils/systemd/delta-instrument-refresh.timer /etc/systemd/system/
 
 sudo systemctl daemon-reload
 ```
 
-If your virtualenv is `venv` instead of `.venv`, edit the `ExecStart=` lines in `/etc/systemd/system/` before running `daemon-reload`.
+All `ExecStart=` lines use `/root/Dhan-codebase/.venv/bin/python`. Do not create a second `venv/` alongside `.venv`.
 
 ### Both Dhan engines (recommended)
 
@@ -247,7 +260,7 @@ Runs `python -m run.main --venue DELTA`.
 
 ```bash
 cd /root/Dhan-codebase
-source .venv/bin/activate   # or: source venv/bin/activate for delta
+source .venv/bin/activate
 
 python -m run.main --engine-id dhan_leaps_rsi
 python -m run.main --engine-id dhan_oi_positional_buy
@@ -259,6 +272,7 @@ python -m run.main --venue DELTA
 
 ```bash
 sudo systemctl daemon-reload          # after editing unit files
+ps aux | grep 'run.main.*dhan' | grep -v grep
 sudo systemctl restart dhan-leaps-rsi.service
 
 
@@ -272,19 +286,32 @@ sudo systemctl list-units 'dhan*' 'option-buildup*' 'delta*'
 
 ## Notes
 
-- Live candle evaluation is feed/aggregator-based.
+- Live evaluation is **candle-driven** (`CandleAggregator` + `should_evaluate`) or **scheduled** (`scheduled_times` IST slots).
+- LEAPS live runs exits + hedge rollover on every closed 60m bar; entries only on RSI crossover.
 - OMS is trade-led: positions are updated from fills, not inferred order state.
 - Multi-strategy mode is supported via `strategy_name` + optional `strategy_names` list in `EngineConfig`.
 
+## Active strategy jobs (see `run/config.py`)
+
+| Engine ID | Strategy | Venue | Typical mode |
+|-----------|----------|-------|--------------|
+| `dhan_leaps_rsi` | LEAPS_RSI | DHAN | LIVE |
+| `dhan_oi_positional_buy` | OIPositionalBuy | DHAN | PAPER |
+| `dhan_banknifty_btst` | BankNiftyBTST | DHAN | LIVE (HYBRID_GTT) |
+| `delta_engine_one` | BTCZeroDTE, BTCZeroDTEElevenPM, RSIBreadAndButter | DELTA | LIVE |
+
 ## Further Reading
 
-- `docs/MULTI_VENUE.md`
-- `docs/PRODUCTION_UPGRADES.md`
-- `core/engine/factory.py`
-- `core/engine/live_engine.py`
+- **`docs/EVENT_DRIVEN_STRATEGY_GUIDE.md`** — add strategies, extension points, optimization roadmap
+- `docs/runtime_flow.md`, `docs/oms_flow.md`
+- `docs/MULTI_VENUE.md`, `docs/PRODUCTION_UPGRADES.md`
+- Strategy readmes: `core/strategies/Leaps/readme.txt`, `core/strategies/BTST/BankNiftyBTST/readme.md`, …
+- `core/engine/factory.py`, `core/engine/live_engine.py`
 
 ## most repeated
 sudo systemctl daemon-reload
 sudo systemctl start dhan-oi-positional-buy.service
 sudo systemctl start dhan-leaps-rsi.service
 sudo systemctl enable option-buildup-scheduler.service
+
+python utils/delta/refresh_crypto_indicator_history.py --only 60,4h,1d

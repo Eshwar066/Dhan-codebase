@@ -15,7 +15,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import psutil
 
 from core.data.candle_aggregator import _resolution_to_seconds
-from core.utils.indicator_history import bucket_ts_is_nse_60m_bar, is_nse_index_context, nse_60m_bar_close_eval_window
+from core.utils.indicator_history import (
+    bucket_ts_is_nse_60m_bar,
+    bucket_ts_is_nse_120m_bar,
+    is_nse_index_context,
+    nse_60m_bar_close_eval_window,
+)
 
 DEFAULT_FEED_STALE_SECONDS = 60
 logger = logging.getLogger(__name__)
@@ -81,9 +86,14 @@ class LiveEngineHelpersMixin:
             try:
                 bid = self.realtime_feed.get_best_bid(symbol)
                 ask = self.realtime_feed.get_best_ask(symbol)
-                return (bid, ask)
+                if bid is not None or ask is not None:
+                    return (bid, ask)
             except Exception:
                 pass
+        # Option legs may not be on the candle feed — REST quote fallback.
+        quote = self._rest_option_quote(symbol)
+        if quote is not None:
+            return (quote[0], quote[1])
         return (None, None)
 
     def _get_tick_size(self, symbol: str) -> float:
@@ -99,13 +109,47 @@ class LiveEngineHelpersMixin:
         self._tick_cache[symbol] = float(tick) if tick is not None else 0.01
         return self._tick_cache[symbol]
 
+    def _rest_option_quote(
+        self, symbol: str
+    ) -> Optional[Tuple[Optional[float], Optional[float], Optional[float]]]:
+        """Return (bid, ask, ltp) via data provider quote API, or None."""
+        data = getattr(self, "data", None)
+        store = getattr(self, "instrument_store", None)
+        if data is None or store is None or not hasattr(data, "get_quote_v2"):
+            return None
+        sym = str(symbol or "").strip()
+        if not sym:
+            return None
+        cache = getattr(self, "_rest_option_quote_cache", None)
+        if cache is None:
+            self._rest_option_quote_cache = {}
+            cache = self._rest_option_quote_cache
+        now = time.time()
+        cached = cache.get(sym)
+        if cached and (now - cached[0]) < 2.0:
+            return cached[1]
+        try:
+            from core.orderExecution.gtt_fallback_book import RestQuoteProvider
+
+            q = RestQuoteProvider(data, store).get_quote(sym)
+            if q is None:
+                return None
+            out = (q.bid, q.ask, q.ltp)
+            cache[sym] = (now, out)
+            return out
+        except Exception:
+            return None
+
     def get_price_map(self, symbol):
         sym_key = str(symbol or "").strip().upper()
         if self.realtime_feed and self.realtime_feed.is_connected():
             ticker = self.realtime_feed.get_last_ticker(symbol)
             if ticker and ticker.get("close") is not None:
-                print(">>exit ticker price ", ticker["close"])
                 return ticker["close"]
+        # Option contract LTP via REST when not on index candle feed.
+        rest_q = self._rest_option_quote(symbol)
+        if rest_q is not None and rest_q[2] is not None and float(rest_q[2]) > 0:
+            return float(rest_q[2])
         if not hasattr(self, "_rest_spot_cache"):
             self._rest_spot_cache = {}
         now = time.time()
@@ -125,7 +169,7 @@ class LiveEngineHelpersMixin:
             sym_u = sym_key
             if sym_u in candles and candles[sym_u].get("close") is not None:
                 close = candles[sym_u]["close"]
-                self._rest_spot_cache[sym_key] = (now, close)
+                self._rest_spot_cache[sym_u] = (now, close)
                 return close
         return None
 
@@ -149,6 +193,18 @@ class LiveEngineHelpersMixin:
 
         print(">>entry ask, bid", symbol, ask, bid)
         if not self._is_spread_acceptable(bid, ask):
+            # Illiquid options: still allow LTP-based limit when spread is wide.
+            rest_q = self._rest_option_quote(symbol)
+            ltp = rest_q[2] if rest_q else None
+            tick = self._get_tick_size(symbol)
+            if is_buy and ask is not None:
+                return float(ask) + tick
+            if is_buy and ltp is not None:
+                return float(ltp) + tick
+            if not is_buy and bid is not None:
+                return float(bid) - tick
+            if not is_buy and ltp is not None:
+                return float(ltp) - tick
             return None
         tick = self._get_tick_size(symbol)
 
@@ -162,16 +218,29 @@ class LiveEngineHelpersMixin:
     def _exit_price_from_depth(self, symbol: str, is_sell: bool):
         bid, ask = self._get_bid_ask(symbol)
         print(">exxit bid and ask", symbol, bid, ask)
-        if not self._is_spread_acceptable(bid, ask):
-            return None
         tick = self._get_tick_size(symbol)
-
-        if is_sell and bid is not None:
-            return bid - tick
-
-        if not is_sell and ask is not None:
-            return ask + tick
-
+        if self._is_spread_acceptable(bid, ask):
+            if is_sell and bid is not None:
+                return bid - tick
+            if not is_sell and ask is not None:
+                return ask + tick
+        # Wide/missing spread (common on LEAPS): use available side or LTP.
+        rest_q = self._rest_option_quote(symbol)
+        ltp = rest_q[2] if rest_q else None
+        if is_sell:
+            if bid is not None:
+                return float(bid) - tick
+            if ltp is not None:
+                return float(ltp) - tick
+            if ask is not None:
+                return float(ask)
+        else:
+            if ask is not None:
+                return float(ask) + tick
+            if ltp is not None:
+                return float(ltp) + tick
+            if bid is not None:
+                return float(bid)
         return None
 
     def _is_spread_acceptable(
@@ -427,9 +496,10 @@ class LiveEngineHelpersMixin:
           if present and divisible by the strategy TF (same seconds as ``CandleAggregator``),
           treat as aligned (canonical closed bar).
         - **NSE index 60m**: require session-anchored hourly opens (09:15, 10:15, …, 15:15 IST).
+        - **NSE index 120m**: require 120m opens (09:15, 11:15, 13:15, 15:15 IST).
         - **Alignment**: unix second offset modulo ``tf_sec`` where ``tf_sec`` comes from
           ``_resolution_to_seconds`` (same map as ``TIMEFRAME_SECONDS`` / aggregator). This
-          matches ``"15"``, ``"15m"``, ``"60"``, ``"1h"``, etc., unlike naive ``int(tf)``.
+          matches ``"15"``, ``"15m"``, ``"60"``, ``"1h"``, ``"120"``, etc., unlike naive ``int(tf)``.
         """
         ts_raw = candle.get("timestamp")
         ts_utc = self._candle_timestamp_to_utc_naive(ts_raw)
@@ -442,6 +512,7 @@ class LiveEngineHelpersMixin:
         tf_sec = int(_resolution_to_seconds(timeframe))
         if tf_sec <= 0:
             tf_sec = 60
+        tf_s = str(timeframe or "").strip().lower()
 
         epoch = dt.datetime(1970, 1, 1)
         bt = candle.get("bucket_ts")
@@ -451,9 +522,13 @@ class LiveEngineHelpersMixin:
             except (TypeError, ValueError):
                 bt_int = None
             if bt_int is not None:
-                if tf_sec == 3600 and self._is_nse_index_candle(candle):
-                    if not bucket_ts_is_nse_60m_bar(bt_int):
-                        return False
+                if self._is_nse_index_candle(candle):
+                    if tf_sec == 3600 or tf_s in ("60", "1h", "60m"):
+                        if not bucket_ts_is_nse_60m_bar(bt_int):
+                            return False
+                    elif tf_sec == 7200 or tf_s in ("120", "2h", "120m"):
+                        if not bucket_ts_is_nse_120m_bar(bt_int):
+                            return False
                 now_unix = int((now_utc - epoch).total_seconds())
                 if candle.get("session_close_partial"):
                     exchange = str(
@@ -475,7 +550,13 @@ class LiveEngineHelpersMixin:
                 return True
 
         unix_s = int((ts_utc - epoch).total_seconds())
-        return (unix_s % tf_sec) == 0
+        # Bar open must land on a TF boundary, and wall-clock must be past bar close.
+        # Without the close check, an aligned open (e.g. 14:30) is treated as closed
+        # mid-bar (e.g. 14:49) and strategies trade on forming candles.
+        if (unix_s % tf_sec) != 0:
+            return False
+        now_unix = int((now_utc - epoch).total_seconds())
+        return now_unix >= unix_s + tf_sec
 
     def _closed_candle_diagnostics(
         self,
@@ -515,7 +596,9 @@ class LiveEngineHelpersMixin:
         now_utc = self._now_utc_naive(now)
         out["ts_utc_naive"] = ts_utc.isoformat()
         out["now_utc_naive"] = now_utc.isoformat()
-        out["forming"] = bool(ts_utc > now_utc)
+        epoch = dt.datetime(1970, 1, 1)
+        unix_s = int((ts_utc - epoch).total_seconds())
+        now_unix = int((now_utc - epoch).total_seconds())
         try:
             out["delta_ts_minus_now_sec"] = (ts_utc - now_utc).total_seconds()
         except Exception:
@@ -527,10 +610,17 @@ class LiveEngineHelpersMixin:
                 out["bucket_mod_tf"] = b % tf_sec
             except (TypeError, ValueError):
                 out["bucket_mod_tf"] = None
-        epoch = dt.datetime(1970, 1, 1)
-        unix_s = int((ts_utc - epoch).total_seconds())
         out["unix_s_mod_tf"] = unix_s % tf_sec
-        if ts_utc > now_utc:
+        bar_still_open = False
+        if bt is not None:
+            try:
+                bar_still_open = now_unix < int(float(bt)) + tf_sec
+            except (TypeError, ValueError):
+                bar_still_open = False
+        elif (unix_s % tf_sec) == 0:
+            bar_still_open = now_unix < unix_s + tf_sec
+        out["forming"] = bool(ts_utc > now_utc or bar_still_open)
+        if ts_utc > now_utc or bar_still_open:
             out["skip_reason"] = "forming"
         elif bt is not None:
             try:
@@ -909,7 +999,7 @@ class LiveEngineHelpersMixin:
         self._entries_paused_feed_stale = any_stale
 
     def _do_exit_order_refresh(self) -> None:
-        """Every 1 min, re-quote open exit orders at near bid/ask until they fill."""
+        """Every 30s, re-quote open exit / force-exit limits at best bid/ask until fill."""
         now = time.time()
         if now - self._last_exit_refresh_time < self._exit_refresh_interval_seconds:
             return
@@ -917,6 +1007,17 @@ class LiveEngineHelpersMixin:
         self.order_router.refresh_stale_exit_orders(
             get_bid_ask=self._get_bid_ask,
             stale_seconds=float(self._exit_refresh_interval_seconds),
+        )
+
+    def _do_entry_order_refresh(self) -> None:
+        """Every 30 seconds, re-quote unfilled entry limits at best bid/ask."""
+        now = time.time()
+        if now - self._last_entry_refresh_time < self._entry_refresh_interval_seconds:
+            return
+        self._last_entry_refresh_time = now
+        self.order_router.refresh_stale_entry_orders(
+            get_bid_ask=self._get_bid_ask,
+            stale_seconds=float(self._entry_refresh_interval_seconds),
         )
 
     def _log_startup_balance_snapshot(self) -> None:
@@ -982,8 +1083,12 @@ class LiveEngineHelpersMixin:
             self.engine_logger.eod_export(path)
 
     def _drain_tick_queue(self) -> None:
-        """Drain tick queue into candle_aggregator (single state owner). Non-blocking; cap per cycle."""
-        if not self.tick_queue or not self.candle_aggregator:
+        """Drain ticks into candles and publish subscribed ``QuoteUpdated`` events."""
+        if not self.tick_queue:
+            return
+        has_aggregator = self.candle_aggregator is not None
+        quote_syms = self._quote_update_symbols()
+        if not has_aggregator and not quote_syms:
             return
         if not hasattr(self, "_tick_debug_count"):
             self._tick_debug_count = 0
@@ -1002,8 +1107,12 @@ class LiveEngineHelpersMixin:
                 v = tick.get("volume", 0)
                 ts = tick.get("timestamp")
                 if s is not None and p is not None and ts is not None:
-                    self.candle_aggregator.on_tick(s, p, v, ts)
+                    if has_aggregator:
+                        self.candle_aggregator.on_tick(s, p, v, ts)
                     self._last_tick_timestamp[s] = time.time()
+                    sym_u = str(s).strip().upper()
+                    if quote_syms and sym_u in quote_syms:
+                        self._publish_quote_updated_from_tick(s, p, ts)
                     self._tick_debug_count += 1
                     now = time.time()
                     if now - self._tick_debug_last_log >= 1800:
@@ -1035,7 +1144,117 @@ class LiveEngineHelpersMixin:
                     )
                 else:
                     logger.exception("Aggregator error for symbol=%s", s)
-        self._drain_candle_queue()
+        if has_aggregator:
+            self._drain_candle_queue()
+
+    def _gtt_watch_symbols(self) -> set:
+        book = getattr(getattr(self, "order_router", None), "gtt_fallback_book", None)
+        if book is None or not book.has_active_watches():
+            return set()
+        fn = getattr(book, "active_trading_symbols", None)
+        if not callable(fn):
+            return set()
+        return {str(s).strip().upper() for s in (fn() or []) if str(s).strip()}
+
+    def _reentry_watch_symbols(self) -> set:
+        book = getattr(
+            getattr(self, "order_router", None), "reentry_at_cost_book", None
+        )
+        if book is None or not getattr(book, "has_pending", lambda: False)():
+            return set()
+        fn = getattr(book, "active_trading_symbols", None)
+        if not callable(fn):
+            return set()
+        return {str(s).strip().upper() for s in (fn() or []) if str(s).strip()}
+
+    def _strategy_quote_symbols(self) -> set:
+        """Underlying symbols explicitly subscribed to strategy quote hooks."""
+        cached = getattr(self, "_strategy_quote_symbols_cache", None)
+        if cached is not None:
+            return set(cached)
+        from core.events.subscriptions import resolve_strategy_subscriptions
+
+        strategies = list(getattr(self, "strategies", None) or [])
+        if not strategies:
+            strategy = getattr(self, "strategy", None)
+            strategies = [strategy] if strategy is not None else []
+        symbols = set()
+        for strategy in strategies:
+            entry = resolve_strategy_subscriptions(strategy).get("QuoteUpdated")
+            if not isinstance(entry, dict) or not entry.get("enabled"):
+                continue
+            symbols.update(
+                str(symbol).strip().upper()
+                for symbol in (entry.get("symbols") or [])
+                if str(symbol).strip()
+            )
+        self._strategy_quote_symbols_cache = frozenset(symbols)
+        return symbols
+
+    def _quote_update_symbols(self) -> set:
+        return (
+            self._gtt_watch_symbols()
+            | self._strategy_quote_symbols()
+            | self._reentry_watch_symbols()
+        )
+
+    def _quote_fields_from_feed(self, symbol: str, ltp: Any) -> dict:
+        """Best bid/ask/ltp from realtime feed cache for QuoteUpdated payload."""
+        feed = getattr(self, "realtime_feed", None)
+        bid = ask = None
+        if feed is not None:
+            bid_fn = getattr(feed, "get_best_bid", None)
+            ask_fn = getattr(feed, "get_best_ask", None)
+            if callable(bid_fn):
+                try:
+                    bid = bid_fn(symbol)
+                except Exception:
+                    bid = None
+            if callable(ask_fn):
+                try:
+                    ask = ask_fn(symbol)
+                except Exception:
+                    ask = None
+            if ltp is None:
+                ticker_fn = getattr(feed, "get_last_ticker", None)
+                if callable(ticker_fn):
+                    try:
+                        tick = ticker_fn(symbol)
+                        if isinstance(tick, dict):
+                            ltp = tick.get("close") or tick.get("last_price") or tick.get("mark_price")
+                    except Exception:
+                        pass
+        return {
+            "symbol": str(symbol),
+            "bid": float(bid) if bid is not None else None,
+            "ask": float(ask) if ask is not None else None,
+            "ltp": float(ltp) if ltp is not None else None,
+            "source": "feed",
+        }
+
+    def _publish_quote_updated_from_tick(self, symbol: Any, price: Any, ts: Any) -> None:
+        """Push ``QuoteUpdated`` for GTT or strategy-subscribed symbols."""
+        bus = getattr(self, "event_bus", None)
+        if bus is None:
+            return
+        sym = str(symbol or "").strip()
+        if not sym:
+            return
+        watched = self._quote_update_symbols()
+        if not watched or sym.upper() not in watched:
+            return
+        from core.events.types import EventType, make_event
+
+        payload = self._quote_fields_from_feed(sym, price)
+        payload["ts"] = float(ts) if ts is not None else None
+        self._last_gtt_feed_quote_ts = time.time()
+        bus.publish(
+            make_event(
+                EventType.QUOTE_UPDATED,
+                payload,
+                engine_id=getattr(self, "engine_id", None) or "live",
+            )
+        )
 
     def _drain_candle_queue(self) -> None:
         """Apply Delta exchange candlestick OHLC over tick-built bars (per resolution)."""

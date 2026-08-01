@@ -1,0 +1,73 @@
+id: DirectionalOptionSelling
+implementation:
+  module: core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling
+  class: DirectionalOptionSelling
+instrument: OPTION
+allowed_modes:
+- BACKTEST
+- PAPER
+- LIVE
+broker:
+  venue: DELTA
+  api: DELTA
+  delta:
+    india: true
+    testnet: false
+    leverage: 5
+symbols:
+- BTCUSD
+- ETHUSD
+exchange: NSE
+timeframe: '60'
+schedule:
+  eval_mode: live_feed
+data:
+  default:
+    data: {}
+profile:
+  live:
+    exchange: DELTA
+    sector: 'YES'
+  backtest:
+    start_date: '2026-06-02'
+    end_date: '2026-07-03'
+    timeframe: '60'
+    exchange: DELTA
+    sector: 'YES'
+dependencies:
+  mixins:
+  - IndiaMktMixins
+  - DeltaMktMixins
+  meta_key: directional_option_selling
+subscriptions:
+  BarClosed:
+    enabled: true
+    timeframes:
+    - '60'
+    - 4h
+    - 1d
+    symbols:
+    - BTCUSD
+    - ETHUSD
+  ScheduledSlot:
+    enabled: false
+    symbols:
+    - BTCUSD
+    - ETHUSD
+  QuoteUpdated:
+    enabled: true
+    symbols:
+    - BTCUSD
+    - ETHUSD
+execution:
+  bracket_leg_tags:
+  - MAIN_SL
+documentation:
+  title: BTC/ETH SuperTrend Option Selling
+  overview: >
+    Multi-sleeve SuperTrend option selling for BTCUSD and ETHUSD. Per-symbol
+    knobs (premium floors, trail points, lots) live in SYMBOL_CONFIG.
+  rules: |
+    - SuperTrend length 16, multiplier 1.5 on 60-minute closed candles
+    - Symbol-wise config for strike selection / risk distances / lots
+    - Sleeves: weekly, monthly, daily, morning (see readme.md)

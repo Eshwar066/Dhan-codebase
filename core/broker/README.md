@@ -53,34 +53,21 @@ Strategy → Intent → RiskManager → OrderRouter → Broker.place_order()
 2. In `run/main.py`, set `BROKER_NAME = "DELTA"` and pass `DeltaBrokerApi(...)` into `DeltaBroker`.
 3. Data can stay on Dhan/NSE until Delta provides a data feed; then add `DeltaDataProvider` in the data layer.
 
-Broker → BrokerApi → Source
-Broker (business)
-BrokerApi (exchange contract)
-Source (transport)
+## Layering (Source → Api → Broker)
 
-Checking the broker structure to explain why the API layer exists.
-There are two layers in the broker package:
-Broker (e.g. DhanBroker) – application/order-management layer
-Works with OrderIntent (strategy-level object).
-Builds the order payload, handles retries, intent_store, idempotency (find_order_by_client_id), sync_positions, exit_position.
-Depends on position_manager and intent_store.
-BrokerApi (e.g. DhanBrokerApi) – exchange-facing layer
-Works with raw order params: tradingsymbol, exchange, quantity, price, etc.
-Exposes place_order(...), get_positions(), get_order_list().
-For Dhan, it’s a thin wrapper over DhanSource (which actually talks to the broker).
-So the “extra” API layer is the BrokerApi between the Broker and the real backend (e.g. DhanSource).
-Why it exists
-Single contract for all brokers
-IBrokerApi defines one interface (place_order with raw params, get_positions, get_order_list). Dhan and Delta both implement that. The Broker only knows “call api.place_order(...)”; it doesn’t care if the backend is Dhan or Delta.
-Separation of responsibilities
-Broker: intent → payload, retries, intent_store, position sync (order-management logic).
-BrokerApi: “how we call this exchange” (same shape for every exchange).
-Testability
-You can test DhanBroker (retries, payload building, intent_store updates) by passing a mock that implements IBrokerApi, without a real DhanSource or network.
-Aligns with data vs orders
-DhanSource does both data (candles, LTP, option chain) and orders. The data layer uses it only for data. The broker layer uses DhanBrokerApi (wrapping the same source) only for orders. So the “API” here is the order side of that source, behind a fixed contract.
-Could you remove it?
-Yes. You could have DhanBroker call DhanSource directly (e.g. dhan_source.place_order(...)), and keep only the Broker layer. You’d lose:
-A single IBrokerApi-style contract for swapping Dhan vs Delta.
-A clear place to mock “the exchange” when testing the Broker.
-So the extra API layer is there to keep exchange communication behind one interface and order-management logic in the Broker, and to make testing and adding new brokers (e.g. Delta) easier. If you prefer a flatter design and are fine with the Broker depending on the concrete source, you could collapse BrokerApi into the Broker and still have a working setup.
+```
+Strategy → OrderRouter → Broker (intent, retries, intent_store)
+                              → BrokerApi (IBrokerApi: raw place_order params)
+                                   → Source (DhanSource / DeltaSource transport)
+```
+
+| Layer | Responsibility | Do not |
+|-------|----------------|--------|
+| **Source** | HTTP/WS to exchange; candles, quotes, raw `place_order` | Build `OrderIntent` payloads |
+| **BrokerApi** | Thin `IBrokerApi` adapter over Source | Risk checks, position accounting |
+| **Broker** | `OrderIntent` → payload, retries, fill sync, `exit_position` | Fetch option chains / indicators |
+
+**Data vs orders:** `DhanSource` can do both; the data layer uses it for market data only. The broker stack uses `DhanBrokerApi` → same source for orders only. Do not duplicate order placement in strategies or the data layer.
+
+**App imports:** `from core.broker import DhanBroker, DhanBrokerApi` — not `core.broker.internal.*`.
+

@@ -120,6 +120,15 @@ class BaseEngine:
                 if px is None:
                     px = float(candle.get("close", 0) or 0)
             price_map[ts] = float(px)
+        # Spot-index stops (e.g. DirectionalOptionSelling SuperTrend trail) compare
+        # against the underlying candle, not option LTP.
+        candle_sym = str(candle.get("symbol") or "").strip().upper()
+        try:
+            spot = float(candle.get("close") or 0)
+        except (TypeError, ValueError):
+            spot = 0.0
+        if candle_sym and spot > 0:
+            price_map[candle_sym] = spot
         if not price_map:
             return
         br.evaluate_pending_stops(

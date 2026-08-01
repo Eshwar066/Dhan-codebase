@@ -24,6 +24,18 @@ IST = ZoneInfo("Asia/Kolkata")
 
 logger = logging.getLogger(__name__)
 
+# Delta: if MAIN_SL never rests on exchange, re-arm every 3 min up to 10 times, then flatten.
+DELTA_MAIN_SL_RETRY_INTERVAL_SEC = 180
+DELTA_MAIN_SL_RETRY_MAX_ATTEMPTS = 10
+
+
+def _position_allows_strategy_exit(pos: Any) -> bool:
+    """MAIN book and post-partial trail legs (tag may become MAIN_TARGET after TARGET fill)."""
+    tag_u = str(getattr(pos, "tag", None) or "").upper()
+    if tag_u == "HEDGE":
+        return False
+    return tag_u == "MAIN" or tag_u.startswith("MAIN_")
+
 from run.config import RunMode
 from core.engine.base_engine import BaseEngine
 from core.data.candle_aggregator import _bucket_ts, _resolution_to_seconds
@@ -36,8 +48,10 @@ from core.engine.execution_engine import ExecutionEngine
 from core.engine.indicator_manager import IndicatorManager
 from core.utils.indicator_history import (
     bucket_ts_is_nse_60m_bar,
+    bucket_ts_is_nse_120m_bar,
     is_nse_index_context,
     nse_60m_bar_close_eval_window,
+    nse_120m_bar_close_eval_window,
 )
 from core.orderExecution.account_router import AccountRouter
 
@@ -100,6 +114,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         max_active_account_symbol_keys: int = 200,
         account_circuit_breaker_threshold: int = 5,
         feed_stall_seconds: float = 60.0,
+        execution_validator: Optional[Dict[str, Any]] = None,
+        event_blackout_guard: Optional[Any] = None,
     ):
         super().__init__(
             strategy,
@@ -127,6 +143,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         )
         self.candle_service = candle_service
         self.order_router = order_router
+        self.order_router.bundle_price_refresher = self._refresh_bundle_entry_prices
+        self.order_router.on_broker_no_open_position = self._on_broker_no_open_position
         self.position_manager = position_manager
         self.position_manager.on_structure_exit = getattr(
             strategy, "on_structure_exit", None
@@ -134,14 +152,30 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self.position_manager.on_forced_exit = getattr(strategy, "on_forced_exit", None)
         self.position_manager.on_main_entry_fill = self._on_pm_main_entry_fill
         self.position_manager.on_main_exit_fill = self._on_pm_main_exit_fill
+        self._configure_reentry_at_cost_book()
         self.realtime_feed = realtime_feed
         self.tick_queue = tick_queue
         self.candle_queue = candle_queue
         self.candle_aggregator = candle_aggregator
         self.engine_id = engine_id or "live"
+        self.event_bus = None
+        self._feed_disconnect_event_sent = False
         self.venue = venue or ""
+        self._execution_validator_cfg = (
+            dict(execution_validator) if isinstance(execution_validator, dict) else None
+        )
+        self._event_blackout_guard = event_blackout_guard
         self.market_exchange = str(market_exchange or "").upper()
         self.engine_logger = engine_logger
+        self._configure_execution_validator()
+        # Keep RiskManager guard in sync if factory attached it elsewhere.
+        if (
+            event_blackout_guard is not None
+            and self.order_router is not None
+            and getattr(self.order_router, "risk", None) is not None
+            and getattr(self.order_router.risk, "event_blackout_guard", None) is None
+        ):
+            self.order_router.risk.event_blackout_guard = event_blackout_guard
         self.feed_stale_seconds = feed_stale_seconds
         self._last_tick_timestamp: Dict[str, float] = {}
         self._last_candle_timestamp: Dict[str, float] = {}
@@ -153,15 +187,24 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         # Duplicate signal protection
         self._last_signal_hash_per_symbol: Dict[str, int] = {}
         self._delta_align_log_keys: set[str] = set()
+        # Delta MAIN_SL placement watch: structure_id -> {attempts, next_at}
+        self._delta_main_sl_retry: Dict[str, Dict[str, Any]] = {}
         # Time-of-day guard
         self.allowed_trading_hours = allowed_trading_hours or []
         # Order state check (Fix 2: Default to 1m if not set)
         self.order_state_check_interval_min = order_state_check_interval_min or 1
         self._last_order_state_check_time: float = 0
         self._entries_paused_order_mismatch = False
-        # Stale exit order refresh: re-quote at near bid/ask every 1 min until fill
-        self._exit_refresh_interval_seconds = 60
+        # Full position reconcile on mismatch is expensive and noisy on multi-strategy
+        # engines; cooldown avoids per-minute Seeded… spam while mismatch persists.
+        self._last_mismatch_full_reconcile_ts: float = 0.0
+        self._mismatch_reconcile_cooldown_sec: float = 300.0
+        # Stale exit / force-exit limits: re-quote at best bid/ask every 30s until fill
+        self._exit_refresh_interval_seconds = 30
         self._last_exit_refresh_time: float = 0
+        # Unfilled entry limits: chase the executable best quote every 30 seconds.
+        self._entry_refresh_interval_seconds = 30
+        self._last_entry_refresh_time: float = 0
         self.run_mode = run_mode
         self._open_positions_logger = open_positions_logger
         # Memory guard
@@ -173,6 +216,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         self.latency_critical_ms = latency_critical_ms
         self.latency_critical_cycles = latency_critical_cycles
         self._latency_critical_count = 0
+        self._latency_recovery_count = 0
         self._entries_paused_latency = False
         # Symbol-level failure isolation
         self.symbol_error_threshold = symbol_error_threshold
@@ -273,7 +317,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             account_router=self.account_router,
             engine_logger=self.engine_logger,
             is_shutdown_requested=lambda: self._shutdown_requested,
-            on_latency_critical=lambda: setattr(self, "_entries_paused_latency", True),
+            on_latency_critical=self._on_latency_observed,
             latency_critical_ms=self.latency_critical_ms,
             worker_watchdog_interval_seconds=self._worker_watchdog_interval_seconds,
             queue_overflow_policy=self._queue_overflow_policy,
@@ -307,22 +351,9 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         )
 
     def _underlying_from_strategy_meta(self, metadata_extras: Any) -> Optional[str]:
-        if isinstance(metadata_extras, dict):
-            od = metadata_extras.get("one_day_magical_line") or metadata_extras.get(
-                "one_day_ml1"
-            )
-            if isinstance(od, dict) and od.get("symbol"):
-                return str(od["symbol"])
-            niml = metadata_extras.get("nifty_intraday_magical_line")
-            if isinstance(niml, dict) and niml.get("symbol"):
-                return str(niml["symbol"])
-            oi = metadata_extras.get("oi_positional_buy")
-            if isinstance(oi, dict) and oi.get("symbol"):
-                return str(oi["symbol"])
-            btst = metadata_extras.get("banknifty_btst")
-            if isinstance(btst, dict) and btst.get("symbol"):
-                return str(btst["symbol"])
-        return None
+        from core.strategies.meta import underlying_from_metadata
+
+        return underlying_from_metadata(metadata_extras)
 
     @staticmethod
     def _underlying_from_structure_id(structure_id: Any) -> Optional[str]:
@@ -372,6 +403,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         if first_live_ts is None or last_hist_ts is None:
             return first_live_ts
         if bucket_ts_is_nse_60m_bar(first_live_ts) and not bucket_ts_is_nse_60m_bar(
+            last_hist_ts
+        ):
+            return first_live_ts
+        if bucket_ts_is_nse_120m_bar(first_live_ts) and not bucket_ts_is_nse_120m_bar(
             last_hist_ts
         ):
             return first_live_ts
@@ -433,9 +468,17 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             if df is None or len(df) == 0 or "timestamp" not in df.columns:
                 return None
             tf_s = str(tf or "").strip()
-            nse_60m = tf_s in ("60", "1h") and is_nse_index_context(symbol, exchange)
-            if nse_60m:
-                # Ignore wall-clock / misaligned rows (e.g. 12:16) that break alignment.
+            nse_session_tf = is_nse_index_context(symbol, exchange) and tf_s in (
+                "60",
+                "1h",
+                "60m",
+                "120",
+                "2h",
+                "120m",
+            )
+            if nse_session_tf:
+                # Ignore wall-clock / misaligned rows that break alignment.
+                want_120 = tf_s in ("120", "2h", "120m")
                 for i in range(len(df) - 1, -1, -1):
                     last_ts = df.iloc[i].get("timestamp")
                     if last_ts is None:
@@ -450,7 +493,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         bt = int(float(last_ts))
                     else:
                         continue
-                    if bucket_ts_is_nse_60m_bar(bt):
+                    if want_120:
+                        if bucket_ts_is_nse_120m_bar(bt):
+                            return bt
+                    elif bucket_ts_is_nse_60m_bar(bt):
                         return bt
                 return None
             last_ts = df.iloc[-1].get("timestamp")
@@ -473,15 +519,43 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     bt = int(float(last_ts))
                 else:
                     continue
-                if bt > cutoff:
-                    continue
-                return bt
+                if bt <= cutoff:
+                    return bt
             return None
         except Exception:
             return None
         return None
 
     def _on_pm_main_entry_fill(self, **kwargs: Any) -> None:
+        strategy_name = kwargs.get("strategy")
+        strategy_obj = self._strategy_obj_for_name(strategy_name)
+        if strategy_obj is None:
+            return
+        # Deduplicate concurrent MAIN_SL arms for the same structure (rebind+ensure race).
+        sid = str(kwargs.get("structure_id") or "").strip()
+        if sid:
+            armed = getattr(self, "_main_sl_arm_inflight", None)
+            if armed is None:
+                self._main_sl_arm_inflight = set()
+                armed = self._main_sl_arm_inflight
+            if sid in armed:
+                return
+            intent_store = getattr(self.order_router, "intent_store", None)
+            if intent_store is not None and intent_store.has_pending_intent(
+                str(strategy_name or ""),
+                sid,
+                tags=["MAIN_SL"],
+                actions=["FORCE_EXIT"],
+            ):
+                return
+            armed.add(sid)
+        try:
+            self._on_pm_main_entry_fill_impl(**kwargs)
+        finally:
+            if sid:
+                getattr(self, "_main_sl_arm_inflight", set()).discard(sid)
+
+    def _on_pm_main_entry_fill_impl(self, **kwargs: Any) -> None:
         strategy_name = kwargs.get("strategy")
         strategy_obj = self._strategy_obj_for_name(strategy_name)
         if strategy_obj is None:
@@ -509,6 +583,15 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         }
         kwargs.pop("ctx", None)
         ctx = self.build_context_only(candle)
+        # OMS reentry-at-cost: stop on MAIN open when bus is not wired
+        # (bus path: IntentFilled → ReentryAtCostFillHandler).
+        from core.events.handlers.reentry_at_cost import stop_on_main_opened
+
+        stop_on_main_opened(
+            self,
+            strategy=strategy_obj,
+            instrument=kwargs.get("instrument"),
+        )
         intents = fn(ctx=ctx, **kwargs) or []
         risk_manager = getattr(self.order_router, "risk", None)
         bracket_tags = {"MAIN_SL", "MAIN_TARGET"}
@@ -589,6 +672,27 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         }
         kwargs.pop("ctx", None)
         ctx = self.build_context_only(candle_stub) if sym else None
+        # OMS reentry-at-cost: arm/cancel when bus is not wired
+        # (bus path: IntentFilled → ReentryAtCostFillHandler).
+        from core.events.handlers.reentry_at_cost import (
+            arm_from_main_sl,
+            cancel_for_structure,
+        )
+
+        tag_u = str(kwargs.get("tag") or "").upper()
+        if tag_u == "MAIN_SL":
+            arm_from_main_sl(
+                self,
+                strategy=strategy_obj,
+                instrument=kwargs.get("instrument"),
+                structure_id=kwargs.get("structure_id"),
+                metadata_extras=meta_ex,
+                qty=kwargs.get("qty"),
+                side=kwargs.get("side"),
+                price=kwargs.get("price"),
+            )
+        elif tag_u in ("MAIN_EXIT", "MAIN_TARGET"):
+            cancel_for_structure(self, kwargs.get("structure_id"))
         pairs = fn(ctx=ctx, **kwargs) or []
         risk_manager = getattr(self.order_router, "risk", None)
         for intent, candle in pairs:
@@ -661,40 +765,122 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     f"Failed to fetch broker positions: {e}"
                 )
             return False
+
+        # Restore persisted open legs before comparing local vs broker (avoids false mismatch on restart).
+        if hasattr(
+            self.position_manager, "rebuild_position_metadata_from_open_positions_csv"
+        ):
+            self.position_manager.rebuild_position_metadata_from_open_positions_csv()
+        if (
+            hasattr(self.position_manager, "rebuild_open_positions_from_open_positions_csv")
+            and self.instrument_store
+        ):
+            restored = self.position_manager.rebuild_open_positions_from_open_positions_csv(
+                self.instrument_store,
+                exchange=self._live_exchange or "NSE",
+            )
+            if restored and self.engine_logger:
+                self.engine_logger.reconciliation(
+                    f"Restored {restored} open position(s) from CSV before broker compare"
+                )
+        seed_fn = getattr(
+            self.order_router, "seed_filled_intents_from_open_positions_csv", None
+        )
+        csv_path = getattr(self.position_manager, "open_positions_csv_path", None)
+        if callable(seed_fn) and csv_path:
+            try:
+                seeded = seed_fn(csv_path)
+                if seeded and self.engine_logger:
+                    self.engine_logger.reconciliation(
+                        f"Seeded {seeded} FILLED intent(s) from open-positions CSV"
+                    )
+            except Exception as exc:
+                if self.engine_logger:
+                    self.engine_logger.reconciliation(
+                        f"Open-positions intent seed failed: {exc}"
+                    )
+
         local_snapshot = self.position_manager.snapshot()
         resolved_broker_positions = {}
         diff = []
+        from core.utils.expiry_resolver import ExpiryResolver
+
+        local_by_identity = {}
+        for loc_sym in local_snapshot.keys():
+            ik = ExpiryResolver.option_identity_key(loc_sym)
+            if ik and ik not in local_by_identity:
+                local_by_identity[ik] = loc_sym
 
         for b_sym, bp in broker_positions.items():
             # Resolve broker symbol (id or short_name) to engine symbol
             engine_sym = b_sym
             if self.instrument_store:
+                from core.orderExecution.position_manager import PositionManager
+
+                opt, strike = PositionManager._extract_option_hint(b_sym, None)
+                space = ExpiryResolver.parse_dhan_space_option_symbol(b_sym)
+                expiry = None
+                if space is not None:
+                    _root, expiry, space_strike, space_opt = space
+                    if strike is None:
+                        strike = space_strike
+                    if opt is None:
+                        opt = space_opt
+                # Venue is often "DHAN"; instrument master uses NSE/BSE.
+                exch = self.venue or "NSE"
                 inst = self.instrument_store.intent_creation_details(
-                    b_sym, self.venue, None, None, None
+                    b_sym, exch, expiry, opt, strike
                 )
+                if inst is None and str(exch).upper() == "DHAN":
+                    inst = self.instrument_store.intent_creation_details(
+                        b_sym, "NSE", expiry, opt, strike
+                    )
                 if inst:
                     engine_sym = inst.trading_symbol
+                else:
+                    ik = ExpiryResolver.option_identity_key(b_sym)
+                    if ik and ik in local_by_identity:
+                        engine_sym = local_by_identity[ik]
 
             resolved_broker_positions[engine_sym] = bp
 
             local = local_snapshot.get(engine_sym, {})
             lq = local.get("qty", 0)
             bq = int(bp.get("qty", 0))
-            if (
-                lq != bq
-                or abs(local.get("avg_price", 0) - float(bp.get("avg_price", 0))) > 0.01
-            ):
+            if lq == 0 and bq == 0:
+                continue
+            # Qty mismatch is a real position drift. Avg-only drift is normal
+            # (fill price vs broker cost-average) — sync quietly, do not alarm.
+            if lq != bq:
                 diff.append(
                     {
                         "symbol": engine_sym,
                         "local_qty": lq,
                         "broker_qty": bq,
+                        "local_avg": local.get("avg_price"),
                         "broker_avg": bp.get("avg_price"),
                     }
                 )
+            else:
+                try:
+                    local_avg = float(local.get("avg_price") or 0)
+                    broker_avg = float(bp.get("avg_price") or 0)
+                except (TypeError, ValueError):
+                    local_avg, broker_avg = 0.0, 0.0
+                if abs(local_avg - broker_avg) > 0.01 and self.engine_logger:
+                    self.engine_logger.reconciliation(
+                        f"Avg price sync {engine_sym}: local={local_avg} broker={broker_avg}"
+                    )
 
         for sym in set(local_snapshot.keys()) - set(resolved_broker_positions.keys()):
             if local_snapshot[sym].get("qty", 0) != 0:
+                # Identity already covered under a remapped broker key.
+                ik = ExpiryResolver.option_identity_key(sym)
+                if ik and any(
+                    ExpiryResolver.option_identity_key(bs) == ik
+                    for bs in resolved_broker_positions.keys()
+                ):
+                    continue
                 diff.append(
                     {
                         "symbol": sym,
@@ -740,31 +926,96 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             self.position_manager, "rebuild_position_metadata_from_open_positions_csv"
         ):
             self.position_manager.rebuild_position_metadata_from_open_positions_csv()
-        if hasattr(
-            self.position_manager, "rebuild_open_positions_from_open_positions_csv"
-        ) and self.instrument_store:
-            self.position_manager.rebuild_open_positions_from_open_positions_csv(
-                self.instrument_store,
-                exchange=self._live_exchange or "NSE",
-            )
-        self.position_manager.reconcile_with_broker(
-            resolved_broker_positions, strategy=None
+        merge_own = getattr(
+            self.position_manager,
+            "merge_ownership_from_all_strategy_open_positions_csvs",
+            None,
         )
-        restore_fn = getattr(self.strategy, "restore_state_on_startup", None)
-        if callable(restore_fn):
+        if callable(merge_own):
             try:
-                restore_fn(self.position_manager, intent_store)
+                merge_own(engine_id=self.engine_id)
             except Exception as exc:
                 if self.engine_logger:
                     self.engine_logger.reconciliation(
-                        f"restore_state_on_startup failed: {exc}"
+                        f"strategy CSV ownership merge failed: {exc}"
                     )
+        self.position_manager.reconcile_with_broker(
+            resolved_broker_positions, strategy=None
+        )
+        # Re-apply ownership after broker-adopted bare legs.
+        if callable(merge_own):
+            try:
+                merge_own(engine_id=self.engine_id)
+            except Exception:
+                pass
+        # Manual Dhan exits: clear ownership + cancel resting local orders when
+        # broker confirms flat. Runs after CSV merge so stale SYNC rows cannot
+        # resurrect metadata for legs already closed on Dhan.
+        try:
+            self._apply_manual_flat_closes_after_reconcile(resolved_broker_positions)
+        except Exception as exc:
+            if self.engine_logger:
+                self.engine_logger.reconciliation(
+                    f"manual flat sync after reconcile failed: {exc}"
+                )
+        self._restore_strategies_after_reconcile(intent_store)
         self._ensure_bracket_legs_after_reconcile()
         if self._open_positions_logger is not None and self.run_mode == RunMode.LIVE:
             self._open_positions_logger.record_broker_reconcile_snapshot(
                 self.position_manager
             )
+        if self.engine_logger:
+            open_legs = [
+                {"symbol": sym, "qty": int(pos.net_qty)}
+                for sym, pos in self.position_manager.positions.items()
+                if int(getattr(pos, "net_qty", 0) or 0) != 0
+            ]
+            self.engine_logger.reconciliation(
+                "Reconciliation OK",
+                details={
+                    "open_positions": len(open_legs),
+                    "mismatches_synced": len(diff),
+                    "positions": open_legs,
+                },
+            )
         return True
+
+    def _restore_strategies_after_reconcile(self, intent_store: Any = None) -> None:
+        """Call each strategy's restore_state_on_startup (not only self.strategy)."""
+        from types import SimpleNamespace
+
+        restore_ctx = SimpleNamespace(
+            position_store=self.position_manager,
+            intent_store=intent_store,
+            order_router=self.order_router,
+        )
+        for strategy_obj in self.strategies:
+            restore_fn = getattr(strategy_obj, "restore_state_on_startup", None)
+            if not callable(restore_fn):
+                continue
+            strategy_name = str(
+                getattr(strategy_obj, "name", type(strategy_obj).__name__)
+            )
+            try:
+                restore_fn(
+                    self.position_manager,
+                    intent_store,
+                    ctx=restore_ctx,
+                )
+            except TypeError:
+                # Older strategies: restore_state_on_startup(pm, intent_store)
+                try:
+                    restore_fn(self.position_manager, intent_store)
+                except Exception as exc:
+                    if self.engine_logger:
+                        self.engine_logger.reconciliation(
+                            f"restore_state_on_startup failed strategy={strategy_name}: {exc}"
+                        )
+            except Exception as exc:
+                if self.engine_logger:
+                    self.engine_logger.reconciliation(
+                        f"restore_state_on_startup failed strategy={strategy_name}: {exc}"
+                    )
 
     def _resolve_position_ownership_from_intent_store(
         self, sym: str, pos: Any, intent_store: Any
@@ -861,7 +1112,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             list(intent_store.list_by_status(IntentStatus.SENT))
             + list(intent_store.list_by_status(IntentStatus.VALIDATED))
             + list(intent_store.list_by_status(IntentStatus.CREATED))
-            + list(intent_store.list_by_status(IntentStatus.REJECTED))
+            # Do not adopt REJECTED intents (REJECTED -> SENT is illegal and
+            # crashed the engine when a failed MAIN_SL shared the structure).
         )
         for rec in pending:
             payload = rec.get("payload") or {}
@@ -914,6 +1166,76 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         if not intent_store:
             return
         broker = getattr(self.order_router, "broker", None)
+        broker_positions = None
+        if broker is not None and hasattr(broker, "get_positions_for_recon"):
+            try:
+                broker_positions = broker.get_positions_for_recon() or {}
+            except Exception as exc:
+                if self.engine_logger:
+                    self.engine_logger.reconciliation(
+                        f"Bracket ensure: broker position fetch failed: {exc}"
+                    )
+                broker_positions = None
+
+        from core.utils.expiry_resolver import ExpiryResolver
+
+        def _broker_confirms_open(trading_symbol: str, pos: Any) -> bool:
+            """Do not re-arm SL/target when broker is flat for this contract."""
+            if broker_positions is None:
+                # Fetch failed — keep prior behavior (local qty already checked).
+                return True
+            if not broker_positions:
+                return False
+            want = {
+                str(trading_symbol or "").strip().upper(),
+                "".join(
+                    ch for ch in str(trading_symbol or "").upper() if ch.isalnum()
+                ),
+            }
+            ik = ExpiryResolver.option_identity_key(str(trading_symbol or ""))
+            if ik:
+                want.add(ik)
+            inst = getattr(pos, "instrument", None)
+            if inst is not None:
+                for attr in ("trading_symbol", "custom_symbol"):
+                    raw = str(getattr(inst, attr, "") or "")
+                    if raw:
+                        want.add(raw.upper())
+                        want.add("".join(ch for ch in raw.upper() if ch.isalnum()))
+                        oid = ExpiryResolver.option_identity_key(raw)
+                        if oid:
+                            want.add(oid)
+                place = getattr(inst, "place_order_symbol", None)
+                if callable(place):
+                    try:
+                        raw = str(place() or "")
+                        if raw:
+                            want.add(raw.upper())
+                            want.add(
+                                "".join(ch for ch in raw.upper() if ch.isalnum())
+                            )
+                            oid = ExpiryResolver.option_identity_key(raw)
+                            if oid:
+                                want.add(oid)
+                    except Exception:
+                        pass
+            want.discard("")
+            for b_sym, row in broker_positions.items():
+                b_keys = {
+                    str(b_sym or "").strip().upper(),
+                    "".join(ch for ch in str(b_sym or "").upper() if ch.isalnum()),
+                }
+                bik = ExpiryResolver.option_identity_key(str(b_sym or ""))
+                if bik:
+                    b_keys.add(bik)
+                if not (want & b_keys):
+                    continue
+                try:
+                    return int((row or {}).get("qty") or 0) != 0
+                except (TypeError, ValueError):
+                    return False
+            return False
+
         for sym, pos in list(self.position_manager.positions.items()):
             if int(pos.net_qty or 0) == 0:
                 continue
@@ -952,6 +1274,12 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         pass
             sim_brackets_ok = True
             sym = getattr(getattr(pos, "instrument", None), "trading_symbol", None) or sym
+            if not _broker_confirms_open(sym, pos):
+                if self.engine_logger:
+                    self.engine_logger.reconciliation(
+                        f"Skip bracket re-arm for {sym}: not open on broker"
+                    )
+                continue
             if self.run_mode == RunMode.PAPER and broker is not None:
                 pending_sl = getattr(broker, "_pending_sl", {}) or {}
                 pending_tgt = getattr(broker, "_pending_target", {}) or {}
@@ -977,6 +1305,20 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             candle_ts = dt.datetime.now(dt.timezone.utc)
             inst = pos.instrument
             lot_size = max(1, int(getattr(inst, "lot_size", 0) or 1))
+            # Bare broker-reconcile Instrument often defaults lot_size=1; prefer store.
+            if lot_size <= 1 and self.instrument_store is not None:
+                try:
+                    resolved = self.instrument_store.intent_creation_details(
+                        str(sym), "NSE", None, None, None
+                    )
+                    if resolved is not None:
+                        lot_size = max(
+                            1, int(getattr(resolved, "lot_size", 0) or lot_size)
+                        )
+                        if getattr(inst, "lot_size", 1) in (0, 1) and lot_size > 1:
+                            inst.lot_size = lot_size
+                except Exception:
+                    pass
             fill_qty = max(1, abs(int(pos.net_qty)) // lot_size)
             self._on_pm_main_entry_fill(
                 instrument=inst,
@@ -993,6 +1335,442 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 metadata_extras=meta_bucket.get("strategy_meta"),
             )
 
+    def _maybe_retry_delta_missing_main_sl(self) -> None:
+        """
+        Delta only: if an open MAIN has no MAIN_SL (intent or exchange),
+        re-arm every 3 minutes up to 10 times; then force-close the position.
+        """
+        if str(self.venue or "").upper() != "DELTA":
+            return
+        intent_store = getattr(self.order_router, "intent_store", None)
+        if not intent_store:
+            return
+        broker = getattr(self.order_router, "broker", None)
+        now = time.time()
+        active_sids: set[str] = set()
+
+        for sym, pos in list(self.position_manager.positions.items()):
+            if int(pos.net_qty or 0) == 0:
+                continue
+            if str(getattr(pos, "tag", "") or "").upper() != "MAIN":
+                continue
+            self._resolve_position_ownership_from_intent_store(sym, pos, intent_store)
+            strategy_name = str(getattr(pos, "strategy", None) or "").strip()
+            if not strategy_name:
+                meta_bucket = self.position_manager.get_position_metadata(sym) or {}
+                strategy_name = str(meta_bucket.get("strategy") or "").strip()
+            if not strategy_name:
+                continue
+            strategy_obj = self._strategy_obj_for_name(strategy_name)
+            if strategy_obj is None:
+                continue
+            bracket_tags = list(
+                getattr(strategy_obj, "bracket_leg_tags", None)
+                or ["MAIN_SL", "MAIN_TARGET"]
+            )
+            if "MAIN_SL" not in [str(t).upper() for t in bracket_tags]:
+                continue
+            struct_id = getattr(pos, "structure_id", None)
+            if not struct_id:
+                meta_bucket = self.position_manager.get_position_metadata(sym) or {}
+                struct_id = meta_bucket.get("structure_id")
+            if not struct_id:
+                continue
+            sid = str(struct_id)
+            active_sids.add(sid)
+            trading_sym = (
+                getattr(getattr(pos, "instrument", None), "trading_symbol", None) or sym
+            )
+
+            if self.run_mode == RunMode.PAPER and broker is not None:
+                pending_sl = getattr(broker, "_pending_sl", {}) or {}
+                sl_ok = sid in pending_sl
+            else:
+                sl_ok = self._bracket_leg_satisfied(
+                    strategy_name,
+                    sid,
+                    "MAIN_SL",
+                    intent_store,
+                    broker,
+                    trading_sym,
+                )
+            if sl_ok:
+                self._delta_main_sl_retry.pop(sid, None)
+                continue
+
+            state = self._delta_main_sl_retry.setdefault(
+                sid, {"attempts": 0, "next_at": 0.0}
+            )
+            if now < float(state.get("next_at") or 0):
+                continue
+
+            attempts = int(state.get("attempts") or 0)
+            if attempts >= DELTA_MAIN_SL_RETRY_MAX_ATTEMPTS:
+                logger.error(
+                    "Delta MAIN_SL missing after %s retries; force-closing "
+                    "strategy=%s sid=%s symbol=%s",
+                    DELTA_MAIN_SL_RETRY_MAX_ATTEMPTS,
+                    strategy_name,
+                    sid,
+                    trading_sym,
+                )
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "delta_main_sl_force_close",
+                        f"sid={sid} symbol={trading_sym} attempts={attempts}",
+                    )
+                state["next_at"] = now + DELTA_MAIN_SL_RETRY_INTERVAL_SEC
+                self._force_close_position_missing_main_sl(
+                    strategy_obj=strategy_obj,
+                    strategy_name=strategy_name,
+                    pos=pos,
+                    symbol=str(sym),
+                    structure_id=sid,
+                )
+                continue
+
+            attempts += 1
+            state["attempts"] = attempts
+            state["next_at"] = now + DELTA_MAIN_SL_RETRY_INTERVAL_SEC
+            meta_bucket = self.position_manager.get_position_metadata(sym) or {}
+            inst = pos.instrument
+            lot_size = max(1, int(getattr(inst, "lot_size", 0) or 1))
+            fill_qty = max(1, abs(int(pos.net_qty)) // lot_size)
+            candle_ts = dt.datetime.now(dt.timezone.utc)
+            logger.warning(
+                "Delta MAIN_SL missing; retry place %s/%s strategy=%s sid=%s symbol=%s",
+                attempts,
+                DELTA_MAIN_SL_RETRY_MAX_ATTEMPTS,
+                strategy_name,
+                sid,
+                trading_sym,
+            )
+            if self.engine_logger:
+                self.engine_logger.log(
+                    "delta_main_sl_retry",
+                    f"attempt={attempts}/{DELTA_MAIN_SL_RETRY_MAX_ATTEMPTS} "
+                    f"sid={sid} symbol={trading_sym}",
+                )
+            try:
+                self._on_pm_main_entry_fill(
+                    instrument=inst,
+                    side="SELL" if pos.net_qty < 0 else "BUY",
+                    qty=fill_qty,
+                    price=float(pos.avg_price or 0),
+                    strategy=strategy_name,
+                    structure_id=sid,
+                    tag="MAIN",
+                    action="ENTRY",
+                    candle_ts=candle_ts,
+                    intent_id=getattr(pos, "intent_id", None)
+                    or meta_bucket.get("intent_id"),
+                    metadata_extras=meta_bucket.get("strategy_meta"),
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Delta MAIN_SL retry failed strategy=%s sid=%s: %s",
+                    strategy_name,
+                    sid,
+                    exc,
+                )
+
+        for stale_sid in list(self._delta_main_sl_retry.keys()):
+            if stale_sid not in active_sids:
+                self._delta_main_sl_retry.pop(stale_sid, None)
+
+    def _on_broker_no_open_position(
+        self,
+        *,
+        trading_symbol: Optional[str] = None,
+        structure_id: Optional[str] = None,
+        strategy_id: Optional[str] = None,
+        message: str = "",
+        **kwargs: Any,
+    ) -> None:
+        """Broker says no open position while placing bracket/SL — sync local state."""
+        sym = str(trading_symbol or "").strip()
+        sid = str(structure_id or "").strip()
+        strat = str(strategy_id or "").strip()
+        reason = str(message or "no_open_position")
+        clear_meta = "manual" in reason.lower() or reason in (
+            "manual_broker_exit",
+            "confirmed_broker_flat",
+        )
+
+        synced = False
+        pm = self.position_manager
+        if sym and hasattr(pm, "sync_symbol_flat_at_broker"):
+            synced = bool(
+                pm.sync_symbol_flat_at_broker(
+                    sym, reason=reason, clear_metadata=clear_meta
+                )
+            )
+            if clear_meta and not synced and hasattr(pm, "clear_ownership_metadata"):
+                # Already flat locally but metadata/CSV ghosts remain.
+                if pm.clear_ownership_metadata(sym):
+                    synced = True
+
+        if sid:
+            self._delta_main_sl_retry.pop(sid, None)
+
+        from core.events.handlers.reentry_at_cost import stop_for_flat
+
+        stop_for_flat(
+            self,
+            trading_symbol=sym or None,
+            strategy_id=strat or None,
+            structure_id=sid or None,
+        )
+
+        if self.engine_logger and synced:
+            self.engine_logger.log(
+                "reconciliation",
+                (
+                    f"PM synced flat trading_symbol={sym} structure_id={sid} "
+                    f"strategy_id={strat} reason={reason} clear_metadata={clear_meta}"
+                ),
+                symbol=sym or None,
+                structure_id=sid or None,
+                strategy_id=strat or None,
+            )
+        elif synced:
+            logger.warning(
+                "Broker flat sync: PM zeroed trading_symbol=%s structure_id=%s (%s)",
+                sym,
+                sid,
+                message,
+            )
+
+    @staticmethod
+    def _nse_session_open_for_manual_flat() -> bool:
+        """NSE cash session 09:15–15:30 IST — only then treat empty book as real flat."""
+        now = dt.datetime.now(IST).time()
+        return dt_time(9, 15) <= now <= dt_time(15, 30)
+
+    def _broker_open_qty_map(
+        self, broker_positions: Optional[Dict[str, Any]]
+    ) -> Dict[str, int]:
+        """Map engine/identity keys → abs qty for flat detection."""
+        from core.utils.expiry_resolver import ExpiryResolver
+
+        out: Dict[str, int] = {}
+        for b_sym, row in (broker_positions or {}).items():
+            try:
+                qty = abs(int((row or {}).get("qty") or 0))
+            except (TypeError, ValueError):
+                qty = 0
+            keys = {
+                str(b_sym or "").strip().upper(),
+                "".join(ch for ch in str(b_sym or "").upper() if ch.isalnum()),
+            }
+            ik = ExpiryResolver.option_identity_key(str(b_sym or ""))
+            if ik:
+                keys.add(ik)
+            for k in keys:
+                if k:
+                    out[k] = max(out.get(k, 0), qty)
+        return out
+
+    def _apply_manual_flat_closes_after_reconcile(
+        self, broker_positions: Dict[str, Any]
+    ) -> None:
+        """
+        Manual square-off sync (Dhan) after broker reconcile.
+
+        Contract:
+        - Market hours (09:15–15:30 IST) + broker confirms leg gone
+          (missing from a real book, qty 0, or empty book in-session)
+          → clear ownership metadata, cancel resting local intents, and
+            cancel broker orders when ``broker_order_id`` is known.
+          Prevents: manual exit → flat at Dhan → old MAIN_SL still live →
+          unexpected short/reverse fill.
+        - Outside market hours + empty/ambiguous broker book
+          → do nothing here (keep metadata). PM may zero local qty but must
+          not delete ownership so a temporary API hole cannot make the
+          strategy forget an overnight carry and recreate it after restart.
+        - Outside hours + non-empty book with this leg absent
+          → still clear (broker confirmed that specific contract is gone).
+        """
+        from core.utils.expiry_resolver import ExpiryResolver
+
+        if self.run_mode != RunMode.LIVE:
+            return
+        book = broker_positions if isinstance(broker_positions, dict) else {}
+        # Overnight / pre-open empty book is ambiguous — keep ownership.
+        if not book and not self._nse_session_open_for_manual_flat():
+            if self.engine_logger:
+                self.engine_logger.reconciliation(
+                    "Skip manual-flat metadata clear: empty broker book "
+                    "outside NSE session (09:15–15:30 IST)"
+                )
+            return
+
+        open_map = self._broker_open_qty_map(book)
+        pm = self.position_manager
+        router = getattr(self, "order_router", None)
+        sync_fn = getattr(router, "sync_local_after_manual_broker_flat", None)
+
+        candidates: Dict[str, Dict[str, Any]] = {}
+        for sym, pos in list(getattr(pm, "positions", {}).items()):
+            if int(getattr(pos, "net_qty", 0) or 0) == 0:
+                continue
+            candidates[str(sym)] = pm.ownership_snapshot(sym) if hasattr(
+                pm, "ownership_snapshot"
+            ) else {
+                "strategy": getattr(pos, "strategy", None),
+                "structure_id": getattr(pos, "structure_id", None),
+                "tag": getattr(pos, "tag", None),
+                "intent_id": getattr(pos, "intent_id", None),
+            }
+        for sym, meta in list(getattr(pm, "position_metadata", {}).items()):
+            if sym not in candidates:
+                candidates[str(sym)] = dict(meta or {})
+
+        for sym, own in candidates.items():
+            keys = {
+                str(sym).strip().upper(),
+                "".join(ch for ch in str(sym).upper() if ch.isalnum()),
+            }
+            ik = ExpiryResolver.option_identity_key(str(sym))
+            if ik:
+                keys.add(ik)
+            broker_qty = 0
+            matched = False
+            for k in keys:
+                if k in open_map:
+                    matched = True
+                    broker_qty = max(broker_qty, open_map[k])
+            # Still open on broker → leave alone.
+            if matched and broker_qty != 0:
+                continue
+            # Confirmed flat:
+            # - in-session empty book (gate above), or
+            # - non-empty book and this identity absent / qty 0.
+            if hasattr(pm, "sync_symbol_flat_at_broker"):
+                pm.sync_symbol_flat_at_broker(
+                    sym, reason="confirmed_broker_flat", clear_metadata=True
+                )
+            elif hasattr(pm, "clear_ownership_metadata"):
+                pm.clear_ownership_metadata(sym)
+
+            # Drop in-memory BTST meta so 9:15/9:25 will not resurrect the leg.
+            strat_name = str(own.get("strategy") or "").strip()
+            sid = str(own.get("structure_id") or "").strip()
+            if strat_name and sid:
+                strategy_obj = self._strategy_obj_for_name(strat_name)
+                meta_map = getattr(strategy_obj, "_meta_by_structure_id", None)
+                if isinstance(meta_map, dict):
+                    meta_map.pop(sid, None)
+
+            cancelled = 0
+            if callable(sync_fn):
+                cancelled = int(
+                    sync_fn(
+                        trading_symbol=sym,
+                        structure_id=sid or None,
+                        strategy_id=strat_name or None,
+                        reason="manual_broker_exit",
+                    )
+                    or 0
+                )
+            if self.engine_logger:
+                self.engine_logger.reconciliation(
+                    f"Manual/broker flat close synced for {sym} "
+                    f"(cancelled_intents={cancelled})"
+                )
+
+    def _force_close_position_missing_main_sl(
+        self,
+        *,
+        strategy_obj: Any,
+        strategy_name: str,
+        pos: Any,
+        symbol: str,
+        structure_id: str,
+    ) -> None:
+        """Flatten MAIN after MAIN_SL placement retries are exhausted."""
+        candle_ts = dt.datetime.now(dt.timezone.utc)
+        spot = self.get_price_map(symbol)
+        if spot is None:
+            spot = 0.0
+        candle = {
+            "symbol": symbol,
+            "timestamp": candle_ts,
+            "close": float(spot),
+            "exchange": None,
+        }
+        ctx = self.build_context_only(candle)
+        reason = "missing_main_sl_after_retries"
+        exit_intent = None
+        exit_fn = getattr(strategy_obj, "_exit_intent", None)
+        if callable(exit_fn):
+            try:
+                exit_intent = exit_fn(pos, candle, ctx, reason)
+            except Exception as exc:
+                logger.exception(
+                    "Delta force-close _exit_intent failed strategy=%s sid=%s: %s",
+                    strategy_name,
+                    structure_id,
+                    exc,
+                )
+        if exit_intent is None:
+            create_fn = getattr(strategy_obj, "create_order_intent", None)
+            if not callable(create_fn):
+                logger.error(
+                    "Delta force-close skipped: no exit builder strategy=%s sid=%s",
+                    strategy_name,
+                    structure_id,
+                )
+                return
+            net_qty = int(getattr(pos, "net_qty", 0) or 0)
+            required_exit_side = "BUY" if net_qty < 0 else "SELL"
+            trading_sym = str(
+                getattr(getattr(pos, "instrument", None), "trading_symbol", None)
+                or symbol
+            )
+            is_sell = required_exit_side == "SELL"
+            exit_price = (
+                self._exit_price_from_depth(trading_sym, is_sell)
+                or self.get_price_map(trading_sym)
+                or self._positive_price(getattr(pos, "avg_price", None))
+                or self.get_price_map(symbol)
+            )
+            if exit_price is None or float(exit_price) <= 0:
+                logger.error(
+                    "Delta force-close skipped: no LIMIT price strategy=%s sid=%s "
+                    "(market orders disabled)",
+                    strategy_name,
+                    structure_id,
+                )
+                return
+            exit_intent = create_fn(
+                inst=pos.instrument,
+                side=required_exit_side,
+                qty=abs(net_qty) or 1,
+                price=float(exit_price),
+                order_type="LIMIT",
+                strategy=strategy_name,
+                candle_ts=candle_ts,
+                structure_id=structure_id,
+                tag="MAIN_EXIT",
+                symbol=symbol,
+                action="EXIT",
+                metadata_extras={"exit_reason": reason},
+            )
+        required_exit_side = "BUY" if int(pos.net_qty or 0) < 0 else "SELL"
+        risk_manager = getattr(self.order_router, "risk", None)
+        self._process_strategy_exit_intent(
+            exit_intent,
+            strategy_obj,
+            symbol,
+            candle,
+            pos,
+            required_exit_side,
+            None,
+            getattr(strategy_obj, "timeframe", None),
+            risk_manager,
+        )
+
     def _do_order_state_check(self) -> None:
         # PAPER: skip broker order comparison (SimulatedBroker has no real orders; avoids false mismatches).
         # LIVE: fetch broker orders, compare with OMS, resolve mismatches.
@@ -1007,6 +1785,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         ):
             return
         self._last_order_state_check_time = now
+        self._prune_runtime_memory()
         ok, details = self.order_router.verify_open_orders_with_broker()
         if not ok:
             transient = self._is_transient_broker_reconcile_error(details)
@@ -1022,9 +1801,31 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     )
             else:
                 self._entries_paused_order_mismatch = True
-                self.reconcile_positions_on_start()
+                if (
+                    now - self._last_mismatch_full_reconcile_ts
+                    >= self._mismatch_reconcile_cooldown_sec
+                ):
+                    self._last_mismatch_full_reconcile_ts = now
+                    self.reconcile_positions_on_start()
         else:
             self._entries_paused_order_mismatch = False
+
+    def _prune_runtime_memory(self) -> None:
+        """Bound IntentStore / order-state maps that otherwise grow until OOM."""
+        intent_store = getattr(self, "intent_store", None)
+        if intent_store is not None and hasattr(intent_store, "cleanup_finalized"):
+            try:
+                dropped = intent_store.cleanup_finalized(keep_recent_seconds=6 * 3600)
+                if dropped:
+                    logger.info("IntentStore pruned %s finalized intent(s)", dropped)
+            except Exception:
+                logger.debug("IntentStore cleanup_finalized failed", exc_info=True)
+        router = getattr(self, "order_router", None)
+        if router is not None and hasattr(router, "prune_terminal_order_states"):
+            try:
+                router.prune_terminal_order_states(keep_recent_seconds=6 * 3600)
+            except Exception:
+                logger.debug("OrderRouter prune_terminal_order_states failed", exc_info=True)
 
     @staticmethod
     def _is_transient_broker_reconcile_error(details: Optional[Dict[str, Any]]) -> bool:
@@ -1036,6 +1837,39 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             or "FAILED TO FETCH BROKER OPEN ORDERS" in err
         )
 
+    def _on_latency_observed(self, total_ms: float) -> None:
+        """Pause entries after N consecutive slow cycles; clear after N healthy ones."""
+        try:
+            total_ms = float(total_ms)
+        except (TypeError, ValueError):
+            return
+        if total_ms > self.latency_critical_ms:
+            self._latency_critical_count += 1
+            self._latency_recovery_count = 0
+            if (
+                self._latency_critical_count >= self.latency_critical_cycles
+                and not self._entries_paused_latency
+            ):
+                self._entries_paused_latency = True
+                if self.engine_logger:
+                    self.engine_logger.latency_critical_pause(
+                        f"Latency critical for {self.latency_critical_cycles} cycles "
+                        f"(last={total_ms:.0f}ms, threshold={self.latency_critical_ms:.0f}ms); "
+                        "entries paused"
+                    )
+        else:
+            self._latency_critical_count = 0
+            if self._entries_paused_latency:
+                self._latency_recovery_count += 1
+                if self._latency_recovery_count >= self.latency_critical_cycles:
+                    self._entries_paused_latency = False
+                    self._latency_recovery_count = 0
+                    if self.engine_logger:
+                        self.engine_logger.latency_pause_cleared(
+                            f"Latency recovered for {self.latency_critical_cycles} cycles "
+                            f"(last={total_ms:.0f}ms); entries resumed"
+                        )
+
     def _entry_pause_reasons(self) -> List[str]:
         reasons: List[str] = []
         if self._entries_paused_feed_stale:
@@ -1046,6 +1880,17 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             reasons.append("memory")
         if self._entries_paused_latency:
             reasons.append("latency")
+        guard = getattr(self, "_event_blackout_guard", None)
+        if (
+            guard is not None
+            and str(getattr(self, "venue", "") or "").upper() == "DELTA"
+        ):
+            try:
+                if guard.is_blackout_active(venue="DELTA"):
+                    reasons.append("economic_event_blackout")
+            except Exception:
+                # Soft pause path: do not crash the loop; hard gate is RiskManager.
+                reasons.append("economic_event_blackout")
         return reasons
 
     def _log_entry_skipped_if_paused(
@@ -1528,6 +2373,22 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         trading_sym = self._intent_place_order_symbol(single_intent, symbol)
         return {trading_sym: exec_price}
 
+    def _refresh_bundle_entry_prices(
+        self,
+        bundle_item: Dict[str, Any],
+        intents: List[Any],
+        price_map: Dict[str, float],
+    ) -> None:
+        """Refresh bundle leg limit prices from live best bid/ask (LEAPS hedge retry)."""
+        symbol = str(bundle_item.get("symbol") or "").strip()
+        for intent in intents or []:
+            sym = symbol
+            if not sym:
+                sym = str(getattr(intent, "symbol", "") or "").strip()
+            pm = self._resolve_entry_price_map(intent, sym, None)
+            if pm:
+                price_map.update(pm)
+
     def _enqueue_entry_intents_grouped(
         self,
         entry_intents: list,
@@ -1709,6 +2570,147 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         for strategy in self.strategies:
             self._ensure_strategy_worker(strategy)
 
+    def _configure_gtt_fallback_book(self) -> None:
+        book = getattr(self.order_router, "gtt_fallback_book", None)
+        if book is None:
+            return
+        from core.orderExecution.gtt_fallback_book import (
+            CompositeQuoteProvider,
+            FeedQuoteProvider,
+            RestQuoteProvider,
+        )
+
+        providers = []
+        if self.realtime_feed is not None:
+            providers.append(FeedQuoteProvider(self.realtime_feed))
+        data = getattr(self, "data", None)
+        store = getattr(self, "instrument_store", None)
+        if data is not None and store is not None and hasattr(data, "get_quote_v2"):
+            providers.append(RestQuoteProvider(data, store))
+        if providers:
+            book.set_quote_provider(CompositeQuoteProvider(*providers))
+        book.set_subscribe_callback(self._gtt_fallback_subscribe)
+        try:
+            n_store = book.restore_from_intent_store()
+            n_disk = book.restore_from_disk()
+            n_logs = book.restore_missing_from_strategy_logs()
+            if (n_store or n_disk or n_logs) and self.engine_logger:
+                self.engine_logger.reconciliation(
+                    f"GTT watches restored store={n_store} disk={n_disk} logs={n_logs}"
+                )
+            adopt_fn = getattr(
+                self.order_router, "adopt_pending_entries_from_broker_positions", None
+            )
+            broker = getattr(self.order_router, "broker", None)
+            positions = {}
+            if broker is not None and hasattr(broker, "get_positions_for_recon"):
+                try:
+                    positions = broker.get_positions_for_recon() or {}
+                except Exception:
+                    positions = {}
+            if callable(adopt_fn) and positions:
+                n = adopt_fn(positions)
+                if n and self.engine_logger:
+                    self.engine_logger.reconciliation(
+                        f"Adopted {n} pending GTT ENTRY fill(s) after watch restore"
+                    )
+            # FILLED GTT intents skipped by adopt still need ownership + MAIN_SL.
+            rebind = getattr(book, "rebind_filled_legs_for_brackets", None)
+            if callable(rebind) and positions:
+                try:
+                    n_rebind = rebind(positions)
+                    if n_rebind and self.engine_logger:
+                        self.engine_logger.reconciliation(
+                            f"Rebound {n_rebind} filled GTT leg(s) for bracket re-arm"
+                        )
+                except Exception as exc:
+                    logger.warning("GttFallback filled-leg rebind failed: %s", exc)
+            if positions:
+                self._ensure_bracket_legs_after_reconcile()
+        except Exception as exc:
+            logger.warning("GttFallbackBook restore failed: %s", exc)
+
+    @staticmethod
+    def _merge_feed_instruments(
+        existing: List[Dict[str, Any]], new_rows: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        merged: Dict[tuple, Dict[str, Any]] = {}
+        for row in list(existing or []) + list(new_rows or []):
+            if not isinstance(row, dict):
+                continue
+            key = (
+                str(row.get("ExchangeSegment") or ""),
+                str(row.get("SecurityId") or ""),
+            )
+            merged[key] = row
+        return list(merged.values())
+
+    def _gtt_fallback_subscribe(self, trading_symbols: List[str]) -> None:
+        feed = self.realtime_feed
+        store = self.instrument_store
+        if feed is None or store is None or not hasattr(feed, "replace_instruments"):
+            return
+        syms = [str(s).strip() for s in (trading_symbols or []) if str(s).strip()]
+        if not syms:
+            return
+        rows = store.get_feed_instruments(syms)
+        if not rows:
+            return
+        existing = list(getattr(feed, "instruments", None) or [])
+        feed.replace_instruments(self._merge_feed_instruments(existing, rows))
+
+    def _subscribe_open_option_legs(self) -> None:
+        """Subscribe WS quotes for open option positions (needed for LEAPS exit pricing)."""
+        pm = getattr(self, "position_manager", None)
+        if pm is None or not hasattr(pm, "get_open_positions"):
+            return
+        try:
+            open_pos = pm.get_open_positions() or []
+        except Exception:
+            return
+        syms: List[str] = []
+        for pos in open_pos:
+            if int(getattr(pos, "net_qty", 0) or 0) == 0:
+                continue
+            inst = getattr(pos, "instrument", None)
+            if inst is None:
+                continue
+            if hasattr(inst, "place_order_symbol"):
+                try:
+                    s = inst.place_order_symbol()
+                except Exception:
+                    s = None
+                if s:
+                    syms.append(str(s))
+            ts = getattr(inst, "trading_symbol", None)
+            if ts:
+                syms.append(str(ts))
+        if syms:
+            self._gtt_fallback_subscribe(syms)
+
+    def _run_gtt_fallback_tick(self) -> None:
+        """
+        GTT maintenance (fill sync + active_until) every cycle.
+
+        Quote triggers are push-driven: feed ticks → QuoteUpdated → on_quote.
+        When the feed has been quiet for watched symbols, run ``book.tick()``
+        (QuoteProvider REST/cache fallback). Same behavior with or without event_bus.
+        """
+        book = getattr(self.order_router, "gtt_fallback_book", None)
+        if book is None or not book.has_active_watches():
+            return
+        now_ist = self._current_ist_now()
+        maintenance = getattr(book, "maintenance_tick", None)
+        if callable(maintenance):
+            maintenance(now_ist)
+            # Quiet-period quote scan still required after maintenance.
+            last_feed = float(getattr(self, "_last_gtt_feed_quote_ts", 0.0) or 0.0)
+            if (time.time() - last_feed) >= 3.0:
+                book.tick(now_ist)
+            return
+        # No maintenance_tick API: full tick covers maintenance + quotes.
+        book.tick(now_ist)
+
 
     @staticmethod
     def _is_scheduled_timeframe(timeframe: Any) -> bool:
@@ -1757,6 +2759,37 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             for s in (strategies or [])
         )
 
+    @classmethod
+    def needs_tick_queue(
+        cls,
+        strategies: List[Any],
+        strategy_eval_modes: Optional[Dict[str, str]] = None,
+    ) -> bool:
+        """True when candle aggregation or GTT QuoteUpdated push needs the tick queue."""
+        if cls.needs_candle_aggregator(strategies, strategy_eval_modes):
+            return True
+        try:
+            from core.events.subscriptions import collect_enabled_events
+
+            return "QuoteUpdated" in collect_enabled_events(strategies or [])
+        except Exception:
+            logger.exception(
+                "needs_tick_queue: subscription resolution failed; "
+                "falling back to strategy GTT heuristic"
+            )
+            # Do not always allocate a tick queue — only if a strategy opts into GTT.
+            for s in strategies or []:
+                mode = str(
+                    getattr(s, "ENTRY_EXECUTION_MODE", None)
+                    or getattr(s, "execution_mode", None)
+                    or ""
+                ).upper()
+                if mode in ("GTT", "HYBRID_GTT"):
+                    return True
+                if getattr(s, "gtt_fallback", None):
+                    return True
+            return False
+
     @staticmethod
     def _collect_feed_symbols(
         engine_symbols: List[str],
@@ -1766,9 +2799,11 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         """Symbols that require websocket tick aggregation (excludes scheduled-only underlyings)."""
         candle_syms: set[str] = set()
         for s in strategies or []:
-            if LiveEngine._is_scheduled_strategy(s, strategy_eval_modes):
-                continue
             allowed = getattr(s, "underlying_symbols", None) or []
+            if LiveEngine._is_scheduled_strategy(s, strategy_eval_modes):
+                for sym in allowed:
+                    candle_syms.add(str(sym).strip().upper())
+                continue
             if allowed:
                 for sym in allowed:
                     candle_syms.add(str(sym).strip().upper())
@@ -1792,6 +2827,11 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             if tf_s and tf_s not in seen:
                 seen.add(tf_s)
                 out.append(tf_s)
+            for extra in getattr(s, "extra_timeframes", None) or []:
+                extra_s = str(extra or "").strip()
+                if extra_s and extra_s not in seen:
+                    seen.add(extra_s)
+                    out.append(extra_s)
         if not out:
             if not LiveEngine._is_scheduled_strategy(primary, strategy_eval_modes):
                 p = str(getattr(primary, "timeframe", "") or "").strip()
@@ -1953,6 +2993,27 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             candle = self._build_scheduled_candle(
                 sym, close, slot_time, exchange, now_ist
             )
+            bus = getattr(self, "event_bus", None)
+            from core.events.types import EventType, make_event
+
+            if bus is not None and self._event_bus_has_subscribers(
+                bus, EventType.SCHEDULED_SLOT
+            ):
+                bus.publish(
+                    make_event(
+                        EventType.SCHEDULED_SLOT,
+                        {
+                            "strategy": strategy,
+                            "symbol": sym,
+                            "candle": candle,
+                            "slot_time": slot_time.strftime("%H:%M"),
+                            "dedupe_key": key,
+                            "exchange": exchange,
+                        },
+                        engine_id=self.engine_id,
+                    )
+                )
+                continue
             self._scheduled_evaluated_keys.add(key)
             if self.engine_logger:
                 self.engine_logger.log(
@@ -1964,6 +3025,11 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     strategy=str(getattr(strategy, "name", "")),
                     symbol=sym,
                 )
+            recent = self._recent_candles_for_strategy(strategy, candle)
+            ctx_pre = self.build_context_only(candle, recent_candles=recent)
+            self._run_exits_and_rollover(
+                strategy, sym, candle, ctx_pre, timeframe=None
+            )
             for eval_result in self._evaluate_strategies_parallel(
                 candle, scheduled=True
             ):
@@ -1995,18 +3061,377 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     timeframe=None,
                 )
 
+    def _configure_execution_validator(self) -> None:
+        """Attach Delta OMS ExecutionValidator to OrderRouter (mark/mid/stop gates)."""
+        router = getattr(self, "order_router", None)
+        if router is None or not hasattr(router, "configure_execution_validator"):
+            return
+        raw = getattr(self, "_execution_validator_cfg", None)
+        venue = str(getattr(self, "venue", "") or "").upper()
+        # Default: enable for DELTA when job omits the block; DHAN stays off.
+        if raw is None and venue == "DELTA":
+            raw = {"enabled": True, "venue": "DELTA"}
+        elif raw is None:
+            return
+        if isinstance(raw, dict) and "venue" not in raw and venue:
+            raw = {**raw, "venue": venue}
+        router.configure_execution_validator(
+            venue=venue or None,
+            config=raw,
+            snapshot_provider=self._market_snapshot_for_symbol,
+            on_invalid_stop=self._on_invalid_stop,
+        )
+        if self.engine_logger:
+            enabled = True
+            if isinstance(raw, dict):
+                enabled = bool(raw.get("enabled", True))
+            self.engine_logger.log(
+                "oms",
+                f"ExecutionValidator configured venue={venue} enabled={enabled}",
+                venue=venue,
+                enabled=enabled,
+            )
+
+    @staticmethod
+    def _ticker_has_mark(ticker: Any) -> bool:
+        if not isinstance(ticker, dict):
+            return False
+        quotes = ticker.get("quotes") if isinstance(ticker.get("quotes"), dict) else {}
+        for key in ("mark_price", "mark"):
+            try:
+                val = float(ticker.get(key) or quotes.get(key) or 0)
+            except (TypeError, ValueError):
+                val = 0.0
+            if val > 0:
+                return True
+        return False
+
+    def _market_snapshot_for_symbol(self, symbol: str):
+        """Single snapshot from feed ticker + top of book (Delta)."""
+        from core.orderExecution.execution_validator import snapshot_from_ticker
+
+        sym = str(symbol or "").strip()
+        if not sym:
+            return None
+        feed = self.realtime_feed
+        ticker = None
+        bid = ask = bid_size = ask_size = None
+        source = "feed"
+        if feed is not None:
+            get_ticker = getattr(feed, "get_last_ticker", None)
+            if callable(get_ticker):
+                try:
+                    ticker = get_ticker(sym)
+                except Exception:
+                    ticker = None
+            get_bid = getattr(feed, "get_best_bid", None)
+            get_ask = getattr(feed, "get_best_ask", None)
+            if callable(get_bid):
+                try:
+                    bid = get_bid(sym)
+                except Exception:
+                    bid = None
+            if callable(get_ask):
+                try:
+                    ask = get_ask(sym)
+                except Exception:
+                    ask = None
+        venue_u = str(getattr(self, "venue", "") or "").upper()
+        # Feed often has L2 bid/ask without mark. REST-fill when ticker/mark/book
+        # is incomplete so ExecutionValidator does not reject on missing_mark.
+        need_rest = venue_u == "DELTA" and (
+            ticker is None
+            or bid is None
+            or ask is None
+            or not self._ticker_has_mark(ticker)
+        )
+        if need_rest:
+            broker = getattr(self.order_router, "broker", None)
+            get_ticker = getattr(broker, "get_ticker", None) if broker else None
+            if callable(get_ticker):
+                try:
+                    rest = get_ticker(sym)
+                except Exception:
+                    rest = None
+                if isinstance(rest, dict):
+                    # Feed wins for overlapping keys, but keep REST mark when feed
+                    # has bid/ask without a usable mark_price.
+                    merged = {**rest, **(ticker or {})}
+                    if not self._ticker_has_mark(merged) and self._ticker_has_mark(rest):
+                        for key in ("mark_price", "mark"):
+                            if rest.get(key) is not None:
+                                merged[key] = rest[key]
+                        rest_quotes = (
+                            rest.get("quotes")
+                            if isinstance(rest.get("quotes"), dict)
+                            else {}
+                        )
+                        if rest_quotes:
+                            mq = dict(merged.get("quotes") or {})
+                            for key in ("mark_price", "mark"):
+                                if rest_quotes.get(key) is not None and key not in mq:
+                                    mq[key] = rest_quotes[key]
+                            if mq:
+                                merged["quotes"] = mq
+                    ticker = merged
+                    source = "feed+rest" if source == "feed" else "rest"
+                    quotes = (
+                        rest.get("quotes")
+                        if isinstance(rest.get("quotes"), dict)
+                        else {}
+                    )
+                    if bid is None:
+                        bid = (
+                            quotes.get("best_bid")
+                            or rest.get("bid")
+                            or rest.get("best_bid")
+                        )
+                    if ask is None:
+                        ask = (
+                            quotes.get("best_ask")
+                            or rest.get("ask")
+                            or rest.get("best_ask")
+                        )
+        snap = snapshot_from_ticker(
+            sym,
+            ticker if isinstance(ticker, dict) else None,
+            bid=bid,
+            ask=ask,
+            bid_size=bid_size,
+            ask_size=ask_size,
+            source=source,
+        )
+        # If ticker had no timestamp, stamp now so age checks stay meaningful.
+        if snap.ts is None:
+            snap.ts = time.time()
+        return snap
+
+    def _on_invalid_stop(self, intent: Any, result: Any) -> None:
+        """
+        Post-fill safety: MAIN_SL invalid vs mark → force-exit the open MAIN.
+        Pre-ENTRY rejects never reach here (no position yet).
+        """
+        reason = getattr(result, "reason", None) or "invalid_stop_vs_mark"
+        details = getattr(result, "details", None) or {}
+        sid = str(getattr(intent, "structure_id", None) or "").strip()
+        strategy_name = str(
+            getattr(intent, "strategy", None)
+            or getattr(intent, "strategy_id", None)
+            or ""
+        ).strip()
+        inst = getattr(intent, "instrument", None)
+        trading_sym = str(
+            getattr(inst, "trading_symbol", None)
+            or details.get("symbol")
+            or getattr(intent, "symbol", None)
+            or ""
+        ).strip()
+        underlying = str(getattr(intent, "symbol", None) or "").strip()
+
+        logger.error(
+            "ExecutionValidator invalid MAIN_SL → force exit "
+            "reason=%s sid=%s symbol=%s mark=%s trigger=%s",
+            reason,
+            sid,
+            trading_sym,
+            details.get("mark"),
+            details.get("trigger") or details.get("planned_sl_trigger"),
+        )
+        if self.engine_logger:
+            self.engine_logger.log(
+                "order_failed",
+                (
+                    f"invalid_stop_vs_mark force_exit sid={sid} "
+                    f"symbol={trading_sym} mark={details.get('mark')} "
+                    f"trigger={details.get('trigger')}"
+                ),
+                structure_id=sid or None,
+                symbol=trading_sym or None,
+                reason=str(reason),
+                mark=details.get("mark"),
+                trigger=details.get("trigger"),
+            )
+
+        if not sid and not trading_sym:
+            return
+
+        pos = None
+        symbol_key = underlying or trading_sym
+        for sym, candidate in list(self.position_manager.positions.items()):
+            if int(getattr(candidate, "net_qty", 0) or 0) == 0:
+                continue
+            c_sid = str(getattr(candidate, "structure_id", None) or "").strip()
+            c_tsym = str(
+                getattr(
+                    getattr(candidate, "instrument", None), "trading_symbol", None
+                )
+                or sym
+            ).strip()
+            if sid and c_sid == sid:
+                pos = candidate
+                symbol_key = sym
+                break
+            if trading_sym and c_tsym == trading_sym:
+                pos = candidate
+                symbol_key = sym
+        if pos is None:
+            logger.warning(
+                "invalid_stop force_exit skipped: no open MAIN sid=%s symbol=%s",
+                sid,
+                trading_sym,
+            )
+            return
+
+        if not strategy_name:
+            strategy_name = str(getattr(pos, "strategy", None) or "").strip()
+        strategy_obj = (
+            self._strategy_obj_for_name(strategy_name) if strategy_name else None
+        )
+        if strategy_obj is None:
+            strategy_obj = self.strategy
+            strategy_name = str(getattr(strategy_obj, "name", "") or strategy_name)
+
+        if sid:
+            self._delta_main_sl_retry.pop(sid, None)
+
+        self._force_close_position_missing_main_sl(
+            strategy_obj=strategy_obj,
+            strategy_name=strategy_name or "unknown",
+            pos=pos,
+            symbol=str(symbol_key),
+            structure_id=sid or str(getattr(pos, "structure_id", "") or ""),
+        )
+
+    def _configure_reentry_at_cost_book(self) -> None:
+        book = getattr(self.order_router, "reentry_at_cost_book", None)
+        if book is None:
+            return
+        book.set_strategy_resolver(self._strategy_obj_for_name)
+
+        def _premium(
+            trading_symbol: str,
+            *,
+            side: str = "SELL",
+            strike: Any = None,
+            option_type: Any = None,
+            expiry: Any = None,
+        ) -> Optional[float]:
+            sym = str(trading_symbol or "").strip()
+            if not sym:
+                return None
+            # Prefer live option ticker (bid for short re-entry).
+            feed = self.realtime_feed
+            if feed is not None and feed.is_connected():
+                get_bid = getattr(feed, "get_best_bid", None)
+                get_ask = getattr(feed, "get_best_ask", None)
+                if str(side).upper() == "SELL" and callable(get_bid):
+                    bid = get_bid(sym)
+                    if bid is not None and float(bid) > 0:
+                        return float(bid)
+                if str(side).upper() == "BUY" and callable(get_ask):
+                    ask = get_ask(sym)
+                    if ask is not None and float(ask) > 0:
+                        return float(ask)
+                ticker_fn = getattr(feed, "get_last_ticker", None)
+                if callable(ticker_fn):
+                    tick = ticker_fn(sym)
+                    if isinstance(tick, dict):
+                        px = tick.get("close") or tick.get("last_price")
+                        if px is not None and float(px) > 0:
+                            return float(px)
+            broker = getattr(self.order_router, "broker", None)
+            get_ticker = getattr(broker, "get_ticker", None) if broker else None
+            if not callable(get_ticker):
+                source = getattr(self, "data", None)
+                get_ticker = getattr(source, "get_ticker", None) if source else None
+            if callable(get_ticker):
+                try:
+                    ticker = get_ticker(sym)
+                except Exception:
+                    ticker = None
+                if isinstance(ticker, dict):
+                    quotes = ticker.get("quotes") or {}
+                    if str(side).upper() == "SELL":
+                        bid = quotes.get("best_bid")
+                        if bid is not None and float(bid) > 0:
+                            return float(bid)
+                    else:
+                        ask = quotes.get("best_ask")
+                        if ask is not None and float(ask) > 0:
+                            return float(ask)
+                    mark = ticker.get("mark_price") or ticker.get("close")
+                    if mark is not None and float(mark) > 0:
+                        return float(mark)
+            return None
+
+        book.set_premium_fn(_premium)
+
+    def _maybe_tick_reentry_at_cost(self) -> None:
+        """OMS poll: place same-contract re-entries when premium returns to cost.
+
+        When the bus owns reentry, publish ``QuoteUpdated`` (maintenance) so the
+        quote handler is the only tick path. Otherwise call ``tick_book`` directly.
+        """
+        from core.events.handlers.reentry_at_cost import (
+            get_book,
+            reentry_driven_by_bus,
+            tick_book,
+        )
+
+        if reentry_driven_by_bus(self):
+            book = get_book(self)
+            if book is None or not getattr(book, "has_pending", lambda: False)():
+                return
+            bus = getattr(self, "event_bus", None)
+            if bus is None:
+                return
+            from core.events.types import EventType, make_event
+
+            bus.publish(
+                make_event(
+                    EventType.QUOTE_UPDATED,
+                    {"source": "reentry_maintenance", "symbol": ""},
+                    engine_id=getattr(self, "engine_id", None) or "live",
+                )
+            )
+            return
+        tick_book(self)
+
+    @staticmethod
+    def _strategy_owns_timeframe(strategy: Any, timeframe: str) -> bool:
+        tf_s = str(timeframe or "").strip()
+        if not tf_s or strategy is None:
+            return False
+        if str(getattr(strategy, "timeframe", "") or "").strip() == tf_s:
+            return True
+        for extra in getattr(strategy, "extra_timeframes", None) or []:
+            if str(extra or "").strip() == tf_s:
+                return True
+        return False
+
     def _candle_strategy_for(self, symbol: str, timeframe: str) -> Any:
-        """Live-feed strategy whose ``timeframe`` matches the closed bar."""
+        """Live-feed strategy that owns the closed bar (primary TF or extra_timeframes)."""
         tf_s = str(timeframe or "").strip()
         sym_u = str(symbol or "").strip().upper()
+        primary_match = None
+        extra_match = None
         for strategy in self.strategies:
             if self._is_scheduled_strategy(strategy, self.strategy_eval_modes):
                 continue
-            if str(getattr(strategy, "timeframe", "") or "").strip() != tf_s:
-                continue
             if sym_u and not strategy.applies_to_symbol(sym_u):
                 continue
-            return strategy
+            if str(getattr(strategy, "timeframe", "") or "").strip() == tf_s:
+                primary_match = strategy
+                break
+            if extra_match is None and self._strategy_owns_timeframe(strategy, tf_s):
+                extra_match = strategy
+        if primary_match is not None:
+            return primary_match
+        if extra_match is not None:
+            return extra_match
+        # Avoid attributing an unmatched HTF bar to the primary strategy stream.
+        if self._strategy_owns_timeframe(self.strategy, tf_s):
+            return self.strategy
         return self.strategy
 
     def _enrich_candle_for_strategy(
@@ -2015,6 +3440,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         candle: Dict[str, Any],
         out_meta: Optional[Dict[str, Any]] = None,
         allow_live_persist: bool = True,
+        timeframe: Optional[str] = None,
     ) -> Dict[str, Any]:
         return self.indicator_manager.enrich_candle_for_strategy(
             strategy=strategy,
@@ -2022,6 +3448,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             candle_bucket_fn=self._candle_bucket_start_unix,
             out_meta=out_meta,
             allow_live_persist=allow_live_persist,
+            timeframe=timeframe,
         )
 
     def _recent_candles_for_strategy(
@@ -2047,8 +3474,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
     def _should_process_nse_60m_closed_bar(
         self, candle: Dict[str, Any], timeframe: str
     ) -> bool:
-        tf = str(timeframe or "").strip()
-        if tf not in ("60", "1h"):
+        tf = str(timeframe or "").strip().lower()
+        if tf not in ("60", "1h", "60m", "120", "2h", "120m"):
             return True
         symbol = str(candle.get("symbol") or "")
         exchange = str(
@@ -2058,6 +3485,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         )
         if not is_nse_index_context(symbol, exchange):
             return True
+        if tf in ("120", "2h", "120m"):
+            return nse_120m_bar_close_eval_window(candle)
         return nse_60m_bar_close_eval_window(candle)
 
     def _evaluate_strategies_parallel(
@@ -2066,29 +3495,53 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         timeframe: Optional[str] = None,
         scheduled: bool = False,
         already_enriched: bool = False,
+        only_strategy_names: Optional[set] = None,
     ) -> List[Dict[str, Any]]:
         response_q: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         expected = 0
+        pending_close_owners = 0
         tf_filter = str(timeframe or "").strip() if timeframe is not None else ""
         candle_symbol = str(candle.get("symbol") or "").strip().upper()
+        only_names = None
+        if only_strategy_names:
+            only_names = {str(n) for n in only_strategy_names}
         for strategy in self.strategies:
+            strategy_id = str(getattr(strategy, "name", "unknown_strategy"))
+            if only_names is not None and strategy_id not in only_names:
+                continue
             if scheduled:
                 if not self._is_scheduled_strategy(strategy, self.strategy_eval_modes):
                     continue
             else:
                 if self._is_scheduled_strategy(strategy, self.strategy_eval_modes):
                     continue
-                if tf_filter and str(getattr(strategy, "timeframe", "") or "").strip() != tf_filter:
-                    continue
+                if tf_filter:
+                    primary_tf = str(getattr(strategy, "timeframe", "") or "").strip()
+                    if primary_tf != tf_filter and not self._strategy_owns_timeframe(
+                        strategy, tf_filter
+                    ):
+                        continue
             if candle_symbol and not strategy.applies_to_symbol(candle_symbol):
                 continue
-            if already_enriched and str(getattr(strategy, "timeframe", "") or "").strip() == tf_filter:
+            if already_enriched and (
+                str(getattr(strategy, "timeframe", "") or "").strip() == tf_filter
+                or self._strategy_owns_timeframe(strategy, tf_filter)
+            ):
                 strategy_candle = dict(candle)
             else:
                 strategy_candle = self._enrich_candle_for_strategy(
                     strategy, candle, allow_live_persist=False
                 )
             if not strategy.should_evaluate(strategy_candle):
+                # Forming-bar / already-seen rejects are normal; track owners that
+                # still need a closed-bar retry so the engine does not dedup yet.
+                bar_closed_fn = getattr(strategy, "_bar_is_fully_closed", None)
+                if callable(bar_closed_fn):
+                    try:
+                        if not bar_closed_fn(strategy_candle):
+                            pending_close_owners += 1
+                    except Exception:
+                        pass
                 continue
             log_msg_fn = getattr(strategy, "eval_signal_log_message", None)
             if self.engine_logger and callable(log_msg_fn):
@@ -2097,7 +3550,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 except Exception:
                     sig_msg = None
                 if sig_msg:
-                    strategy_id = str(getattr(strategy, "name", "unknown_strategy"))
                     sig_symbol = str(
                         strategy_candle.get("symbol") or candle.get("symbol") or ""
                     )
@@ -2109,7 +3561,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         timeframe=str(getattr(strategy, "timeframe", "") or ""),
                     )
             self._ensure_strategy_worker(strategy)
-            strategy_id = str(getattr(strategy, "name", "unknown_strategy"))
             recent_candles = self._recent_candles_for_strategy(
                 strategy, strategy_candle
             )
@@ -2125,22 +3576,40 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 queue_key=strategy_id,
             ):
                 expected += 1
+            else:
+                # should_evaluate already marked the bar; roll back so a later
+                # loop can retry instead of permanently skipping the close.
+                unmark = getattr(strategy, "unmark_evaluated", None)
+                if callable(unmark):
+                    try:
+                        unmark(strategy_candle)
+                    except Exception:
+                        pass
+                pending_close_owners += 1
+                logger.warning(
+                    "strategy_queue overflow; will retry bar strategy=%s symbol=%s tf=%s",
+                    strategy_id,
+                    candle_symbol,
+                    tf_filter or strategy_candle.get("timeframe"),
+                )
         out: List[Dict[str, Any]] = []
+        completed = 0
         timeout = max(1.0, float(self.strategy_timeout_seconds or 5.0))
         deadline = time.time() + timeout
-        while len(out) < expected and time.time() < deadline:
+        while completed < expected and time.time() < deadline:
             try:
                 item = response_q.get(timeout=0.1)
             except queue.Empty:
                 continue
+            completed += 1
             if item.get("error") is not None:
-                logger.exception("Strategy evaluation failed: %s", item["error"])
+                logger.error("Strategy evaluation failed: %s", item["error"])
                 continue
             out.append(item)
-        if len(out) < expected and expected > 0:
+        if completed < expected and expected > 0:
             logger.warning(
                 "Strategy evaluation timed out: got %s/%s responses within %.1fs",
-                len(out),
+                completed,
                 expected,
                 timeout,
             )
@@ -2148,10 +3617,14 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 self.engine_logger.log(
                     "strategy_timeout",
                     (
-                        f"Strategy worker timeout responses={len(out)}/{expected} "
+                        f"Strategy worker timeout responses={completed}/{expected} "
                         f"threshold_sec={timeout:.1f}"
                     ),
                 )
+        # Stash for StrategyEvalService / bus path: avoid permanent dedup when
+        # owners still need a fully-closed retry (e.g. DOS close+2s buffer).
+        self._last_eval_pending_close_owners = int(pending_close_owners)
+        self._last_eval_queued = int(expected)
         return out
 
     def _log_intent_filled(self, trade: Dict[str, Any]) -> None:
@@ -2176,6 +3649,13 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             account_id=account_id,
             order_id=trade.get("order_id"),
         )
+
+    @staticmethod
+    def _event_bus_has_subscribers(bus: Any, event_type: Any) -> bool:
+        if bus is None:
+            return False
+        subs = getattr(bus, "_subs", {}).get(event_type, None)
+        return bool(subs)
 
     def _check_feed_stall_fail_safe(self) -> None:
         feed_syms = self._feed_health_symbols()
@@ -2234,6 +3714,19 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             if (now - last_seen) > self._feed_stall_seconds:
                 stale_symbols.append(sym)
         if len(stale_symbols) != len(feed_syms):
+            if self._feed_disconnect_event_sent:
+                bus = getattr(self, "event_bus", None)
+                if bus is not None:
+                    from core.events.types import EventType, make_event
+
+                    bus.publish(
+                        make_event(
+                            EventType.FEED_RECOVERED,
+                            {"symbols": list(feed_syms), "reason": "feed_stall_cleared"},
+                            engine_id=self.engine_id,
+                        )
+                    )
+                self._feed_disconnect_event_sent = False
             self._feed_stall_last_log_ts = 0.0
             return
         if (
@@ -2249,6 +3742,22 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         if self.engine_logger:
             self.engine_logger.log("feed_stalled", msg)
         self._feed_stall_last_log_ts = now
+        if not self._feed_disconnect_event_sent:
+            bus = getattr(self, "event_bus", None)
+            if bus is not None:
+                from core.events.types import EventType, make_event
+
+                bus.publish(
+                    make_event(
+                        EventType.FEED_DISCONNECTED,
+                        {
+                            "symbols": stale_symbols,
+                            "reason": msg,
+                        },
+                        engine_id=self.engine_id,
+                    )
+                )
+                self._feed_disconnect_event_sent = True
 
     def start(self, exchange, sector, rsi):
         self._live_exchange = str(exchange or "INDEX")
@@ -2292,7 +3801,13 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         _rm = getattr(self.run_mode, "value", None) or str(self.run_mode or "")
         self._log_startup_balance_snapshot()
 
-        self._do_order_state_check()
+        try:
+            self._do_order_state_check()
+        except Exception:
+            logger.exception(
+                "Startup order-state check failed; continuing (entries may pause)"
+            )
+            self._entries_paused_order_mismatch = True
         if (
             str(self.venue or "").upper() == "DELTA"
             and self.realtime_feed
@@ -2317,6 +3832,12 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 self._dhan_order_ws_bound = True
             except Exception:
                 self._dhan_order_ws_bound = False
+        self._configure_gtt_fallback_book()
+        from core.events.wiring import wire_event_bus
+
+        wire_event_bus(self)
+        # WS quotes for open option legs (LEAPS exit pricing + GTT symbols).
+        self._subscribe_open_option_legs()
         primary_tf = getattr(self.strategy, "timeframe", None)
         engine_timeframes = list(self._engine_timeframes or [])
         if not engine_timeframes and primary_tf:
@@ -2342,8 +3863,12 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             self._do_order_state_check()
             self._sync_delta_ws_trades()
             self._retry_dhan_pending_fills()
+            self._do_entry_order_refresh()
             self._do_exit_order_refresh()
+            self._run_gtt_fallback_tick()
+            self._maybe_retry_delta_missing_main_sl()
             self._maybe_run_scheduled_evaluations(exchange)
+            self._maybe_tick_reentry_at_cost()
 
             # Export eod report funtion
             if loop_count % 60 == 0:
@@ -2356,17 +3881,19 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             use_feed = bool(
                 self.realtime_feed and self.realtime_feed.is_connected()
             )
-
-            if engine_timeframes:
-                use_aggregator = (
-                    use_feed
-                    and self.tick_queue is not None
-                    and self.candle_aggregator is not None
-                )
-                if use_aggregator:
-                    if live_candle_pipeline:
-                        self._drain_tick_queue()
-                    self._maybe_flush_session_end_candles()
+            use_aggregator = (
+                use_feed
+                and self.tick_queue is not None
+                and self.candle_aggregator is not None
+            )
+            use_tick_drain = use_feed and self.tick_queue is not None
+            # Drain ticks for candle pipeline and/or GTT QuoteUpdated push
+            # (scheduled-only engines may have empty engine_timeframes).
+            need_tick_drain = live_candle_pipeline or bool(self._gtt_watch_symbols())
+            if use_tick_drain and need_tick_drain:
+                self._drain_tick_queue()
+            if engine_timeframes and use_aggregator:
+                self._maybe_flush_session_end_candles()
 
             self.check_feed_health()
             self._check_feed_stall_fail_safe()
@@ -2556,13 +4083,18 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             getattr(self.realtime_feed, "is_dummy_feed", False)
                         )
                         tf_sec = max(60, int(_resolution_to_seconds(tf)))
-                        nse_60m_bar = (
-                            str(tf) in ("60", "1h")
+                        nse_session_bar = (
+                            str(tf).strip().lower()
+                            in ("60", "1h", "60m", "120", "2h", "120m")
                             and is_nse_index_context(symbol, exchange)
                             and eval_bucket is not None
-                            and bucket_ts_is_nse_60m_bar(eval_bucket)
+                            and (
+                                bucket_ts_is_nse_120m_bar(eval_bucket)
+                                if str(tf).strip().lower() in ("120", "2h", "120m")
+                                else bucket_ts_is_nse_60m_bar(eval_bucket)
+                            )
                         )
-                        if nse_60m_bar:
+                        if nse_session_bar:
                             self._first_live_alignment_done[symbol] = True
                         elif not is_dummy_feed and (
                             not self._first_live_alignment_done.get(symbol, False)
@@ -2659,11 +4191,14 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                         )
                     enrich_meta: Dict[str, Any] = {}
                     candle_strategy = self._candle_strategy_for(symbol, str(tf))
+                    # Persist live_append under the closed bar TF (primary or extra_timeframes).
+                    candle["timeframe"] = str(tf)
                     enriched_candle = self._enrich_candle_for_strategy(
                         candle_strategy,
                         candle,
                         out_meta=enrich_meta,
                         allow_live_persist=True,
+                        timeframe=str(tf),
                     )
                     if self.engine_logger and enrich_meta.get("bar_closed_for_append"):
                         if self._should_log_closed_candle(symbol, tf, candle):
@@ -2672,38 +4207,79 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                             )
 
                     self._enrich_candle_depth(symbol, candle)
-                    for eval_result in self._evaluate_strategies_parallel(
-                        enriched_candle, timeframe=tf, already_enriched=True
+                    bus = getattr(self, "event_bus", None)
+                    from core.events.types import EventType, make_event
+
+                    if bus is not None and self._event_bus_has_subscribers(
+                        bus, EventType.BAR_CLOSED
                     ):
-                        eval_strategy = eval_result.get("strategy")
-                        eval_strategy_name = str(
-                            getattr(eval_strategy, "name", "unknown_strategy")
-                        )
-                        if self.engine_logger:
-                            self.engine_logger.log(
-                                "strategy_evaluated",
-                                message=f"Strategy evaluated: {eval_strategy_name}",
-                                strategy=eval_strategy_name,
-                                symbol=symbol,
+                        # Reset before publish so a filtered/no-op handler cannot
+                        # reuse stale pending/queued counts from a prior bar.
+                        self._last_eval_pending_close_owners = 0
+                        self._last_eval_queued = 0
+                        bus.publish(
+                            make_event(
+                                EventType.BAR_CLOSED,
+                                {
+                                    "symbol": symbol,
+                                    "timeframe": tf,
+                                    "candle": candle,
+                                    "enriched_candle": enriched_candle,
+                                    "eval_key": eval_key,
+                                    "eval_ts_key": eval_ts_key,
+                                },
+                                engine_id=self.engine_id,
                             )
-                        intent = eval_result["intent"]
-                        if self._log_entry_skipped_if_paused(
-                            strategy=eval_strategy,
-                            symbol=symbol,
-                            intent=intent,
-                        ):
-                            continue
-                        self._run_strategy(
-                            symbol,
-                            candle,
-                            eval_result["ctx"],
-                            intent,
-                            strategy=eval_result["strategy"],
-                            strategy_time_ms=eval_result["strategy_time_ms"],
-                            timeframe=tf,
                         )
-                    if eval_key is not None:
-                        self._last_evaluated_candle_ts[eval_ts_key] = eval_key
+                        # Dedup only when entry eval actually queued work (or no
+                        # owner is waiting on a not-yet-fully-closed buffer).
+                        pending = int(
+                            getattr(self, "_last_eval_pending_close_owners", 0) or 0
+                        )
+                        queued = int(getattr(self, "_last_eval_queued", 0) or 0)
+                        if (
+                            eval_key is not None
+                            and (pending <= 0 or queued > 0)
+                        ):
+                            self._last_evaluated_candle_ts[eval_ts_key] = eval_key
+                    else:
+                        self._run_exits_and_rollover_for_closed_bar(
+                            symbol, candle, tf, enriched_candle=enriched_candle
+                        )
+                        eval_svc = getattr(self, "strategy_eval_service", None)
+                        if eval_svc is not None:
+                            eval_svc.evaluate_and_publish_intents(
+                                candle=enriched_candle,
+                                symbol=symbol,
+                                timeframe=tf,
+                                already_enriched=True,
+                                source_candle=candle,
+                                eval_key=eval_key,
+                                eval_ts_key=eval_ts_key,
+                            )
+                        else:
+                            for eval_result in self._evaluate_strategies_parallel(
+                                enriched_candle, timeframe=tf, already_enriched=True
+                            ):
+                                eval_strategy = eval_result.get("strategy")
+                                intent = eval_result["intent"]
+                                if self._log_entry_skipped_if_paused(
+                                    strategy=eval_strategy,
+                                    symbol=symbol,
+                                    intent=intent,
+                                ):
+                                    continue
+                                self._run_strategy(
+                                    symbol,
+                                    candle,
+                                    eval_result["ctx"],
+                                    intent,
+                                    strategy=eval_result["strategy"],
+                                    strategy_time_ms=eval_result["strategy_time_ms"],
+                                    timeframe=tf,
+                                )
+                            if eval_key is not None:
+                                self._last_evaluated_candle_ts[eval_ts_key] = eval_key
             # To be checked properly else condition--> Pending
             else:
                 candles = None
@@ -2800,6 +4376,193 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             except Exception:
                 pass
 
+    def _run_exits_and_rollover_for_closed_bar(
+        self,
+        symbol: str,
+        candle: Dict[str, Any],
+        timeframe: str,
+        enriched_candle: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Exits + monthly hedge rollover on every closed live-feed bar (backtest parity)."""
+        svc = getattr(self, "exit_rollover_service", None)
+        if svc is not None:
+            svc.run_for_closed_bar(
+                symbol, candle, timeframe, enriched_candle=enriched_candle
+            )
+            return
+        from core.events.services.exit_rollover import ExitRolloverService
+
+        ExitRolloverService(self).run_for_closed_bar(
+            symbol, candle, timeframe, enriched_candle=enriched_candle
+        )
+
+    def _run_exits_and_rollover(
+        self,
+        strategy: Any,
+        symbol: str,
+        candle: Dict[str, Any],
+        ctx: Any,
+        timeframe: Optional[str] = None,
+        strategy_time_ms: Optional[float] = None,
+    ) -> None:
+        """Strategy exits and hedge rollover — always run before entry evaluation."""
+        svc = getattr(self, "exit_rollover_service", None)
+        if svc is not None:
+            svc.run_exits_and_rollover(
+                strategy,
+                symbol,
+                candle,
+                ctx,
+                timeframe=timeframe,
+                strategy_time_ms=strategy_time_ms,
+            )
+            return
+        from core.events.services.exit_rollover import ExitRolloverService
+
+        ExitRolloverService(self).run_exits_and_rollover(
+            strategy,
+            symbol,
+            candle,
+            ctx,
+            timeframe=timeframe,
+            strategy_time_ms=strategy_time_ms,
+        )
+
+    def _process_strategy_exit_intent(
+        self,
+        raw_intent: Any,
+        strategy: Any,
+        symbol: str,
+        candle: Dict[str, Any],
+        position: Any,
+        required_exit_side: str,
+        strategy_time_ms: Optional[float],
+        timeframe: Optional[str],
+        risk_manager: Any,
+    ) -> None:
+        tag_u = str(getattr(raw_intent, "tag", "") or "").upper()
+        action_u = str(getattr(raw_intent, "action", "") or "").upper()
+        is_exit = action_u == "EXIT" or tag_u.endswith("EXIT")
+        if not is_exit:
+            self._process_entry_like_intent(
+                raw_intent,
+                strategy,
+                symbol,
+                candle,
+                strategy_time_ms,
+                timeframe,
+                risk_manager,
+            )
+            return
+
+        exit_intent = raw_intent
+        # MAIN_EXIT must close the MAIN position side; hedge/other exits keep their own side.
+        if tag_u == "MAIN_EXIT" and getattr(exit_intent, "side", None) != required_exit_side:
+            exit_intent = dataclasses.replace(exit_intent, side=required_exit_side)
+
+        self._log_signal(
+            exit_intent,
+            symbol,
+            action="EXIT",
+            qty_fallback=abs(getattr(position, "net_qty", 0) or 0),
+        )
+        trading_sym = self._intent_place_order_symbol(exit_intent, symbol)
+        side_u = str(getattr(exit_intent, "side", "") or "").upper()
+        is_sell = side_u == "SELL"
+        exit_price = (
+            self._exit_price_from_depth(trading_sym, is_sell)
+            or self.get_price_map(trading_sym)
+            or self._positive_price(getattr(exit_intent, "price", None))
+            or self.get_price_map(symbol)
+        )
+        if exit_price is None:
+            logger.warning(
+                "EXIT skipped: no executable price symbol=%s trading_sym=%s "
+                "strategy=%s tag=%s",
+                symbol,
+                trading_sym,
+                getattr(strategy, "name", ""),
+                tag_u,
+            )
+            return
+        self._validate_lot_size(exit_intent, trading_sym)
+        # Key by both place_order_symbol and compact trading_symbol for OrderRouter lookup.
+        compact = ""
+        inst = getattr(exit_intent, "instrument", None)
+        if inst is not None:
+            compact = str(getattr(inst, "trading_symbol", "") or "").strip()
+        price_map = {trading_sym: float(exit_price)}
+        if compact and compact != trading_sym:
+            price_map[compact] = float(exit_price)
+        exit_idem_key = getattr(exit_intent, "idempotency_key", None) or self._signal_hash(
+            symbol,
+            timeframe or "",
+            candle.get("timestamp"),
+            f"exit|{trading_sym}|{tag_u}",
+        )
+        self._enqueue_intent(
+            strategy=strategy,
+            intent=exit_intent,
+            price_map=price_map,
+            idempotency_key=exit_idem_key,
+            strategy_time_ms=strategy_time_ms,
+        )
+
+    def _process_rollover_intent(
+        self,
+        raw_intent: Any,
+        strategy: Any,
+        symbol: str,
+        candle: Dict[str, Any],
+        strategy_time_ms: Optional[float],
+        timeframe: Optional[str],
+        risk_manager: Any,
+    ) -> None:
+        action = str(getattr(raw_intent, "action", "") or "").upper()
+        tag = str(getattr(raw_intent, "tag", "") or "").upper()
+        if action == "EXIT" or tag.endswith("EXIT"):
+            side = str(getattr(raw_intent, "side", "") or "").upper()
+            is_sell = side == "SELL"
+            trading_sym = self._intent_place_order_symbol(raw_intent, symbol)
+            exit_price = (
+                self._exit_price_from_depth(trading_sym, is_sell)
+                or self._positive_price(getattr(raw_intent, "price", None))
+            )
+            if exit_price is None:
+                logger.warning(
+                    "Hedge rollover exit skipped: no executable price symbol=%s "
+                    "strategy=%s tag=%s",
+                    trading_sym,
+                    getattr(strategy, "name", ""),
+                    tag,
+                )
+                return
+            self._log_signal(raw_intent, symbol, action="EXIT")
+            self._validate_lot_size(raw_intent, trading_sym)
+            idem_key = getattr(raw_intent, "idempotency_key", None) or self._signal_hash(
+                symbol,
+                timeframe or "",
+                candle.get("timestamp"),
+                f"rollover_exit|{trading_sym}|{tag}",
+            )
+            self._enqueue_intent(
+                strategy=strategy,
+                intent=raw_intent,
+                price_map={trading_sym: exit_price},
+                idempotency_key=idem_key,
+                strategy_time_ms=strategy_time_ms,
+            )
+            return
+        self._process_entry_like_intent(
+            raw_intent,
+            strategy,
+            symbol,
+            candle,
+            strategy_time_ms,
+            timeframe,
+            risk_manager,
+        )
+
     def _process_entry_like_intent(
         self,
         single_intent,
@@ -2885,7 +4648,13 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             trading_sym = self._intent_place_order_symbol(single_intent, symbol)
             self._validate_lot_size(single_intent, trading_sym)
             self._last_signal_hash_per_symbol[symbol] = signal_hash
-            price_map = {trading_sym: exec_price}
+            price_map = {trading_sym: float(exec_price)}
+            compact = ""
+            inst = getattr(single_intent, "instrument", None)
+            if inst is not None:
+                compact = str(getattr(inst, "trading_symbol", "") or "").strip()
+            if compact and compact != trading_sym:
+                price_map[compact] = float(exec_price)
             self._enqueue_intent(
                 strategy=strategy,
                 intent=single_intent,
@@ -2900,16 +4669,7 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     total_latency_ms=total_ms,
                     strategy_id=str(getattr(strategy, "name", "") or ""),
                 )
-            if total_ms > self.latency_critical_ms:
-                self._latency_critical_count += 1
-                if self._latency_critical_count >= self.latency_critical_cycles:
-                    self._entries_paused_latency = True
-                    if self.engine_logger:
-                        self.engine_logger.latency_critical_pause(
-                            "Latency critical for N cycles; entries paused"
-                        )
-            else:
-                self._latency_critical_count = 0
+            self._on_latency_observed(total_ms)
         else:
             trading_sym = self._intent_place_order_symbol(single_intent, symbol)
             logger.warning(
@@ -2933,89 +4693,45 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         timeframe: Optional[str] = None,
     ):
         strategy = strategy or self.strategy
-        risk_manager = getattr(self.order_router, "risk", None)
-        self.evaluate_sim_broker_stops(candle, ctx)
-        open_positions = self.position_manager.get_open_positions(
-            underlying=symbol, strategy=strategy.name
-        )
-        for position in open_positions:
-            exit_signal = strategy.should_exit(position, candle, ctx)
-            if exit_signal:
-                exit_intents = (
-                    strategy.on_position_exit(position, candle, ctx) or []
-                )
-                is_sell = position.net_qty > 0
-                required_exit_side = "SELL" if is_sell else "BUY"
-                if exit_intents:
-                    if self.engine_logger:
-                        self.engine_logger.exit_triggered(
-                            symbol,
-                            required_exit_side,
-                            abs(position.net_qty),
-                            "Strategy exit",
-                        )
-                    for raw_intent in exit_intents:
-                        # e.g. OneDayMagicalLine reversal: MAIN_EXIT only here; ENTRY after exit fill
-                        is_main_exit = (
-                            str(getattr(raw_intent, "action", "") or "").upper()
-                            == "EXIT"
-                            and str(getattr(raw_intent, "tag", "") or "").upper()
-                            == "MAIN_EXIT"
-                        )
-                        if not is_main_exit:
-                            self._process_entry_like_intent(
-                                raw_intent,
-                                strategy,
-                                symbol,
-                                candle,
-                                strategy_time_ms,
-                                timeframe,
-                                risk_manager,
-                            )
-                            continue
-                        exit_intent = raw_intent
-                        # Position direction validation: exit side must match position (prevents accidental reversal)
-                        if getattr(exit_intent, "side", None) != required_exit_side:
-                            exit_intent = dataclasses.replace(
-                                exit_intent, side=required_exit_side
-                            )
-                        self._log_signal(
-                            exit_intent,
-                            symbol,
-                            action="EXIT",
-                            qty_fallback=abs(position.net_qty),
-                        )
-                        # Exit price from depth by intent's instrument and position direction (correct bid/ask for this contract)
-                        trading_sym = self._intent_place_order_symbol(
-                            exit_intent, symbol
-                        )
-                        exit_price = (
-                            self._exit_price_from_depth(trading_sym, is_sell)
-                            or self.get_price_map(trading_sym)
-                            or self.get_price_map(symbol)
-                        )
-                        if exit_price is None:
-                            continue
-                        self._validate_lot_size(exit_intent, trading_sym)
-                        price_map = {trading_sym: exit_price}
-                        # Fix 3: Ensure exit intents have idempotency keys for deduplication (pass in; intent is frozen)
-                        exit_idem_key = getattr(
-                            exit_intent, "idempotency_key", None
-                        ) or self._signal_hash(
-                            symbol, timeframe or "", candle.get("timestamp"), "exit"
-                        )
-                        self._enqueue_intent(
-                            strategy=strategy,
-                            intent=exit_intent,
-                            price_map=price_map,
-                            idempotency_key=exit_idem_key,
-                            strategy_time_ms=strategy_time_ms,
-                        )
+        bus = getattr(self, "event_bus", None)
+        from core.events.types import EventType, make_event
 
+        if (
+            bus is not None
+            and intent is not None
+            and self._event_bus_has_subscribers(bus, EventType.INTENT_CREATED)
+        ):
+            bus.publish(
+                make_event(
+                    EventType.INTENT_CREATED,
+                    {
+                        "strategy": strategy,
+                        "symbol": symbol,
+                        "candle": candle,
+                        "intent": intent,
+                        "strategy_time_ms": strategy_time_ms,
+                        "timeframe": timeframe,
+                    },
+                    engine_id=self.engine_id,
+                )
+            )
+            return
+        exec_svc = getattr(self, "execution_service", None)
+        if exec_svc is not None:
+            exec_svc.enqueue_intent(
+                strategy=strategy,
+                symbol=symbol,
+                candle=candle,
+                intent=intent,
+                strategy_time_ms=strategy_time_ms,
+                timeframe=timeframe,
+            )
+            return
+        risk_manager = getattr(self.order_router, "risk", None)
         entry_intents = (
             [intent]
             if intent is not None and not isinstance(intent, list)
-            else (intent or [])
+            else list(intent or [])
         )
         self._enqueue_entry_intents_grouped(
             entry_intents,
