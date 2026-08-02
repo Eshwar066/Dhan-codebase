@@ -188,7 +188,8 @@ class GauthamLiquiditySweep:
         st.armed_zone = zone
         if bar_key:
             st.consumed_sweeps.add(bar_key)
-        self.zones.mark_consumed(
+        # Keep zone in active.json until a closed 4H bar sweeps it.
+        self.zones.reserve_entry_sweep(
             str(candle.get("symbol") or ""), zone, swept_at=bar_key
         )
         logger.info(

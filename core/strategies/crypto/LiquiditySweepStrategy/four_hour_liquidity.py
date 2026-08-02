@@ -64,10 +64,14 @@ class ConsumedRecord:
 @dataclass
 class _SymbolZones:
     bars: List[dict] = field(default_factory=list)
+    bar_keys: set = field(default_factory=set)
     high_zones: List[LiquidityZone] = field(default_factory=list)
     low_zones: List[LiquidityZone] = field(default_factory=list)
     consumed: set = field(default_factory=set)
     consumed_detail: Dict[str, ConsumedRecord] = field(default_factory=dict)
+    # Entry-TF (1m/5m) sweeps reserve a zone for trading without writing
+    # ``consumed`` / active.json — cleared on the next closed 4H bar.
+    entry_reserved: set = field(default_factory=set)
 
 
 def zones_jsonl_path(log_root: Optional[str] = None) -> str:
@@ -175,33 +179,19 @@ class FourHourLiquidityBook:
 
     def on_4h_close(self, symbol: str, candle: dict) -> bool:
         """
-        Ingest a fully closed 4H bar and rebuild active zones (idempotent by bar key).
+        Ingest a fully closed 4H bar and update active zones (idempotent by bar key).
 
         Returns True when a new bar was accepted.
         """
         sym = str(symbol or "").strip().upper()
-        ohlc = self._ohlc(candle)
-        if not sym or ohlc is None:
-            return False
-        o, h, l, c = ohlc
         st = self._state(sym)
-        key = self._bar_key(candle)
-        if key and any(b.get("key") == key for b in st.bars):
+        if not self._ingest_closed_bar(sym, candle, st):
             return False
-        st.bars.append(
-            {
-                "key": key,
-                "open": o,
-                "high": h,
-                "low": l,
-                "close": c,
-            }
-        )
-        self._rebuild_zones(sym, st)
-        # Invalidate levels already swept by this closed 4H bar.
-        self._apply_bar_sweeps(sym, candle, st)
-        as_of = candle.get("candle_timestamp_ist") or key or None
+        as_of = candle.get("candle_timestamp_ist") or self._bar_key(candle) or None
         self._persist_symbol(sym, as_of=as_of, event="zone_snapshot")
+        ohlc = self._ohlc(candle)
+        h = float(ohlc[1]) if ohlc else 0.0
+        l = float(ohlc[2]) if ohlc else 0.0
         logger.debug(
             "FourHourLiquidityBook %s zones hi=%s lo=%s consumed=%s (bars=%s) last_4h H=%.2f L=%.2f",
             sym,
@@ -213,6 +203,114 @@ class FourHourLiquidityBook:
             l,
         )
         return True
+
+    def _ingest_closed_bar(self, symbol: str, candle: dict, st: "_SymbolZones") -> bool:
+        """Append one closed 4H bar and update zones incrementally (no disk I/O)."""
+        ohlc = self._ohlc(candle)
+        if not symbol or ohlc is None:
+            return False
+        o, h, l, c = ohlc
+        key = self._bar_key(candle)
+        if key and key in st.bar_keys:
+            return False
+        st.bars.append(
+            {
+                "key": key,
+                "open": o,
+                "high": h,
+                "low": l,
+                "close": c,
+            }
+        )
+        if key:
+            st.bar_keys.add(key)
+        self._update_zones_after_append(st)
+        self._apply_bar_sweeps(symbol, candle, st)
+        # Entry-TF reservations are only for the current 4H window.
+        st.entry_reserved.clear()
+        return True
+
+    def _update_zones_after_append(self, st: "_SymbolZones") -> None:
+        """
+        Incremental zone update after ``st.bars`` gained one bar.
+
+        Equivalent to full ``_rebuild_zones`` but O(window + active zones) instead of
+        O(n) swing scan on every bar (critical for history catch-up of hundreds of 4H bars).
+        """
+        bars = list(st.bars)
+        if not bars:
+            st.high_zones = []
+            st.low_zones = []
+            return
+
+        # prev_4h is only the latest weekday bar — drop prior prev_4h stubs.
+        highs = [z for z in st.high_zones if z.source != "prev_4h"]
+        lows = [z for z in st.low_zones if z.source != "prev_4h"]
+
+        last_weekday = next(
+            (b for b in reversed(bars) if not self._is_weekend_bar(b)),
+            None,
+        )
+        if last_weekday is not None:
+            highs.append(
+                self._zone_from_bar(
+                    last_weekday,
+                    price=float(last_weekday["high"]),
+                    side="high",
+                    source="prev_4h",
+                )
+            )
+            lows.append(
+                self._zone_from_bar(
+                    last_weekday,
+                    price=float(last_weekday["low"]),
+                    side="low",
+                    source="prev_4h",
+                )
+            )
+
+        left, right = SWING_LEFT, SWING_RIGHT
+        n = len(bars)
+        if n >= left + right + 1:
+            i = n - 1 - right
+            if i >= left and not self._is_weekend_bar(bars[i]):
+                h_win = [bars[j]["high"] for j in range(i - left, i + right + 1)]
+                l_win = [bars[j]["low"] for j in range(i - left, i + right + 1)]
+                if bars[i]["high"] == max(h_win):
+                    highs.append(
+                        self._zone_from_bar(
+                            bars[i],
+                            price=float(bars[i]["high"]),
+                            side="high",
+                            source="swing_4h",
+                        )
+                    )
+                if bars[i]["low"] == min(l_win):
+                    lows.append(
+                        self._zone_from_bar(
+                            bars[i],
+                            price=float(bars[i]["low"]),
+                            side="low",
+                            source="swing_4h",
+                        )
+                    )
+
+        def _dedupe(zones: List[LiquidityZone]) -> List[LiquidityZone]:
+            seen = set()
+            out: List[LiquidityZone] = []
+            for z in reversed(zones):
+                rk = round(z.price, 2)
+                if rk in seen:
+                    continue
+                ck = f"{z.side}:{rk}"
+                if ck in st.consumed:
+                    continue
+                seen.add(rk)
+                out.append(z)
+            return out
+
+        st.high_zones = self._sort_zones_recent_first(_dedupe(highs))
+        st.low_zones = self._sort_zones_recent_first(_dedupe(lows))
 
     def _mark_consumed_internal(
         self,
@@ -705,11 +803,15 @@ class FourHourLiquidityBook:
                 return True
             return str(z.source or "").strip().lower() in src_ok
 
+        def _not_reserved(z: LiquidityZone) -> bool:
+            ck = f"{z.side}:{round(z.price, 2)}"
+            return ck not in st.entry_reserved and ck not in st.consumed
+
         # Prefer nearest swept high (bearish) / low (bullish).
         swept_hi: Optional[LiquidityZone] = None
         if enable_high:
             for z in sorted(st.high_zones, key=lambda x: abs(x.price - c)):
-                if not _src_allowed(z):
+                if not _src_allowed(z) or not _not_reserved(z):
                     continue
                 if self._sweep_high(h, c, z.price):
                     swept_hi = z
@@ -717,7 +819,7 @@ class FourHourLiquidityBook:
         swept_lo: Optional[LiquidityZone] = None
         if enable_low:
             for z in sorted(st.low_zones, key=lambda x: abs(x.price - c)):
-                if not _src_allowed(z):
+                if not _src_allowed(z) or not _not_reserved(z):
                     continue
                 if self._sweep_low(l, c, z.price):
                     swept_lo = z
@@ -733,10 +835,39 @@ class FourHourLiquidityBook:
             return "LONG", swept_lo
         return None
 
+    def reserve_entry_sweep(
+        self, symbol: str, zone: LiquidityZone, *, swept_at: Optional[str] = None
+    ) -> bool:
+        """
+        Hold a zone after an entry-TF (1m/5m) sweep so it is not re-armed.
+
+        Does **not** write ``consumed`` or rewrite ``liquidity_zones_active.json``.
+        Real consumption happens only when a closed 4H bar sweeps the level.
+        """
+        sym = str(symbol or "").strip().upper()
+        if not sym:
+            return False
+        st = self._state(sym)
+        ck = f"{zone.side}:{round(zone.price, 2)}"
+        if ck in st.consumed or ck in st.entry_reserved:
+            return False
+        st.entry_reserved.add(ck)
+        logger.info(
+            "FourHourLiquidityBook %s entry-reserved %s=%.2f swept_at=%s "
+            "(active.json unchanged until 4H close)",
+            sym,
+            zone.side,
+            zone.price,
+            swept_at or zone.bar_key or "",
+        )
+        return True
+
     def mark_consumed(
         self, symbol: str, zone: LiquidityZone, *, swept_at: Optional[str] = None
     ) -> None:
         st = self._state(symbol)
+        ck = f"{zone.side}:{round(zone.price, 2)}"
+        st.entry_reserved.discard(ck)
         if not self._mark_consumed_internal(st, zone, swept_at=swept_at):
             return
         self._persist_symbol(

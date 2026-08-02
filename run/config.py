@@ -84,6 +84,7 @@ ENGINE_JOBS = [
             # "BTCZeroDTE",
             # "BTCZeroDTEElevenPM",
             "DirectionalOptionSelling",
+            "LiquiditySweepStrategy",
             # "RSIBreadAndButter",
         ],
         "max_open_positions": 15,
@@ -149,7 +150,7 @@ ENGINE_JOBS = [
     {
         "engine_id": "dhan_oi_positional_buy",
         "venue": "DHAN",
-        "enabled": True,
+        "enabled": False,
         "run_mode": "PAPER",
         "capital": 200_000,
         "ORDER_QTY_LOTS": 1,
@@ -371,23 +372,25 @@ ENGINE_JOBS = [
     },
 
     {
+        # Standalone LSS job — keep disabled while LiquiditySweepStrategy runs on
+        # delta_engine_one (same LIVE account would double-enter).
         "engine_id": "delta_liquidity_sweep_bt",
         "venue": "DELTA",
         "enabled": False,
-        "run_mode": "BACKTEST",
-        "capital": 200_000,
+        "run_mode": "Live",
+        "capital": 200000,
         "strategies": ["LiquiditySweepStrategy"],
         "symbols": ["BTCUSD","PAXGUSD"],
         "delta_india": True,
         "delta_testnet": False,
-        "delta_leverage": 50,
-        "ORDER_QTY_LOTS": 5,
+        "delta_leverage": 100,
+        "ORDER_QTY_LOTS": 3,
         "backtest": {
             "start_date": "2026-07-19",
             "end_date": "2026-08-01",
             # Omit timeframe to use strategy entry_timeframe (params.entry_timeframe).
             # Or set explicitly to "1" / "5" to match strategy.yaml.
-            "timeframe": "5",
+            "timeframe": "1",
             "exchange": "DELTA",
             "sector": "YES",
         },

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -192,6 +194,74 @@ class TestFourHourLiquidityBook(unittest.TestCase):
             _c(o=118, h=121, l=117, c=119, ts="2026-07-22T10:02:00Z"),
         )
         self.assertIsNone(again)
+
+    def test_entry_reserve_keeps_zone_until_4h_consume(self):
+        """1m/5m sweep must not persist-consume; 4H close that sweeps does."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            active = os.path.join(td, "liquidity_zones_active.json")
+            jsonl = os.path.join(td, "liquidity_zones.jsonl")
+            book = FourHourLiquidityBook(
+                persist=True, jsonl_path=jsonl, active_path=active
+            )
+            book.set_persist_source("live")
+            _seed_swing_high_120(book)
+            self.assertIn(120.0, book.snapshot("BTCUSD")["highs"])
+            hit = book.detect_1m_sweep(
+                "BTCUSD",
+                _c(o=118, h=121, l=117, c=119, candle_timestamp_ist="2026-07-22 14:00"),
+            )
+            self.assertIsNotNone(hit)
+            _, zone = hit
+            self.assertEqual(zone.price, 120.0)
+            self.assertTrue(book.reserve_entry_sweep("BTCUSD", zone, swept_at="2026-07-22 14:00"))
+            # Still listed as active (not consumed on disk).
+            self.assertIn(120.0, book.snapshot("BTCUSD")["highs"])
+            with open(active, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            highs = [float(z["price"]) for z in raw["symbols"]["BTCUSD"]["highs"]]
+            self.assertIn(120.0, highs)
+            cons = raw["symbols"]["BTCUSD"].get("consumed") or []
+            self.assertFalse(
+                any(float(c.get("price", 0)) == 120.0 for c in cons if isinstance(c, dict))
+            )
+            # Reserved → no second 1m arm on same zone.
+            self.assertIsNone(
+                book.detect_1m_sweep(
+                    "BTCUSD",
+                    _c(
+                        o=118,
+                        h=121,
+                        l=117,
+                        c=119,
+                        ts="2026-07-22T10:02:00Z",
+                        candle_timestamp_ist="2026-07-22 14:02",
+                    ),
+                )
+            )
+            # 4H bar that sweeps swing 120 → consumed + dropped from active file.
+            book.on_4h_close(
+                "BTCUSD",
+                _c(
+                    o=106,
+                    h=122,
+                    l=100,
+                    c=105,
+                    timeframe="4h",
+                    ts="2026-07-22T00:00:00Z",
+                    candle_timestamp_ist="2026-07-22 05:30",
+                ),
+            )
+            self.assertNotIn(120.0, book.snapshot("BTCUSD")["highs"])
+            with open(active, "r", encoding="utf-8") as f:
+                raw2 = json.load(f)
+            highs2 = [float(z["price"]) for z in raw2["symbols"]["BTCUSD"]["highs"]]
+            self.assertNotIn(120.0, highs2)
+            cons2 = raw2["symbols"]["BTCUSD"].get("consumed") or []
+            self.assertTrue(
+                any(float(c.get("price", 0)) == 120.0 for c in cons2 if isinstance(c, dict))
+            )
 
     def test_4h_bar_marks_prior_high_swept(self):
         book = FourHourLiquidityBook(persist=False)
@@ -528,6 +598,7 @@ class TestParentFourHourRouting(unittest.TestCase):
         s._zones = FourHourLiquidityBook(persist=False)
         s._zones_hydrated = set()
         s._4h_hist_rows = {}
+        s._4h_hist_mtime = {}
         s._4h_applied_count = {}
         s.enable_high_entries = True
         s.enable_low_entries = True
@@ -598,6 +669,43 @@ class TestParentFourHourRouting(unittest.TestCase):
         # After second closed
         s._ensure_zones_as_of("BTCUSD", "2026-07-22T08:30:00Z")
         self.assertIn(130.0, s._zones.snapshot("BTCUSD")["highs"])
+
+    def test_ensure_zones_as_of_persists_active_file_when_enabled(self):
+        """LIVE catch-up must rewrite liquidity_zones_active.json once per new batch."""
+        import tempfile
+
+        s = self._bare()
+        with tempfile.TemporaryDirectory() as td:
+            active = os.path.join(td, "liquidity_zones_active.json")
+            jsonl = os.path.join(td, "liquidity_zones.jsonl")
+            s._zones = FourHourLiquidityBook(
+                persist=True, jsonl_path=jsonl, active_path=active
+            )
+            s._zones.set_persist_source("live")
+            s._gautham = GauthamLiquiditySweep(zones=s._zones)
+            s._4h_hist_rows["BTCUSD"] = [
+                {
+                    "timestamp": pd.Timestamp("2026-07-22T00:00:00Z"),
+                    "open": 100.0,
+                    "high": 120.0,
+                    "low": 95.0,
+                    "close": 110.0,
+                },
+            ]
+            # Leave _4h_hist_mtime unset so injected rows are trusted.
+            self.assertFalse(os.path.isfile(active))
+            s._ensure_zones_as_of("BTCUSD", "2026-07-22T04:30:00Z")
+            self.assertTrue(os.path.isfile(active))
+            with open(active, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            self.assertEqual(raw.get("source"), "live")
+            highs = (raw.get("symbols") or {}).get("BTCUSD", {}).get("highs") or []
+            self.assertTrue(any(float(z.get("price")) == 120.0 for z in highs))
+            # Second call with no new bars must not rewrite.
+            mtime1 = os.path.getmtime(active)
+            s._ensure_zones_as_of("BTCUSD", "2026-07-22T04:45:00Z")
+            self.assertEqual(s._4h_applied_count["BTCUSD"], 1)
+            self.assertEqual(os.path.getmtime(active), mtime1)
 
 
 if __name__ == "__main__":

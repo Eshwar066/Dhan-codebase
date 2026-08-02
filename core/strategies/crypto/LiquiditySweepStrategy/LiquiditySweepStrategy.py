@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,7 +30,7 @@ from core.strategies.crypto.LiquiditySweepStrategy.gautham_liquidity_sweep impor
     GauthamEntrySignal,
     GauthamLiquiditySweep,
 )
-from core.utils.structure import MarketStructureConfig
+from core.utils.structure import DEFAULT_STRUCTURE_LOOKBACK, MarketStructureConfig
 from core.utils import indicator_history as ind_hist
 
 if TYPE_CHECKING:
@@ -41,7 +42,7 @@ META_KEY = "liquidity_sweep"
 PARTIAL_BOOK_FRAC = 0.50
 # Book 50% at this R-multiple; trail the remainder after partial.
 PARTIAL_TARGET_RR = 2.0
-DEFAULT_ORDER_QTY = 5
+DEFAULT_ORDER_QTY = 3
 _4H_TF_ALIASES = frozenset({"4h", "4", "240"})
 _4H_BAR_SECONDS = 4 * 60 * 60
 ALLOWED_ENTRY_TFS = frozenset({"1", "5"})
@@ -110,6 +111,7 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
         self._zones.set_persist_source("live")
         self._zones_hydrated: set[str] = set()
         self._4h_hist_rows: Dict[str, List[dict]] = {}
+        self._4h_hist_mtime: Dict[str, Optional[float]] = {}
         self._4h_applied_count: Dict[str, int] = {}
         # Do NOT seed from liquidity_zones_active.json here.
         # That file is an end-state snapshot; its ``consumed`` set hides levels
@@ -134,9 +136,27 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
         if mode_u in ("LIVE", "PAPER"):
             self._zones.persist = True
             self._zones.set_persist_source("live")
+            # Cold-start once off the 1m eval queue so catch-up cannot stall workers.
+            self._bootstrap_live_zones()
         else:
             self._zones.persist = False
             self._zones.set_persist_source("backtest")
+
+    def _bootstrap_live_zones(self) -> None:
+        """Apply all closed 4H history and rewrite ``liquidity_zones_active.json``."""
+        as_of = pd.Timestamp.now(tz="UTC")
+        for raw in list(getattr(self, "underlying_symbols", None) or []):
+            sym = str(raw or "").strip().upper()
+            if not sym:
+                continue
+            try:
+                self._ensure_zones_as_of(sym, as_of)
+            except Exception as exc:
+                logger.warning(
+                    "LiquiditySweepStrategy live zone bootstrap failed %s: %s",
+                    sym,
+                    exc,
+                )
 
     @staticmethod
     def _normalize_entry_tf(raw: Any) -> str:
@@ -203,6 +223,9 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
         return max(1, int(DEFAULT_ORDER_QTY))
 
     def market_structure_config(self) -> MarketStructureConfig:
+        # Entry uses 4H zones (Gautham), not 1m liq_sweep_* columns. Liquidity
+        # sweeps are O(n) Python and ~3s/bar on a full-day 1m window — that
+        # starves the live engine. Keep swings only for trail stops.
         return MarketStructureConfig(
             swing_left=2,
             swing_right=2,
@@ -210,29 +233,22 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
             include_order_blocks=False,
             include_bos_choch=False,
             include_rsi_divergence=False,
+            include_liquidity_sweeps=False,
         )
 
     def prepare_indicators(self, df: Any) -> Any:
-        from core.utils.structure.liquidity import add_liquidity_sweeps
-
-        df = super().prepare_indicators(df)
-        return add_liquidity_sweeps(df)
+        return super().prepare_indicators(df)
 
     def persisted_indicator_keys(self) -> List[str]:
-        from core.utils.structure.liquidity import LIQUIDITY_COLS
-
-        keys = list(super().persisted_indicator_keys() or [])
-        for col in LIQUIDITY_COLS:
-            if col not in keys:
-                keys.append(col)
-        return keys
+        return list(super().persisted_indicator_keys() or [])
 
     def get_warmup_period(self) -> int:
-        # ~1 day of entry bars for structure / swing context
+        # 1m: default structure lookback (~5h). Full-day 1440 was only needed
+        # when recomputing session/PDH liquidity levels every bar.
         tf = self._normalize_entry_tf(getattr(self, "timeframe", DEFAULT_ENTRY_TF))
         if tf == "1":
-            return max(50, 1440)
-        return max(50, 288)
+            return max(50, int(DEFAULT_STRUCTURE_LOOKBACK))
+        return max(50, 288)  # ~1 day of 5m bars
 
     def get_structure_lookback(self) -> int:
         return max(100, self.get_warmup_period() + 50)
@@ -365,11 +381,30 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
             return None
         return t
 
-    def _load_4h_history_rows(self, symbol: str) -> List[dict]:
-        """Load OHLC from logs/indicators/{SYMBOL}/4h/indicator_history.jsonl."""
+    def _invalidate_4h_history_cache(self, symbol: str) -> None:
         sym = str(symbol or "").strip().upper()
+        if not sym:
+            return
+        self._4h_hist_rows.pop(sym, None)
+        self._4h_hist_mtime.pop(sym, None)
+
+    def _load_4h_history_rows(self, symbol: str) -> List[dict]:
+        """Load OHLC from logs/indicators/{SYMBOL}/4h/indicator_history.jsonl.
+
+        Reloads when the history file mtime changes so live_append 4H bars are
+        picked up by ``_ensure_zones_as_of`` (cache is otherwise sticky).
+        """
+        sym = str(symbol or "").strip().upper()
+        path = ind_hist.indicator_history_path(sym, INDICATOR_HISTORY_ZONE_TF)
+        try:
+            mtime: Optional[float] = os.path.getmtime(path)
+        except OSError:
+            mtime = None
         cached = self._4h_hist_rows.get(sym)
-        if cached is not None:
+        # Injected rows (tests) omit mtime until first disk load / invalidate.
+        if cached is not None and sym not in self._4h_hist_mtime:
+            return cached
+        if cached is not None and self._4h_hist_mtime.get(sym) == mtime:
             return cached
         try:
             rows = ind_hist.load_indicator_history_rows(
@@ -379,11 +414,12 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
             logger.warning(
                 "LiquiditySweepStrategy 4H history load failed %s path=%s: %s",
                 sym,
-                ind_hist.indicator_history_path(sym, INDICATOR_HISTORY_ZONE_TF),
+                path,
                 exc,
             )
             rows = []
         self._4h_hist_rows[sym] = rows
+        self._4h_hist_mtime[sym] = mtime
         return rows
 
     def _row_to_4h_candle(self, symbol: str, row: dict) -> dict:
@@ -415,6 +451,10 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
 
         Used for backtest (engine only replays primary TF) and live cold-start.
         Live closed 4H bars also call ``on_4h_close`` directly (idempotent).
+
+        When new bars are applied in LIVE/PAPER (``persist=True``), rewrite
+        ``liquidity_zones_active.json`` once for this catch-up batch so disk
+        matches in-memory zones after restart / late 4H live_append.
         """
         sym = str(symbol or "").strip().upper()
         as_of_ts = self._as_utc(as_of)
@@ -423,6 +463,8 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
 
         rows = self._load_4h_history_rows(sym)
         applied = int(self._4h_applied_count.get(sym, 0))
+        prev_applied = applied
+        last_as_of: Any = None
         with self._zones.suspend_persist():
             while applied < len(rows):
                 row = rows[applied]
@@ -433,13 +475,25 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
                 close_at = open_ts + pd.Timedelta(seconds=_4H_BAR_SECONDS)
                 if close_at > as_of_ts:
                     break
-                self._zones.on_4h_close(sym, self._row_to_4h_candle(sym, row))
+                candle = self._row_to_4h_candle(sym, row)
+                self._zones.on_4h_close(sym, candle)
+                last_as_of = candle.get("candle_timestamp_ist") or row.get("timestamp")
                 applied += 1
         self._4h_applied_count[sym] = applied
-        # Do not rewrite liquidity_zones_active.json on every 5m/history catch-up.
-        # Persist only on real 4H closes / rebuild / mark_consumed.
         if applied > 0:
             self._zones_hydrated.add(sym)
+        # Persist only when this call advanced the book (not every entry bar).
+        if applied > prev_applied and self._zones.persist:
+            self._zones._persist_symbol(
+                sym, as_of=last_as_of, event="zone_snapshot"
+            )
+            logger.info(
+                "LiquiditySweepStrategy zones persisted %s bars=%s→%s as_of=%s",
+                sym,
+                prev_applied,
+                applied,
+                last_as_of,
+            )
 
     def should_evaluate(self, candle: dict) -> bool:
         if candle.get("close") is None:
@@ -484,6 +538,9 @@ class LiquiditySweepStrategy(MarketStructureMixin, IndiaMktMixins, BaseStrategy)
         if self._is_4h_candle(candle):
             self._zones.on_4h_close(symbol, candle)
             self._zones_hydrated.add(symbol)
+            # History file may already include this bar (DOS enrich live_append);
+            # drop cache so the next entry-bar catch-up sees the new mtime/rows.
+            self._invalidate_4h_history_cache(symbol)
             return None
 
         # Only evaluate entries on the configured entry TF (1 or 5).
