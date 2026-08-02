@@ -100,32 +100,30 @@ def create_logged_in_neo_api(creds: Optional[KotakCredentials] = None) -> Any:
     """
     Construct NeoAPI and complete TOTP + MPIN login (unless access_token is set).
 
+    Uses the installed ``neo_api_client.NeoAPI`` (kotakneoapi package).
     Returns a live ``NeoAPI`` instance ready for REST / WS.
     """
-    from core.library.kotak_neo.neo_api import NeoAPI
+    from neo_api_client import NeoAPI
 
     c = creds or get_kotak_credentials()
     env = "prod" if c.environment in ("prod", "production", "live") else "uat"
 
     if c.access_token:
         api = NeoAPI(
+            consumer_key=c.consumer_key or None,
             environment=env,
             access_token=c.access_token,
             neo_fin_key=c.neo_fin_key or None,
-            consumer_key=c.consumer_key or None,
         )
         logger.info("Kotak NeoAPI initialized with KOTAK_ACCESS_TOKEN (skip TOTP)")
         return api
 
     api = NeoAPI(
+        consumer_key=c.consumer_key or None,
         environment=env,
         access_token=None,
         neo_fin_key=c.neo_fin_key or None,
-        consumer_key=c.consumer_key or None,
     )
-    # neo_api_client may expect consumer_secret on configuration
-    if c.consumer_secret and hasattr(api.configuration, "consumer_secret"):
-        api.configuration.consumer_secret = c.consumer_secret
 
     totp_code = c.totp or _current_totp(c.totp_secret)
     login_resp = api.totp_login(mobile_number=c.mobile, ucc=c.ucc, totp=totp_code)
@@ -138,9 +136,19 @@ def create_logged_in_neo_api(creds: Optional[KotakCredentials] = None) -> Any:
     ):
         raise RuntimeError(f"Kotak Neo totp_validate failed: {validate_resp}")
 
-    if not getattr(api.configuration, "edit_token", None):
+    cfg = getattr(api, "configuration", None)
+    edit_token = getattr(cfg, "edit_token", None) if cfg is not None else None
+    # Newer SDK may store the trade token under different attribute names.
+    if not edit_token and cfg is not None:
+        edit_token = (
+            getattr(cfg, "token", None)
+            or getattr(cfg, "editToken", None)
+            or getattr(cfg, "access_token", None)
+        )
+    if not edit_token:
         raise RuntimeError(
             "Kotak Neo login did not set edit_token; check credentials / TOTP / MPIN"
+            f" login={login_resp!r} validate={validate_resp!r}"
         )
     logger.info("Kotak Neo session ready (TOTP + MPIN) env=%s ucc=%s", env, c.ucc)
     return api

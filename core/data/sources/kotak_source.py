@@ -33,14 +33,14 @@ class KotakSource:
             self._api = create_logged_in_neo_api(credentials)
         else:
             creds = credentials or get_kotak_credentials()
-            from core.library.kotak_neo.neo_api import NeoAPI
+            from neo_api_client import NeoAPI
 
             env = "prod" if creds.environment in ("prod", "production", "live") else "uat"
             self._api = NeoAPI(
+                consumer_key=creds.consumer_key or None,
                 environment=env,
                 access_token=creds.access_token or None,
                 neo_fin_key=creds.neo_fin_key or None,
-                consumer_key=creds.consumer_key or None,
             )
         self._scrip_cache: Optional[List[Dict[str, Any]]] = None
 
