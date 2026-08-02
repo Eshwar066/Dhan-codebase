@@ -18,13 +18,22 @@ class BaseEngine:
         instrument_store,
         position_manager,
         universe_service=None,
+        option_chain_api: str | None = None,
     ):
         self.strategy = strategy
         self.data = data
         self.instrument_store = instrument_store
         self.position_manager = position_manager
         self.universe_service = universe_service
-        self.data_router = DataRouter(data)
+        # Venue-owned default so strategies need not hardcode DHAN vs KOTAK.
+        if option_chain_api is None and hasattr(data, "bind_instrument_store"):
+            # KotakDataProvider exposes bind_instrument_store
+            from core.data.datalayer.kotak_data_provider import KotakDataProvider
+
+            if isinstance(data, KotakDataProvider):
+                option_chain_api = "KOTAK"
+                data.bind_instrument_store(instrument_store)
+        self.data_router = DataRouter(data, default_api=option_chain_api)
         self.option_chain_service = OptionChainService(self.data_router)
 
     def get_strategy_params(self):

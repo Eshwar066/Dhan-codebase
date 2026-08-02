@@ -334,6 +334,8 @@ class EngineFactory:
         instrument_store = EngineFactory._instrument_store(
             config, kotak_source=kotak_source
         )
+        if hasattr(data_provider, "bind_instrument_store"):
+            data_provider.bind_instrument_store(instrument_store)
 
         # ---------- Broker + OrderRouter (venue-specific) ----------
         # PAPER: use SimulatedBroker (same logs/safeguards as LIVE; no real orders).

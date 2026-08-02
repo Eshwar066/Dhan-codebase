@@ -10,7 +10,7 @@ python-dateutil
 pytz
 dhanhq
 Dhan-Tradehull
-neo_api_client
+kotakneoapi
 pyotp
 psutil
 PyYAML

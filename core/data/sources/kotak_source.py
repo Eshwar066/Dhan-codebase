@@ -33,14 +33,14 @@ class KotakSource:
             self._api = create_logged_in_neo_api(credentials)
         else:
             creds = credentials or get_kotak_credentials()
-            from core.library.kotak_neo.neo_api import NeoAPI
+            from neo_api_client import NeoAPI
 
             env = "prod" if creds.environment in ("prod", "production", "live") else "uat"
             self._api = NeoAPI(
+                consumer_key=creds.consumer_key or None,
                 environment=env,
                 access_token=creds.access_token or None,
                 neo_fin_key=creds.neo_fin_key or None,
-                consumer_key=creds.consumer_key or None,
             )
         self._scrip_cache: Optional[List[Dict[str, Any]]] = None
 
@@ -136,6 +136,156 @@ class KotakSource:
         return self._api.quotes(
             instrument_tokens=instrument_tokens, quote_type=quote_type
         )
+
+    @staticmethod
+    def _is_quotes_error(payload: Any) -> bool:
+        if payload is None:
+            return True
+        if isinstance(payload, dict):
+            if payload.get("Error"):
+                return True
+            err = payload.get("error")
+            if err is True:
+                return True
+            if isinstance(err, (list, dict, str)) and bool(err):
+                return True
+            msg = str(payload.get("message") or "").lower()
+            if "invalid" in msg and "consumer" in msg:
+                return True
+        return False
+
+    def fetch_quote_map(
+        self,
+        instrument_tokens: List[Dict[str, Any]],
+        *,
+        quote_type: str = "all",
+        chunk_size: int = 40,
+        ws_timeout_sec: float = 12.0,
+    ) -> Dict[str, Any]:
+        """
+        Map ``instrument_token`` → quote payload.
+
+        Prefers REST ``quotes``; falls back to SFeed websocket snapshot when
+        script-details rejects the consumer key (common until market-data is
+        entitled on the Neo Trade API token).
+        """
+        tokens = [t for t in (instrument_tokens or []) if isinstance(t, dict)]
+        if not tokens:
+            return {}
+
+        out: Dict[str, Any] = {}
+        rest_ok = False
+        for i in range(0, len(tokens), max(1, int(chunk_size))):
+            chunk = tokens[i : i + max(1, int(chunk_size))]
+            try:
+                raw = self.quotes(instrument_tokens=chunk, quote_type=quote_type)
+            except Exception as e:
+                logger.warning("Kotak REST quotes failed: %s", e)
+                rest_ok = False
+                break
+            if self._is_quotes_error(raw):
+                logger.info(
+                    "Kotak REST quotes unavailable (%s); using websocket snapshot",
+                    (raw.get("message") if isinstance(raw, dict) else raw),
+                )
+                rest_ok = False
+                break
+            rest_ok = True
+            rows = raw
+            if isinstance(raw, dict):
+                rows = (
+                    raw.get("data")
+                    or raw.get("quotes")
+                    or raw.get("result")
+                    or []
+                )
+            if isinstance(rows, dict):
+                rows = [rows]
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                tok = str(
+                    row.get("instrument_token")
+                    or row.get("tk")
+                    or row.get("token")
+                    or ""
+                ).strip()
+                if tok:
+                    out[tok] = row
+
+        if rest_ok and out:
+            return out
+
+        return self._fetch_quote_map_via_ws(tokens, timeout_sec=ws_timeout_sec)
+
+    def _fetch_quote_map_via_ws(
+        self,
+        instrument_tokens: List[Dict[str, Any]],
+        *,
+        timeout_sec: float = 12.0,
+        chunk_size: int = 200,
+    ) -> Dict[str, Any]:
+        """One-shot SFeed snapshot(+subscribe) for LTP/bid/ask."""
+        import asyncio
+
+        try:
+            from neo_api_client.websocket.feed import WsToken
+        except ImportError as e:
+            logger.error("Kotak WS quotes unavailable: %s", e)
+            return {}
+
+        ws_tokens: List[Any] = []
+        for t in instrument_tokens:
+            tok = str(t.get("instrument_token") or "").strip()
+            seg = str(t.get("exchange_segment") or "nse_fo").strip()
+            if tok:
+                ws_tokens.append(WsToken(seg, tok))
+        if not ws_tokens:
+            return {}
+
+        async def _run() -> Dict[str, Any]:
+            collected: Dict[str, Any] = {}
+            async with self._api.create_websocket() as ws:
+                for i in range(0, len(ws_tokens), max(1, int(chunk_size))):
+                    chunk = ws_tokens[i : i + max(1, int(chunk_size))]
+                    try:
+                        await ws.snapshot(chunk, intent="scrips")
+                    except Exception as e:
+                        logger.debug("Kotak WS snapshot: %s", e)
+                    try:
+                        await ws.subscribe_scrips(chunk)
+                    except Exception as e:
+                        logger.debug("Kotak WS subscribe: %s", e)
+
+                deadline = asyncio.get_event_loop().time() + float(timeout_sec)
+                async for msg in ws:
+                    tok = str(getattr(msg, "instrument_token", "") or "").strip()
+                    if tok:
+                        collected[tok] = msg
+                    if len(collected) >= len(ws_tokens):
+                        break
+                    if asyncio.get_event_loop().time() >= deadline:
+                        break
+            return collected
+
+        try:
+            return asyncio.run(_run())
+        except RuntimeError:
+            # Already inside an event loop (rare in engine threads) — use a bridge.
+            try:
+                loop = asyncio.new_event_loop()
+                try:
+                    return loop.run_until_complete(_run())
+                finally:
+                    loop.close()
+            except Exception as e:
+                logger.exception("Kotak WS quote snapshot failed: %s", e)
+                return {}
+        except Exception as e:
+            logger.exception("Kotak WS quote snapshot failed: %s", e)
+            return {}
 
     def search_scrip(
         self,
