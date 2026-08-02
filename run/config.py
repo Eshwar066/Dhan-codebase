@@ -396,6 +396,18 @@ ENGINE_JOBS = [
         },
     },
 
+    {
+        "engine_id": "kotak_nifty_intraday_magical_paper",
+        "venue": "KOTAK",
+        "enabled": False,
+        "run_mode": "PAPER",
+        "capital": 200_000,
+        "ORDER_QTY_LOTS": 1,
+        "strategies": ["NiftyIntradayMagicalLine"],
+        "symbols": ["NIFTY"],
+        "exchange": "INDEX",
+    },
+
 ]
 
 

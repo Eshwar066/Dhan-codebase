@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 VALID_INSTRUMENTS = frozenset({"OPTION", "FUTURE", "EQUITY"})
 VALID_MODES = frozenset({"BACKTEST", "PAPER", "LIVE"})
 VALID_EVAL_MODES = frozenset({"live_feed", "scheduled"})
-VALID_VENUES = frozenset({"DHAN", "DELTA"})
+VALID_VENUES = frozenset({"DHAN", "DELTA", "KOTAK"})
 
 # Event names strategies may declare under subscriptions:
 VALID_SUBSCRIPTION_EVENTS = frozenset(

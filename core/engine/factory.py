@@ -32,7 +32,8 @@ from core.engine.backtest_engine import BacktestEngine
 from core.engine.live_engine import LiveEngine
 from core.data.sources.dhan_source import DhanSource
 from core.data.sources.delta_source import DeltaSource, DELTA_BASE_URL_INDIA_TEST
-from core.data.datalayer import DhanDataProvider, DeltaDataProvider
+from core.data.sources.kotak_source import KotakSource
+from core.data.datalayer import DhanDataProvider, DeltaDataProvider, KotakDataProvider
 from core.data.candle_service import CandleService
 from core.data.candle_aggregator import (
     CandleAggregator,
@@ -40,14 +41,17 @@ from core.data.candle_aggregator import (
     MCX_DEFAULT_SESSION_START_SEC,
     _resolution_to_seconds,
 )
-from core.data.feeds import DeltaWebSocketFeed, DhanWebSocketFeed
+from core.data.feeds import DeltaWebSocketFeed, DhanWebSocketFeed, KotakWebSocketFeed
 from core.data.feeds.delta_candlestick import resolutions_from_engine_timeframes
 from core.data.feeds.dhan_order_update_feed import DhanOrderUpdateFeed
+from core.data.feeds.kotak_order_update_feed import KotakOrderUpdateFeed
 from core.broker import (
     DhanBroker,
     DhanBrokerApi,
     DeltaBroker,
     DeltaBrokerApi,
+    KotakBroker,
+    KotakBrokerApi,
     SimulatedBroker,
 )
 from core.orderExecution.order_router import OrderRouter
@@ -56,6 +60,7 @@ from core.orderExecution.intent_store import IntentStore
 from core.orderExecution.position_manager import PositionManager
 from core.orderExecution.risk_manager import RiskManager, make_short_option_margin_check
 from core.utils.delta_env import get_delta_credentials
+from core.utils.kotak_env import get_kotak_credentials
 from core.utils.instruments.instrument_store import InstrumentStore
 from core.utils.telegram_alert import send_telegram_alert
 from utils.logger.trade_logger import TradeLogger
@@ -135,6 +140,7 @@ class EngineFactory:
         EngineFactory._attach_engine_context(strategies, config)
 
         # ---------- Data (venue-specific) ----------
+        # KOTAK backtest: reuse Dhan/local hist (Neo has no OHLC history API).
         if config.broker_name == "DELTA":
             source = DeltaSource(
                 testnet=config.delta_testnet,
@@ -205,6 +211,7 @@ class EngineFactory:
         Build LiveEngine with isolated stack for config.broker_name.
         PAPER: SimulatedBroker (same stack and logs as LIVE; no real orders).
         LIVE + Dhan: DhanDataProvider, DhanBroker, DhanWebSocketFeed when credentials set.
+        LIVE + Kotak: KotakDataProvider, KotakBroker, KotakWebSocketFeed when login succeeds.
         LIVE + Delta: DeltaDataProvider, DeltaBroker, DeltaWebSocketFeed when credentials set.
         """
         load_dotenv()
@@ -238,6 +245,9 @@ class EngineFactory:
         EngineFactory._attach_engine_context(strategies, config)
 
         # ---------- Data (venue-specific) ----------
+        kotak_source = None
+        dhan_source = None
+        delta_source = None
         if config.broker_name == "DELTA":
             delta_source = DeltaSource(
                 testnet=config.delta_testnet,
@@ -245,6 +255,13 @@ class EngineFactory:
                 symbols=getattr(config, "symbols", None) or [],
             )
             data_provider = DeltaDataProvider(delta_source)
+        elif config.broker_name == "KOTAK":
+            try:
+                kotak_source = KotakSource(auto_login=True)
+                data_provider = KotakDataProvider(kotak_source)
+            except Exception as e:
+                logger.error("Kotak Neo login/source failed: %s", e)
+                raise
         else:
             dhan_source = DhanSource()
             data_provider = DhanDataProvider(dhan_source)
@@ -314,7 +331,9 @@ class EngineFactory:
         )
 
         # ---------- Instruments (needed by OrderRouter) ----------
-        instrument_store = EngineFactory._instrument_store(config)
+        instrument_store = EngineFactory._instrument_store(
+            config, kotak_source=kotak_source
+        )
 
         # ---------- Broker + OrderRouter (venue-specific) ----------
         # PAPER: use SimulatedBroker (same logs/safeguards as LIVE; no real orders).
@@ -330,6 +349,13 @@ class EngineFactory:
                 position_manager=position_manager,
                 intent_store=intent_store,
                 default_leverage=int(getattr(config, "delta_leverage", None) or 1),
+            )
+        elif config.broker_name == "KOTAK":
+            broker_api = KotakBrokerApi(kotak_source)
+            broker = KotakBroker(
+                api=broker_api,
+                position_manager=position_manager,
+                intent_store=intent_store,
             )
         else:
             broker_api = DhanBrokerApi(dhan_source)
@@ -537,6 +563,61 @@ class EngineFactory:
                     access_token=access_token,
                     client_id=client_id,
                 )
+        elif config.broker_name == "KOTAK":
+            if kotak_source is None:
+                logger.warning("Kotak realtime feed skipped: KotakSource not available")
+            elif hasattr(instrument_store, "get_feed_instruments"):
+                eval_modes = getattr(config, "strategy_eval", None) or {}
+                feed_symbols = LiveEngine._collect_feed_symbols(
+                    config.symbols or [], strategies, eval_modes
+                )
+                market_exchange = str(
+                    getattr(config, "market_exchange", "") or ""
+                ).upper()
+                is_nse_like = market_exchange in {"NSE", "INDEX", "NSE_INDEX", ""}
+                is_mcx = market_exchange == "MCX"
+                instruments = (
+                    instrument_store.get_feed_instruments(feed_symbols)
+                    if feed_symbols
+                    else []
+                )
+                if feed_symbols and not instruments:
+                    logger.warning(
+                        "Kotak realtime feed skipped: get_feed_instruments empty for %s",
+                        feed_symbols,
+                    )
+                if instruments:
+                    realtime_feed = KotakWebSocketFeed(
+                        neo_api=kotak_source.api,
+                        instruments=instruments,
+                        engine_logger=engine_logger,
+                        debug_mode=bool(getattr(config, "debug_mode", False)),
+                    )
+                    if LiveEngine.needs_tick_queue(strategies, eval_modes):
+                        tick_queue = queue.Queue(maxsize=TICK_QUEUE_MAXSIZE)
+                        if is_nse_like:
+                            candle_aggregator = CandleAggregator(
+                                session_start_sec=(9 * 3600) + (15 * 60),
+                                session_end_sec=(15 * 3600) + (30 * 60),
+                                engine_logger=engine_logger,
+                                debug_mode=bool(getattr(config, "debug_mode", False)),
+                            )
+                        elif is_mcx:
+                            candle_aggregator = CandleAggregator(
+                                session_start_sec=MCX_DEFAULT_SESSION_START_SEC,
+                                session_end_sec=MCX_DEFAULT_SESSION_END_SEC,
+                                engine_logger=engine_logger,
+                                debug_mode=bool(getattr(config, "debug_mode", False)),
+                            )
+                        else:
+                            candle_aggregator = CandleAggregator(
+                                engine_logger=engine_logger,
+                                debug_mode=bool(getattr(config, "debug_mode", False)),
+                            )
+                        realtime_feed.set_tick_queue(tick_queue)
+                    realtime_feed.start()
+                # Duck-typed into LiveEngine.dhan_order_update_feed (same callbacks).
+                dhan_order_update_feed = KotakOrderUpdateFeed(neo_api=kotak_source.api)
 
         return LiveEngine(
             strategy=strategy,
@@ -595,7 +676,7 @@ class EngineFactory:
         )
 
     @staticmethod
-    def _instrument_store(config: EngineConfig) -> InstrumentStore:
+    def _instrument_store(config: EngineConfig, kotak_source=None) -> InstrumentStore:
         """Build venue-specific InstrumentStore (same class, different paths)."""
         deps = config.dependencies_dir
         current_date = __import__("time").strftime("%Y-%m-%d")
@@ -606,6 +687,14 @@ class EngineFactory:
             if getattr(config, "delta_testnet", False) and getattr(config, "delta_india", True):
                 base_url = DELTA_BASE_URL_INDIA_TEST  # https://cdn-ind.testnet.deltaex.org
             return InstrumentStore(broker="DELTA", csv_path=csv_path, base_url=base_url)
+        if config.broker_name == "KOTAK":
+            # Dual period: prefer kotak-named cache, else shared NSE master CSV (Dhan schema).
+            kotak_file = deps / ("kotak_instrument_" + current_date + ".csv")
+            dhan_file = deps / ("all_instrument" + current_date + ".csv")
+            csv_path = kotak_file if kotak_file.exists() else dhan_file
+            return InstrumentStore(
+                broker="KOTAK", csv_path=csv_path, kotak_source=kotak_source
+            )
         expected_file = "all_instrument" + current_date + ".csv"
         return InstrumentStore(csv_path=deps / expected_file)
 

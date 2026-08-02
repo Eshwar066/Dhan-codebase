@@ -12,6 +12,8 @@ One process per engine (recommended for mixed LIVE + PAPER on DHAN):
 Two processes (parallel Dhan + Delta):
     Process 1: python -m run.main --venue DHAN
     Process 2: python -m run.main --venue DELTA
+    Process 3: python -m run.main --venue KOTAK
+      (or: python -m run.main --engine-id kotak_nifty_intraday_magical_paper)
 
 Optional: use Supervisor in code to run both venues in one process (two threads).
 """
@@ -175,11 +177,11 @@ def _select_jobs(engine_id: str | None, venue: str | None) -> list[dict]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Multi-venue trading: Dhan (India) + Delta (Crypto)"
+        description="Multi-venue trading: Dhan / Kotak Neo (India) + Delta (Crypto)"
     )
     parser.add_argument(
         "--venue",
-        choices=["DHAN", "DELTA"],
+        choices=["DHAN", "DELTA", "KOTAK"],
         default=None,
         help="Run only enabled jobs for this venue.",
     )
