@@ -131,22 +131,42 @@ class IndicatorManager:
             return df
         if not self._should_sanitize_delta_ohlc(timeframe):
             return df
-        out = df.copy()
         for col in ("open", "high", "low", "close"):
-            if col not in out.columns:
+            if col not in df.columns:
                 return df
+        # Vector-friendly path: avoid per-row Series construction (loc/to_dict),
+        # which dominated live CPU when called on every enrich.
+        import numpy as np
+
+        opens = np.array(df["open"], dtype=float, copy=True)
+        highs = np.array(df["high"], dtype=float, copy=True)
+        lows = np.array(df["low"], dtype=float, copy=True)
+        closes = np.array(df["close"], dtype=float, copy=True)
+        n = len(opens)
         prev_close: Optional[float] = None
-        for idx in out.index:
+        for i in range(n):
             row = self._sanitize_delta_ohlc_row(
-                out.loc[idx].to_dict(),
+                {
+                    "open": float(opens[i]),
+                    "high": float(highs[i]),
+                    "low": float(lows[i]),
+                    "close": float(closes[i]),
+                },
                 ref_close=prev_close,
             )
-            for col in ("open", "high", "low", "close"):
-                out.at[idx, col] = row[col]
+            opens[i] = row["open"]
+            highs[i] = row["high"]
+            lows[i] = row["low"]
+            closes[i] = row["close"]
             try:
                 prev_close = float(row.get("close") or 0) or prev_close
             except (TypeError, ValueError):
                 pass
+        out = df.copy()
+        out["open"] = opens
+        out["high"] = highs
+        out["low"] = lows
+        out["close"] = closes
         return out
 
     @staticmethod
@@ -1494,7 +1514,9 @@ class IndicatorManager:
 
             if not cache_hit:
                 compute_start = time.time()
-                work_df = self._sanitize_delta_ohlc_df(df.copy(), timeframe=tf)
+                # Delta 1m/5m OHLC is clamped on bootstrap/append (_finalize_delta_base_df).
+                # Re-sanitizing the whole window here was a major live CPU cost.
+                work_df = df.copy()
                 merge_cap = max(400, int(window or 0))
                 if self._strategy_uses_indicator_history(strategy):
                     work_df = self._merge_rsi_history_into_base_df(
