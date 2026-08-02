@@ -23,7 +23,7 @@ from run.config import (
 )
 
 
-BrokerName = Literal["DHAN", "DELTA"]
+BrokerName = Literal["DHAN", "DELTA", "KOTAK"]
 
 _logging_configured = False
 
