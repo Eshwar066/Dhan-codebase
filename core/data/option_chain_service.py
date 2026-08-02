@@ -7,10 +7,16 @@ class OptionChainService:
     def __init__(self, data_router):
         self.data_router = data_router
 
+    def _resolve_api(self, api: str | None) -> str:
+        resolve = getattr(self.data_router, "resolve_api", None)
+        if callable(resolve):
+            return resolve(api)
+        return (api or "").upper()
+
     def get_expiries(self, api: str, ctx: StrategyContext, instrument: str):
         ctx.instrument = instrument
         params = {
-            "api": api,
+            "api": self._resolve_api(api),
             "symbol": ctx.symbol,
             "instrument": ctx.instrument,
         }
@@ -22,8 +28,9 @@ class OptionChainService:
         return adapter.get_expiries(ctx)
 
     def get_chain(self, *, api: str, ctx: StrategyContext, params: dict):
-        """api: "NSE" or "DHAN"; ctx: StrategyContext; params: option chain params."""
-        params["api"] = api
+        """Fetch option chain; ``api`` is resolved via DataRouter.default_api when set."""
+        params = dict(params or {})
+        params["api"] = self._resolve_api(api)
         adapter = self.data_router.from_candle(params)
 
         if RUN_MODE == RunMode.LIVE or RUN_MODE == RunMode.PAPER:

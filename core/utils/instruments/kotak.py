@@ -9,9 +9,16 @@ unchanged. Feed subscription payloads are mapped to Neo token format.
 from __future__ import annotations
 
 import logging
+from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import pandas as pd
+
+from core.data.option_chain.kotak_chain import (
+    list_option_expiries,
+    option_rows_for_expiry,
+)
 from core.utils.instruments.dhan import DhanInstrumentStore
 
 logger = logging.getLogger(__name__)
@@ -79,3 +86,23 @@ class KotakInstrumentStore(DhanInstrumentStore):
         except Exception as e:
             logger.warning("KotakInstrumentStore scrip_master failed: %s", e)
             return 0
+
+    def list_option_expiries(
+        self, symbol: str, *, monthly_only: bool = False
+    ) -> List[date]:
+        """Sorted option expiry dates for an underlying from the NSE master CSV."""
+        return list_option_expiries(
+            self.df, symbol, monthly_only=monthly_only
+        )
+
+    def list_options_for_expiry(
+        self,
+        symbol: str,
+        expiry: date,
+        *,
+        monthly_only: bool = False,
+    ) -> pd.DataFrame:
+        """OPTIDX/OPTSTK rows for ``symbol`` on ``expiry`` (CE+PE)."""
+        return option_rows_for_expiry(
+            self.df, symbol, expiry, monthly_only=monthly_only
+        )
