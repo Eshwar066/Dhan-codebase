@@ -1992,7 +1992,91 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertEqual(s._entry_qty_lots("monthly"), 25)
         self.assertEqual(s._entry_qty_lots("MONTHLY"), 25)
         self.assertEqual(s._entry_qty_lots("weekly"), 50)
-        self.assertTrue(s._uses_4h_trail("monthly"))
+        self.assertTrue(s._uses_4h_trail("weekly"))
+        self.assertFalse(s._uses_4h_trail("monthly"))
+        self.assertTrue(s._uses_1d_trail("monthly"))
+        self.assertFalse(s._uses_1d_trail("weekly"))
+
+    def test_monthly_trails_on_1d_supertrend(self):
+        """Monthly index MAIN_SL trails 1D ST, not 4H (weekly) or 1H."""
+        from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import (
+            _PositionMeta,
+        )
+        from core.strategies.crypto.DirectionalOptionSelling.constants import (
+            SL_MODE_INDEX,
+            SLEEVE_MONTHLY,
+        )
+
+        instrument = SimpleNamespace(
+            option_type="CE",
+            expiry="280826",
+            strike=66000,
+            trading_symbol="C-BTC-66000-280826",
+            product_id=42,
+        )
+        position = SimpleNamespace(
+            tag="MAIN",
+            net_qty=-1,
+            structure_id="DirectionalOptionSelling:BTCUSD:monthly:2026-08-01:CE:37ac80b1",
+            instrument=instrument,
+            intent_id="m1",
+            avg_price=1023,
+        )
+        ctx = SimpleNamespace(
+            position_store=_PositionStore([position]),
+            intent_store=None,
+            order_router=SimpleNamespace(broker=SimpleNamespace()),
+        )
+        sid = position.structure_id
+        self.strategy._meta_by_structure_id[sid] = _PositionMeta(
+            symbol="BTCUSD",
+            direction=-1,
+            option_type="CE",
+            supertrend=63470.0,
+            strike=66000,
+            expiry="280826",
+            entry_premium=1023,
+            entry_reason="one_d_signal",
+            sleeve=SLEEVE_MONTHLY,
+            sl_mode=SL_MODE_INDEX,
+        )
+        self.strategy._current_4h_supertrend = 63470.9
+        self.strategy._current_1d_supertrend = 62000.0
+        self.strategy._confirmed_direction = -1
+        self.strategy._current_supertrend = 63500.0
+        candle = {
+            "symbol": "BTCUSD",
+            "timeframe": "60",
+            "timestamp": datetime(2026, 8, 2, 7, 0, tzinfo=timezone.utc),
+            "close": 63538.0,
+            "supertrend": 63500.0,
+            "supertrend_direction": -1,
+            "supertrend_4h": 63470.9,
+            "supertrend_1d": 62000.0,
+        }
+        with patch.object(self.strategy, "_bar_is_fully_closed", return_value=True):
+            with patch.object(
+                self.strategy,
+                "_resolve_weekly_trail_st",
+                return_value=63470.9,
+            ):
+                with patch.object(
+                    self.strategy,
+                    "_resolve_1d_trail_st",
+                    return_value=62000.0,
+                ):
+                    with patch.object(
+                        self.strategy, "_modify_broker_trail_sl", return_value=True
+                    ) as modify:
+                        with patch.object(
+                            self.strategy, "_build_entry", return_value=None
+                        ):
+                            self.strategy.on_candle(candle, ctx)
+        modify.assert_called_once()
+        self.assertAlmostEqual(modify.call_args.kwargs["supertrend"], 62000.0)
+        self.assertAlmostEqual(
+            self.strategy._meta_by_structure_id[sid].supertrend, 62000.0
+        )
 
     def test_monthly_enters_only_on_1d_flip(self):
         """Steady 1D does not enter monthly; 1D flip does."""

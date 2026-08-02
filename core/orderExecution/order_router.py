@@ -59,6 +59,18 @@ _TERMINAL_ORDER_STATES: Set[OrderState] = {
     OrderState.EXPIRED,
 }
 
+# Stop / bracket legs carry an intentional limit relative to trigger.
+# Never overwrite with live bid/ask from price_map or stale-exit refresh.
+_STOP_ORDER_TYPES: Set[str] = {
+    "SL",
+    "SL-M",
+    "SLM",
+    "STOP",
+    "STOP_MARKET",
+    "STOP_LIMIT",
+}
+_STRATEGY_FIXED_LIMIT_TAGS: Set[str] = {"MAIN_SL", "MAIN_TARGET"}
+
 
 class OrderRouter:
     def __init__(
@@ -1721,6 +1733,41 @@ class OrderRouter:
                 return coerced
         return None
 
+    @staticmethod
+    def _intent_keeps_strategy_limit(intent: Any) -> bool:
+        """
+        True when limit must stay as strategy computed it (vs live bid/ask).
+
+        MAIN_SL buy-to-cover stop-LIMIT uses trigger+band (e.g. +1..+10). Replacing
+        that with the option ask leaves limit below trigger (see 2026-08-02 DOS).
+        """
+        tag = str(getattr(intent, "tag", "") or "").upper()
+        if tag in _STRATEGY_FIXED_LIMIT_TAGS:
+            return True
+        ot = str(getattr(intent, "order_type", "") or "").upper()
+        return ot in _STOP_ORDER_TYPES
+
+    def _resolve_exec_price(
+        self,
+        intent: Any,
+        price_map: Optional[Dict[str, Any]],
+        trading_sym: str = "",
+    ) -> Optional[float]:
+        """Pick execution/limit price: strategy limit for stops; else price_map."""
+        if self._intent_keeps_strategy_limit(intent):
+            exec_price = self._coerce_positive_exec_price(
+                getattr(intent, "price", None)
+            )
+            if exec_price is None:
+                exec_price = self._lookup_price_map(price_map, intent, trading_sym)
+            return exec_price
+        exec_price = self._lookup_price_map(price_map, intent, trading_sym)
+        if exec_price is None:
+            exec_price = self._coerce_positive_exec_price(
+                getattr(intent, "price", None)
+            )
+        return exec_price
+
     def process_intent(
         self,
         intent,
@@ -1828,15 +1875,11 @@ class OrderRouter:
                     )
                     return {"ok": True, "retryable": False, "reason": "duplicate_exit"}
 
-        # Resolve execution price: always prefer price_map (engine updates it with best bid/ask).
-        # Engine may key by place_order_symbol (Dhan SEM_CUSTOM_SYMBOL) while intent.instrument
-        # uses compact trading_symbol — try both.
-        exec_price = None
-        if price_map:
-            exec_price = self._lookup_price_map(price_map, intent, sym)
-        if exec_price is None:
-            exec_price = intent.price
-        exec_price = self._coerce_positive_exec_price(exec_price)
+        # Resolve execution price: prefer live price_map for ENTRY/EXIT limits.
+        # Stop / MAIN_SL / MAIN_TARGET keep strategy intent.price (trigger band).
+        # Engine may key by place_order_symbol (Dhan SEM_CUSTOM_SYMBOL) while
+        # intent.instrument uses compact trading_symbol — try both via lookup.
+        exec_price = self._resolve_exec_price(intent, price_map, sym)
         if exec_price is None:
             self._log_oms_step(
                 "price_resolve",
@@ -2755,16 +2798,17 @@ class OrderRouter:
         price_map: Dict[str, float],
     ) -> List[Tuple[Any, float]]:
         out: List[Tuple[Any, float]] = []
-        for intent, _ in resolved:
+        for intent, prev_price in resolved:
+            if self._intent_keeps_strategy_limit(intent):
+                # Keep intentional stop/target limits; do not chase bid/ask.
+                out.append((intent, prev_price))
+                continue
             sym = (
                 getattr(intent.instrument, "trading_symbol", None)
                 if getattr(intent, "instrument", None)
                 else ""
             )
-            exec_price = self._lookup_price_map(price_map, intent, sym)
-            if exec_price is None:
-                exec_price = getattr(intent, "price", None)
-            exec_price = self._coerce_positive_exec_price(exec_price)
+            exec_price = self._resolve_exec_price(intent, price_map, sym)
             if exec_price is not None:
                 exec_price = self.slippage_model(exec_price)
                 if sym:
@@ -3166,10 +3210,7 @@ class OrderRouter:
                 if getattr(intent, "instrument", None)
                 else ""
             )
-            exec_price = self._lookup_price_map(price_map, intent, sym)
-            if exec_price is None:
-                exec_price = getattr(intent, "price", None)
-            exec_price = self._coerce_positive_exec_price(exec_price)
+            exec_price = self._resolve_exec_price(intent, price_map, sym)
             if exec_price is None:
                 return {
                     "ok": False,
@@ -3177,7 +3218,7 @@ class OrderRouter:
                     "reason": "no_price",
                 }
             exec_price = self.slippage_model(exec_price)
-            if sym:
+            if sym and not self._intent_keeps_strategy_limit(intent):
                 price_map[sym] = exec_price
             resolved.append((intent, exec_price))
 
@@ -3312,15 +3353,11 @@ class OrderRouter:
                 if getattr(intent, "instrument", None)
                 else ""
             )
-            exec_price = self._lookup_price_map(price_map, intent, sym)
-            if exec_price is None:
-                exec_price = getattr(intent, "price", None)
-            exec_price = self._coerce_positive_exec_price(exec_price)
+            exec_price = self._resolve_exec_price(intent, price_map, sym)
             if exec_price is None:
                 return {"ok": False, "retryable": False, "reason": "no_price"}
             exec_price = self.slippage_model(exec_price)
-            if sym:
-                price_map[sym] = exec_price
+            # Do not write SL/TARGET limits into shared price_map (same option key).
             resolved.append((intent, exec_price))
 
         broker = self.broker
@@ -3787,6 +3824,15 @@ class OrderRouter:
             if not intent_id:
                 continue
             payload = rec.get("payload") or {}
+            tag_u = str(
+                rec.get("tag") or payload.get("tag") or ""
+            ).upper()
+            order_type_u = str(
+                payload.get("order_type") or rec.get("order_type") or ""
+            ).upper()
+            # Resting stop / bracket limits must not chase bid/ask.
+            if tag_u in _STRATEGY_FIXED_LIMIT_TAGS or order_type_u in _STOP_ORDER_TYPES:
+                continue
 
             # Use last_price_update_ts so only re-quote interval matters. Fallback to updated_at only when missing (not when 0).
             # Explicit 0 = "always stale" (adopted EXIT orphan from yesterday) so we must not fall back to updated_at.

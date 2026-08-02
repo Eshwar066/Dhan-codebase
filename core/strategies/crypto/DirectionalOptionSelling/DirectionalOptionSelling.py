@@ -86,6 +86,7 @@ class _SymbolRuntime:
     confirmed_4h_direction: Optional[int] = None
     confirmed_1d_direction: Optional[int] = None
     current_4h_supertrend: Optional[float] = None
+    current_1d_supertrend: Optional[float] = None
     last_seen_4h_bar_open: Optional[pd.Timestamp] = None
     htf_st_cache: Dict[str, Tuple[int, float, pd.Timestamp]] = field(
         default_factory=dict
@@ -143,8 +144,9 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
     - Weekly: when 1D and 4H SuperTrend agree on a **closed 4H bar**, sell near
       4H SuperTrend on the weekly Friday (skip to next week if DTE too low).
     - Monthly: only on a confirmed **1D SuperTrend flip**, sell near 4H
-      SuperTrend on the monthly (last Friday) expiry. Gated by
-      ``ENABLE_MONTHLY_TRADES`` (+ per-symbol ``enable_monthly``).
+      SuperTrend on the monthly (last Friday) expiry; trail / force-exit on
+      **1D** SuperTrend. Gated by ``ENABLE_MONTHLY_TRADES`` (+ per-symbol
+      ``enable_monthly``).
     - Daily (0DTE/1DTE): only on a confirmed 1H SuperTrend flip (no mid-regime
       catch-up), and only when 1D and 4H agree with that 1H direction; sell near
       1H SuperTrend (0DTE before 17:25 IST, else 1DTE).
@@ -265,6 +267,14 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
     @_current_4h_supertrend.setter
     def _current_4h_supertrend(self, value: Optional[float]) -> None:
         self._rt().current_4h_supertrend = value
+
+    @property
+    def _current_1d_supertrend(self) -> Optional[float]:
+        return self._rt().current_1d_supertrend
+
+    @_current_1d_supertrend.setter
+    def _current_1d_supertrend(self, value: Optional[float]) -> None:
+        self._rt().current_1d_supertrend = value
 
     @property
     def _last_seen_4h_bar_open(self) -> Optional[pd.Timestamp]:
@@ -395,8 +405,13 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
 
     @staticmethod
     def _uses_4h_trail(sleeve: str) -> bool:
-        """Weekly and monthly trail / force-exit off 4H SuperTrend."""
-        return str(sleeve or "").strip().lower() in (SLEEVE_WEEKLY, SLEEVE_MONTHLY)
+        """Weekly trails / force-exits off 4H SuperTrend."""
+        return str(sleeve or "").strip().lower() == SLEEVE_WEEKLY
+
+    @staticmethod
+    def _uses_1d_trail(sleeve: str) -> bool:
+        """Monthly trails / force-exits off 1D SuperTrend."""
+        return str(sleeve or "").strip().lower() == SLEEVE_MONTHLY
 
     def _min_premium_for_sleeve(self, sleeve: str, symbol: Any = None) -> float:
         """Min sell premium: morning uses a lower floor; others use sleeve default."""
@@ -552,25 +567,25 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         """
         SuperTrend used for ST±300 force-exit / should_exit.
 
-        Weekly / monthly sleeves must use 4H ST only (never 1H). Daily uses 1H.
+        Weekly → 4H; monthly → 1D; daily / morning → 1H.
         """
         sleeve_u = str(sleeve or SLEEVE_DAILY).strip().lower()
         if self._uses_4h_trail(sleeve_u):
-            for candidate in (
+            candidates = (
                 self._current_4h_supertrend,
                 meta.supertrend if meta is not None else None,
-            ):
-                try:
-                    st = float(candidate) if candidate is not None else 0.0
-                except (TypeError, ValueError):
-                    continue
-                if st > 0:
-                    return st
-            return None
-        for candidate in (
-            self._current_supertrend,
-            meta.supertrend if meta is not None else None,
-        ):
+            )
+        elif self._uses_1d_trail(sleeve_u):
+            candidates = (
+                self._current_1d_supertrend,
+                meta.supertrend if meta is not None else None,
+            )
+        else:
+            candidates = (
+                self._current_supertrend,
+                meta.supertrend if meta is not None else None,
+            )
+        for candidate in candidates:
             try:
                 st = float(candidate) if candidate is not None else 0.0
             except (TypeError, ValueError):
@@ -933,10 +948,16 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                         strike = float(parts[2])
                     if not expiry:
                         expiry = str(parts[3])
-            # Weekly / monthly sleeves trail 4H ST; daily / morning trail 1H ST.
+            # Weekly → 4H ST; monthly → 1D ST; daily / morning → 1H ST.
             if self._uses_4h_trail(sleeve):
                 st = float(
                     self._current_4h_supertrend
+                    or self._current_supertrend
+                    or 0
+                )
+            elif self._uses_1d_trail(sleeve):
+                st = float(
+                    self._current_1d_supertrend
                     or self._current_supertrend
                     or 0
                 )
@@ -2499,6 +2520,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             )
             return switch_intents
         weekly_st = self._resolve_weekly_trail_st(ctx, candle)
+        monthly_st = self._resolve_1d_trail_st(ctx, candle)
         for position in positions:
             meta = self._ensure_meta(position, ctx)
             pos_dir = (
@@ -2523,6 +2545,19 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 if ref_st <= 0:
                     logger.error(
                         "%s TRAIL_SKIP_%s sid=%s source=%s reason=no_live_4h_st "
+                        "meta_ST=%s (will not fall back to 1H/entry ST)",
+                        self.name,
+                        str(sleeve).upper(),
+                        sid,
+                        source,
+                        f"{float(meta.supertrend):.2f}" if meta is not None else "None",
+                    )
+                    continue
+            elif self._uses_1d_trail(sleeve):
+                ref_st = float(monthly_st) if monthly_st is not None else 0.0
+                if ref_st <= 0:
+                    logger.error(
+                        "%s TRAIL_SKIP_%s sid=%s source=%s reason=no_live_1d_st "
                         "meta_ST=%s (will not fall back to 1H/entry ST)",
                         self.name,
                         str(sleeve).upper(),
@@ -3287,7 +3322,11 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             else (
                 self._confirmed_4h_direction
                 if self._uses_4h_trail(sleeve)
-                else self._confirmed_direction
+                else (
+                    self._confirmed_1d_direction
+                    if self._uses_1d_trail(sleeve)
+                    else self._confirmed_direction
+                )
             )
         )
         if position_direction is None or supertrend is None:

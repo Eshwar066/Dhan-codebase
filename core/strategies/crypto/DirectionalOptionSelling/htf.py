@@ -316,8 +316,9 @@ class DosHtfMixin:
             return None
         self._stamp_htf_on_candle(candle, snap)
         d4, st4 = snap["4h"]
-        d1d, _st1d = snap["1d"]
+        d1d, st1d = snap["1d"]
         self._current_4h_supertrend = float(st4)
+        self._current_1d_supertrend = float(st1d)
         bar_open = None
         cached = self._htf_st_cache.get("4h")
         if cached is not None:
@@ -417,3 +418,54 @@ class DosHtfMixin:
             candle["supertrend_4h"] = float(st)
             return float(st)
         return None
+
+    def _hydrate_1d_from_history(self, candle: Optional[dict] = None) -> Optional[float]:
+        """Load last fully closed 1D SuperTrend from indicator history."""
+        under = self._htf_underlying(candle)
+        if candle is None:
+            candle = {
+                "symbol": under,
+                "timestamp": pd.Timestamp.now(tz="UTC"),
+                "timeframe": "1d",
+            }
+        as_of = self._as_of_utc(candle)
+        hist = self._latest_closed_st_from_indicator_history(
+            "1d", as_of, symbol=under
+        )
+        if hist is None:
+            return None
+        direction, st, bar_open = hist
+        self._htf_st_cache["1d"] = hist
+        self._current_1d_supertrend = float(st)
+        self._confirmed_1d_direction = int(direction)
+        return float(st)
+
+    def _resolve_1d_trail_st(self, ctx: Any, candle: dict) -> Optional[float]:
+        """
+        Live 1D SuperTrend for monthly MAIN_SL trail.
+
+        Prefer HTF refresh / indicator history; never treat entry-meta ST as live.
+        """
+        self._refresh_htf_state(ctx, candle)
+        stamped = candle.get("supertrend_1d")
+        try:
+            if stamped is not None and float(stamped) > 0:
+                self._current_1d_supertrend = float(stamped)
+                return float(stamped)
+        except (TypeError, ValueError):
+            pass
+        hydrated = self._hydrate_1d_from_history(candle)
+        if hydrated is not None and hydrated > 0:
+            candle["supertrend_1d"] = float(hydrated)
+            return float(hydrated)
+        snap = self._htf_supertrend(ctx, "1d", candle)
+        if snap is not None:
+            _d, st, _bar = snap
+            self._current_1d_supertrend = float(st)
+            candle["supertrend_1d"] = float(st)
+            return float(st)
+        try:
+            cached = float(self._current_1d_supertrend or 0)
+        except (TypeError, ValueError):
+            cached = 0.0
+        return cached if cached > 0 else None

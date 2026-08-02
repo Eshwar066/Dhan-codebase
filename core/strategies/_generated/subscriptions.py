@@ -292,10 +292,12 @@ GENERATED_STRATEGY_SUBSCRIPTIONS: dict = {
             'timeframes': [
                 '1',
                 '5',
+                '5',
                 '4h',
             ],
             'symbols': [
                 'BTCUSD',
+                'PAXGUSD',
             ],
         },
         'FeedDisconnected': {
@@ -317,12 +319,14 @@ GENERATED_STRATEGY_SUBSCRIPTIONS: dict = {
             'enabled': False,
             'symbols': [
                 'BTCUSD',
+                'PAXGUSD',
             ],
         },
         'ScheduledSlot': {
             'enabled': False,
             'symbols': [
                 'BTCUSD',
+                'PAXGUSD',
             ],
         },
     },

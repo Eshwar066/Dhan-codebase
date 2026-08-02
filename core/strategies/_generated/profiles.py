@@ -179,12 +179,13 @@ STRATEGY_PROFILES: dict = {
     'LiquiditySweepStrategy': {
         'symbols': [
             'BTCUSD',
+            'PAXGUSD',
         ],
         'exchange': 'NSE',
         'delta': {
             'india': True,
             'testnet': False,
-            'leverage': 5,
+            'leverage': 100,
         },
         'live': {
             'exchange': 'DELTA',
@@ -193,7 +194,7 @@ STRATEGY_PROFILES: dict = {
         'backtest': {
             'start_date': '2026-07-24',
             'end_date': '2026-08-01',
-            'timeframe': '5',
+            'timeframe': '1',
             'exchange': 'DELTA',
             'sector': 'YES',
         },

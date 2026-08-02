@@ -6,9 +6,10 @@ shared reference files used by live:
   logs/LiquiditySweepStrategy/liquidity_zones.jsonl
   logs/LiquiditySweepStrategy/liquidity_zones_active.json
 
-Usage:
-  python -m core.strategies.crypto.LiquiditySweepStrategy.rebuild_liquidity_zones
-  python -m core.strategies.crypto.LiquiditySweepStrategy.rebuild_liquidity_zones --symbols BTCUSD
+Usage (use the project venv — system python3 has no pandas):
+  .venv/bin/python -m core.strategies.crypto.LiquiditySweepStrategy.rebuild_liquidity_zones
+  .venv/bin/python -m core.strategies.crypto.LiquiditySweepStrategy.rebuild_liquidity_zones --symbols BTCUSD
+  .venv/bin/python -m core.strategies.crypto.LiquiditySweepStrategy.rebuild_liquidity_zones --symbols BTCUSD PAXGUSD
 """
 
 from __future__ import annotations
@@ -30,13 +31,27 @@ logging.basicConfig(
 logger = logging.getLogger("rebuild_liquidity_zones")
 
 
+def _normalize_symbols(raw: list[str]) -> list[str]:
+    """Split comma-separated tokens and strip junk (``BTCUSD,`` → ``BTCUSD``)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in raw or []:
+        for part in str(token or "").replace(",", " ").split():
+            sym = part.strip().upper()
+            if not sym or sym in seen:
+                continue
+            seen.add(sym)
+            out.append(sym)
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "--symbols",
         nargs="+",
         default=["BTCUSD"],
-        help="Symbols to rebuild (default: BTCUSD)",
+        help="Symbols to rebuild (space- or comma-separated; default: BTCUSD)",
     )
     p.add_argument(
         "--keep-log",
@@ -44,10 +59,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Append to existing jsonl instead of clearing first",
     )
     args = p.parse_args(argv)
+    symbols = _normalize_symbols(list(args.symbols))
+    if not symbols:
+        logger.error("No symbols after normalizing --symbols %r", args.symbols)
+        return 2
 
     book = FourHourLiquidityBook(persist=True)
     counts = book.rebuild_from_indicator_history(
-        list(args.symbols),
+        symbols,
         clear_log=not args.keep_log,
         source="backtest_rebuild",
     )
@@ -62,6 +81,13 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"{sym}: 4h_bars={n} active_highs={snap['highs']} active_lows={snap['lows']}"
         )
+        if n <= 0:
+            from core.utils import indicator_history as ind_hist
+
+            path = ind_hist.indicator_history_path(sym, "4h")
+            print(
+                f"  WARN: no 4h bars for {sym} — expected history at {path}"
+            )
     print(f"jsonl={DEFAULT_ZONES_JSONL}")
     print(f"active={DEFAULT_ZONES_ACTIVE}")
     return 0

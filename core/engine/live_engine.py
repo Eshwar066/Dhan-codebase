@@ -4280,44 +4280,12 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                                 )
                             if eval_key is not None:
                                 self._last_evaluated_candle_ts[eval_ts_key] = eval_key
-            # To be checked properly else condition--> Pending
-            else:
-                candles = None
-                if use_feed:
-                    candles = {}
-                    for symbol in self.symbols:
-                        ticker = self.realtime_feed.get_last_ticker(symbol)
-                        if ticker:
-                            self._last_tick_timestamp[symbol] = time.time()
-                            candles[symbol] = {
-                                "open": ticker.get("close"),
-                                "high": ticker.get("high") or ticker.get("close"),
-                                "low": ticker.get("low") or ticker.get("close"),
-                                "close": ticker.get("close"),
-                                "volume": ticker.get("volume", 0),
-                                "symbol": symbol,
-                            }
-                if not candles:
-                    time.sleep(1)
-                    continue
 
-                for symbol, candle in candles.items():
-                    candle["timestamp"] = dt.datetime.now()
-                    candle["symbol"] = symbol
-                    candle["exchange"] = exchange
-                    if not self._validate_candle_integrity(candle, symbol):
-                        continue
-                    self._enrich_candle_depth(symbol, candle)
-                    for eval_result in self._evaluate_strategies_parallel(candle):
-                        self._run_strategy(
-                            symbol,
-                            candle,
-                            eval_result["ctx"],
-                            eval_result["intent"],
-                            strategy=eval_result["strategy"],
-                            strategy_time_ms=eval_result["strategy_time_ms"],
-                            timeframe=None,
-                        )
+            # Intentionally no for/else ticker fallback here. Python for/else runs
+            # after every normal loop completion and previously re-evaluated all
+            # strategies on raw tickers every ~100ms (near-100% CPU). Per-TF
+            # quote_feed fallback already lives inside the loop when
+            # use_aggregator is False.
 
             self._sync_market_ws_to_session()
             if self.tick_queue is not None and self.candle_aggregator is not None:
