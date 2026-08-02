@@ -61,8 +61,8 @@ SuperTrend params: length **16**, factor **1.5**.
 | Exit type | Weekly | Monthly | Daily | Morning |
 |-----------|--------|---------|-------|---------|
 | **Signal / regime exit** | 1D **or** 4H no longer matches open weekly direction → `MAIN_EXIT` (`weekly_htf_misaligned`) | Confirmed **1D ST flip** against open monthly → `MAIN_EXIT` (`one_d_reversal`) | Confirmed **1H ST flip** against open daily direction → `MAIN_EXIT` (`one_h_reversal`) | Confirmed **1H ST flip** against open morning direction → `MAIN_EXIT` (`morning_one_h_reversal`) |
-| **Broker trail SL** | Starts at **2× entry premium**; switches once to **4H ST ± 100** when green + ST favorable | Same as weekly (4H) | Same → **1H ST ± 100** | Same → **1H ST ± 100** |
-| **Force exit (strategy)** | Spot hits **4H ST ± 300** → LIMIT exit | Same (4H) | Spot hits **1H ST ± 300** → LIMIT exit | Spot hits **1H ST ± 300** → LIMIT exit |
+| **Broker trail SL** | Starts at **2× entry premium**; switches once to **4H ST ± 100** when green + ST favorable | Same premium→index, then **1D ST ± 100** | Same → **1H ST ± 100** | Same → **1H ST ± 100** |
+| **Force exit (strategy)** | Spot hits **4H ST ± 300** → LIMIT exit | Spot hits **1D ST ± 300** → LIMIT exit | Spot hits **1H ST ± 300** → LIMIT exit | Spot hits **1H ST ± 300** → LIMIT exit |
 | **Strike proximity** | Spot within **±50** of option strike → LIMIT exit | Same | Same | Same |
 | **17:25 IST rollover** | Only if holding **today’s** daily expiry (unusual for weekly Friday) → exit + next daily | Unlikely (monthly expiry) | If holding **today’s** expiry → exit + roll next day (≥ 200 pts from ST) | If still open on **today’s** 0DTE → **flat EXIT only** (`morning_0dte_flat`) — **no** next-expiry roll |
 | **Mid-bar / flicker** | Ignores unconfirmed 1H flicker; weekly cares about HTF | 1D flip seen on next closed 1H after HTF refresh | 1H flip needs **close confirmation** on new side of ST | Same close-confirmation rule as daily |
@@ -93,7 +93,7 @@ If the enable flag is off, the sleeve **exits only** (no re-entry / no transitio
 
 | Rule | Level | Reference ST | Who fires |
 |------|-------|--------------|-----------|
-| Trail SL | **2× entry** mark, then ST ± **100** | Weekly → **4H**; Daily / Morning → **1H** (after premium→index switch) | Broker `MAIN_SL`. Premium while red/flat; one-way switch to spot trail when green + ST favorable. Modify failures log `TRAIL_SL_STALE` and retry. |
+| Trail SL | **2× entry** mark, then ST ± **100** | Weekly → **4H**; Monthly → **1D**; Daily / Morning → **1H** (after premium→index switch) | Broker `MAIN_SL`. Premium while red/flat; one-way switch to spot trail when green + ST favorable. Modify failures log `TRAIL_SL_STALE` and retry. |
 | Force exit | ST ± **300** | Same sleeve ST as above | Strategy on quote / candle |
 | Strike proximity | Spot within ± **50** of strike | Option strike | Strategy |
 | Expiry rollover | **17:25 IST** | Any open **today** expiry | Daily/weekly: exit + next daily (min **200** pts from ST). **Morning: flat exit only** (no roll). |
