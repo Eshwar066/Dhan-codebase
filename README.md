@@ -316,3 +316,11 @@ sudo systemctl enable option-buildup-scheduler.service
 
 python utils/delta/refresh_crypto_indicator_history.py --only 60,4h,1d
 python -m core.strategies.crypto.LiquiditySweepStrategy.rebuild_liquidity_zones
+
+sudo systemctl daemon-reload
+sudo systemctl start --now delta.service
+python utils/delta/sync_crypto_indicator_gaps.py              # once (startup)
+python utils/delta/sync_crypto_indicator_gaps.py --dry-run
+python utils/delta/sync_crypto_indicator_gaps.py --loop --interval 3600
+
+python -m core.strategies.crypto.LiquiditySweepStrategy.rebuild_liquidity_zones --symbols BTCUSD, PAXGUSD

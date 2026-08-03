@@ -201,6 +201,23 @@ class DeltaWebSocketFeed(RealtimeFeed):
                     logger.debug("Delta feed: telegram recovered alert failed: %s", e)
             self._stall_reconnect_triggered = False
 
+        def _on_unavailable(reason: str) -> None:
+            msg = (
+                "Delta WebSocket disconnected and unable to reconnect. "
+                f"reason={reason}. Live candles/ticks stalled until restart or recovery."
+            )
+            logger.error(msg)
+            if self._engine_logger:
+                try:
+                    self._engine_logger.feed_health_warning(message=msg)
+                except Exception as e:
+                    logger.debug("Delta feed: engine_logger unavailable failed: %s", e)
+            if self._telegram_alert:
+                try:
+                    self._telegram_alert(f"🚨 {msg}")
+                except Exception as e:
+                    logger.debug("Delta feed: telegram unavailable alert failed: %s", e)
+
         def _on_open() -> None:
             # Re-subscribe on every websocket open (initial connect + reconnect).
             def _subscribe_after_ready() -> None:
@@ -237,6 +254,11 @@ class DeltaWebSocketFeed(RealtimeFeed):
             ),
             on_feed_recovered=(
                 _on_feed_recovered
+                if (self._engine_logger or self._telegram_alert)
+                else None
+            ),
+            on_unavailable=(
+                _on_unavailable
                 if (self._engine_logger or self._telegram_alert)
                 else None
             ),

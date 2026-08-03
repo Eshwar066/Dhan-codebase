@@ -1,0 +1,13 @@
+[Unit]
+Description=Hourly crypto indicator gap check + sync (BTCUSD/PAXGUSD)
+
+[Timer]
+# Startup-ish: soon after timer is enabled / boot
+OnBootSec=2min
+# Then every hour wall-clock (IST-friendly UTC hour)
+OnCalendar=hourly
+Persistent=true
+Unit=delta-indicator-gap-sync.service
+
+[Install]
+WantedBy=timers.target
