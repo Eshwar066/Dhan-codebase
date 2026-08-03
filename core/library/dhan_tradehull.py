@@ -696,19 +696,29 @@ class Tradehull:
         global instrument_df
         current_date = time.strftime("%Y-%m-%d")
         expected_file = "all_instrument" + str(current_date) + ".csv"
-        for item in os.listdir("Dependencies"):
-            path = os.path.join(item)
+        deps_dir = os.path.join("Dependencies")
+        os.makedirs(deps_dir, exist_ok=True)
+        expected_path = os.path.join(deps_dir, expected_file)
 
-            # if (item.startswith('all_instrument')) and (current_date not in item.split(" ")[1]):
-            if os.path.isfile("Dependencies\\" + path):
-                os.remove("Dependencies\\" + path)
+        # Drop stale daily masters only (keep today's file; leave log_files /
+        # equity_universe / delta_instrument_* alone). Use os.path.join so this
+        # works on Linux — the old ``Dependencies\\`` paths never matched here.
+        for name in os.listdir(deps_dir):
+            if not name.startswith("all_instrument") or not name.endswith(".csv"):
+                continue
+            if name == expected_file:
+                continue
+            stale = os.path.join(deps_dir, name)
+            if os.path.isfile(stale):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
 
-        if expected_file in os.listdir("Dependencies"):
+        if os.path.isfile(expected_path):
             try:
                 print(f"reading existing file {expected_file}")
-                instrument_df = pd.read_csv(
-                    "Dependencies\\" + expected_file, low_memory=False
-                )
+                instrument_df = pd.read_csv(expected_path, low_memory=False)
             except Exception as e:
                 print(
                     "This BOT Is Instrument file is not generated completely, Picking New File from Dhan Again"
@@ -722,7 +732,7 @@ class Tradehull:
                     .str.strip()
                     .str.replace(r"\s+", " ", regex=True)
                 )
-                instrument_df.to_csv("Dependencies\\" + expected_file, float_format="%.2f")
+                instrument_df.to_csv(expected_path, float_format="%.2f")
         else:
             # this will fetch instrument_df file from Dhan
             print("This BOT Is Picking New File From Dhan")
@@ -734,7 +744,7 @@ class Tradehull:
                 .str.strip()
                 .str.replace(r"\s+", " ", regex=True)
             )
-            instrument_df.to_csv("Dependencies\\" + expected_file, float_format="%.2f")
+            instrument_df.to_csv(expected_path, float_format="%.2f")
         return instrument_df
 
     def correct_step_df_creation(self):

@@ -50,7 +50,7 @@ _SYMBOL_CONFIG_BTC: Dict[str, Any] = {
     "order_qty_lots_weekly": 1,
     "order_qty_lots_monthly": 1,
     "order_qty_lots_daily": 10,
-    "order_qty_lots_morning": 100,
+    "order_qty_lots_morning": 200,
     "weekly_min_dte": 3,
     "monthly_min_dte": 7,
     "enable_weekly_deeper_otm": True,
