@@ -1,5 +1,5 @@
 [Unit]
-Description=Dhan LEAPS_RSI engine (LIVE) — python -m run.main --engine-id dhan_leaps_rsi
+Description=Kotak Neo engine (LIVE) — python -m run.main --engine-id kotak
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=86400
@@ -10,12 +10,12 @@ Type=simple
 User=root
 WorkingDirectory=/root/Dhan-codebase
 EnvironmentFile=-/root/Dhan-codebase/.env
-ExecStart=/root/Dhan-codebase/.venv/bin/python -m run.main --engine-id dhan_leaps_rsi
+ExecStart=/root/Dhan-codebase/.venv/bin/python -m run.main --engine-id kotak
 Restart=on-failure
 RestartSec=300
 TimeoutStopSec=120
-StandardOutput=append:/root/dhan-leaps-rsi.log
-StandardError=append:/root/dhan-leaps-rsi.err.log
+StandardOutput=append:/root/kotak-trading.log
+StandardError=append:/root/kotak-trading.err.log
 
 [Install]
 WantedBy=multi-user.target
