@@ -648,7 +648,8 @@ class LiveEngineHelpersMixin:
     def _is_market_open_for_feed_health(self) -> bool:
         """
         When False, skip feed staleness checks (no ticks overnight is expected).
-        If allowed_trading_hours is set, use that; else DHAN→NSE index session, DELTA→DELTA calendar.
+        If allowed_trading_hours is set, use that; else DHAN/KOTAK→NSE index session,
+        DELTA→DELTA calendar.
         """
         if self.allowed_trading_hours:
             return self._within_trading_hours()
@@ -656,7 +657,7 @@ class LiveEngineHelpersMixin:
         try:
             from core.utils.session.session_manager import SessionManager
 
-            if v == "DHAN":
+            if v in {"DHAN", "KOTAK"}:
                 return SessionManager.is_market_open("INDEX")
             if v == "DELTA":
                 return SessionManager.is_market_open("DELTA")
