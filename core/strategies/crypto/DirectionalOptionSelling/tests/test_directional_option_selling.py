@@ -455,6 +455,44 @@ class DirectionalOptionSellingTests(unittest.TestCase):
             ["180726"],
         )
 
+    def test_ordered_expiries_target_no_weekly_fallback_when_strict(self):
+        """Morning 0DTE: missing today must not fall through to next Friday."""
+        expiries = ["090826", "140826", "210826"]
+        trade = datetime(2026, 8, 8).date()
+        # Weekly-style: allow next listed after missing target.
+        self.assertEqual(
+            self.strategy._ordered_expiries(
+                expiries,
+                trade,
+                0,
+                target_expiry="080826",
+                allow_next_expiry_fallback=True,
+            ),
+            ["090826"],
+        )
+        # Morning strict: skip order entirely.
+        self.assertEqual(
+            self.strategy._ordered_expiries(
+                expiries,
+                trade,
+                0,
+                target_expiry="080826",
+                allow_next_expiry_fallback=False,
+            ),
+            [],
+        )
+        # Target present → only that code, even if weekly also listed.
+        self.assertEqual(
+            self.strategy._ordered_expiries(
+                ["080826", "140826"],
+                trade,
+                0,
+                target_expiry="080826",
+                allow_next_expiry_fallback=False,
+            ),
+            ["080826"],
+        )
+
     def test_prepare_indicators_adds_backtest_supertrend_columns(self):
         rows = 80
         frame = pd.DataFrame(
@@ -2648,31 +2686,30 @@ class DirectionalOptionSellingTests(unittest.TestCase):
 
     def test_is_morning_entry_slot_0830_ist(self):
         s = DirectionalOptionSelling()
-        # 60m bucket open 07:30 IST → close 08:30 IST (03:00 UTC open → 03:00+1h).
-        # Prefer bucket_ts: open at 02:00 UTC = 07:30 IST, close = 08:30 IST.
+        # 60m bucket open 08:30 IST → close 09:30 IST (MORNING_ENTRY_TIME).
         candle = {
-            "timestamp": datetime(2026, 7, 22, 2, 0, tzinfo=timezone.utc),
-            "bucket_ts": datetime(2026, 7, 22, 2, 0, tzinfo=timezone.utc).timestamp(),
+            "timestamp": datetime(2026, 7, 22, 3, 0, tzinfo=timezone.utc),
+            "bucket_ts": datetime(2026, 7, 22, 3, 0, tzinfo=timezone.utc).timestamp(),
             "timeframe": "60",
         }
         self.assertTrue(s._is_morning_entry_slot(candle))
         other = {
-            "timestamp": datetime(2026, 7, 22, 3, 0, tzinfo=timezone.utc),
-            "bucket_ts": datetime(2026, 7, 22, 3, 0, tzinfo=timezone.utc).timestamp(),
+            "timestamp": datetime(2026, 7, 22, 2, 0, tzinfo=timezone.utc),
+            "bucket_ts": datetime(2026, 7, 22, 2, 0, tzinfo=timezone.utc).timestamp(),
             "timeframe": "60",
         }
         self.assertFalse(s._is_morning_entry_slot(other))
 
     def test_morning_entry_fires_at_0830_without_htf(self):
-        """08:30 closed bar enters morning sleeve on 1H ST; skips daily HTF filter."""
+        """09:30 closed bar enters morning sleeve on 1H ST; skips daily HTF filter."""
         ctx = SimpleNamespace(position_store=_PositionStore())
         self.strategy._confirmed_direction = 1
         self.strategy._current_supertrend = 65000.0
-        # Bar open 07:30 IST / close 08:30 IST.
+        # Bar open 08:30 IST / close 09:30 IST.
         candle = {
             "symbol": "BTCUSD",
-            "timestamp": datetime(2026, 7, 22, 2, 0, tzinfo=timezone.utc),
-            "bucket_ts": datetime(2026, 7, 22, 2, 0, tzinfo=timezone.utc).timestamp(),
+            "timestamp": datetime(2026, 7, 22, 3, 0, tzinfo=timezone.utc),
+            "bucket_ts": datetime(2026, 7, 22, 3, 0, tzinfo=timezone.utc).timestamp(),
             "timeframe": "60",
             "close": 65100.0,
             "supertrend": 65000.0,
@@ -2779,8 +2816,11 @@ class DirectionalOptionSellingTests(unittest.TestCase):
                                     )
         self.assertIsNotNone(intent)
         daily_htf.assert_not_called()
-        self.assertEqual(intent.qty, 100)
+        self.assertEqual(intent.qty, 200)
         self.assertEqual(select.call_args.kwargs.get("target_expiry"), "220726")
+        self.assertEqual(
+            select.call_args.kwargs.get("allow_next_expiry_fallback"), False
+        )
         self.assertEqual(
             select.call_args.kwargs.get("min_strike_distance"), 100.0
         )

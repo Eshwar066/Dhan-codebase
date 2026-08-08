@@ -1261,6 +1261,8 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         trade_date: date,
         min_dte: int,
         target_expiry: Optional[str] = None,
+        *,
+        allow_next_expiry_fallback: bool = True,
     ) -> List[str]:
         dated = []
         for code in set(expiries):
@@ -1277,8 +1279,10 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                     if expiry == target_d or code == target:
                         ordered.append(code)
                         break
-                # Fallback: next listed expiry after the weekly target.
-                if not ordered:
+                # Weekly may roll to the next listed Friday when the exact
+                # code is missing. Morning / strict 0DTE must NOT fall through
+                # to a weekly — empty list → skip the order.
+                if not ordered and allow_next_expiry_fallback:
                     for expiry, code in dated:
                         if expiry > target_d:
                             ordered.append(code)
@@ -1309,6 +1313,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         min_premium: Optional[float] = None,
         otm_skip: int = 0,
         min_strike_spot_distance: float = 0.0,
+        allow_next_expiry_fallback: bool = True,
     ) -> Optional[tuple[float, float, pd.Series, str]]:
         source = _delta_source_from_ctx(ctx)
         if source is None:
@@ -1340,7 +1345,52 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             trade_date,
             min_dte,
             target_expiry=target_expiry,
+            allow_next_expiry_fallback=allow_next_expiry_fallback,
         )
+        # Strict target (morning 0DTE): if missing from cached products, refresh
+        # once from the API before giving up — never substitute a weekly.
+        if (
+            target_expiry
+            and not allow_next_expiry_fallback
+            and str(target_expiry).strip() not in set(expiry_order)
+        ):
+            logger.warning(
+                "%s target expiry %s missing from product cache; "
+                "refreshing Delta products once (strict, no weekly fallback)",
+                self.name,
+                target_expiry,
+            )
+            products = source.get_products(use_cache=False) or []
+            matching = [
+                product
+                for product in products
+                if str(product.get("symbol") or "").upper().startswith(prefix)
+            ]
+            expiry_order = self._ordered_expiries(
+                [self._product_expiry(product) for product in matching],
+                trade_date,
+                min_dte,
+                target_expiry=target_expiry,
+                allow_next_expiry_fallback=False,
+            )
+            if str(target_expiry).strip() not in set(expiry_order):
+                logger.warning(
+                    "%s skip ENTRY: strict target expiry %s still not listed "
+                    "after product refresh",
+                    self.name,
+                    target_expiry,
+                )
+                return None
+            # Keep instrument CSV in sync when the store supports refresh.
+            store = getattr(ctx, "instrument_store", None)
+            refresh_fn = getattr(store, "refresh_products", None)
+            if callable(refresh_fn):
+                try:
+                    refresh_fn()
+                except Exception:
+                    logger.exception(
+                        "%s instrument_store.refresh_products failed", self.name
+                    )
         for expiry in expiry_order:
             candidates = []
             for product in matching:
@@ -1408,6 +1458,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         min_premium: Optional[float] = None,
         otm_skip: int = 0,
         min_strike_spot_distance: float = 0.0,
+        allow_next_expiry_fallback: bool = True,
     ) -> Optional[tuple[float, float, pd.Series, str]]:
         df = self.load_delta_data_for_candle(candle, ctx)
         if df is None or df.empty:
@@ -1447,6 +1498,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             self._timestamp_ist(candle["timestamp"]).date(),
             min_dte,
             target_expiry=target_expiry,
+            allow_next_expiry_fallback=allow_next_expiry_fallback,
         )
         for expiry in expiry_order:
             latest = (
@@ -1495,6 +1547,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         min_premium: Optional[float] = None,
         otm_skip: int = 0,
         min_strike_spot_distance: float = 0.0,
+        allow_next_expiry_fallback: bool = True,
     ) -> Optional[tuple[float, float, pd.Series, str]]:
         option_type = self._option_type(direction)
         if RUN_MODE == RunMode.BACKTEST:
@@ -1509,6 +1562,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 min_premium=min_premium,
                 otm_skip=otm_skip,
                 min_strike_spot_distance=min_strike_spot_distance,
+                allow_next_expiry_fallback=allow_next_expiry_fallback,
             )
         return self._select_live_contract(
             candle,
@@ -1521,6 +1575,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             min_premium=min_premium,
             otm_skip=otm_skip,
             min_strike_spot_distance=min_strike_spot_distance,
+            allow_next_expiry_fallback=allow_next_expiry_fallback,
         )
 
     def _build_entry(
@@ -1631,7 +1686,8 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 )
                 return None
         elif sleeve_u == SLEEVE_MORNING:
-            # Prefer today's daily expiry; never roll morning slot to next day.
+            # Prefer today's daily expiry; never roll morning slot to next day /
+            # weekly — if 0DTE is missing after refresh, skip the order.
             target_expiry = self._0dte_expiry_code(candle)
             entry_min_dte = 0
             if self._open_main_has_expiry(ctx, target_expiry, underlying=under):
@@ -1672,6 +1728,8 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 else 0
             ),
             min_strike_spot_distance=spot_gate,
+            # Morning 0DTE must not silently land on the next weekly.
+            allow_next_expiry_fallback=sleeve_u != SLEEVE_MORNING,
         )
         if selected is None:
             logger.warning(
