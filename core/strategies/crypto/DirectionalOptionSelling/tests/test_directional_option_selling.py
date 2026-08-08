@@ -2827,6 +2827,38 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         sid = next(iter(s._meta_by_structure_id))
         self.assertEqual(s._meta_by_structure_id[sid].sleeve, "morning")
 
+    def test_premium_skip_notifies_telegram(self):
+        s = DirectionalOptionSelling()
+        s._current_supertrend = 65000.0
+        notify = MagicMock()
+        ctx = SimpleNamespace(
+            engine_logger=SimpleNamespace(notify_operator=notify),
+            position_store=SimpleNamespace(),
+        )
+        candle = {
+            "timestamp": pd.Timestamp("2026-08-07 09:30", tz="Asia/Kolkata"),
+            "symbol": "BTCUSD",
+            "supertrend": 65000.0,
+            "close": 64270.0,
+        }
+        with patch.object(s, "_open_main_positions", return_value=[]):
+            with patch.object(s, "_open_main_has_expiry", return_value=False):
+                with patch.object(s, "_select_contract", return_value=None):
+                    intent = s._build_entry(
+                        candle,
+                        ctx,
+                        -1,
+                        reason="morning_830",
+                        sleeve="morning",
+                    )
+        self.assertIsNone(intent)
+        notify.assert_called_once()
+        text = notify.call_args.args[0]
+        self.assertIn("premium/strike gate", text)
+        self.assertIn("morning", text)
+        self.assertIn("BTCUSD", text)
+        self.assertIn("CE", text)
+
 
 if __name__ == "__main__":
     unittest.main()

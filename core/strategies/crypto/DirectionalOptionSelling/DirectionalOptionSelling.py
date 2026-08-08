@@ -1578,6 +1578,38 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             allow_next_expiry_fallback=allow_next_expiry_fallback,
         )
 
+    def _notify_premium_entry_skip(
+        self,
+        ctx: Any,
+        *,
+        sleeve: str,
+        option_type: str,
+        min_premium: float,
+        supertrend: float,
+        spot_gate: float,
+        symbol: str,
+        reason: str,
+        direction: int,
+    ) -> None:
+        """Telegram when ENTRY is skipped because no contract clears the premium floor."""
+        msg = (
+            f"⚠️ {self.name} ENTRY skipped (premium/strike gate)\n"
+            f"sleeve={sleeve} symbol={symbol} reason={reason}\n"
+            f"opt={option_type} dir={direction} min_premium=${min_premium:.2f}\n"
+            f"ST={supertrend:.2f} min_|strike-spot|={spot_gate:.0f}\n"
+            f"No qualifying contract — order not placed."
+        )
+        eng = getattr(ctx, "engine_logger", None) if ctx is not None else None
+        notify = getattr(eng, "notify_operator", None) if eng is not None else None
+        if not callable(notify):
+            return
+        try:
+            notify(msg)
+        except Exception:
+            logger.debug(
+                "%s telegram premium-skip notify failed", self.name, exc_info=True
+            )
+
     def _build_entry(
         self,
         candle: dict,
@@ -1732,16 +1764,29 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             allow_next_expiry_fallback=sleeve_u != SLEEVE_MORNING,
         )
         if selected is None:
+            opt = self._option_type(direction)
+            floor = self._min_premium_for_sleeve(sleeve_u, under)
             logger.warning(
                 "%s: no %s %s contract premium >= %.2f near SuperTrend %.2f"
                 " (min |strike-spot|=%.0f) symbol=%s",
                 self.name,
                 sleeve_u,
-                self._option_type(direction),
-                self._min_premium_for_sleeve(sleeve_u, under),
+                opt,
+                floor,
                 supertrend,
                 spot_gate,
                 under,
+            )
+            self._notify_premium_entry_skip(
+                ctx,
+                sleeve=sleeve_u,
+                option_type=opt,
+                min_premium=floor,
+                supertrend=supertrend,
+                spot_gate=spot_gate,
+                symbol=under,
+                reason=reason,
+                direction=int(direction),
             )
             return None
         strike, premium, row, expiry = selected
