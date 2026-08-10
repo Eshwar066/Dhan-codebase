@@ -60,7 +60,7 @@ ENGINE_JOBS = [
         "ORDER_QTY_LOTS": 1,
         "market_ws_stall_timeout_seconds": 0,
         "strategy_timeout_seconds": 60,
-        "strategies": ["LEAPS_RSI", "BankNiftyBTST"], #"NiftySMA9Weekly"
+        "strategies": ["LEAPS_RSI"], #"NiftySMA9Weekly",, "BankNiftyBTST"
         "telegram": {
             "bot_token": os.getenv(
                 "TELEGRAM_LEAPS_BOT_TOKEN",
@@ -106,7 +106,7 @@ ENGINE_JOBS = [
             # "BTCZeroDTE",
             # "BTCZeroDTEElevenPM",
             "DirectionalOptionSelling",
-            "LiquiditySweepStrategy",
+            # "LiquiditySweepStrategy",
             # "RSIBreadAndButter",
         ],
         "max_open_positions": 15,

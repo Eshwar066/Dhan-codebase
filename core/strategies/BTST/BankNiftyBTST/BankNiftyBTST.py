@@ -572,7 +572,13 @@ class BankNiftyBTST(IndiaMktMixins, BaseStrategy):
 
         if pm is not None and hasattr(pm, "reconcile_with_broker"):
             try:
-                pm.reconcile_with_broker(broker_positions, strategy=self.name)
+                # Only claim BANKNIFTY orphans — never stamp shared-engine NIFTY
+                # LEAPS legs (or other underlyings) as BankNiftyBTST.
+                pm.reconcile_with_broker(
+                    broker_positions,
+                    strategy=self.name,
+                    claim_underlying="BANKNIFTY",
+                )
             except Exception as exc:
                 print(
                     f"BankNiftyBTST: position_store reconcile before exit failed: {exc}"

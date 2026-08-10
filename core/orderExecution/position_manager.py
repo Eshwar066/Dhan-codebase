@@ -768,12 +768,94 @@ class PositionManager:
             for sym, slices in acc.items():
                 self._structure_slices[sym] = dict(slices)
 
-    def _merge_open_positions_csv_dict(self, file_meta: dict) -> None:
+    @staticmethod
+    def symbol_underlying_root(trading_symbol: str) -> str:
+        """Best-effort underlying root (BANKNIFTY before NIFTY)."""
+        compact = "".join(
+            ch for ch in str(trading_symbol or "").upper() if ch.isalnum()
+        )
+        if compact.startswith("BANKNIFTY"):
+            return "BANKNIFTY"
+        if compact.startswith("FINNIFTY"):
+            return "FINNIFTY"
+        if compact.startswith("MIDCPNIFTY"):
+            return "MIDCPNIFTY"
+        if compact.startswith("NIFTY"):
+            return "NIFTY"
+        if compact.startswith("SENSEX"):
+            return "SENSEX"
+        if compact.startswith("BANKEX"):
+            return "BANKEX"
+        return ""
+
+    # Strategy CSV / reconcile claim domains. Prevents e.g. BankNiftyBTST from
+    # adopting bare NIFTY LEAPS legs after ownership metadata was lost.
+    _STRATEGY_CLAIM_UNDERLYINGS: Dict[str, tuple] = {
+        "BankNiftyBTST": ("BANKNIFTY",),
+        "LEAPS_RSI": ("NIFTY",),
+        "NiftySMA9Weekly": ("NIFTY",),
+        "NiftyIntradayMagicalLine": ("NIFTY",),
+    }
+
+    @classmethod
+    def strategy_may_claim_symbol(cls, strategy: Optional[str], trading_symbol: str) -> bool:
+        strat = str(strategy or "").strip()
+        if not strat:
+            return False
+        allowed = cls._STRATEGY_CLAIM_UNDERLYINGS.get(strat)
+        if not allowed:
+            return True
+        root = cls.symbol_underlying_root(trading_symbol)
+        return bool(root) and root in allowed
+
+    @classmethod
+    def _ownership_row_compatible_with_folder(
+        cls, folder_name: str, trading_symbol: str, meta: dict
+    ) -> bool:
+        """Drop poisoned rows (e.g. NIFTY PE parked under BankNiftyBTST CSV)."""
+        folder = str(folder_name or "").strip()
+        strat = str((meta or {}).get("strategy") or "").strip()
+        if strat and folder and strat != folder:
+            # Strategy-named folders must not contribute another strategy's rows.
+            if folder in cls._STRATEGY_CLAIM_UNDERLYINGS or strat in cls._STRATEGY_CLAIM_UNDERLYINGS:
+                return False
+        claim_strat = strat or folder
+        if claim_strat and not cls.strategy_may_claim_symbol(claim_strat, trading_symbol):
+            return False
+        return True
+
+    def _merge_open_positions_csv_dict(
+        self, file_meta: dict, *, protect_existing_strategy: bool = True
+    ) -> None:
         for sym, meta in file_meta.items():
+            if not meta:
+                continue
             cur = dict(self.position_metadata.get(sym) or {})
+            cur_strat = str(cur.get("strategy") or "").strip()
+            incoming_strat = str(meta.get("strategy") or "").strip()
+            if (
+                protect_existing_strategy
+                and cur_strat
+                and incoming_strat
+                and cur_strat != incoming_strat
+            ):
+                # Another strategy's CSV must not steal ownership.
+                continue
             for k, v in meta.items():
-                if v not in (None, ""):
-                    cur[k] = v
+                if v in (None, ""):
+                    continue
+                existing = cur.get(k)
+                if (
+                    protect_existing_strategy
+                    and k in ("strategy", "structure_id", "tag", "intent_id")
+                    and existing not in (None, "")
+                    and str(existing) != str(v)
+                    and cur_strat
+                    and incoming_strat
+                    and cur_strat != incoming_strat
+                ):
+                    continue
+                cur[k] = v
             self.position_metadata[sym] = cur
 
     def merge_ownership_from_all_strategy_open_positions_csvs(
@@ -819,10 +901,22 @@ class PositionManager:
             file_meta = load_position_metadata_from_csv(path)
             if not file_meta:
                 continue
-            before = len(self.position_metadata)
-            self._merge_open_positions_csv_dict(file_meta)
-            merged += max(0, len(file_meta))
-            _ = before
+            filtered = {
+                sym: meta
+                for sym, meta in file_meta.items()
+                if self._ownership_row_compatible_with_folder(name, sym, meta or {})
+            }
+            skipped = len(file_meta) - len(filtered)
+            if skipped:
+                logger.warning(
+                    "Skipping %s incompatible ownership row(s) from %s",
+                    skipped,
+                    path,
+                )
+            if not filtered:
+                continue
+            self._merge_open_positions_csv_dict(filtered)
+            merged += len(filtered)
         # Also re-apply ownership onto any already-open positions that lost meta.
         applied = 0
         with self._lock:
@@ -1115,14 +1209,48 @@ class PositionManager:
     # ---------------------
     # BROKER RECONCILIATION
     # ---------------------
+    def _claim_strategy_for_symbol(
+        self,
+        sym: str,
+        *,
+        meta_strategy: Optional[str],
+        strategy: Optional[str],
+        claim_underlying: Optional[str] = None,
+    ) -> Optional[str]:
+        """Resolve ownership stamp for a broker-adopted / empty-strategy leg.
+
+        ``strategy`` is only applied when the symbol is in that strategy's claim
+        domain (and optional ``claim_underlying`` filter). Prevents BankNiftyBTST
+        exit reconcile from tagging orphan NIFTY LEAPS legs.
+        """
+        if meta_strategy:
+            return meta_strategy
+        strat = str(strategy or "").strip() or None
+        if not strat:
+            return None
+        if claim_underlying:
+            root = self.symbol_underlying_root(sym)
+            if root != str(claim_underlying).strip().upper():
+                return None
+        if not self.strategy_may_claim_symbol(strat, sym):
+            return None
+        return strat
+
     def reconcile_with_broker(
-        self, broker_positions, drift_threshold: int = 0, strategy: str = None
+        self,
+        broker_positions,
+        drift_threshold: int = 0,
+        strategy: str = None,
+        *,
+        claim_underlying: Optional[str] = None,
     ):
         """
         Sync PositionManager to broker truth.
         broker_positions: { symbol: { "qty": int, "avg_price": float, "segment": str, "lot_size": int } }
         drift_threshold: if |local_qty - broker_qty| > this, set trading_paused.
-        strategy: strategy name to associate with newly discovered positions.
+        strategy: strategy name to associate with newly discovered positions
+            (only when the symbol is in that strategy's claim domain).
+        claim_underlying: optional hard filter (e.g. ``BANKNIFTY``) for ``strategy``.
         """
         file_meta = None
         if self.open_positions_csv_path and os.path.isfile(
@@ -1255,13 +1383,19 @@ class PositionManager:
                 structure_id_m = meta.get("structure_id")
                 intent_id_m = meta.get("intent_id")
                 meta_strategy = meta.get("strategy")
+                claim_strategy = self._claim_strategy_for_symbol(
+                    sym,
+                    meta_strategy=meta_strategy,
+                    strategy=strategy,
+                    claim_underlying=claim_underlying,
+                )
 
                 if sym not in self.positions:
                     pos = Position(inst)
                     pos.net_qty = bqty
                     pos.avg_price = float(bp.get("avg_price", 0))
-                    pos.strategy = meta_strategy or strategy
-                    pos.tag = tag_m or ("MAIN" if meta_strategy or strategy else None)
+                    pos.strategy = claim_strategy
+                    pos.tag = tag_m or ("MAIN" if claim_strategy else None)
                     pos.structure_id = structure_id_m
                     pos.intent_id = intent_id_m
                     # Adopted broker legs must still produce complete trade_log rows on exit.
@@ -1332,14 +1466,14 @@ class PositionManager:
 
                 if not getattr(local, "tag", None):
                     local.tag = tag_m or (
-                        "MAIN" if (meta_strategy or strategy or local.strategy) else None
+                        "MAIN" if (claim_strategy or local.strategy) else None
                     )
                 if not getattr(local, "structure_id", None):
                     local.structure_id = structure_id_m
                 if not getattr(local, "intent_id", None):
                     local.intent_id = intent_id_m
                 if not getattr(local, "strategy", None):
-                    local.strategy = meta_strategy or strategy
+                    local.strategy = claim_strategy
                 if int(local.net_qty or 0) != 0:
                     if not getattr(local, "trade_id", None):
                         local.trade_id = f"T-{uuid.uuid4().hex[:10]}"
