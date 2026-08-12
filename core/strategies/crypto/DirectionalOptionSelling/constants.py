@@ -39,7 +39,7 @@ _SYMBOL_CONFIG_BTC: Dict[str, Any] = {
     "enabled": True,
     "min_premium_usd": 120.0,
     "min_premium_usd_morning": 20.0,
-    "min_strike_spot_distance": 400.0,
+    "min_strike_spot_distance": 200.0,
     # Morning 0DTE: strike must be at least this far from 1H SuperTrend.
     "morning_min_strike_distance": 100.0,
     "rollover_min_strike_distance": 200.0,

@@ -50,7 +50,7 @@ SuperTrend params: length **16**, factor **1.5**.
 | **HTF filter (1D + 4H)** | **Required** (1D must equal 4H) | **None** (flip is the filter) | **Required** (both must match 1H direction) | **None** — 1H only |
 | **Strike reference ST** | **4H** SuperTrend | **4H** SuperTrend | **1H** SuperTrend | **1H** SuperTrend |
 | **Expiry** | Friday weekly; if DTE ≤ 2 → next Friday (min DTE **3**) | Monthly last Friday; if DTE &lt; **7** → next month | Before 17:25 IST → **0DTE**; at/after → **1DTE** | Always prefer **today 0DTE** |
-| **Qty / premium** | OTM, outside ST, premium ≥ **$120**; deeper OTM if enabled | Same as weekly | Same (≥ **$120**); also `|strike−spot| ≥ **400**` | Same rules, premium ≥ **$20**; also `|strike−spot| ≥ **400**` |
+| **Qty / premium** | OTM, outside ST, premium ≥ **$120**; deeper OTM if enabled | Same as weekly | Same (≥ **$120**); also `|strike−spot| ≥ **200**` | Same rules, premium ≥ **$20**; also `|strike−spot| ≥ **200**` |
 | **Duplicate guard** | No open weekly sleeve; skip if same Friday already open | No open monthly sleeve; skip if same expiry already open | No open daily sleeve; skip if same contract already open | No open morning sleeve; skip if same 0DTE expiry already open |
 | **Entry reason tag** | `weekly_htf_aligned` | `one_d_signal` | `one_h_signal` | `morning_830` |
 
@@ -279,7 +279,7 @@ flowchart TD
 | `PREMIUM_SL_MULT` | 2.0 | Initial mark SL = entry × this |
 | `FORCE_EXIT_POINTS` | 300 | Strategy emergency vs sleeve ST |
 | `STRIKE_PROXIMITY_EXIT_POINTS` | 50 | Exit if spot near strike |
-| `MIN_STRIKE_SPOT_DISTANCE` | 400 | Morning / daily ENTRY min \|strike−spot\| |
+| `MIN_STRIKE_SPOT_DISTANCE` | 200 | Morning / daily ENTRY min \|strike−spot\| |
 | `ROLLOVER_TIME` | 17:25 IST | Today-expiry rollover |
 | `ROLLOVER_MIN_STRIKE_DISTANCE` | 200 | Min distance on rollover strike |
 | `ORDER_QTY_LOTS_WEEKLY` | 10 | Weekly entry lots |

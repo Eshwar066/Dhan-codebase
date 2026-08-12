@@ -100,11 +100,11 @@ class DirectionalOptionSellingTests(unittest.TestCase):
         self.assertEqual(selected[3], "170726")
 
     def test_live_selection_skips_strikes_inside_spot_gate(self):
-        """|strike−spot| < 400 skipped; fall through to next eligible CE."""
+        """|strike−spot| < 200 skipped; fall through to next eligible CE."""
         products = [
             {"symbol": "C-BTC-65400-270726", "strike_price": 65400},  # ~133 from spot
-            {"symbol": "C-BTC-65500-270726", "strike_price": 65500},  # ~233
-            {"symbol": "C-BTC-65700-270726", "strike_price": 65700},  # ~433 OK
+            {"symbol": "C-BTC-65500-270726", "strike_price": 65500},  # ~233 OK
+            {"symbol": "C-BTC-65700-270726", "strike_price": 65700},  # farther
             {"symbol": "C-BTC-65800-270726", "strike_price": 65800},  # farther
         ]
         source = _LiveSource(
@@ -134,10 +134,10 @@ class DirectionalOptionSellingTests(unittest.TestCase):
                 min_dte=0,
                 min_strike_distance=0,
                 min_premium=20,
-                min_strike_spot_distance=400,
+                min_strike_spot_distance=200,
             )
         self.assertIsNotNone(selected)
-        self.assertEqual(selected[0], 65700)
+        self.assertEqual(selected[0], 65500)
         self.assertEqual(selected[3], "270726")
 
     def test_live_selection_weekly_deeper_otm_skips_nearest(self):

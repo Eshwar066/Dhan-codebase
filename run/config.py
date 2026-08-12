@@ -119,7 +119,7 @@ ENGINE_JOBS = [
         # Delta OMS: reject ENTRY / MAIN_SL when book or mark is unsafe.
         "execution_validator": {
             "enabled": True,
-            "max_spread_pct": 0.10,
+            "max_spread_pct": 0.15,
             "max_mark_mid_pct": 0.50,
             "max_quote_age_sec": 30.0,
             "require_bid_ask": True,
