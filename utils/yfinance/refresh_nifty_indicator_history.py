@@ -9,6 +9,7 @@ Default outputs (schema v2 JSONL)::
 
     logs/indicators/NIFTY/60/indicator_history.jsonl   — RSI(14) + EMA8 high/low on 60m bars
     logs/indicators/NIFTY/15/indicator_history.jsonl   — Bollinger(20,2) on 15m bars
+    logs/indicators/NIFTY/30/indicator_history.jsonl   — ADX(14), Supertrend(10,3), SMA(9) on 30m bars
     logs/indicators/NIFTY/120/indicator_history.jsonl  — SMA(9) on 120m bars
 
 Backfill EMA on an existing 60m file (uses OHLC already in the file)::
@@ -24,6 +25,7 @@ Usage (from repo root, with venv + yfinance + TA-Lib)::
     python3 utils/yfinance/refresh_nifty_indicator_history.py --period 60d --dry-run
     python3 utils/yfinance/refresh_nifty_indicator_history.py --only 60
     python3 utils/yfinance/refresh_nifty_indicator_history.py --only 15
+    python3 utils/yfinance/refresh_nifty_indicator_history.py --only 30
     python3 utils/yfinance/refresh_nifty_indicator_history.py --only 120
 
 cd /root/Dhan-codebase
@@ -71,6 +73,7 @@ from core.utils.indicator_history import (  # noqa: E402
 from utils.yfinance.nifty_yahoo import (  # noqa: E402
     fetch_nifty_120m_with_sma,
     fetch_nifty_15m_with_bollinger,
+    fetch_nifty_30m_with_adx_supertrend_ma9,
     fetch_nifty_hourly_with_rsi,
 )
 
@@ -514,6 +517,96 @@ def _yahoo_rows_15(
     return out
 
 
+def _yahoo_rows_30(
+    *,
+    period: str,
+    symbol: str,
+    timeframe: str = "30",
+    adx_period: int = 14,
+    supertrend_length: int = 10,
+    supertrend_factor: float = 3.0,
+    ma_period: int = 9,
+) -> Tuple[Dict[str, dict], Dict[str, int]]:
+    """Yahoo 30m + ADX, Supertrend, SMA for NiftyADXSupertrend."""
+    df = fetch_nifty_30m_with_adx_supertrend_ma9(
+        symbol=symbol,
+        period=period,
+        tail=None,
+        adx_period=adx_period,
+        supertrend_length=supertrend_length,
+        supertrend_factor=supertrend_factor,
+        ma_period=ma_period,
+    )
+    out: Dict[str, dict] = {}
+    stats = {
+        "fetched": 0,
+        "skipped_adx": 0,
+        "skipped_supertrend": 0,
+        "skipped_sma": 0,
+        "skipped_close": 0,
+    }
+    if df is None or df.empty:
+        return out, stats
+
+    stats["fetched"] = len(df)
+    for _, row in df.iterrows():
+        dt = row.get("Datetime_IST")
+        if dt is None or (isinstance(dt, float) and pd.isna(dt)):
+            continue
+        dt_ist = pd.Timestamp(dt)
+        if dt_ist.tzinfo is None:
+            dt_ist = dt_ist.tz_localize("Asia/Kolkata")
+        else:
+            dt_ist = dt_ist.tz_convert("Asia/Kolkata")
+        key = dt_ist.strftime("%Y-%m-%d %H:%M")
+        adx = _float_or_none(row.get(f"adx_{adx_period}"))
+        di_plus = _float_or_none(row.get(f"adx_di_plus_{adx_period}"))
+        di_minus = _float_or_none(row.get(f"adx_di_minus_{adx_period}"))
+        if adx is None:
+            stats["skipped_adx"] += 1
+            continue
+        supertrend = _float_or_none(row.get("supertrend"))
+        supertrend_dir = _float_or_none(row.get("supertrend_direction"))
+        if supertrend is None:
+            stats["skipped_supertrend"] += 1
+            continue
+        sma_col = f"sma{int(ma_period)}"
+        prev_sma_col = f"prev_sma{int(ma_period)}"
+        sma = _float_or_none(row.get(sma_col))
+        if sma is None:
+            stats["skipped_sma"] += 1
+            continue
+        close = _ohlc_from_row(row, "close")
+        if close is None:
+            stats["skipped_close"] += 1
+            continue
+        indicators: Dict[str, Any] = {
+            f"adx_{adx_period}": adx,
+            f"adx_di_plus_{adx_period}": di_plus,
+            f"adx_di_minus_{adx_period}": di_minus,
+            "supertrend": supertrend,
+            "supertrend_direction": supertrend_dir,
+            "supertrend_is_bullish": row.get("supertrend_is_bullish"),
+            "supertrend_upper": _float_or_none(row.get("supertrend_upper")),
+            "supertrend_lower": _float_or_none(row.get("supertrend_lower")),
+            "supertrend_atr": _float_or_none(row.get("supertrend_atr")),
+            sma_col: sma,
+            prev_sma_col: _float_or_none(row.get(prev_sma_col)),
+            "prev_close": _float_or_none(row.get("prev_close")),
+        }
+        out[key] = _build_schema_row(
+            symbol=symbol,
+            timeframe=timeframe,
+            ist_key=key,
+            o=_ohlc_from_row(row, "open"),
+            h=_ohlc_from_row(row, "high"),
+            l=_ohlc_from_row(row, "low"),
+            c=close,
+            indicators=indicators,
+        )
+    return out, stats
+
+
 def merge_history(
     live: Dict[str, dict],
     other: List[dict],
@@ -558,6 +651,10 @@ def refresh_indicator_history_file(
     bb_period: int = 20,
     bb_std: float = 2.0,
     sma_period: int = 9,
+    adx_period: int = 14,
+    supertrend_length: int = 10,
+    supertrend_factor: float = 3.0,
+    ma_period: int = 9,
     dry_run: bool = False,
 ) -> dict:
     live, other = _load_history(hist_path)
@@ -571,6 +668,17 @@ def refresh_indicator_history_file(
             bb_std=bb_std,
         )
         label = "bollinger"
+    elif mode == "30":
+        yahoo, yahoo_stats = _yahoo_rows_30(
+            period=period,
+            symbol="^NSEI" if symbol.upper() in ("NIFTY", "^NSEI") else symbol,
+            timeframe=timeframe,
+            adx_period=adx_period,
+            supertrend_length=supertrend_length,
+            supertrend_factor=supertrend_factor,
+            ma_period=ma_period,
+        )
+        label = "adx_supertrend_ma"
     elif mode == "120":
         yahoo, yahoo_stats = _yahoo_rows_120(
             period=period,
@@ -604,6 +712,23 @@ def refresh_indicator_history_file(
                 f"(fetched={yahoo_stats.get('fetched', 0)} "
                 f"skipped_nse_time={yahoo_stats.get('skipped_nse_time', 0)} "
                 f"skipped_rsi={yahoo_stats.get('skipped_rsi', 0)} "
+                f"skipped_close={yahoo_stats.get('skipped_close', 0)}). "
+                f"File was not modified: {hist_path}"
+            )
+        if mode == "30" and yahoo_stats.get("fetched", 0) == 0:
+            raise SystemExit(
+                "Yahoo Finance returned no 30m OHLC data for ^NSEI "
+                f"(period={period}). This is usually a network/blocking issue "
+                "or transient Yahoo rate limits. "
+                f"File was not modified: {hist_path}"
+            )
+        if mode == "30":
+            raise SystemExit(
+                "Yahoo 30m data was fetched but produced 0 NSE 30m indicator rows "
+                f"(fetched={yahoo_stats.get('fetched', 0)} "
+                f"skipped_adx={yahoo_stats.get('skipped_adx', 0)} "
+                f"skipped_supertrend={yahoo_stats.get('skipped_supertrend', 0)} "
+                f"skipped_sma={yahoo_stats.get('skipped_sma', 0)} "
                 f"skipped_close={yahoo_stats.get('skipped_close', 0)}). "
                 f"File was not modified: {hist_path}"
             )
@@ -660,6 +785,7 @@ def _default_paths(log_root: str) -> Dict[str, str]:
     return {
         "60": indicator_history_path("NIFTY", "60", log_root=log_root),
         "15": indicator_history_path("NIFTY", "15", log_root=log_root),
+        "30": indicator_history_path("NIFTY", "30", log_root=log_root),
         "120": indicator_history_path("NIFTY", "120", log_root=log_root),
     }
 
@@ -676,9 +802,13 @@ def refresh_all_default(
     bb_period: int,
     bb_std: float,
     sma_period: int = 9,
+    adx_period: int = 14,
+    supertrend_length: int = 10,
+    supertrend_factor: float = 3.0,
+    ma_period: int = 9,
 ) -> List[dict]:
     paths = _default_paths(log_root)
-    # Default still 60+15 (LEAPS / BB). Use --only 120 for SMA9 weekly.
+    # Default still 60+15 (LEAPS / BB). Use --only 120 for SMA9 weekly. Use --only 30 for ADX+Supertrend+MA.
     modes = ["60", "15"]
     if only:
         modes = [only.strip()]
@@ -686,20 +816,52 @@ def refresh_all_default(
     for mode in modes:
         path = paths.get(mode)
         if not path:
-            raise SystemExit(f"Unknown --only value: {only!r} (use 60, 15, or 120)")
-        stats = refresh_indicator_history_file(
-            path,
-            mode=mode,
-            period=period,
-            symbol="NIFTY",
-            timeframe=mode,
-            rsi_period=rsi_period,
-            ema_period=ema_period,
-            bb_period=bb_period,
-            bb_std=bb_std,
-            sma_period=sma_period,
-            dry_run=dry_run,
-        )
+            raise SystemExit(f"Unknown --only value: {only!r} (use 60, 15, 30, or 120)")
+        if mode == "30":
+            stats = refresh_indicator_history_file(
+                path,
+                mode=mode,
+                period=period,
+                symbol="NIFTY",
+                timeframe=mode,
+                adx_period=adx_period,
+                supertrend_length=supertrend_length,
+                supertrend_factor=supertrend_factor,
+                ma_period=ma_period,
+                dry_run=dry_run,
+            )
+        elif mode == "120":
+            stats = refresh_indicator_history_file(
+                path,
+                mode=mode,
+                period=period,
+                symbol="NIFTY",
+                timeframe=mode,
+                sma_period=sma_period,
+                dry_run=dry_run,
+            )
+        elif mode == "15":
+            stats = refresh_indicator_history_file(
+                path,
+                mode=mode,
+                period=period,
+                symbol="NIFTY",
+                timeframe=mode,
+                bb_period=bb_period,
+                bb_std=bb_std,
+                dry_run=dry_run,
+            )
+        else:
+            stats = refresh_indicator_history_file(
+                path,
+                mode=mode,
+                period=period,
+                symbol="NIFTY",
+                timeframe=mode,
+                rsi_period=rsi_period,
+                ema_period=ema_period,
+                dry_run=dry_run,
+            )
         all_stats.append(stats)
 
     if also_legacy_60 and not dry_run and "60" in modes:
@@ -743,7 +905,7 @@ def _write_legacy_rsi_from_v2(v2_path: str, legacy_path: str) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Refresh logs/indicators/NIFTY/{60,15,120}/indicator_history.jsonl from Yahoo ^NSEI "
+            "Refresh logs/indicators/NIFTY/{60,15,30,120}/indicator_history.jsonl from Yahoo ^NSEI "
             "(keeps live_append rows)."
         )
     )
@@ -759,9 +921,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--only",
-        choices=("60", "15", "120"),
+        choices=("60", "15", "30", "120"),
         default=None,
-        help="Refresh only NIFTY/60, NIFTY/15, or NIFTY/120 (default: 60+15)",
+        help="Refresh only NIFTY/60, NIFTY/15, NIFTY/30, or NIFTY/120 (default: 60+15)",
     )
     parser.add_argument(
         "--period",
@@ -781,6 +943,30 @@ def main() -> None:
         type=int,
         default=9,
         help="SMA length for --only 120 (NiftySMA9Weekly default 9)",
+    )
+    parser.add_argument(
+        "--adx-period",
+        type=int,
+        default=14,
+        help="ADX period for --only 30 (default 14)",
+    )
+    parser.add_argument(
+        "--supertrend-length",
+        type=int,
+        default=10,
+        help="Supertrend ATR length for --only 30 (default 10)",
+    )
+    parser.add_argument(
+        "--supertrend-factor",
+        type=float,
+        default=3.0,
+        help="Supertrend multiplier factor for --only 30 (default 3.0)",
+    )
+    parser.add_argument(
+        "--ma-period",
+        type=int,
+        default=9,
+        help="MA period for --only 30 (default 9)",
     )
     parser.add_argument(
         "--backfill-ema",
@@ -817,19 +1003,51 @@ def main() -> None:
     elif args.hist_path:
         mode = args.only or "60"
         tf = mode
-        stats = refresh_indicator_history_file(
-            os.path.abspath(args.hist_path),
-            mode=mode,
-            period=args.period,
-            symbol=args.symbol,
-            timeframe=tf,
-            rsi_period=args.rsi_period,
-            ema_period=args.ema_period,
-            bb_period=args.bb_period,
-            bb_std=args.bb_std,
-            sma_period=args.sma_period,
-            dry_run=args.dry_run,
-        )
+        if mode == "30":
+            stats = refresh_indicator_history_file(
+                os.path.abspath(args.hist_path),
+                mode=mode,
+                period=args.period,
+                symbol=args.symbol,
+                timeframe=tf,
+                adx_period=args.adx_period,
+                supertrend_length=args.supertrend_length,
+                supertrend_factor=args.supertrend_factor,
+                ma_period=args.ma_period,
+                dry_run=args.dry_run,
+            )
+        elif mode == "120":
+            stats = refresh_indicator_history_file(
+                os.path.abspath(args.hist_path),
+                mode=mode,
+                period=args.period,
+                symbol=args.symbol,
+                timeframe=tf,
+                sma_period=args.sma_period,
+                dry_run=args.dry_run,
+            )
+        elif mode == "15":
+            stats = refresh_indicator_history_file(
+                os.path.abspath(args.hist_path),
+                mode=mode,
+                period=args.period,
+                symbol=args.symbol,
+                timeframe=tf,
+                bb_period=args.bb_period,
+                bb_std=args.bb_std,
+                dry_run=args.dry_run,
+            )
+        else:
+            stats = refresh_indicator_history_file(
+                os.path.abspath(args.hist_path),
+                mode=mode,
+                period=args.period,
+                symbol=args.symbol,
+                timeframe=tf,
+                rsi_period=args.rsi_period,
+                ema_period=args.ema_period,
+                dry_run=args.dry_run,
+            )
         all_stats = [stats]
     else:
         all_stats = refresh_all_default(
@@ -843,6 +1061,10 @@ def main() -> None:
             bb_period=args.bb_period,
             bb_std=args.bb_std,
             sma_period=args.sma_period,
+            adx_period=args.adx_period,
+            supertrend_length=args.supertrend_length,
+            supertrend_factor=args.supertrend_factor,
+            ma_period=args.ma_period,
         )
 
     for stats in all_stats:

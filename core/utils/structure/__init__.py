@@ -45,7 +45,11 @@ from core.utils.structure.adx import (
 )
 from core.utils.structure.rsi_divergence import add_rsi_divergence
 from core.utils.structure.sma import add_sma, sma_column_name, sma_column_names
-from core.utils.structure.supertrend import add_supertrend, supertrend_column_names
+from core.utils.structure.supertrend import (
+    add_supertrend,
+    default_persisted_keys_for_supertrend,
+    supertrend_column_names,
+)
 from core.utils.structure.structure_events import add_bos_choch
 from core.utils.structure.swings import add_swing_points, swing_pivot_indices
 
@@ -66,6 +70,7 @@ __all__ = [
     "add_swing_points",
     "adx_column_names",
     "default_persisted_keys_for_adx",
+    "default_persisted_keys_for_supertrend",
     "liquidity_column_names",
     "market_structure_column_names",
     "sma_column_name",
