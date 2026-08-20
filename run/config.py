@@ -78,12 +78,12 @@ ENGINE_JOBS = [
         "engine_id": "kotak",
         "venue": "KOTAK",
         "enabled": True,
-        "run_mode": "LIVE",
+        "run_mode": "PAPER",
         "capital": 200000,
         "ORDER_QTY_LOTS": 1,
         "market_ws_stall_timeout_seconds": 0,
         "strategy_timeout_seconds": 60,
-        "strategies": ["NiftySMA9Weekly"],
+        "strategies": ["NiftyDOS"],
          "telegram": {
             "bot_token": os.getenv(
                 "TELEGRAM_KOTAK_TOKEN",

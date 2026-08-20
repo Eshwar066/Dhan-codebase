@@ -367,6 +367,44 @@ GENERATED_STRATEGY_SUBSCRIPTIONS: dict = {
             ],
         },
     },
+    'NiftyDOS': {
+        'BarClosed': {
+            'enabled': True,
+            'timeframes': [
+                '30',
+            ],
+            'symbols': [
+                'NIFTY',
+            ],
+        },
+        'FeedDisconnected': {
+            'enabled': True,
+        },
+        'FeedRecovered': {
+            'enabled': True,
+        },
+        'IntentCreated': {
+            'enabled': True,
+        },
+        'IntentFilled': {
+            'enabled': True,
+        },
+        'PositionClosed': {
+            'enabled': True,
+        },
+        'QuoteUpdated': {
+            'enabled': False,
+            'symbols': [
+                'NIFTY',
+            ],
+        },
+        'ScheduledSlot': {
+            'enabled': False,
+            'symbols': [
+                'NIFTY',
+            ],
+        },
+    },
     'NiftyIntradayMagicalLine': {
         'BarClosed': {
             'enabled': True,
