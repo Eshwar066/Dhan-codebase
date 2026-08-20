@@ -29,6 +29,12 @@ SCHEMA_VERSION = 2
 NSE_60_BAR_MINUTES = frozenset(
     {(9, 15), (10, 15), (11, 15), (12, 15), (13, 15), (14, 15), (15, 15)}
 )
+# NSE 30m bar opens (IST) with origin 09:15.
+NSE_30_BAR_MINUTES = frozenset(
+    {(9, 15), (9, 45), (10, 15), (10, 45), (11, 15), (11, 45),
+     (12, 15), (12, 45), (13, 15), (13, 45), (14, 15), (14, 45),
+     (15, 15)}
+)
 # NSE 120m bar opens (Yahoo resample / NiftySMA9Weekly): 09:15, 11:15, 13:15, 15:15.
 NSE_120_BAR_MINUTES = frozenset(
     {(9, 15), (11, 15), (13, 15), (15, 15)}
@@ -116,6 +122,13 @@ def is_nse_120m_bar_ist(dt_ist: datetime) -> bool:
     return (int(dt_ist.hour), int(dt_ist.minute)) in NSE_120_BAR_MINUTES
 
 
+def is_nse_30m_bar_ist(dt_ist: datetime) -> bool:
+    """True when ``dt_ist`` is an NSE cash-session 30m bar open (weekday, :15/:45)."""
+    if dt_ist.weekday() >= 5:
+        return False
+    return (int(dt_ist.hour), int(dt_ist.minute)) in NSE_30_BAR_MINUTES
+
+
 def bucket_ts_is_nse_60m_bar(bucket_ts: Any) -> bool:
     """True when unix bucket start maps to an NSE hourly bar open in IST."""
     try:
@@ -127,6 +140,19 @@ def bucket_ts_is_nse_60m_bar(bucket_ts: Any) -> bool:
     except (OSError, OverflowError, ValueError):
         return False
     return is_nse_60m_bar_ist(dt_ist)
+
+
+def bucket_ts_is_nse_30m_bar(bucket_ts: Any) -> bool:
+    """True when unix bucket start maps to an NSE 30m bar open in IST."""
+    try:
+        bt = int(float(bucket_ts))
+    except (TypeError, ValueError):
+        return False
+    try:
+        dt_ist = datetime.fromtimestamp(bt, IST)
+    except (OSError, OverflowError, ValueError):
+        return False
+    return is_nse_30m_bar_ist(dt_ist)
 
 
 def bucket_ts_is_nse_120m_bar(bucket_ts: Any) -> bool:
@@ -308,6 +334,7 @@ def should_append_live_indicator_row(
     """
     Gate ``live_append`` rows for NSE index session bars.
 
+    - 30m: only 30m opens (09:15, 09:45, 10:15, 10:45 … 15:15)
     - 60m / 1h: only hourly opens (09:15 … 15:15)
     - 120m / 2h: only 120m opens (09:15, 11:15, 13:15, 15:15)
     Other symbols/timeframes pass through unchanged.
@@ -318,6 +345,8 @@ def should_append_live_indicator_row(
     dt_ist = row_timestamp_to_ist(row_timestamp)
     if dt_ist is None:
         return False
+    if tf in ("30", "30m"):
+        return is_nse_30m_bar_ist(dt_ist)
     if tf in ("60", "1h", "60m"):
         return is_nse_60m_bar_ist(dt_ist)
     if tf in ("120", "2h", "120m"):
