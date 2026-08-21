@@ -9,6 +9,7 @@ unchanged. Feed subscription payloads are mapped to Neo token format.
 from __future__ import annotations
 
 import logging
+import tempfile
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -39,9 +40,52 @@ _DHAN_TO_NEO_SEGMENT = {
 class KotakInstrumentStore(DhanInstrumentStore):
     """Instrument lookups via NSE master CSV; Neo-shaped feed instruments."""
 
+    # Kotak CSV column name -> Dhan SEM_* column name
+    _KOTAK_TO_DHAN_COLS = {
+        "pTrdSymbol": "SEM_TRADING_SYMBOL",
+        "pSymbolName": "SEM_CUSTOM_SYMBOL",
+        "dStrikePrice;": "SEM_STRIKE_PRICE",
+        "pOptionType": "SEM_OPTION_TYPE",
+        "pAssetCode": "SEM_SMST_SECURITY_ID",
+        "lLotSize": "SEM_LOT_UNITS",
+        "lExpiryDate ": "SEM_EXPIRY_DATE",  # note trailing space in Kotak column
+        "lExpiryDate": "SEM_EXPIRY_DATE",   # without trailing space (just in case)
+        "pExchSeg": "SEM_EXM_EXCH_ID",
+        "pInstType": "SEM_EXCH_INSTRUMENT_TYPE",
+        "pExpiryDate": "SEM_EXPIRY_DATE",   # string format
+        "pSymbol": "SEM_SYMBOL",
+        "pSymbolName": "SEM_CUSTOM_SYMBOL",
+        "pTrdSymbol": "SEM_TRADING_SYMBOL",
+        "pOptionType": "SEM_OPTION_TYPE",
+        "pAssetCode": "SEM_SMST_SECURITY_ID",
+        "lLotSize": "SEM_LOT_UNITS",
+        "lExpiryDate ": "SEM_EXPIRY_DATE",
+        "pExchSeg": "SEM_EXM_EXCH_ID",
+        "pInstType": "SEM_EXCH_INSTRUMENT_TYPE",
+        "pExpiryDate": "SEM_EXPIRY_DATE",
+        # Additional mappings for instrument name/type
+        "pInstName": "SEM_INSTRUMENT_NAME",
+        "pInstType": "SEM_EXCH_INSTRUMENT_TYPE",
+    }
+
     def __init__(self, csv_path: Path, kotak_source: Any = None):
-        super().__init__(csv_path)
+        # Load Kotak CSV and rename columns to Dhan format before parent init
+        import pandas as pd
+        df = pd.read_csv(csv_path, low_memory=False)
+        df.columns = df.columns.str.strip()  # strip whitespace from column names
+        # Rename Kotak columns to Dhan SEM_* format
+        df = df.rename(columns={k: v for k, v in self._KOTAK_TO_DHAN_COLS.items() if k in df.columns})
+        # Save the renamed CSV to a temp file for parent to load
+        import tempfile
+        tmp_path = Path(tempfile.mktemp(suffix=".csv"))
+        df.to_csv(tmp_path, index=False, float_format="%.2f")
+        super().__init__(tmp_path)
         self._kotak_source = kotak_source
+        # Clean up temp file after parent loads
+        try:
+            tmp_path.unlink()
+        except Exception:
+            pass
 
     def get_feed_instruments(self, symbols: List[str]) -> List[Dict[str, Any]]:
         """

@@ -10,14 +10,18 @@ NIFTY-DOS (Supertrend + MA9 + ADX Directional Option Selling)
 - Rollover: 1 trading day before weekly expiry
 - No new entries on NSE holidays, event_no_trade_dates, or weekly expiry day
 
-Exit Rules (5min timeframe check):
-- CALL: SL 3.5%, TP >3.7%
-- PUT: SL 3.5%, TP >3.7%
+
+Exit Rules (5min timeframe check) - based on STRUCTURE CAPITAL (margin for hedged position):
+- Structure = MAIN (short option) + HEDGE (long option) with same structure_id
+- Capital deployed = margin_per_lot * qty (broker margin for hedged structure, e.g., ₹50,000/lot)
+- Combined P&L = MAIN P&L + HEDGE P&L (net structure P&L)
+- CALL: SL 3.5% of capital, TP 3.7% of capital
+- PUT: SL 3.5% of capital, TP 3.7% of capital
 
 Reentry on SL: Nifty price >= MA9 for bullish ST and nifty price <= MA9 for bearish ST with ADX > 25 and check candle (if in favor of trend then only enter)
 Reentry on TP: Nifty price >= MA9 for bullish ST and nifty price <= MA9 for bearish ST
 
-After 3pm: if profit or loss is 3% exit the trade, re-entry if ADX > 25 else reentry on next day 9:45
+After 3pm: if |profit or loss| >= 3% of capital deployed exit the trade, re-entry if ADX > 25 else reentry on next day 9:45
 No Entry at 3:15PM for both CE and PE when ADX < 25
 Check at 9:15: if price is opposite to signal, exit trade and enter in 30min candle close
 """
@@ -55,7 +59,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
     underlying_symbols = ["NIFTY"]
     timeframe = "30"
     required_context = ["option_chain"]
-    api = "KOTAK"
+    api = "DHAN"
     expiryType = "WEEKLY"
     dhan_expiry_flag = "WEEK"
     weekly_expiry_weekday = 1  # Nifty weekly = Tuesday
@@ -74,11 +78,16 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
     hedge_rollover_days_before_expiry = 1
     hedge_prefer_monthly = False
 
-    # TP/SL parameters (percentage)
+    # TP/SL parameters (percentage of capital deployed for the hedged structure)
     call_sl_pct = 3.5
     call_tp_pct = 3.7
     put_sl_pct = 3.5
     put_tp_pct = 3.7
+
+    # Capital per lot for the hedged structure (approximate SPAN margin for MAIN + HEDGE)
+    # This should be configured based on broker's margin requirement for the hedged position
+    # Example: If broker requires ₹50,000 margin per lot for the hedged structure, set to 50000
+    margin_per_lot = 50000  # Approximate margin required per lot for hedged position
 
     # Reentry parameters
     reentry_adx_threshold = 25
@@ -97,8 +106,10 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         self._snapshot_expiry_pref: Optional[str] = None
         self._force_hedge_expiry: Optional[date] = None
         self.rolled_hedges: Set[tuple] = set()
-        self._position_entry_price: dict[str, float] = {}  # structure_id -> entry premium
-        self._position_type: dict[str, str] = {}  # structure_id -> "CALL" or "PUT"
+        # Structure tracking: store both MAIN and HEDGE entry prices
+        self._structure_main_entry_price: dict[str, float] = {}  # structure_id -> main entry premium
+        self._structure_hedge_entry_price: dict[str, float] = {}  # structure_id -> hedge entry premium
+        self._structure_type: dict[str, str] = {}  # structure_id -> "CALL" or "PUT"
         # Track SL/TP hit for reentry timing
         self._sl_hit_structure: dict[str, str] = {}  # structure_id -> option_type (for next candle reentry)
         self._tp_hit_pending: dict[str, str] = {}  # structure_id -> option_type (for immediate reentry)
@@ -138,6 +149,26 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             self.weekly_expiry_weekday = int(params["weekly_expiry_weekday"]) % 7
         if "hedge_rollover_days_before_expiry" in params:
             self.hedge_rollover_days_before_expiry = int(params["hedge_rollover_days_before_expiry"])
+
+        # TP/SL parameters
+        if "call_sl_pct" in params:
+            self.call_sl_pct = float(params["call_sl_pct"])
+        if "call_tp_pct" in params:
+            self.call_tp_pct = float(params["call_tp_pct"])
+        if "put_sl_pct" in params:
+            self.put_sl_pct = float(params["put_sl_pct"])
+        if "put_tp_pct" in params:
+            self.put_tp_pct = float(params["put_tp_pct"])
+
+        # Capital per lot for hedged structure
+        if "margin_per_lot" in params:
+            self.margin_per_lot = float(params["margin_per_lot"])
+
+        # Reentry parameters
+        if "reentry_adx_threshold" in params:
+            self.reentry_adx_threshold = int(params["reentry_adx_threshold"])
+        if "eod_exit_pct" in params:
+            self.eod_exit_pct = float(params["eod_exit_pct"])
 
         events = raw.get("event_no_trade_dates") or []
         parsed: Set[date] = set()
@@ -627,15 +658,18 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         )
         self._entry_signaled_keys.add(signal_key)
 
-        # Store entry price and type for TP/SL tracking
-        self._position_entry_price[structure_id] = float(premium)
-        self._position_type[structure_id] = "CALL" if option_type in ("CE", "CALL") else "PUT"
+        # Store entry prices for both MAIN and HEDGE for TP/SL tracking
+        self._structure_main_entry_price[structure_id] = float(premium)
+        hedge_entry_price = float(getattr(hedge_intent, "price", 0) or 0)
+        self._structure_hedge_entry_price[structure_id] = hedge_entry_price
+        self._structure_type[structure_id] = "CALL" if option_type in ("CE", "CALL") else "PUT"
 
         logger.info(
-            "NiftyDOS entry structure=%s main=%s premium=%s expiry=%s expiry_pref=%s hedge=%s",
+            "NiftyDOS entry structure=%s main=%s premium=%s hedge_premium=%s expiry=%s expiry_pref=%s hedge=%s",
             structure_id,
             trading_symbol,
             premium,
+            hedge_entry_price,
             expiry_for_symbol,
             expiry_pref,
             getattr(getattr(hedge_intent, "instrument", None), "trading_symbol", None),
@@ -748,17 +782,109 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         # For live/paper, would need to fetch from option chain
         return None
 
+    def _get_structure_positions(self, position, ctx):
+        """Get both MAIN and HEDGE positions for a structure."""
+        main_pos = position
+        hedge_pos = None
+        if ctx and ctx.position_store:
+            hedge_pos = ctx.position_store.get_hedge_for(main_pos)
+        return main_pos, hedge_pos
+
+    def _get_structure_capital(self, structure_id: str, main_position, ctx=None) -> float:
+        """Calculate total capital/margin deployed for the hedged structure.
+
+        Uses broker's calculate_structure_margin to get the actual margin required
+        for the hedged position (MAIN + HEDGE with hedge benefit).
+        Falls back to configured margin_per_lot if broker calculation unavailable.
+        """
+        qty = abs(int(main_position.net_qty or 0))
+        if qty <= 0:
+            return 0.0
+
+        # Try to get broker-calculated margin for the hedged structure
+        if ctx and hasattr(ctx, "broker") and ctx.broker:
+            broker = ctx.broker
+            # Find the hedge position for this structure
+            hedge_position = None
+            if ctx.position_store:
+                hedge_position = ctx.position_store.get_hedge_for(main_position)
+
+            if hedge_position and hasattr(broker, "calculate_structure_margin"):
+                try:
+                    # Get entry prices for margin calculation
+                    main_entry = self._structure_main_entry_price.get(structure_id, 0)
+                    hedge_entry = self._structure_hedge_entry_price.get(structure_id, 0)
+
+                    if main_entry > 0 and hedge_entry > 0:
+                        margin_result = broker.calculate_structure_margin(
+                            main_leg=main_position,
+                            hedge_leg=hedge_position,
+                            main_execution_price=main_entry,
+                            hedge_execution_price=hedge_entry,
+                            include_position=True,
+                            include_orders=True,
+                        )
+                        if margin_result and margin_result.get("final_margin", 0) > 0:
+                            # Return margin per lot * qty
+                            final_margin = margin_result["final_margin"]
+                            margin_per_lot = final_margin / qty if qty > 0 else final_margin
+                            logger.debug(
+                                "NiftyDOS: Using broker margin for structure %s: "
+                                "final_margin=%.2f margin_per_lot=%.2f hedge_benefit=%.2f",
+                                structure_id,
+                                final_margin,
+                                margin_per_lot,
+                                margin_result.get("hedge_benefit", 0)
+                            )
+                            return final_margin
+                except Exception as e:
+                    logger.warning("NiftyDOS: Broker margin calculation failed, using fallback: %s", e)
+
+        # Fallback to configured margin_per_lot
+        return self.margin_per_lot * qty
+
+    def _calculate_structure_pnl(self, main_position, hedge_position, candle, ctx) -> float:
+        """Calculate combined P&L for the hedged structure (MAIN + HEDGE).
+
+        MAIN: Short option - profit when premium decreases
+        HEDGE: Long option - profit when premium increases
+        """
+        structure_id = main_position.structure_id
+
+        # Get entry prices
+        main_entry = self._structure_main_entry_price.get(structure_id, 0)
+        hedge_entry = self._structure_hedge_entry_price.get(structure_id, 0)
+
+        if main_entry <= 0:
+            return 0.0
+
+        # Get current prices
+        main_current = self._get_current_premium(main_position, candle, ctx)
+        if main_current is None:
+            return 0.0
+
+        # Calculate MAIN P&L (short: profit when premium drops)
+        lot_size = getattr(main_position.instrument, "lot_size", 0) or 0
+        qty = abs(int(main_position.net_qty or 0))
+        main_pnl = (main_entry - main_current) * lot_size * qty
+
+        # Calculate HEDGE P&L if hedge exists (long: profit when premium rises)
+        hedge_pnl = 0.0
+        if hedge_position and hedge_position.net_qty != 0:
+            hedge_current = self._get_current_premium(hedge_position, candle, ctx)
+            if hedge_current is not None and hedge_entry > 0:
+                hedge_qty = abs(int(hedge_position.net_qty or 0))
+                hedge_pnl = (hedge_current - hedge_entry) * lot_size * hedge_qty
+
+        return main_pnl + hedge_pnl
+
     def _check_tp_sl(self, position, candle, ctx) -> Optional[str]:
-        """Check if TP or SL hit. Returns 'TP', 'SL', or None."""
-        entry_price = self._position_entry_price.get(position.structure_id)
-        if entry_price is None or entry_price <= 0:
-            return None
+        """Check if TP or SL hit based on structure capital (margin deployed).
 
-        current_price = self._get_current_premium(position, candle, ctx)
-        if current_price is None:
-            return None
-
-        pos_type = self._position_type.get(position.structure_id, "")
+        Uses combined P&L (MAIN + HEDGE) vs margin_per_lot * qty.
+        """
+        structure_id = position.structure_id
+        pos_type = self._structure_type.get(structure_id, "")
         if pos_type == "CALL":
             sl_pct = self.call_sl_pct
             tp_pct = self.call_tp_pct
@@ -766,30 +892,50 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             sl_pct = self.put_sl_pct
             tp_pct = self.put_tp_pct
 
-        # For short position: profit when premium decreases, loss when premium increases
-        pnl_pct = ((entry_price - current_price) / entry_price) * 100
+        # Get both positions
+        main_pos, hedge_pos = self._get_structure_positions(position, ctx)
 
-        if pnl_pct <= -sl_pct:
+        # Calculate capital deployed (margin required for hedged structure)
+        capital_used = self._get_structure_capital(structure_id, main_pos, ctx)
+        if capital_used <= 0:
+            return None
+
+        # Calculate combined structure P&L
+        structure_pnl = self._calculate_structure_pnl(main_pos, hedge_pos, candle, ctx)
+
+        # Calculate SL and TP amounts based on capital deployed
+        sl_amount = capital_used * sl_pct / 100.0
+        tp_amount = capital_used * tp_pct / 100.0
+
+        # SL hit when loss exceeds SL amount
+        if structure_pnl <= -sl_amount:
+            logger.info(f"NiftyDOS: SL hit for structure {structure_id}, P&L={structure_pnl:.2f}, SL={sl_amount:.2f}, Capital={capital_used:.2f}")
             return "SL"
-        if pnl_pct >= tp_pct:
+        # TP hit when profit exceeds TP amount
+        if structure_pnl >= tp_amount:
+            logger.info(f"NiftyDOS: TP hit for structure {structure_id}, P&L={structure_pnl:.2f}, TP={tp_amount:.2f}, Capital={capital_used:.2f}")
             return "TP"
         return None
 
     def _check_eod_exit(self, position, candle, ctx) -> bool:
-        """Check if after 3pm and PnL >= 3% (profit or loss)."""
+        """Check if after 3pm and |P&L| >= eod_exit_pct of capital deployed."""
         if not self._is_after_3pm(candle):
             return False
 
-        entry_price = self._position_entry_price.get(position.structure_id)
-        if entry_price is None or entry_price <= 0:
+        structure_id = position.structure_id
+        main_pos, hedge_pos = self._get_structure_positions(position, ctx)
+
+        capital_used = self._get_structure_capital(structure_id, main_pos, ctx)
+        if capital_used <= 0:
             return False
 
-        current_price = self._get_current_premium(position, candle, ctx)
-        if current_price is None:
-            return False
+        structure_pnl = self._calculate_structure_pnl(main_pos, hedge_pos, candle, ctx)
 
-        pnl_pct = ((entry_price - current_price) / entry_price) * 100
-        return abs(pnl_pct) >= self.eod_exit_pct
+        eod_exit_amount = capital_used * self.eod_exit_pct / 100.0
+        if abs(structure_pnl) >= eod_exit_amount:
+            logger.info(f"NiftyDOS: EOD exit for structure {structure_id}, P&L={structure_pnl:.2f}, threshold={eod_exit_amount:.2f}")
+            return True
+        return False
 
     def should_exit(self, position, candle, ctx=None):
         if position.tag != "MAIN":
@@ -799,7 +945,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         tp_sl = self._check_tp_sl(position, candle, ctx)
         if tp_sl:
             # Track for reentry logic
-            opt_type = self._position_type.get(position.structure_id, "")
+            opt_type = self._structure_type.get(position.structure_id, "")
             if tp_sl == "SL":
                 # SL hit - schedule reentry on NEXT candle with MA/ADX/candle check
                 self._sl_hit_structure[position.structure_id] = opt_type
@@ -812,7 +958,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
 
         # Check EOD exit after 3pm
         if self._check_eod_exit(position, candle, ctx):
-            logger.info(f"NiftyDOS: EOD exit (3% PnL) for structure {position.structure_id}")
+            logger.info(f"NiftyDOS: EOD exit for structure {position.structure_id}")
             return True
 
         # Check Supertrend reversal
@@ -863,11 +1009,12 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             intents.append(hedge_exit)
 
         # Get option type before cleaning up
-        opt_type = self._position_type.get(position.structure_id, "")
+        opt_type = self._structure_type.get(position.structure_id, "")
 
         # Clean up tracking
-        self._position_entry_price.pop(position.structure_id, None)
-        self._position_type.pop(position.structure_id, None)
+        self._structure_main_entry_price.pop(position.structure_id, None)
+        self._structure_hedge_entry_price.pop(position.structure_id, None)
+        self._structure_type.pop(position.structure_id, None)
 
         # Handle reentry after exit
         # Check for immediate TP reentry (same candle)

@@ -48,8 +48,7 @@ class KotakBrokerApi:
             amo="YES" if after_market_order else "NO",
             disclosed_quantity=str(int(disclosed_quantity or 0)),
             trigger_price=str(float(trigger_price or 0)),
-            tag=tag,
-            scrip_token=str(scrip_token) if scrip_token is not None else None,
+            # NeoAPI doesn't support tag or scrip_token
         )
 
     def modify_order(

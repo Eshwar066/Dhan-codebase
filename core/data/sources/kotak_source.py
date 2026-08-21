@@ -304,6 +304,50 @@ class KotakSource:
             strike_price=strike_price,
         )
 
+    def get_option_chain_for_expiry(
+        self,
+        *,
+        exchange_segment: str,
+        symbol: str,
+        expiry: str,
+        option_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch all options for a given expiry from Kotak's live API.
+        Uses search_scrip without strike_price to get all strikes for the expiry.
+
+        Args:
+            exchange_segment: e.g., "NFO"
+            symbol: e.g., "NIFTY"
+            expiry: Expiry in DDMMMYY format (e.g., "25AUG26")
+            option_type: "CE" or "PE" (optional, fetches both if not specified)
+
+        Returns:
+            List of option data dicts
+        """
+        results: List[Dict[str, Any]] = []
+        opt_types = [option_type] if option_type else ["CE", "PE"]
+
+        for opt_type in opt_types:
+            try:
+                result = self._api.search_scrip(
+                    exchange_segment=exchange_segment,
+                    symbol=symbol,
+                    expiry=expiry,
+                    option_type=opt_type,
+                    strike_price=None,  # No strike = fetch all strikes
+                )
+                if isinstance(result, list):
+                    # Filter for the target symbol (exclude FINNIFTY, NIFTYNXT50, etc.)
+                    for row in result:
+                        if str(row.get("pSymbolName", "")).upper() == symbol.upper():
+                            results.append(row)
+            except Exception as e:
+                logger.warning("get_option_chain_for_expiry failed for %s %s: %s",
+                             symbol, opt_type, e)
+
+        return results
+
     def scrip_master(
         self, exchange_segment: Optional[str] = None, force: bool = False
     ) -> List[Dict[str, Any]]:

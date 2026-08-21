@@ -76,9 +76,9 @@ ENGINE_JOBS = [
     },
     {
         "engine_id": "kotak",
-        "venue": "KOTAK",
+        "venue": "DHAN",
         "enabled": True,
-        "run_mode": "PAPER",
+        "run_mode": "LIVE",
         "capital": 200000,
         "ORDER_QTY_LOTS": 1,
         "market_ws_stall_timeout_seconds": 0,
