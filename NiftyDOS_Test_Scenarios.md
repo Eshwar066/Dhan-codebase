@@ -60,12 +60,14 @@ The strategy now integrates with the shared indicator history system (`logs/indi
 | **E4** | **Current Weekly No Strike** | Non-expiry day, no OTM strike 80-105 on current weekly | Auto-roll to NEXT_WEEKLY, enter there |
 | **E5** | **Both Weeks No Strike** | No valid strike 80-105 on WEEKLY or NEXT_WEEKLY | Skip entry, log warning |
 | **E6** | **Holiday/Event Day** | NSE holiday or `event_no_trade_dates` | No evaluation, no entry |
-| **E7** | **Weekly Expiry Day** | `_is_weekly_expiry_day()` = True | No new entry (handled in `should_evaluate`) |
+| **E7** | **Weekly Expiry Day** | `_is_weekly_expiry_day()` = True | **Allow entry** - `_build_entry_intents` forces NEXT_WEEKLY expiry |
 | **E8** | **After 3:15 PM** | Time ≥ 15:15, ADX < 25 | No new initial entry |
 | **E9** | **After 3:15 PM with ADX ≥ 25** | Time ≥ 15:15, ADX ≥ 25 | Allow entry (reentry only per rules) |
 | **E10** | **Duplicate Signal Prevention** | Same structure_id + bar_open_key in `_entry_signaled_keys` | Skip duplicate entry |
 | **E11** | **Position Already Exists** | Open MAIN position for structure_id | Skip entry |
 | **E12** | **Pending Intent Exists** | Intent store has pending ENTRY for structure_id | Skip entry |
+| **E13** | **9:45 AM Entry (No Open Position)** | 9:45 AM candle, no open MAIN position, ST=BULLISH/BEARISH | Enter Short PUT/CALL on current weekly (or NEXT_WEEKLY on expiry day) |
+| **E14** | **9:45 AM Entry (Position Exists)** | 9:45 AM candle, MAIN position already open | Skip entry (no duplicate) |
 
 ---
 
@@ -117,6 +119,9 @@ The strategy now integrates with the shared indicator history system (`logs/indi
 | Time | Scenario | Behavior |
 |------|----------|----------|
 | **9:15 AM** | Price opposite to ST signal | Exit signal generated (handled in position mgmt) |
+| **9:45 AM** | No open position | **Create position on Supertrend direction** (PUT if BULLISH, CALL if BEARISH) |
+| **9:45 AM** | Position already open | Skip entry |
+| **9:45 AM on Expiry Day** | No open position | Create position on NEXT_WEEKLY expiry |
 | **9:15-15:15** | Normal trading | All entry/exit/reentry logic active |
 | **15:15-15:30** | EOD zone | No new initial entry if ADX<25; EOD exit check active; reentry allowed if ADX≥25 |
 | **Post 15:30** | Market closed | No evaluation (live mode) |
@@ -146,6 +151,22 @@ The strategy now integrates with the shared indicator history system (`logs/indi
 # TC-E5: Holiday - no entry
 # Given: NSE holiday, ST=BULLISH
 # Expect: should_evaluate()=False, no entry
+
+# TC-E6: 9:45 AM entry - bullish, no position
+# Given: 9:45 AM Wed, ST=BULLISH, no open position, PUT 24400 premium=92
+# Expect: Short PUT 24400 + Long PUT 23900 on current weekly
+
+# TC-E7: 9:45 AM entry - bearish, no position
+# Given: 9:45 AM Wed, ST=BEARISH, no open position, CALL 24600 premium=92
+# Expect: Short CALL 24600 + Long CALL 25100 on current weekly
+
+# TC-E8: 9:45 AM entry on expiry day
+# Given: 9:45 AM Tuesday (expiry), ST=BULLISH, no open position, PUT 24450 premium=90 on next weekly
+# Expect: Short PUT 24450 + Long PUT 23950 on NEXT_WEEKLY
+
+# TC-E9: 9:45 AM entry skipped - position exists
+# Given: 9:45 AM Wed, ST=BULLISH, Short PUT already open from 9:15
+# Expect: No new entry, existing position continues
 ```
 
 ### Exit Tests
@@ -280,15 +301,16 @@ event_no_trade_dates:
 ### Critical Code Locations
 | Logic | Method | Lines |
 |-------|--------|-------|
-| Entry gating | `should_evaluate` | ~830-860 |
+| Entry gating | `should_evaluate` | ~840-870 |
 | Entry building | `_build_entry_intents` | ~660-830 |
 | Expiry day logic | `_build_entry_intents` | ~690-730 |
-| Exit checks | `should_exit` | ~1160-1210 |
-| ST flip detection | `should_exit` | ~1180-1210 |
-| Position exit | `on_position_exit` | ~1210-1275 |
-| SL reentry | `_attempt_sl_reentry` | ~1315-1355 |
-| TP reentry | `_attempt_immediate_reentry` | ~1355-1370 |
-| ST flip reentry | `_attempt_st_flip_reentry` | ~1370-1390 |
+| 9:45 AM entry | `on_candle` | ~927-960 |
+| Exit checks | `should_exit` | ~1170-1220 |
+| ST flip detection | `should_exit` | ~1190-1220 |
+| Position exit | `on_position_exit` | ~1220-1285 |
+| SL reentry | `_attempt_sl_reentry` | ~1325-1365 |
+| TP reentry | `_attempt_immediate_reentry` | ~1365-1380 |
+| ST flip reentry | `_attempt_st_flip_reentry` | ~1380-1400 |
 | Indicator preparation | `prepare_indicators` | ~310-345 |
 | Persisted keys | `persisted_indicator_keys` | ~345-370 |
 | Signal methods | `_get_supertrend_signal`, `_get_ma_signal`, `_get_adx_value` | ~650-680 |
@@ -302,6 +324,9 @@ event_no_trade_dates:
 - [ ] Entry: Fallback to next weekly
 - [ ] Entry: Holiday/event day blocked
 - [ ] Entry: After 3:15 PM blocked (ADX<25)
+- [ ] Entry: 9:45 AM - no position (bullish/bearish)
+- [ ] Entry: 9:45 AM - expiry day (uses NEXT_WEEKLY)
+- [ ] Entry: 9:45 AM - position exists (skipped)
 - [ ] Exit: SL hit
 - [ ] Exit: TP hit
 - [ ] Exit: EOD (post 3PM)
