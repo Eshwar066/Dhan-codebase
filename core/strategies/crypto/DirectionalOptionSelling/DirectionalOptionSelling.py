@@ -63,9 +63,9 @@ logger = logging.getLogger(__name__)
 # Sleeve entry switches (flip to False to stop new entries / SL re-entries for
 # that sleeve globally). Open positions still trail SL, force-exit, and roll.
 # Per-symbol enable_* in SYMBOL_CONFIG can further disable a sleeve.
-ENABLE_WEEKLY_TRADES = True
-ENABLE_MONTHLY_TRADES = True
-ENABLE_INTRADAY_TRADES = True
+ENABLE_WEEKLY_TRADES = False
+ENABLE_MONTHLY_TRADES = False
+ENABLE_INTRADAY_TRADES = False
 ENABLE_MORNING_0DTE_TRADES = True
 # Per-underlying master switches (False = no new entries / SL re-entries for that
 # symbol). Open risk still trails, force-exits, and rolls.

@@ -58,30 +58,42 @@ def load_dhan_credentials():
 
 
 def fetch_live_spot(dhan):
-    """Fetch live NIFTY spot from Dhan using quote_data."""
+    """Fetch live NIFTY spot from Dhan using ticker_data."""
     try:
-        # NIFTY index security ID is 13 on NSE_INDEX
-        quote = dhan.quote_data(securities={"NSE_INDEX": [13]})
-        if quote and 'data' in quote and 'data' in quote['data']:
-            for sec_data in quote['data']['data']:
-                if sec_data.get('security_id') == '13':
-                    ltp = sec_data.get('last_price', 0)
-                    if ltp > 0:
-                        return float(ltp)
+        # NIFTY index security ID is 13 on IDX_I (index exchange)
+        ticker = dhan.ticker_data(securities={"IDX_I": [13]})
+        if ticker and 'data' in ticker and 'data' in ticker['data']:
+            # Extract LTP from the nested data structure
+            data_dict = ticker['data']['data']
+            if 'IDX_I' in data_dict and '13' in data_dict['IDX_I']:
+                ltp = data_dict['IDX_I']['13'].get('last_price', 0)
+                if ltp > 0:
+                    return float(ltp)
     except Exception as e:
-        logger.warning(f"Could not fetch live spot via quote_data: {e}")
+        logger.warning(f"Could not fetch live spot via ticker_data: {e}")
     return None
 
 
 def get_option_chain_dhan(dhan, expiry_str, option_type):
-    """Get option chain from Dhan."""
+    """Get option chain from Dhan using Tradehull-compatible parameters."""
     try:
-        # Dhan option_chain method: UnderlyingScrip=13 (NIFTY), ExpiryDate=expiry_str, OptionType=CE/PE
+        # Based on Tradehull's get_option_chain method and ticker_data success:
+        # For NIFTY index, use under_exchange_segment = 'IDX_I' (index exchange)
+        # Format expiry as YYYY-MM-DD
+        from datetime import datetime
+        # Convert expiry_str from "DDMMMYY" to "YYYY-MM-DD"
+        expiry_date = datetime.strptime(expiry_str, "%d%b%y")
+        expiry_formatted = expiry_date.strftime("%Y-%m-%d")
+
         chain = dhan.option_chain(
-            UnderlyingScrip=13,
-            ExpiryDate=expiry_str,
-            OptionType=option_type
+            under_security_id=13,
+            under_exchange_segment="IDX_I",  # Index exchange for NIFTY
+            expiry=expiry_formatted
         )
+        # Check if the chain indicates failure
+        if chain and chain.get('status') == 'failure':
+            logger.warning(f"Dhan option chain failed for {expiry_str} {option_type}: {chain.get('remarks', {})}")
+            return None
         return chain
     except Exception as e:
         logger.warning(f"Dhan option chain failed for {expiry_str} {option_type}: {e}")
@@ -95,11 +107,55 @@ def parse_dhan_chain(chain, option_type):
 
     premiums = {}
 
-    # Dhan option_chain returns different structures, try to parse
-    data = chain.get('data', chain)
+    # Handle the actual data structure from dhanhq option_chain
+    # chain structure: {'status': 'success', 'remarks': '', 'data': {'data': {'last_price': ..., 'oc': {STRIKE: {'ce': {...}, 'pe': {...}}}}}}
+    oc_data = None
+    if isinstance(chain, dict) and 'data' in chain and isinstance(chain['data'], dict):
+        inner_data = chain['data'].get('data')
+        if isinstance(inner_data, dict):
+            oc_data = inner_data.get('oc')
 
-    if isinstance(data, list):
-        for item in data:
+    # If we didn't find the oc data in the expected structure, try the original approach
+    if oc_data is None:
+        oc_data = chain.get('data', chain)
+
+    # Handle different possible structures for oc_data
+    if isinstance(oc_data, dict):
+        # This is the expected structure: {STRIKE: {'ce': {...}, 'pe': {...}}}
+        for strike_str, strike_data in oc_data.items():
+            try:
+                strike = int(float(strike_str))
+
+                # Get the relevant option type data (ce for call, pe for put)
+                option_key = 'ce' if option_type in ('CE', 'CALL') else 'pe'
+                option_data = strike_data.get(option_key)
+
+                if not option_data:
+                    continue
+
+                # Extract price data from option_data
+                bid = float(option_data.get('top_bid_price', 0) or 0)
+                ask = float(option_data.get('top_ask_price', 0) or 0)
+                ltp = float(option_data.get('last_price', 0) or 0)
+
+                if bid > 0 and ask > 0:
+                    premium = (bid + ask) / 2
+                elif ltp > 0:
+                    premium = ltp
+                else:
+                    continue
+
+                premiums[strike] = {
+                    'premium': premium,
+                    'bid': bid,
+                    'ask': ask,
+                    'ltp': ltp,
+                }
+            except (ValueError, TypeError, KeyError):
+                continue
+    elif isinstance(oc_data, list):
+        # Handle list structure (fallback to original logic)
+        for item in oc_data:
             try:
                 strike = int(float(item.get('strike_price', item.get('StrikePrice', 0))))
                 bid = float(item.get('bid_price', item.get('BidPrice', 0)) or 0)
@@ -121,27 +177,21 @@ def parse_dhan_chain(chain, option_type):
                 }
             except (ValueError, TypeError):
                 continue
-    elif isinstance(data, dict):
-        for strike_str, strike_data in data.items():
+    elif isinstance(oc_data, dict) and not isinstance(oc_data.get(next(iter(oc_data)), None), dict):
+        # Handle flat dictionary structure: {STRIKE: value}
+        for strike_str, value in oc_data.items():
             try:
                 strike = int(float(strike_str))
-                bid = float(strike_data.get('bid_price', strike_data.get('BidPrice', 0)) or 0)
-                ask = float(strike_data.get('ask_price', strike_data.get('AskPrice', 0)) or 0)
-                ltp = float(strike_data.get('last_price', strike_data.get('LastPrice', strike_data.get('LTP', 0))) or 0)
-
-                if bid > 0 and ask > 0:
-                    premium = (bid + ask) / 2
-                elif ltp > 0:
-                    premium = ltp
-                else:
-                    continue
-
-                premiums[strike] = {
-                    'premium': premium,
-                    'bid': bid,
-                    'ask': ask,
-                    'ltp': ltp,
-                }
+                # Assuming value is a direct price or contains price info
+                # This is a fallback - adjust based on actual structure
+                ltp = float(value) if isinstance(value, (int, float)) or (isinstance(value, str) and value.replace('.','',1).isdigit()) else 0
+                if ltp > 0:
+                    premiums[strike] = {
+                        'premium': ltp,
+                        'bid': ltp,
+                        'ask': ltp,
+                        'ltp': ltp,
+                    }
             except (ValueError, TypeError):
                 continue
 
@@ -235,16 +285,29 @@ def get_trading_symbol_from_instrument_df(instrument_df, strike, option_type, ex
         expiry_str = pd.to_datetime(expiry_date).strftime('%d%b%y').upper()
         opt_type = 'CE' if option_type in ('CE', 'CALL') else 'PE'
 
+        # Convert instrument expiry to same format (strip time), coercing errors to NaT
+        instrument_expiry_str = pd.to_datetime(instrument_df['SEM_EXPIRY_DATE'], errors='coerce').dt.strftime('%d%b%y').str.upper()
+
         # Filter for matching symbol
-        filtered = instrument_df[
-            (instrument_df['SEM_CUSTOM_SYMBOL'].str.startswith('NIFTY')) &
-            (instrument_df['SEM_EXPIRY_DATE'] == expiry_str) &
-            (instrument_df['SEM_OPTION_TYPE'] == opt_type) &
-            (instrument_df['SEM_STRIKE_PRICE'] == int(strike * 100))  # Dhan stores in paise
-        ]
+        mask_custom = instrument_df['SEM_CUSTOM_SYMBOL'].str.startswith('NIFTY')
+        mask_expiry = instrument_expiry_str == expiry_str
+        mask_opt = instrument_df['SEM_OPTION_TYPE'] == opt_type
+        # For options, strike price is stored as actual strike (not multiplied by 100)
+        mask_strike = abs(instrument_df['SEM_STRIKE_PRICE'] - strike) < 0.01
+
+        combined_mask = mask_custom & mask_expiry & mask_opt & mask_strike
+
+        filtered = instrument_df[combined_mask]
 
         if not filtered.empty:
             return filtered.iloc[0]['SEM_TRADING_SYMBOL'], int(filtered.iloc[0]['SEM_SMST_SECURITY_ID']), int(filtered.iloc[0]['SEM_LOT_UNITS'])
+
+        # Fallback: try matching by SEM_TRADING_SYMBOL
+        mask_custom2 = instrument_df['SEM_TRADING_SYMBOL'].str.startswith('NIFTY')
+        combined_mask2 = mask_custom2 & mask_expiry & mask_opt & mask_strike
+
+        if not filtered2.empty:
+            return filtered2.iloc[0]['SEM_TRADING_SYMBOL'], int(filtered2.iloc[0]['SEM_SMST_SECURITY_ID']), int(filtered2.iloc[0]['SEM_LOT_UNITS'])
 
         # Fallback: construct symbol
         symbol = f"NIFTY{expiry_str}{int(strike)}{opt_type}"
@@ -527,28 +590,14 @@ def main():
         main_price=main_leg['premium'], hedge_price=hedge_leg['premium']
     )
 
-    if margin_result:
-        logger.info(f"\n{'='*60}")
-        logger.info("MARGIN CALCULATION (Dhan API)")
-        logger.info(f"{'='*60}")
-        logger.info(f"Final Margin (hedged):     ₹{margin_result['final_margin']:,.2f}")
-        logger.info(f"Margin per Lot:            ₹{margin_result['final_margin']:,.2f}")
-    else:
-        logger.warning("Dhan margin API failed, using fallback estimation")
-        # Fallback estimation
-        strike_dist = abs(main_leg['strike'] - hedge_leg['strike'])
-        max_loss = strike_dist * lot_size
-        est_margin = max_loss * 1.2
-        est_span = max_loss * 0.35
-        est_exposure = max_loss * 0.15
-        margin_result = {
-            'final_margin': est_margin,
-            'total_margin': est_margin,
-        }
-        logger.info(f"  Estimated Max Loss: ₹{max_loss:,.2f}")
-        logger.info(f"  Estimated Final Margin: ₹{est_margin:,.2f}")
-        logger.info(f"  Estimated SPAN: ₹{est_span:,.2f}")
-        logger.info(f"  Estimated Exposure: ₹{est_exposure:,.2f}")
+    if margin_result is None:
+        logger.error("Dhan margin API failed. Cannot proceed without margin calculation.")
+        return 1
+    logger.info(f"\n{'='*60}")
+    logger.info("MARGIN CALCULATION (Dhan API)")
+    logger.info(f"{'='*60}")
+    logger.info(f"Final Margin (hedged):     ₹{margin_result['final_margin']:,.2f}")
+    logger.info(f"Margin per Lot:            ₹{margin_result['final_margin']:,.2f}")
 
     capital = margin_result['final_margin']
     sl_amt = capital * 0.035

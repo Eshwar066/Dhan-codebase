@@ -48,6 +48,9 @@ from core.strategies.indicator_helpers import (
 from core.utils.expiry_resolver import ExpiryResolver
 from core.utils.option_chain_snapshot_log import log_option_chain_snapshot
 from core.utils.session.session_manager import SessionManager
+# Dhan API imports for live trading
+from dhanhq import dhanhq, DhanContext
+from core.library.dhan_tradehull import Tradehull
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +181,86 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             except Exception:
                 logger.warning("NiftyDOS: bad event_no_trade date=%s", item)
         self._event_no_trade_dates = parsed
+
+    def get_trading_symbol_from_instrument_df(self, instrument_df, strike, option_type, expiry_date):
+        """Get trading symbol from instrument dataframe."""
+        try:
+            expiry_str = pd.to_datetime(expiry_date).strftime('%d%b%y').upper()
+            opt_type = 'CE' if option_type in ('CE', 'CALL') else 'PE'
+
+            # Convert instrument expiry to same format (strip time), coercing errors to NaT
+            instrument_expiry_str = pd.to_datetime(instrument_df['SEM_EXPIRY_DATE'], errors='coerce').dt.strftime('%d%b%y').str.upper()
+
+            # Filter for matching symbol
+            mask_custom = instrument_df['SEM_CUSTOM_SYMBOL'].str.startswith('NIFTY')
+            mask_expiry = instrument_expiry_str == expiry_str
+            mask_opt = instrument_df['SEM_OPTION_TYPE'] == opt_type
+            # For options, strike price is stored as actual strike (not multiplied by 100)
+            mask_strike = abs(instrument_df['SEM_STRIKE_PRICE'] - strike) < 0.01
+
+            combined_mask = mask_custom & mask_expiry & mask_opt & mask_strike
+
+            filtered = instrument_df[combined_mask]
+
+            if not filtered.empty:
+                return filtered.iloc[0]['SEM_TRADING_SYMBOL'], int(filtered.iloc[0]['SEM_SMST_SECURITY_ID']), int(filtered.iloc[0]['SEM_LOT_UNITS'])
+
+            # Fallback: try matching by SEM_TRADING_SYMBOL
+            mask_custom2 = instrument_df['SEM_TRADING_SYMBOL'].str.startswith('NIFTY')
+            combined_mask2 = mask_custom2 & mask_expiry & mask_opt & mask_strike
+
+            if not filtered2.empty:
+                return filtered2.iloc[0]['SEM_TRADING_SYMBOL'], int(filtered2.iloc[0]['SEM_SMST_SECURITY_ID']), int(filtered2.iloc[0]['SEM_LOT_UNITS'])
+
+            # Fallback: construct symbol
+            symbol = f"NIFTY{expiry_str}{int(strike)}{opt_type}"
+            return symbol, 0, 75
+        except Exception as e:
+            logger.warning(f"Could not find trading symbol: {e}")
+            return None, 0, 75
+
+    def calculate_margin_dhan(self, dhan, tradehull, main_symbol, hedge_symbol, main_expiry, hedge_expiry, main_strike, hedge_strike, option_type, main_qty=75, hedge_qty=75, main_price=0, hedge_price=0):
+        """Calculate margin using Dhan's margin_calculator_multi API."""
+        try:
+            # Build scrip list for multi-leg margin
+            scrip_list = [
+                {
+                    "tradingsymbol": main_symbol,
+                    "exchange": "NFO",
+                    "transaction_type": "SELL",
+                    "quantity": main_qty,
+                    "trade_type": "MARGIN",
+                    "price": main_price,
+                    "trigger_price": 0,
+                },
+                {
+                    "tradingsymbol": hedge_symbol,
+                    "exchange": "NFO",
+                    "transaction_type": "BUY",
+                    "quantity": hedge_qty,
+                    "trade_type": "MARGIN",
+                    "price": hedge_price,
+                    "trigger_price": 0,
+                }
+            ]
+
+            margin_result = tradehull.margin_calculator_multi(
+                scrip_list=scrip_list,
+                include_position=True,
+                include_orders=True
+            )
+
+            if margin_result and isinstance(margin_result, dict):
+                total_margin = margin_result.get('totalMargin') or margin_result.get('total_margin') or 0
+                return {
+                    'final_margin': total_margin,
+                    'total_margin': total_margin,
+                    'margin_result': margin_result
+                }
+        except Exception as e:
+            logger.warning(f"Dhan margin calculation failed: {e}")
+
+        return None
 
     def get_warmup_period(self):
         return max(50, int(self.supertrend_atr_period) * 5, int(self.adx_period) * 3)
@@ -793,13 +876,79 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
     def _get_structure_capital(self, structure_id: str, main_position, ctx=None) -> float:
         """Calculate total capital/margin deployed for the hedged structure.
 
-        Uses broker's calculate_structure_margin to get the actual margin required
-        for the hedged position (MAIN + HEDGE with hedge benefit).
-        Falls back to configured margin_per_lot if broker calculation unavailable.
+        First tries direct Dhan API margin calculation (like emergency file),
+        then falls back to broker's calculate_structure_margin,
+        finally falls back to configured margin_per_lot.
         """
         qty = abs(int(main_position.net_qty or 0))
         if qty <= 0:
             return 0.0
+
+        # Try direct Dhan API margin calculation first (like emergency file)
+        try:
+            # Load Dhan credentials from environment
+            import os
+            from dotenv import load_dotenv
+            load_dotenv('/root/Dhan-codebase/.env')
+            client_id = os.getenv("DHAN_CLIENT_CODE") or os.getenv("DHAN_CLIENT_ID")
+            access_token = os.getenv("DHAN_ACCESS_TOKEN")
+
+            if client_id and access_token:
+                dhan_context = DhanContext(client_id, access_token)
+                dhan = dhanhq(dhan_context)
+                tradehull = Tradehull(client_id, access_token)
+
+                # Get position details for margin calculation
+                main_symbol = getattr(main_position.instrument, 'tradingsymbol', '')
+                hedge_position = None
+                if ctx and ctx.position_store:
+                    hedge_position = ctx.position_store.get_hedge_for(main_position)
+                hedge_symbol = getattr(hedge_position.instrument, 'tradingsymbol', '') if hedge_position else ''
+
+                # Get entry prices
+                main_entry = self._structure_main_entry_price.get(structure_id, 0.0)
+                hedge_entry = self._structure_hedge_entry_price.get(structure_id, 0.0)
+
+                # Get strike prices from positions
+                main_strike = getattr(main_position.instrument, 'strike', 0.0)
+                hedge_strike = getattr(hedge_position.instrument, 'strike', 0.0) if hedge_position else 0.0
+
+                # Get option types
+                main_option_type = getattr(main_position.instrument, 'option_type', '')
+                # Hedge option type is same as main for this strategy
+                hedge_option_type = main_option_type
+
+                # Get quantities
+                main_qty = abs(int(getattr(main_position, 'net_qty', 0) or 0))
+                hedge_qty = abs(int(getattr(hedge_position, 'net_qty', 0) or 0)) if hedge_position else main_qty
+
+                # Calculate margin using direct Dhan API
+                margin_result = self.calculate_margin_dhan(
+                    dhan=dhan,
+                    tradehull=tradehull,
+                    main_symbol=main_symbol,
+                    hedge_symbol=hedge_symbol,
+                    main_expiry=getattr(main_position.instrument, 'expiry', None),
+                    hedge_expiry=getattr(hedge_position.instrument, 'expiry', None) if hedge_position else None,
+                    main_strike=main_strike,
+                    hedge_strike=hedge_strike,
+                    option_type=main_option_type,
+                    main_qty=main_qty,
+                    hedge_qty=hedge_qty,
+                    main_price=main_entry,
+                    hedge_price=hedge_entry
+                )
+
+                if margin_result and margin_result.get('final_margin', 0) > 0:
+                    final_margin = margin_result['final_margin']
+                    logger.debug(
+                        "NiftyDOS: Using direct Dhan API margin for structure %s: final_margin=%.2f",
+                        structure_id,
+                        final_margin
+                    )
+                    return final_margin
+        except Exception as e:
+            logger.warning("NiftyDOS: Direct Dhan API margin calculation failed, trying broker method: %s", e)
 
         # Try to get broker-calculated margin for the hedged structure
         if ctx and hasattr(ctx, "broker") and ctx.broker:
