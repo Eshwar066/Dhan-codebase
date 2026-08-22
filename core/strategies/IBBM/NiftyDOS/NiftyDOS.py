@@ -7,7 +7,6 @@ NIFTY-DOS (Supertrend + MA9 + ADX Directional Option Selling)
 - Supertrend Green (bullish) + MA9 bullish + ADX > 25 → SELL OTM PUT (premium 80-105)
 - Supertrend Red (bearish) + MA9 bearish + ADX > 25 → SELL OTM CALL (premium 80-105)
 - Hedge: 500 points OTM from MAIN on same weekly expiry
-- Rollover: 1 trading day before weekly expiry
 - No new entries on NSE holidays, event_no_trade_dates, or weekly expiry day
 
 
@@ -78,7 +77,6 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
     premium_min = 80
     premium_max = 105
     hedge_distance_points = 500
-    hedge_rollover_days_before_expiry = 1
     hedge_prefer_monthly = False
 
     # TP/SL parameters (percentage of capital deployed for the hedged structure)
@@ -107,8 +105,6 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         self._evaluated_signal_keys: set[str] = set()
         self._event_no_trade_dates: Set[date] = set()
         self._snapshot_expiry_pref: Optional[str] = None
-        self._force_hedge_expiry: Optional[date] = None
-        self.rolled_hedges: Set[tuple] = set()
         # Structure tracking: store both MAIN and HEDGE entry prices
         self._structure_main_entry_price: dict[str, float] = {}  # structure_id -> main entry premium
         self._structure_hedge_entry_price: dict[str, float] = {}  # structure_id -> hedge entry premium
@@ -152,8 +148,6 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             self.hedge_distance_points = int(params["hedge_distance_points"])
         if "weekly_expiry_weekday" in params:
             self.weekly_expiry_weekday = int(params["weekly_expiry_weekday"]) % 7
-        if "hedge_rollover_days_before_expiry" in params:
-            self.hedge_rollover_days_before_expiry = int(params["hedge_rollover_days_before_expiry"])
 
         # TP/SL parameters
         if "call_sl_pct" in params:
@@ -1362,70 +1356,4 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             return self._attempt_immediate_reentry(candle, ctx, option_type, structure_id)
         return None
 
-    # ---------- Weekly hedge rollover ----------
-
-    def is_rollover_window(self, ts):
-        current = pd.to_datetime(ts).date()
-        return current.weekday() < 5
-
-    def should_roll_hedge(self, hedge, ts):
-        expiry = pd.to_datetime(hedge.instrument.expiry).date()
-        current = pd.to_datetime(ts).date()
-        if expiry <= current:
-            return False
-        days_before = int(getattr(self, "hedge_rollover_days_before_expiry", 1) or 1)
-        roll_day = expiry
-        for _ in range(max(1, days_before)):
-            roll_day = self._prior_trading_day(roll_day)
-        return current >= roll_day
-
-    def on_candle_rollover(self, open_positions, candle, ctx):
-        ts = pd.to_datetime(candle["timestamp"])
-        if not self.is_rollover_window(ts):
-            return []
-
-        intents = []
-        for hedge in [p for p in open_positions if p.tag == "HEDGE" and p.net_qty != 0]:
-            if not self.should_roll_hedge(hedge, ts):
-                continue
-            parent = next(
-                (
-                    p
-                    for p in open_positions
-                    if p.structure_id == hedge.structure_id and p.tag == "MAIN"
-                ),
-                None,
-            )
-            if not parent:
-                continue
-
-            roll_key = (hedge.structure_id, ts.date())
-            if roll_key in self.rolled_hedges:
-                continue
-
-            wd = int(getattr(self, "weekly_expiry_weekday", 1) or 1) % 7
-            next_exp = ExpiryResolver.next_weekly_expiry(ts.date(), weekday=wd)
-            self._force_hedge_expiry = next_exp
-            try:
-                new_hedge = self.create_hedge_intent(parent, candle, ctx)
-                if not new_hedge:
-                    logger.warning(
-                        "NiftyDOS hedge rollover skipped (no new hedge) structure=%s",
-                        hedge.structure_id,
-                    )
-                    continue
-                intents.append(new_hedge)
-                hedge_exit = self.create_hedge_exit_intent(parent, candle, ctx)
-                if hedge_exit:
-                    intents.append(hedge_exit)
-            finally:
-                self._force_hedge_expiry = None
-
-            self.rolled_hedges.add(roll_key)
-            logger.info(
-                "NiftyDOS hedge rollover structure=%s next_expiry=%s",
-                hedge.structure_id,
-                next_exp,
-            )
-
-        return intents
+    
