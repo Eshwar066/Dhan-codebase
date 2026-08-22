@@ -520,6 +520,10 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         t = self._candle_time_ist(candle)
         return t.hour == 9 and t.minute == 15
 
+    def _is_945am(self, candle: dict) -> bool:
+        t = self._candle_time_ist(candle)
+        return t.hour == 9 and t.minute == 45
+
     def _is_expiry_day_new_trade(self, candle: dict) -> bool:
         """Check if it's expiry day and we need to shift to next expiry."""
         trade_date = self._trade_date(candle)
@@ -842,8 +846,10 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         trade_date = self._trade_date(candle)
         if self._is_event_no_trade_day(trade_date):
             return False
-        if self._is_weekly_expiry_day(trade_date):
-            return False
+
+        # On expiry day, allow evaluation - _build_entry_intents will handle NEXT_WEEKLY expiry
+        # The original logic blocked all expiry day entries, but _build_entry_intents forces
+        # NEXT_WEEKLY expiry on expiry day, so we should allow evaluation.
 
         # Check Supertrend signal - ONLY supertrend for initial entry
         st_signal = self._get_supertrend_signal(candle)
@@ -875,8 +881,11 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
 
     def on_candle(self, candle, ctx):
         trade_date = self._trade_date(candle)
-        if self._is_event_no_trade_day(trade_date) or self._is_weekly_expiry_day(trade_date):
+        if self._is_event_no_trade_day(trade_date):
             return None
+
+        # On expiry day, allow entry - _build_entry_intents will force NEXT_WEEKLY expiry
+        # (No longer blocking expiry day entries here)
 
         st_signal = self._get_supertrend_signal(candle)
         if st_signal is None:
@@ -911,6 +920,40 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
                     pass
                 elif st_signal == "BEARISH" and close > ma_val:
                     pass
+
+        # Check 9:45 AM rule - if no open position, create position on Supertrend direction
+        if self._is_945am(candle):
+            # Check if there's already an open position for this strategy
+            has_open_position = False
+            if ctx and ctx.position_store:
+                try:
+                    open_positions = ctx.position_store.get_open_positions(
+                        underlying=str(candle.get("symbol") or ""),
+                        strategy=self.name,
+                    ) or []
+                    # Check for any MAIN position with non-zero qty
+                    for pos in open_positions:
+                        if getattr(pos, "tag", "") == "MAIN" and int(getattr(pos, "net_qty", 0) or 0) != 0:
+                            has_open_position = True
+                            break
+                except Exception as e:
+                    logger.warning(f"NiftyDOS: Error checking open positions at 9:45: {e}")
+
+            if not has_open_position:
+                logger.info(f"NiftyDOS: 9:45 AM - No open position, creating position on Supertrend direction: {st_signal}")
+                # Determine option type based on Supertrend signal
+                if st_signal == "BULLISH":
+                    option_type = "PUT"
+                    regime = "SUPER_BULLISH_945"
+                elif st_signal == "BEARISH":
+                    option_type = "CALL"
+                    regime = "SUPER_BEARISH_945"
+                else:
+                    option_type = None
+
+                if option_type:
+                    structure_id = self.build_structure_id(candle, regime)
+                    return self._build_entry_intents(candle, ctx, option_type, structure_id=structure_id)
 
         # New entry on Supertrend signal (no MA/ADX filter)
         if st_signal == "BULLISH":
