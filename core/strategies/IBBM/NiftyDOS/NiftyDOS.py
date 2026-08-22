@@ -658,10 +658,11 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         max_prem = float(getattr(self, "premium_max", 105) or 105)
         spot = float(candle.get("close") or 0)
 
-        # Prefer current weekly; if no OTM in premium band, roll MAIN to next weekly.
-        result = None
-        expiry_pref = "WEEKLY"
-        for pref in ("WEEKLY", "NEXT_WEEKLY"):
+        # On expiry day, ALWAYS use next weekly expiry (per strategy rules)
+        is_expiry_day = self._is_expiry_day_new_trade(candle)
+        if is_expiry_day:
+            # Force next weekly expiry on expiry day
+            pref = "NEXT_WEEKLY"
             self._snapshot_expiry_pref = pref
             try:
                 candidate = self.find_strike_in_premium_range(
@@ -678,22 +679,57 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             if accepted is not None:
                 result = accepted
                 expiry_pref = pref
-                if pref == "NEXT_WEEKLY":
-                    logger.info(
-                        "NiftyDOS: no OTM prem=%s-%s on current weekly; using next weekly opt=%s ts=%s",
-                        min_prem,
-                        max_prem,
+                logger.info(
+                    "NiftyDOS: Expiry day - using next weekly expiry opt=%s ts=%s",
+                    option_type,
+                    candle.get("timestamp"),
+                )
+            else:
+                logger.warning(
+                    "NiftyDOS entry skipped: no OTM strike in prem=%s-%s on NEXT_WEEKLY (expiry day) opt=%s ts=%s",
+                    min_prem,
+                    max_prem,
+                    option_type,
+                    candle.get("timestamp"),
+                )
+                return None
+        else:
+            # Normal logic: prefer current weekly; if no OTM in premium band, roll to next weekly
+            result = None
+            expiry_pref = "WEEKLY"
+            for pref in ("WEEKLY", "NEXT_WEEKLY"):
+                self._snapshot_expiry_pref = pref
+                try:
+                    candidate = self.find_strike_in_premium_range(
+                        candle,
+                        ctx,
                         option_type,
-                        candle.get("timestamp"),
+                        min_prem=min_prem,
+                        max_prem=max_prem,
+                        expiry_pref=pref,
                     )
-                break
-            logger.info(
-                "NiftyDOS: no OTM strike in prem=%s-%s expiry_pref=%s opt=%s",
-                min_prem,
-                max_prem,
-                pref,
-                option_type,
-            )
+                finally:
+                    self._snapshot_expiry_pref = None
+                accepted = self._accept_otm_premium_strike(candidate, option_type, spot, min_prem, max_prem)
+                if accepted is not None:
+                    result = accepted
+                    expiry_pref = pref
+                    if pref == "NEXT_WEEKLY":
+                        logger.info(
+                            "NiftyDOS: no OTM prem=%s-%s on current weekly; using next weekly opt=%s ts=%s",
+                            min_prem,
+                            max_prem,
+                            option_type,
+                            candle.get("timestamp"),
+                        )
+                    break
+                logger.info(
+                    "NiftyDOS: no OTM strike in prem=%s-%s expiry_pref=%s opt=%s",
+                    min_prem,
+                    max_prem,
+                    pref,
+                    option_type,
+                )
 
         if result is None:
             logger.warning(
