@@ -586,7 +586,7 @@ def main():
         selected_expiry, selected_expiry,
         main_leg['strike'], hedge_leg['strike'],
         option_type,
-        main_qty=lot_size, hedge_qty=hedge_lot_size,
+        main_qty=lot_size*20, hedge_qty=hedge_lot_size*20,
         main_price=main_leg['premium'], hedge_price=hedge_leg['premium']
     )
 

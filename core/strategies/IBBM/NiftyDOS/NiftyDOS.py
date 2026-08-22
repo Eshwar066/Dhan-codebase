@@ -116,7 +116,9 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         # Track SL/TP hit for reentry timing
         self._sl_hit_structure: dict[str, str] = {}  # structure_id -> option_type (for next candle reentry)
         self._tp_hit_pending: dict[str, str] = {}  # structure_id -> option_type (for immediate reentry)
+        # Track Supertrend flip for immediate reentry
         self._prev_st_signal: Optional[str] = None  # track previous supertrend for flip detection
+        self._st_flip_reentry_pending: dict[str, str] = {}  # structure_id -> new_option_type (for immediate reentry on ST flip)
         self._load_config_from_yaml()
 
     def _load_config_from_yaml(self) -> None:
@@ -1117,9 +1119,20 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
 
         opt = str(getattr(position.instrument, "option_type", "") or "").upper()
         # Short PUT (bullish) exits on bearish ST; Short CALL (bearish) exits on bullish ST
+        st_flip = False
+        new_option_type = None
         if opt in ("PE", "PUT") and st_signal == "BEARISH":
-            return True
-        if opt in ("CE", "CALL") and st_signal == "BULLISH":
+            st_flip = True
+            new_option_type = "CALL"
+        elif opt in ("CE", "CALL") and st_signal == "BULLISH":
+            st_flip = True
+            new_option_type = "PUT"
+
+        if st_flip and new_option_type:
+            # Supertrend flipped - schedule immediate reentry on same candle in new direction
+            self._st_flip_reentry_pending[position.structure_id] = new_option_type
+            logger.info(f"NiftyDOS: Supertrend flip detected for structure {position.structure_id}, "
+                        f"old={opt} new={new_option_type}, immediate reentry on same candle")
             return True
 
         return False
@@ -1172,6 +1185,15 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             if reentry_type:
                 logger.info(f"NiftyDOS: Immediate TP reentry for {reentry_type} on same candle")
                 reentry_intents = self._attempt_immediate_reentry(candle, ctx, reentry_type, position.structure_id)
+                if reentry_intents:
+                    intents.extend(reentry_intents)
+
+        # Check for immediate ST flip reentry (same candle)
+        if position.structure_id in self._st_flip_reentry_pending:
+            reentry_type = self._st_flip_reentry_pending.pop(position.structure_id)
+            if reentry_type:
+                logger.info(f"NiftyDOS: Immediate ST flip reentry for {reentry_type} on same candle")
+                reentry_intents = self._attempt_st_flip_reentry(candle, ctx, reentry_type, position.structure_id)
                 if reentry_intents:
                     intents.extend(reentry_intents)
 
@@ -1275,6 +1297,25 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
 
         logger.info(f"NiftyDOS: Immediate TP reentry for {option_type} - finding strike 80-105")
         new_structure_id = self.build_structure_id(candle, "REENTRY_TP")
+        return self._build_entry_intents(candle, ctx, option_type, structure_id=new_structure_id)
+
+    def _attempt_st_flip_reentry(self, candle, ctx, option_type: str, structure_id: str) -> Optional[List[Any]]:
+        """Attempt IMMEDIATE reentry on Supertrend flip - same candle, NEW direction (opposite of old).
+
+        For ST flip reentry: NO MA/ADX/candle check - just find strike in 80-105 range and enter in new direction.
+        The Supertrend itself IS the signal, so we trust the flip and enter immediately.
+        """
+        trade_date = self._trade_date(candle)
+        if self._is_event_no_trade_day(trade_date) or self._is_weekly_expiry_day(trade_date):
+            return None
+
+        # Check 3:15 PM no-entry rule (but ST flip reentry is allowed if ADX >= 25 per rules)
+        adx = self._get_adx_value(candle)
+        if self._is_after_315pm(candle) and (adx is None or adx < self.reentry_adx_threshold):
+            return None
+
+        logger.info(f"NiftyDOS: Immediate ST flip reentry for {option_type} - finding strike 80-105")
+        new_structure_id = self.build_structure_id(candle, "REENTRY_ST_FLIP")
         return self._build_entry_intents(candle, ctx, option_type, structure_id=new_structure_id)
 
     def _attempt_reentry(self, candle, ctx, option_type: str, structure_id: str, reason: str) -> Optional[List[Any]]:
