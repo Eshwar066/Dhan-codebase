@@ -70,10 +70,15 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
     otm_strike_count = 8
     option_chain_ideal_premium = 92
     option_chain_interval = "5"  # TP/SL check on 5min
+    # Indicator parameters (for indicator_manager to compute and persist)
+    supertrend_length = 16
+    supertrend_factor = 2.0
+    sma_period = 9
+    adx_period = 14
+    # Legacy aliases (used by strategy logic)
     supertrend_atr_period = 16
     supertrend_multiplier = 2.0
     ma_period = 9
-    adx_period = 14
     premium_min = 80
     premium_max = 105
     hedge_distance_points = 500
@@ -132,12 +137,24 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             return
 
         params = raw.get("params") or {}
+        if "supertrend_length" in params:
+            self.supertrend_length = int(params["supertrend_length"])
+            self.supertrend_atr_period = self.supertrend_length
+        if "supertrend_factor" in params:
+            self.supertrend_factor = float(params["supertrend_factor"])
+            self.supertrend_multiplier = self.supertrend_factor
         if "supertrend_atr_period" in params:
             self.supertrend_atr_period = int(params["supertrend_atr_period"])
+            self.supertrend_length = self.supertrend_atr_period
         if "supertrend_multiplier" in params:
             self.supertrend_multiplier = float(params["supertrend_multiplier"])
+            self.supertrend_factor = self.supertrend_multiplier
+        if "sma_period" in params:
+            self.sma_period = int(params["sma_period"])
+            self.ma_period = self.sma_period
         if "ma_period" in params:
             self.ma_period = int(params["ma_period"])
+            self.sma_period = self.ma_period
         if "adx_period" in params:
             self.adx_period = int(params["adx_period"])
         if "premium_min" in params:
@@ -262,14 +279,26 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         return max(50, int(self.supertrend_atr_period) * 5, int(self.adx_period) * 3)
 
     def prepare_indicators(self, df):
-        # Supertrend
+        # Supertrend - indicator_manager computes this with keys: supertrend, supertrend_direction,
+        # supertrend_is_bullish, supertrend_upper, supertrend_lower, supertrend_atr
+        # We still compute here for backtest, but live mode uses indicator_manager's computed values
         df = add_supertrend(
             df,
-            atr_period=int(self.supertrend_atr_period),
-            multiplier=float(self.supertrend_multiplier),
+            atr_period=int(self.supertrend_length),
+            multiplier=float(self.supertrend_factor),
         )
-        # SMA
-        period = int(getattr(self, "ma_period", 9) or 9)
+        # Rename columns to match indicator_manager's persisted keys
+        if "supertrend" in df.columns:
+            df.rename(columns={
+                "supertrend": "supertrend",
+                "supertrend_direction": "supertrend_direction",
+                "supertrend_is_bullish": "supertrend_is_bullish",
+                "supertrend_upper": "supertrend_upper",
+                "supertrend_lower": "supertrend_lower",
+                "supertrend_atr": "supertrend_atr",
+            }, inplace=True)
+        # SMA - indicator_manager uses sma{period} key
+        period = int(getattr(self, "sma_period", 9) or 9)
         ma_col = f"sma{period}"
         prev_ma_col = f"prev_sma{period}"
         df = add_sma(df, period=period, column=ma_col)
@@ -282,22 +311,33 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         return df
 
     def persisted_indicator_keys(self):
-        period = int(getattr(self, "ma_period", 9) or 9)
+        """Return indicator keys that match what indicator_manager writes to the shared JSONL.
+
+        indicator_manager computes Supertrend with keys: supertrend, supertrend_direction,
+        supertrend_is_bullish, supertrend_upper, supertrend_lower, supertrend_atr
+        SMA with key: sma{period}
+        ADX with keys: adx_{period}, adx_di_plus_{period}, adx_di_minus_{period}
+        """
+        period = int(getattr(self, "sma_period", 9) or 9)
         st_keys = [
-            f"supertrend_{int(self.supertrend_atr_period)}_{float(self.supertrend_multiplier)}",
-            f"supertrend_dir_{int(self.supertrend_atr_period)}_{float(self.supertrend_multiplier)}",
+            "supertrend",
+            "supertrend_direction",
+            "supertrend_is_bullish",
+            "supertrend_upper",
+            "supertrend_lower",
+            "supertrend_atr",
         ]
         return (
             default_persisted_keys_for_sma(period, column=f"sma{period}")
             + [f"prev_sma{period}", "prev_close"]
             + st_keys
-            + [f"adx_{int(self.adx_period)}", f"di_plus_{int(self.adx_period)}", f"di_minus_{int(self.adx_period)}"]
+            + [f"adx_{int(self.adx_period)}", f"adx_di_plus_{int(self.adx_period)}", f"adx_di_minus_{int(self.adx_period)}"]
         )
 
     def shared_indicator_signature(self) -> str:
         return (
-            f"dos_st{int(self.supertrend_atr_period)}_{float(self.supertrend_multiplier)}_"
-            f"ma{int(self.ma_period)}_adx{int(self.adx_period)}"
+            f"dos_st{int(self.supertrend_length)}_{float(self.supertrend_factor)}_"
+            f"ma{int(self.sma_period)}_adx{int(self.adx_period)}"
         )
 
     # ---------- Expiry / hedge ----------
@@ -579,19 +619,22 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         return result
 
     def _get_supertrend_signal(self, candle: dict) -> Optional[str]:
-        """Get Supertrend direction: 'BULLISH' (green) or 'BEARISH' (red)."""
-        st_key = f"supertrend_{int(self.supertrend_atr_period)}_{float(self.supertrend_multiplier)}"
-        dir_key = f"supertrend_dir_{int(self.supertrend_atr_period)}_{float(self.supertrend_multiplier)}"
-        st_val = candle.get(st_key)
-        dir_val = candle.get(dir_key)
-        if pd.isna(st_val) or pd.isna(dir_val):
-            return None
-        # dir_val: 1 = bullish (green), -1 = bearish (red)
-        return "BULLISH" if dir_val == 1 else "BEARISH"
+        """Get Supertrend direction: 'BULLISH' (green) or 'BEARISH' (red).
+
+        indicator_manager writes: supertrend_direction (1.0/-1.0) and supertrend_is_bullish (bool)
+        """
+        # Prefer supertrend_is_bullish (bool), fallback to supertrend_direction (1.0/-1.0)
+        is_bullish = candle.get("supertrend_is_bullish")
+        if is_bullish is not None:
+            return "BULLISH" if is_bullish else "BEARISH"
+        dir_val = candle.get("supertrend_direction")
+        if dir_val is not None and not pd.isna(dir_val):
+            return "BULLISH" if dir_val == 1.0 or dir_val == 1 else "BEARISH"
+        return None
 
     def _get_ma_signal(self, candle: dict) -> Optional[str]:
         """Get MA9 direction relative to price."""
-        period = int(getattr(self, "ma_period", 9) or 9)
+        period = int(getattr(self, "sma_period", 9) or 9)
         ma_key = f"sma{period}"
         close = candle.get("close")
         ma = candle.get(ma_key)
@@ -823,7 +866,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         st_signal = self._get_supertrend_signal(candle)
         ma_signal = self._get_ma_signal(candle)
         adx = self._get_adx_value(candle)
-        period = int(getattr(self, "ma_period", 9) or 9)
+        period = int(getattr(self, "sma_period", 9) or 9)
         return (
             f"DOS Signal: ST={st_signal} MA={ma_signal} ADX={adx} "
             f"close={candle.get('close')} sma{period}={candle.get(f'sma{period}')}"
