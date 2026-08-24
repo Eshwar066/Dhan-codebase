@@ -914,16 +914,20 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             # Process all pending SL reentries
             for struct_id, opt_type in list(self._sl_hit_structure.items()):
                 logger.info(f"NiftyDOS: Checking SL reentry for {opt_type} on next 30-min candle")
+                # Block SL reentry after 15:15 PM
+                if self._is_after_315pm(candle):
+                    logger.info(f"NiftyDOS: SL reentry blocked after 15:15 PM")
+                    continue
                 reentry_intents = self._attempt_sl_reentry(candle, ctx, opt_type, struct_id)
                 if reentry_intents:
                     return reentry_intents
             # Clear processed SL reentries (only one per candle to avoid multiple)
             self._sl_hit_structure.clear()
 
-        # Check 3:15 PM no-entry rule (only for initial entry, not reentry)
+        # Check 3:15 PM no-entry rule for initial entry (allows TP reentry via on_position_exit)
         adx = self._get_adx_value(candle)
         if self._is_after_315pm(candle) and (adx is None or adx < self.reentry_adx_threshold):
-            # But allow reentry if we have pending TP reentry
+            # But allow reentry if we have pending TP reentry (handled in on_position_exit)
             if not self._tp_hit_pending:
                 return None
 
@@ -938,6 +942,12 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
                     pass
                 elif st_signal == "BEARISH" and close > ma_val:
                     pass
+
+        # Check 15:15 PM no-entry rule - block initial entry and 9:45 AM entry
+        # TP reentry is handled in on_position_exit (immediate, same candle)
+        # SL reentry is blocked above; ST flip reentry blocked in _attempt_st_flip_reentry
+        if self._is_after_315pm(candle):
+            return None
 
         # Check 9:45 AM rule - if no open position, create position on Supertrend direction
         if self._is_945am(candle):
@@ -1490,9 +1500,9 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         if self._is_event_no_trade_day(trade_date) or self._is_weekly_expiry_day(trade_date):
             return None
 
-        # Check 3:15 PM no-entry rule (but ST flip reentry is allowed if ADX >= 25 per rules)
-        adx = self._get_adx_value(candle)
-        if self._is_after_315pm(candle) and (adx is None or adx < self.reentry_adx_threshold):
+        # Block ST flip reentry after 15:15 PM (only TP reentry allowed)
+        if self._is_after_315pm(candle):
+            logger.info(f"NiftyDOS: ST flip reentry blocked after 15:15 PM")
             return None
 
         logger.info(f"NiftyDOS: Immediate ST flip reentry for {option_type} - finding strike 80-105")

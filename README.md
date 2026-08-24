@@ -317,6 +317,7 @@ sudo systemctl list-units 'dhan*' 'option-buildup*' 'delta*'
 
 ## most repeated
 sudo systemctl daemon-reload
+source .venv/bin/activate
 sudo systemctl start dhan-oi-positional-buy.service
 sudo systemctl start dhan-leaps-rsi.service
 sudo systemctl enable option-buildup-scheduler.service
@@ -336,3 +337,11 @@ python utils/delta/sync_crypto_indicator_gaps.py --dry-run
 python utils/delta/sync_crypto_indicator_gaps.py --loop --interval 3600
 
 python -m core.strategies.crypto.LiquiditySweepStrategy.rebuild_liquidity_zones --symbols BTCUSD, PAXGUSD
+
+Dhan:
+   python3 utils/yfinance/refresh_nifty_indicator_history.py
+    python3 utils/yfinance/refresh_nifty_indicator_history.py --period 60d --dry-run
+    python3 utils/yfinance/refresh_nifty_indicator_history.py --only 60
+    python3 utils/yfinance/refresh_nifty_indicator_history.py --only 15
+    python3 utils/yfinance/refresh_nifty_indicator_history.py --only 30
+    python3 utils/yfinance/refresh_nifty_indicator_history.py --only 120
