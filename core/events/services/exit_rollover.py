@@ -89,7 +89,9 @@ class ExitRolloverService:
         for strategy in engine.strategies:
             if engine._is_scheduled_strategy(strategy, engine.strategy_eval_modes):
                 continue
-            if str(getattr(strategy, "timeframe", "") or "").strip() != tf:
+            primary_tf = str(getattr(strategy, "timeframe", "") or "").strip()
+            extra_tfs = [str(t).strip() for t in getattr(strategy, "extra_timeframes", []) or []]
+            if tf != primary_tf and tf not in extra_tfs:
                 continue
             if sym_u and not strategy.applies_to_symbol(sym_u):
                 continue

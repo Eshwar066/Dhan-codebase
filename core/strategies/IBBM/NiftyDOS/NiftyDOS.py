@@ -48,7 +48,7 @@ from core.utils.expiry_resolver import ExpiryResolver
 from core.utils.option_chain_snapshot_log import log_option_chain_snapshot
 from core.utils.session.session_manager import SessionManager
 # Dhan API imports for live trading
-from dhanhq import dhanhq, DhanContext
+from dhanhq import dhanhq
 from core.library.dhan_tradehull import Tradehull
 
 logger = logging.getLogger(__name__)
@@ -60,6 +60,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
     name = "NiftyDOS"
     underlying_symbols = ["NIFTY"]
     timeframe = "30"
+    extra_timeframes = ["5"]
     required_context = ["option_chain"]
     api = "DHAN"
     expiryType = "WEEKLY"
@@ -98,7 +99,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
     # Reentry parameters
     reentry_adx_threshold = 25
     eod_exit_pct = 3.0  # 3% after 3pm
-    eod_exit_time = time(15, 15)  # 3:15 PM
+    eod_exit_time = time(15, 00)  # 3:00 PM
     no_entry_time = time(15, 15)  # 3:15 PM
     morning_check_time = time(9, 15)  # 9:15 AM
 
@@ -884,6 +885,11 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         if self._is_event_no_trade_day(trade_date):
             return None
 
+        # Determine candle timeframe
+        candle_tf = str(candle.get("timeframe", self.timeframe) or "").strip()
+        is_primary_tf = (candle_tf == str(self.timeframe).strip())
+        is_5min_tf = (candle_tf == "5")
+
         # On expiry day, allow entry - _build_entry_intents will force NEXT_WEEKLY expiry
         # (No longer blocking expiry day entries here)
 
@@ -891,11 +897,23 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         if st_signal is None:
             return None
 
-        # Handle SL reentry from PREVIOUS candle (check on this candle - the "next" candle)
-        if self._sl_hit_structure:
+        # ===== TP/SL CHECK ON 5-MIN CANDLES =====
+        # Check TP/SL on EVERY 5-min candle (for intrabar exit)
+        if is_5min_tf:
+            exit_intents = self._check_tp_sl_on_5min(candle, ctx)
+            if exit_intents:
+                return exit_intents
+
+        # ===== REENTRY LOGIC =====
+        # TP reentry: immediate on SAME 5-min candle (handled in _check_tp_sl_on_5min via on_position_exit)
+        # ST flip reentry: immediate on SAME 5-min candle (handled in should_exit -> on_position_exit)
+        # SL reentry: ONLY on 30-min (primary) timeframe, on NEXT candle after SL hit
+
+        # Handle SL reentry from PREVIOUS candle - ONLY on primary timeframe (30-min)
+        if is_primary_tf and self._sl_hit_structure:
             # Process all pending SL reentries
             for struct_id, opt_type in list(self._sl_hit_structure.items()):
-                logger.info(f"NiftyDOS: Checking SL reentry for {opt_type} on next candle")
+                logger.info(f"NiftyDOS: Checking SL reentry for {opt_type} on next 30-min candle")
                 reentry_intents = self._attempt_sl_reentry(candle, ctx, opt_type, struct_id)
                 if reentry_intents:
                     return reentry_intents
@@ -955,7 +973,10 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
                     structure_id = self.build_structure_id(candle, regime)
                     return self._build_entry_intents(candle, ctx, option_type, structure_id=structure_id)
 
-        # New entry on Supertrend signal (no MA/ADX filter)
+        # New entry on Supertrend signal (no MA/ADX filter) - ONLY on primary timeframe (30-min)
+        if not is_primary_tf:
+            return None
+
         if st_signal == "BULLISH":
             option_type = "PUT"
             regime = "SUPER_BULLISH"
@@ -1012,8 +1033,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             access_token = os.getenv("DHAN_ACCESS_TOKEN")
 
             if client_id and access_token:
-                dhan_context = DhanContext(client_id, access_token)
-                dhan = dhanhq(dhan_context)
+                dhan = dhanhq(client_id, access_token)
                 tradehull = Tradehull(client_id, access_token)
 
                 # Get position details for margin calculation
@@ -1204,52 +1224,97 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             return True
         return False
 
+    def _check_tp_sl_on_5min(self, candle, ctx):
+        """Check TP/SL and EOD exit on 5-min candle and return exit intents if hit."""
+        if not ctx or not ctx.position_store:
+            return None
+
+        symbol = str(candle.get("symbol", "") or "")
+        open_positions = ctx.position_store.get_open_positions(
+            underlying=symbol, strategy=self.name
+        ) or []
+
+        exit_intents = []
+        for position in open_positions:
+            if position.tag != "MAIN":
+                continue
+
+            # Check TP/SL
+            tp_sl = self._check_tp_sl(position, candle, ctx)
+            if tp_sl:
+                opt_type = self._structure_type.get(position.structure_id, "")
+                if tp_sl == "SL":
+                    self._sl_hit_structure[position.structure_id] = opt_type
+                    logger.info(f"NiftyDOS: 5min SL hit for structure {position.structure_id}, reentry on next candle")
+                elif tp_sl == "TP":
+                    self._tp_hit_pending[position.structure_id] = opt_type
+                    logger.info(f"NiftyDOS: 5min TP hit for structure {position.structure_id}, immediate reentry")
+
+                # Generate exit intents
+                intents = self.on_position_exit(position, candle, ctx) or []
+                exit_intents.extend(intents)
+                continue  # Skip EOD check if TP/SL already hit
+
+            # Check EOD exit after 3pm (also on 5-min candles)
+            if self._check_eod_exit(position, candle, ctx):
+                logger.info(f"NiftyDOS: 5min EOD exit for structure {position.structure_id}")
+                intents = self.on_position_exit(position, candle, ctx) or []
+                exit_intents.extend(intents)
+
+        return exit_intents if exit_intents else None
+
     def should_exit(self, position, candle, ctx=None):
         if position.tag != "MAIN":
             return False
 
-        # Check TP/SL on 5min timeframe
-        tp_sl = self._check_tp_sl(position, candle, ctx)
-        if tp_sl:
-            # Track for reentry logic
-            opt_type = self._structure_type.get(position.structure_id, "")
-            if tp_sl == "SL":
-                # SL hit - schedule reentry on NEXT candle with MA/ADX/candle check
-                self._sl_hit_structure[position.structure_id] = opt_type
-                logger.info(f"NiftyDOS: SL hit for structure {position.structure_id}, reentry on next candle")
-            elif tp_sl == "TP":
-                # TP hit - immediate reentry on SAME candle, same direction
-                self._tp_hit_pending[position.structure_id] = opt_type
-                logger.info(f"NiftyDOS: TP hit for structure {position.structure_id}, immediate reentry")
-            return True
+        # Detect if this is a 5-min candle (extra timeframe)
+        candle_tf = str(candle.get("timeframe", self.timeframe) or "").strip()
+        is_5min_tf = (candle_tf == "5")
 
-        # Check EOD exit after 3pm
-        if self._check_eod_exit(position, candle, ctx):
-            logger.info(f"NiftyDOS: EOD exit for structure {position.structure_id}")
-            return True
+        # On 5-min candles: SKIP TP/SL/EOD/ST-FLIP checks (all handled on 30-min only)
+        if not is_5min_tf:
+            # Check TP/SL (only on primary timeframe - 30-min)
+            tp_sl = self._check_tp_sl(position, candle, ctx)
+            if tp_sl:
+                # Track for reentry logic
+                opt_type = self._structure_type.get(position.structure_id, "")
+                if tp_sl == "SL":
+                    # SL hit - schedule reentry on NEXT candle with MA/ADX/candle check
+                    self._sl_hit_structure[position.structure_id] = opt_type
+                    logger.info(f"NiftyDOS: SL hit for structure {position.structure_id}, reentry on next 30-min candle")
+                elif tp_sl == "TP":
+                    # TP hit - immediate reentry on SAME candle, same direction
+                    self._tp_hit_pending[position.structure_id] = opt_type
+                    logger.info(f"NiftyDOS: TP hit for structure {position.structure_id}, immediate reentry")
+                return True
 
-        # Check Supertrend reversal
-        st_signal = self._get_supertrend_signal(candle)
-        if st_signal is None:
-            return False
+            # Check EOD exit after 3pm (only on primary timeframe)
+            if self._check_eod_exit(position, candle, ctx):
+                logger.info(f"NiftyDOS: EOD exit for structure {position.structure_id}")
+                return True
 
-        opt = str(getattr(position.instrument, "option_type", "") or "").upper()
-        # Short PUT (bullish) exits on bearish ST; Short CALL (bearish) exits on bullish ST
-        st_flip = False
-        new_option_type = None
-        if opt in ("PE", "PUT") and st_signal == "BEARISH":
-            st_flip = True
-            new_option_type = "CALL"
-        elif opt in ("CE", "CALL") and st_signal == "BULLISH":
-            st_flip = True
-            new_option_type = "PUT"
+            # Check Supertrend reversal (only on 30-min timeframe)
+            st_signal = self._get_supertrend_signal(candle)
+            if st_signal is None:
+                return False
 
-        if st_flip and new_option_type:
-            # Supertrend flipped - schedule immediate reentry on same candle in new direction
-            self._st_flip_reentry_pending[position.structure_id] = new_option_type
-            logger.info(f"NiftyDOS: Supertrend flip detected for structure {position.structure_id}, "
-                        f"old={opt} new={new_option_type}, immediate reentry on same candle")
-            return True
+            opt = str(getattr(position.instrument, "option_type", "") or "").upper()
+            # Short PUT (bullish) exits on bearish ST; Short CALL (bearish) exits on bullish ST
+            st_flip = False
+            new_option_type = None
+            if opt in ("PE", "PUT") and st_signal == "BEARISH":
+                st_flip = True
+                new_option_type = "CALL"
+            elif opt in ("CE", "CALL") and st_signal == "BULLISH":
+                st_flip = True
+                new_option_type = "PUT"
+
+            if st_flip and new_option_type:
+                # Supertrend flipped - schedule immediate reentry on same candle in new direction
+                self._st_flip_reentry_pending[position.structure_id] = new_option_type
+                logger.info(f"NiftyDOS: Supertrend flip detected for structure {position.structure_id}, "
+                            f"old={opt} new={new_option_type}, immediate reentry on same 30-min candle")
+                return True
 
         return False
 

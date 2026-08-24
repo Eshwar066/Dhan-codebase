@@ -54,9 +54,9 @@ _SYMBOL_CONFIG_BTC: Dict[str, Any] = {
     "weekly_min_dte": 3,
     "monthly_min_dte": 7,
     "enable_weekly_deeper_otm": True,
-    "enable_weekly": True,
-    "enable_monthly": True,
-    "enable_intraday": True,
+    "enable_weekly": False,
+    "enable_monthly": False,
+    "enable_intraday": False,
     "enable_morning": True,
 }
 
@@ -81,9 +81,9 @@ _SYMBOL_CONFIG_ETH: Dict[str, Any] = {
     "weekly_min_dte": 3,
     "monthly_min_dte": 7,
     "enable_weekly_deeper_otm": True,
-    "enable_weekly": True,
-    "enable_monthly": True,
-    "enable_intraday": True,
+    "enable_weekly": False,
+    "enable_monthly": False,
+    "enable_intraday": False,
     "enable_morning": True,
 }
 
