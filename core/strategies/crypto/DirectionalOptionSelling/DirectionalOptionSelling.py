@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -55,6 +55,9 @@ from .constants import (
     symbol_config,
     underlying_from_option_symbol,
 )
+
+# End-of-day reset time (IST) — clear all position state after 17:25 rollover.
+EOD_RESET_TIME = time(17, 30)
 from .htf import DosHtfMixin
 from .trail_sl import DosTrailSlMixin, PendingTrailRetry as _PendingTrailRetry
 
@@ -1907,6 +1910,37 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         self._sl_reentry_after = None
         self._sl_reentry_sleeve = None
 
+    def _daily_reset(self, now_ist: pd.Timestamp) -> None:
+        """
+        End-of-day reset at 17:30 IST for ENABLE_MORNING_0DTE_TRADES only.
+        Clears morning sleeve position state for the next trading day.
+        """
+        # Only run if morning 0DTE trades are enabled
+        if not ENABLE_MORNING_0DTE_TRADES:
+            return
+
+        # Only run once per day per symbol
+        reset_date = now_ist.date()
+        for sym, rt in self._runtime_by_symbol.items():
+            # Use a marker to track if we've reset for this date
+            if not hasattr(rt, '_last_eod_reset_date') or rt._last_eod_reset_date != reset_date:
+                # Clear SL reentry state only if it's for morning sleeve
+                if rt._sl_reentry_sleeve == SLEEVE_MORNING:
+                    rt._sl_reentry_direction = None
+                    rt._sl_reentry_after = None
+                    rt._sl_reentry_sleeve = None
+                # Clear morning entry dates (new day = new morning slot)
+                rt._morning_entry_dates.clear()
+                # Note: Do NOT clear _pending_transition, _pending_closed_entry, _rollover_dates
+                # as those are used by weekly/monthly/daily sleeves
+                rt._last_eod_reset_date = reset_date
+                logger.info(
+                    "%s EOD reset (morning sleeve) completed symbol=%s date=%s",
+                    self.name,
+                    sym,
+                    reset_date,
+                )
+
     def _sl_reentry_ready(self, candle: dict) -> bool:
         """True once this candle's close time is after the SL fill time."""
         if self._sl_reentry_direction is None or self._sl_reentry_after is None:
@@ -2561,6 +2595,8 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                     getattr(getattr(position, "instrument", None), "expiry", None),
                     direction,
                 )
+                # Clear SL reentry state so subsequent bars don't attempt re-entry.
+                self._clear_sl_reentry()
             return intent
 
         # Daily / weekly today-expiry: exit + re-enter next listed daily.
@@ -2861,6 +2897,12 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         if sym not in SUPPORTED_UNDERLYINGS:
             return None
         self._bind_symbol(sym)
+
+        # End-of-day reset at 17:30 IST — clear all position state for next day.
+        now_ist = self._closed_bar_time_ist(candle)
+        if now_ist.time() >= EOD_RESET_TIME:
+            self._daily_reset(now_ist)
+
         tf = self._candle_timeframe(candle)
         tf_l = tf.lower()
         # 1D closed bars: trail HTF sleeves only.
