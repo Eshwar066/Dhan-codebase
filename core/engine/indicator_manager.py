@@ -366,9 +366,19 @@ class IndicatorManager:
 
     @staticmethod
     def _strategy_sma_lengths(strategy: Any) -> tuple:
-        """Return ``(period, periods)`` from strategy attrs; either may be None."""
+        """Return ``(period, periods, column)`` from strategy attrs; either may be None."""
         periods = getattr(strategy, "sma_periods", None)
         period = getattr(strategy, "sma_period", None)
+        column = None
+        if period is not None:
+            # Strategy may define column name like f"sma{period}" (e.g., "sma9")
+            column = getattr(strategy, "sma_column", None)
+            if column is None:
+                # Default to sma{period} format (e.g., "sma9") to match persisted_indicator_keys
+                try:
+                    column = f"sma{int(period)}"
+                except Exception:
+                    column = None
         if periods is not None:
             try:
                 periods = [int(p) for p in list(periods) if p is not None]
@@ -381,7 +391,7 @@ class IndicatorManager:
                 period = int(period)
             except Exception:
                 period = None
-        return period, periods
+        return period, periods, column
 
     @staticmethod
     def _compute_supertrend_columns(
@@ -1562,13 +1572,14 @@ class IndicatorManager:
                     work_df = strategy.prepare_indicators(work_df)
                 except Exception:
                     pass
-                sma_period, sma_periods = self._strategy_sma_lengths(strategy)
+                sma_period, sma_periods, sma_column = self._strategy_sma_lengths(strategy)
                 if sma_period is not None or sma_periods is not None:
                     try:
                         work_df = self._compute_sma_columns(
                             work_df,
                             period=sma_period,
                             periods=sma_periods,
+                            column=sma_column,
                         )
                     except Exception:
                         pass

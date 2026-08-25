@@ -509,7 +509,9 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             ts = ts.tz_convert(IST)
         close_ts = ts + pd.Timedelta(minutes=30)
         now_ist = pd.Timestamp.now(tz=IST)
-        return (now_ist - close_ts).total_seconds() / 60 <= grace_minutes
+        diff_minutes = (now_ist - close_ts).total_seconds() / 60
+        logger.info(f"NiftyDOS: _in_30m_close_eval_window ts={ts} close_ts={close_ts} now_ist={now_ist} diff={diff_minutes:.2f}min grace={grace_minutes}")
+        return diff_minutes <= grace_minutes
 
     def _is_after_3pm(self, candle: dict) -> bool:
         return self._candle_time_ist(candle) >= self.eod_exit_time
@@ -841,12 +843,15 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         return [hedge_intent, sell_intent] if hedge_intent else [sell_intent]
 
     def should_evaluate(self, candle):
+        logger.info(f"NiftyDOS: should_evaluate tf={candle.get('timeframe')} ts={candle.get('timestamp')}")
         # Live: only eval shortly after 30m bar close. Backtest: every closed bar.
         if RUN_MODE != RunMode.BACKTEST and not self._in_30m_close_eval_window(candle):
+            logger.info(f"NiftyDOS: should_evaluate False - not in eval window")
             return False
 
         trade_date = self._trade_date(candle)
         if self._is_event_no_trade_day(trade_date):
+            logger.info(f"NiftyDOS: should_evaluate False - event no trade day")
             return False
 
         # On expiry day, allow evaluation - _build_entry_intents will handle NEXT_WEEKLY expiry
@@ -856,6 +861,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         # Check Supertrend signal - ONLY supertrend for initial entry
         st_signal = self._get_supertrend_signal(candle)
         if st_signal is None:
+            logger.info(f"NiftyDOS: should_evaluate False - no ST signal")
             return False
 
         # Track Supertrend flip for signal change detection
@@ -866,8 +872,10 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
 
         eval_key = self._bar_open_key(candle)
         if eval_key in self._evaluated_signal_keys:
+            logger.info(f"NiftyDOS: should_evaluate False - already evaluated key={eval_key}")
             return False
         self._evaluated_signal_keys.add(eval_key)
+        logger.info(f"NiftyDOS: should_evaluate True - key={eval_key} st_signal={st_signal}")
         return True
 
     def eval_signal_log_message(self, candle) -> Optional[str]:
@@ -882,6 +890,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         )
 
     def on_candle(self, candle, ctx):
+        logger.info(f"NiftyDOS: on_candle called tf={candle.get('timeframe')} ts={candle.get('timestamp')} close={candle.get('close')} candle={candle}")
         trade_date = self._trade_date(candle)
         if self._is_event_no_trade_day(trade_date):
             return None
