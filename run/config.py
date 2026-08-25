@@ -55,7 +55,7 @@ ENGINE_JOBS = [
         "engine_id": "dhan_leaps_rsi",
         "venue": "DHAN",
         "enabled": True,
-        "run_mode": "LIVE",
+        "run_mode": "PAPER",
         "capital": 200000,
         "ORDER_QTY_LOTS": 1,
         "market_ws_stall_timeout_seconds": 0,

@@ -522,8 +522,9 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         return t.hour == 9 and t.minute == 15
 
     def _is_945am(self, candle: dict) -> bool:
-        t = self._candle_time_ist(candle)
-        return t.hour == 9 and t.minute == 45
+        """Check if the candle CLOSE time is 9:45 AM (i.e., the 9:15-9:45 candle just closed)."""
+        close_ts = self._candle_close_ts_ist(candle)
+        return close_ts.hour == 9 and close_ts.minute == 45
 
     def _is_expiry_day_new_trade(self, candle: dict) -> bool:
         """Check if it's expiry day and we need to shift to next expiry."""
