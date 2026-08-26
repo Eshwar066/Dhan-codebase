@@ -52,7 +52,7 @@ DEBUG_MODE = False
 
 ENGINE_JOBS = [
     {
-        "engine_id": "dhan_leaps_rsi",
+        "engine_id": "dhan",
         "venue": "DHAN",
         "enabled": True,
         "run_mode": "PAPER",
