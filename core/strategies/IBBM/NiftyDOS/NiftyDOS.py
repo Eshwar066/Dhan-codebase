@@ -277,7 +277,8 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         return None
 
     def get_warmup_period(self):
-        return max(50, int(self.supertrend_atr_period) * 5, int(self.adx_period) * 3)
+        return 0
+        # return max(50, int(self.supertrend_atr_period) * 5, int(self.adx_period) * 3)
 
     def prepare_indicators(self, df):
         # Supertrend - indicator_manager computes this with keys: supertrend, supertrend_direction,
@@ -501,16 +502,19 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             d -= timedelta(days=1)
         return day - timedelta(days=1)
 
-    def _in_30m_close_eval_window(self, candle: dict, grace_minutes: int = 5) -> bool:
+    def _in_close_eval_window(self, candle: dict, grace_minutes: int = 5) -> bool:
+        """Check if we're within grace period after candle close. Uses strategy timeframe."""
         ts = pd.Timestamp(candle["timestamp"])
         if ts.tzinfo is None:
             ts = ts.tz_localize(IST)
         else:
             ts = ts.tz_convert(IST)
-        close_ts = ts + pd.Timedelta(minutes=30)
+        # Get timeframe in minutes (handles "1", "5", "30", "60", etc.)
+        tf_min = int(str(self.timeframe).strip())
+        close_ts = ts + pd.Timedelta(minutes=tf_min)
         now_ist = pd.Timestamp.now(tz=IST)
         diff_minutes = (now_ist - close_ts).total_seconds() / 60
-        logger.info(f"NiftyDOS: _in_30m_close_eval_window ts={ts} close_ts={close_ts} now_ist={now_ist} diff={diff_minutes:.2f}min grace={grace_minutes}")
+        logger.info(f"NiftyDOS: _in_close_eval_window tf={tf_min}min ts={ts} close_ts={close_ts} now_ist={now_ist} diff={diff_minutes:.2f}min grace={grace_minutes}")
         return diff_minutes <= grace_minutes
 
     def _is_after_3pm(self, candle: dict) -> bool:
@@ -844,10 +848,15 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
 
     def should_evaluate(self, candle):
         logger.info(f"NiftyDOS: should_evaluate tf={candle.get('timeframe')} ts={candle.get('timestamp')}")
-        # Live: only eval shortly after 30m bar close. Backtest: every closed bar.
-        if RUN_MODE != RunMode.BACKTEST and not self._in_30m_close_eval_window(candle):
-            logger.info(f"NiftyDOS: should_evaluate False - not in eval window")
-            return False
+        # Live: only eval shortly after bar close. Backtest: every closed bar.
+        # For dummy feed testing, allow eval if candle is closed (has bucket_ts)
+        if RUN_MODE != RunMode.BACKTEST and not self._in_close_eval_window(candle):
+            # Allow dummy feed candles (simulated timestamps) to pass eval window
+            if candle.get("bucket_ts") is not None and candle.get("session_close_partial") is not True:
+                logger.debug("NiftyDOS: allowing dummy feed candle past eval window")
+            else:
+                logger.info(f"NiftyDOS: should_evaluate False - not in eval window")
+                return False
 
         trade_date = self._trade_date(candle)
         if self._is_event_no_trade_day(trade_date):

@@ -24,7 +24,7 @@ from typing import Any, Dict
 from core.data.candle_aggregator import CandleAggregator
 from core.data.feeds import DummyRealtimeFeed
 from core.engine.factory import EngineFactory
-from run.config import RunMode, ENGINE_JOBS
+from run.config import RunMode, ENGINE_JOBS, RUN_MODE as GLOBAL_RUN_MODE
 from run.main import job_to_engine_config
 from run.strategy_profiles import resolve_engine_job
 
@@ -147,11 +147,25 @@ def main() -> None:
     if not symbols:
         raise ValueError("No symbols available. Set symbols in job config or pass --symbols.")
 
+    # Fix: job_to_engine_config uses job["name"] (engine_id) as strategy_name.
+    # We need to set job["name"] to the actual strategy name.
+    strategies = job.get("strategies") or []
+    if strategies:
+        job["name"] = strategies[0]  # Use first strategy as primary
+
     # Force safe integration mode.
     job["enabled"] = True
-    job["run_mode"] = RunMode.PAPER.value
+    job["run_mode"] = RunMode.PAPER.value  # Live mode with dummy feed
 
     config = job_to_engine_config(job)
+    # Clear Dhan credentials so factory skips real Dhan WS creation
+    config.dhan_access_token = None
+    config.dhan_client_id = None
+    # Also clear any live credentials dict
+    if config.live:
+        config.live["dhan_access_token"] = None
+        config.live["dhan_client_id"] = None
+
     engine = EngineFactory.create_live_engine(config)
 
     # Replace any venue websocket with dummy feed.
@@ -166,13 +180,12 @@ def main() -> None:
     market_exchange = str(
         getattr(config, "market_exchange", None) or live_cfg.get("exchange") or "INDEX"
     ).upper()
-    if market_exchange in {"NSE", "INDEX", "NSE_INDEX"}:
-        aggregator = CandleAggregator(
-            session_start_sec=(9 * 3600) + (15 * 60),
-            session_end_sec=(15 * 3600) + (30 * 60),
-        )
-    else:
-        aggregator = CandleAggregator()
+    # For dummy feed testing, disable session filtering to allow any timestamp
+    aggregator = CandleAggregator()
+    # For 1m candles at tick_interval_ms, need ~60000/tick_interval_ms ticks per minute
+    tick_interval = max(1, args.tick_ms)
+    # Generate 5 minutes worth of data for quick test
+    default_max_ticks = max(300, 5 * 60000 // tick_interval + 20)  # ~5 min worth + buffer
     dummy_feed = DummyRealtimeFeed(
         symbols=symbols,
         tick_interval_ms=args.tick_ms,
@@ -184,6 +197,7 @@ def main() -> None:
         spike_amount=args.spike_amount,
         out_of_order_at_tick=args.ooo_at,
         out_of_order_delay_seconds=args.ooo_delay_seconds,
+        max_ticks=default_max_ticks,  # Generate enough ticks to form 1m+ candles
     )
     dummy_feed.set_tick_queue(tick_queue)
     dummy_feed.start()

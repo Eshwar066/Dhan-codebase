@@ -3849,7 +3849,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         while not self._shutdown_requested:
             # pdb.set_trace()
             loop_count += 1
-            _now = dt.datetime.utcnow()
+            # For dummy feed, use simulated time; otherwise wall clock
+            _now = self._current_ist_now().astimezone(dt.timezone.utc).replace(tzinfo=None)
             if risk_manager and risk_manager.is_engine_blocked():
                 if self.engine_logger:
                     self.engine_logger.log(
@@ -3946,6 +3947,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                                     eval_bucket_key,
                                 )
                                 continue
+                            # Update dedup key immediately so the same closed candle is not
+                            # re-processed on the next loop iteration if the conditional
+                            # update after BAR_CLOSED handlers fails (pending owners but no intents).
+                            self._last_evaluated_candle_ts[eval_ts_key] = eval_bucket_key
                     # Quote/ticker pseudo-candle fallback should be used only when
                     # aggregator mode is NOT active. In aggregator mode, pseudo-candles
                     # can create flat/synthetic OHLC rows (open==high==low==close).

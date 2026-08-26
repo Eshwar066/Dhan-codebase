@@ -726,6 +726,8 @@ class DhanSource:
                 exchange=exchange,
                 expiry=expiry_date,
                 num_strikes=strikes_around_atm,
+                max_retries=3,
+                base_delay=2.0,
             )
         except Exception:
             return None
