@@ -3947,10 +3947,6 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                                     eval_bucket_key,
                                 )
                                 continue
-                            # Update dedup key immediately so the same closed candle is not
-                            # re-processed on the next loop iteration if the conditional
-                            # update after BAR_CLOSED handlers fails (pending owners but no intents).
-                            self._last_evaluated_candle_ts[eval_ts_key] = eval_bucket_key
                     # Quote/ticker pseudo-candle fallback should be used only when
                     # aggregator mode is NOT active. In aggregator mode, pseudo-candles
                     # can create flat/synthetic OHLC rows (open==high==low==close).

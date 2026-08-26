@@ -518,10 +518,14 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         return diff_minutes <= grace_minutes
 
     def _is_after_3pm(self, candle: dict) -> bool:
-        return self._candle_time_ist(candle) >= self.eod_exit_time
+        """Check if candle CLOSE time is after 3:00 PM (for EOD exit)."""
+        close_ts = self._candle_close_ts_ist(candle)
+        return close_ts.time() >= self.eod_exit_time
 
     def _is_after_315pm(self, candle: dict) -> bool:
-        return self._candle_time_ist(candle) >= self.no_entry_time
+        """Check if candle CLOSE time is after 3:15 PM (for no-entry rule)."""
+        close_ts = self._candle_close_ts_ist(candle)
+        return close_ts.time() >= self.no_entry_time
 
     def _is_915am(self, candle: dict) -> bool:
         t = self._candle_time_ist(candle)
