@@ -398,4 +398,27 @@ STRATEGY_RUNTIME_SPEC: dict = {
             'data': {},
         },
     },
+    'SuperTrendStockRider': {
+        RunMode.BACKTEST: {
+            'data': {
+                'exchange': 'NSE',
+                'interval': 'DAY',
+                'sector': 'EQ',
+            },
+        },
+        RunMode.PAPER: {
+            'data': {
+                'exchange': 'NSE',
+                'interval': 'DAY',
+                'sector': 'EQ',
+            },
+        },
+        RunMode.LIVE: {
+            'data': {
+                'exchange': 'NSE',
+                'interval': 'DAY',
+                'sector': 'EQ',
+            },
+        },
+    },
 }

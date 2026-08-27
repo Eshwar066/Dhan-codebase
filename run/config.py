@@ -55,7 +55,7 @@ ENGINE_JOBS = [
         "engine_id": "dhan",
         "venue": "DHAN",
         "enabled": True,
-        "run_mode": "PAPER",
+        "run_mode": "LIVE",
         "capital": 200000,
         "ORDER_QTY_LOTS": 1,
         "market_ws_stall_timeout_seconds": 0,
@@ -74,6 +74,40 @@ ENGINE_JOBS = [
         "latency_critical_cycles": 6,
 
     },
+        {
+
+        "engine_id": "dhan_stocks",
+
+        "venue": "DHAN",
+
+        "enabled": True,
+
+        "run_mode": "BACKTEST",
+
+        "capital": 500000,
+
+        "symbols": ["NUVAMA"],
+
+        "exchange": "NSE",
+
+        "sector": "EQ",
+
+        "market_ws_stall_timeout_seconds": 0,
+
+        "strategy_timeout_seconds": 60,
+
+        "strategies": ["SuperTrendStockRider"],
+
+        "telegram": {
+            "bot_token": os.getenv(
+                "TELEGRAM_EQUITY_BOT_TOKEN",
+                "8389724629:AAHY_CGcBF8HZCexedsEJFw80Mf6SxH5Bkk",
+            ),
+            "chat_id": os.getenv("TELEGRAM_EQUITY_CHAT_ID", "1021479950"),
+        },
+
+    },
+
     {
         "engine_id": "kotak",
         "venue": "DHAN",
@@ -259,6 +293,7 @@ ENGINE_JOBS = [
         "strategies": ["IPOBreakout"],
 
     },
+
 
     {
 

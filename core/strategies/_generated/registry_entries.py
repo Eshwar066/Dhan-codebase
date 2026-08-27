@@ -5,6 +5,7 @@ from run.config import RunMode
 
 from core.strategies.BTST.BankNiftyBTST.BankNiftyBTST import BankNiftyBTST
 from core.strategies.Equity.IPOBreakout.IPOBreakout import IPOBreakout
+from core.strategies.Equity.SuperTrendStockRider.SuperTrendStockRider import SuperTrendStockRider
 from core.strategies.Futures.Futures_EMA.Futures_EMA import FuturesEMAHighLow
 from core.strategies.Futures.Futures_EMA_Momentum.Futures_EMA_Momentum import FuturesEMAMomentum
 from core.strategies.IBBM.Leaps.LeapsQuatery_RSI_52_32 import LeapsQuarterly
@@ -180,6 +181,15 @@ GENERATED_STRATEGY_MAP = {
         "strategy": SignalFloodTestStrategy,
         "instrument": 'FUTURE',
         "allowed_modes": [
+            RunMode.PAPER,
+            RunMode.LIVE,
+        ],
+    },
+    'SuperTrendStockRider': {
+        "strategy": SuperTrendStockRider,
+        "instrument": 'EQUITY',
+        "allowed_modes": [
+            RunMode.BACKTEST,
             RunMode.PAPER,
             RunMode.LIVE,
         ],

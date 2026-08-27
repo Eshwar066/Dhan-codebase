@@ -359,4 +359,23 @@ STRATEGY_PROFILES: dict = {
             'sector': 'YES',
         },
     },
+    'SuperTrendStockRider': {
+        'symbols': [
+            'NUVAMA',
+            'SG',
+        ],
+        'exchange': 'NSE',
+        'eval_mode': 'scheduled',
+        'live': {
+            'exchange': 'NSE',
+            'sector': 'EQ',
+        },
+        'backtest': {
+            'start_date': '2024-01-01',
+            'end_date': '2024-12-31',
+            'timeframe': 'DAY',
+            'exchange': 'NSE',
+            'sector': 'EQ',
+        },
+    },
 }

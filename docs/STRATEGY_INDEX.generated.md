@@ -22,5 +22,6 @@ _AUTO-GENERATED table — run `python -m tools.strategy_manifest generate` to re
 | `OptionBuildup` | `OptionBuildup` | OPTION | DHAN | `core/strategies/OpenIntrest/optionbuildup/strategy.yaml` |
 | `RSIBreadAndButter` | `RSIBreadAndButter` | FUTURE | DELTA | `core/strategies/crypto/RSIBreadAndButter/strategy.yaml` |
 | `SignalFloodTest` | `SignalFloodTestStrategy` | FUTURE | DHAN | `core/strategies/PipelineTest/strategy.yaml` |
+| `SuperTrendStockRider` | `SuperTrendStockRider` | EQUITY | DHAN | `core/strategies/Equity/SuperTrendStockRider/strategy.yaml` |
 
 See `docs/STRATEGY_MANIFEST.md` for the manifest workflow.

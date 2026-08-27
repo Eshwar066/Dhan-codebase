@@ -662,4 +662,45 @@ GENERATED_STRATEGY_SUBSCRIPTIONS: dict = {
             'enabled': False,
         },
     },
+    'SuperTrendStockRider': {
+        'BarClosed': {
+            'enabled': False,
+            'timeframes': [
+                'DAY',
+            ],
+            'symbols': [
+                'NUVAMA',
+                'SG',
+            ],
+        },
+        'FeedDisconnected': {
+            'enabled': True,
+        },
+        'FeedRecovered': {
+            'enabled': True,
+        },
+        'IntentCreated': {
+            'enabled': True,
+        },
+        'IntentFilled': {
+            'enabled': True,
+        },
+        'PositionClosed': {
+            'enabled': True,
+        },
+        'QuoteUpdated': {
+            'enabled': False,
+            'symbols': [
+                'NUVAMA',
+                'SG',
+            ],
+        },
+        'ScheduledSlot': {
+            'enabled': True,
+            'symbols': [
+                'NUVAMA',
+                'SG',
+            ],
+        },
+    },
 }
