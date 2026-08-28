@@ -1034,7 +1034,81 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
                 position.instrument.option_type,
                 position.instrument.expiry,
             )
-        # For live/paper, would need to fetch from option chain
+        # For live/paper, fetch LTP via Dhan marketfeed (more efficient than full option chain)
+        if ctx and hasattr(ctx, "order_router"):
+            try:
+                # Get security ID from instrument
+                instrument = position.instrument
+                security_id = getattr(instrument, "instrument_id", None)
+                if not security_id:
+                    # Fallback: try to get from trading symbol via instrument store
+                    if ctx and ctx.instrument_store:
+                        pass  # Could resolve here if needed
+
+                if security_id:
+                    # Access marketfeed via order_router -> broker -> source
+                    order_router = ctx.order_router
+                    broker = getattr(order_router, "broker", None)
+                    if broker and hasattr(broker, "_source"):
+                        source = broker._source
+                        marketfeed = getattr(source, "_marketfeed", None)
+                        if marketfeed:
+                            # Fetch LTP for the option instrument
+                            # NSE_FNO segment for Nifty options
+                            instruments = {"NSE_FNO": [int(security_id)]}
+                            response = marketfeed.ltp(instruments)
+                            if response.get("status") == "success":
+                                data = response.get("data", {})
+                                nse_fno = data.get("NSE_FNO", {})
+                                sec_data = nse_fno.get(str(security_id), {})
+                                ltp = sec_data.get("last_price")
+                                if ltp is not None:
+                                    premium = float(ltp)
+                                    logger.info(f"NiftyDOS: 5min premium fetch (marketfeed) struct={position.structure_id} strike={instrument.strike} opt={instrument.option_type} premium={premium:.2f}")
+                                    return premium
+            except Exception as e:
+                logger.warning(f"NiftyDOS: Failed to fetch premium from marketfeed: {e}")
+
+        # Fallback: try option chain service (for cases where marketfeed not available)
+        if ctx and hasattr(ctx, "option_chain_service"):
+            try:
+                strike = position.instrument.strike
+                option_type = position.instrument.option_type
+                expiry = position.instrument.expiry
+
+                # Try to get cached chain first (from previous fetch in this candle)
+                cached_chain = getattr(self, "_last_option_chain", None)
+                if cached_chain is not None:
+                    row = self._strike_row_from_chain(cached_chain, strike, option_type)
+                    if row is not None:
+                        px = self._execution_price_from_chain_row(row, option_type, side="BUY")
+                        if px is not None and px > 0:
+                            return float(px)
+
+                # Fetch fresh chain from service
+                params = {
+                    "exchange": ctx.exchange,
+                    "interval": self._option_data_interval(),
+                    "expiry_code": expiry,
+                    "strike": [str(int(float(strike)))],
+                    "option_type": option_type,
+                    "instrument": "OPTIDX",
+                    "exchangeSegment": "NSE_FNO",
+                    "expiry_flag": self._dhan_expiry_flag(),
+                    "securityId": self._dhan_option_security_id(),
+                }
+                chain = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
+                if chain is not None:
+                    self._last_option_chain = chain
+                    row = self._strike_row_from_chain(chain, strike, option_type)
+                    if row is not None:
+                        px = self._execution_price_from_chain_row(row, option_type, side="BUY")
+                        if px is not None and px > 0:
+                            premium = float(px)
+                            logger.info(f"NiftyDOS: 5min premium fetch (option_chain) struct={position.structure_id} strike={strike} opt={option_type} premium={premium:.2f}")
+                            return premium
+            except Exception as e:
+                logger.warning(f"NiftyDOS: Failed to fetch premium from option chain: {e}")
         return None
 
     def _get_structure_positions(self, position, ctx):
@@ -1196,7 +1270,9 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
                 hedge_qty = abs(int(hedge_position.net_qty or 0))
                 hedge_pnl = (hedge_current - hedge_entry) * lot_size * hedge_qty
 
-        return main_pnl + hedge_pnl
+        structure_pnl = main_pnl + hedge_pnl
+        logger.info(f"NiftyDOS: 5min structure P&L struct={structure_id} main_premium={main_current:.2f} main_entry={main_entry:.2f} main_pnl={main_pnl:.2f} hedge_pnl={hedge_pnl:.2f} total_pnl={structure_pnl:.2f}")
+        return structure_pnl
 
     def _check_tp_sl(self, position, candle, ctx) -> Optional[str]:
         """Check if TP or SL hit based on structure capital (margin deployed).
@@ -1415,6 +1491,26 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         # The _sl_hit_structure is checked in on_candle
 
         return intents
+
+    def cleanup_manual_close(self, structure_id: str) -> None:
+        """
+        Clean up strategy tracking state when a position is manually closed at broker.
+
+        Called by engine after detecting manual broker flat via reconciliation.
+        Removes stale entry prices, reentry tracking, and structure type.
+        """
+        if not structure_id:
+            return
+
+        # Clean up tracking dicts
+        self._structure_main_entry_price.pop(structure_id, None)
+        self._structure_hedge_entry_price.pop(structure_id, None)
+        self._structure_type.pop(structure_id, None)
+        self._sl_hit_structure.pop(structure_id, None)
+        self._tp_hit_pending.pop(structure_id, None)
+        self._st_flip_reentry_pending.pop(structure_id, None)
+
+        logger.info(f"NiftyDOS: Cleaned up manual close for structure {structure_id}")
 
     # ---------- Reentry Logic ----------
 

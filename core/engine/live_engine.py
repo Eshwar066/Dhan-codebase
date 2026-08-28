@@ -1662,6 +1662,17 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 if isinstance(meta_map, dict):
                     meta_map.pop(sid, None)
 
+                # Clean up strategy-specific tracking for manual close
+                cleanup_fn = getattr(strategy_obj, "cleanup_manual_close", None)
+                if callable(cleanup_fn):
+                    try:
+                        cleanup_fn(sid)
+                    except Exception as exc:
+                        if self.engine_logger:
+                            self.engine_logger.reconciliation(
+                                f"Strategy cleanup_manual_close failed for {sid}: {exc}"
+                            )
+
             cancelled = 0
             if callable(sync_fn):
                 cancelled = int(

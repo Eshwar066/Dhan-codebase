@@ -268,6 +268,8 @@ Runs `python -m run.main --engine-id kotak` (LIVE strategies on Kotak).
 cd /root/Dhan-codebase
 source .venv/bin/activate
 
+python3 utils/yfinance/refresh_nifty_indicator_history.py --only 30
+
 python -m run.main --engine-id dhan_leaps_rsi
 python -m run.main --engine-id dhan_oi_positional_buy
 PYTHONPATH=/root/Dhan-codebase python run/option_buildup_scheduler.py --symbols NIFTY --exchange NSE
