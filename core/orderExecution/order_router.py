@@ -5715,9 +5715,9 @@ class OrderRouter:
                 sz = float(f.get("size") or 0)
                 pr = float(f.get("price") or 0)
                 is_dhan = type(self.broker).__name__ == "DhanBroker"
-                # Canonical REST reconciliation id for Dhan (distinct from DHAN_WS:* incremental keys).
+                # Canonical trade_id for Dhan (matches WS format: DHAN:{order_id}:{size}:{price})
                 if is_dhan:
-                    trade_id = f"DHAN_REST:{oid}:{int(sz)}:{pr}"
+                    trade_id = f"DHAN:{oid}:{int(sz)}:{pr:.2f}"
                 else:
                     tid = f.get("id") or f.get("trade_id")
                     trade_id = str(tid) if tid else f"{oid}_{int(sz)}_{pr}"

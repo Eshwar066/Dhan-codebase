@@ -113,5 +113,5 @@ documentation:
 subscriptions:
   BarClosed:
     enabled: true
-    timeframes: ['30']
+    timeframes: ['30', '5']
     symbols: [NIFTY]

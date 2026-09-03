@@ -372,6 +372,7 @@ GENERATED_STRATEGY_SUBSCRIPTIONS: dict = {
             'enabled': True,
             'timeframes': [
                 '30',
+                '5',
             ],
             'symbols': [
                 'NIFTY',

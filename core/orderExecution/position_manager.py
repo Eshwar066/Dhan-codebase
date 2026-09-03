@@ -1092,6 +1092,76 @@ class PositionManager:
                         continue
         return opt, strike
 
+    def _detect_hedge_position(
+        self,
+        sym: str,
+        pos: "Position",
+        broker_positions: Dict[str, Any],
+        strategy: Optional[str] = None,
+    ) -> bool:
+        """
+        Detect if a position is a HEDGE leg based on structure characteristics.
+
+        Hedge is a LONG option with:
+        - Same underlying, expiry, option_type as MAIN (short)
+        - Strike offset by hedge_distance_points (CE: +, PE: -) from MAIN
+        - Positive qty (long)
+
+        This fixes metadata for positions loaded from broker where CSV has wrong tag.
+        """
+        if pos.net_qty <= 0:  # Hedge must be long
+            return False
+
+        if not pos.instrument:
+            return False
+
+        hedge_strike = getattr(pos.instrument, "strike", None)
+        option_type = getattr(pos.instrument, "option_type", "")
+        hedge_expiry = getattr(pos.instrument, "expiry", None)
+
+        if hedge_strike is None or not option_type or hedge_expiry is None:
+            return False
+
+        try:
+            hedge_strike_f = float(hedge_strike)
+        except (TypeError, ValueError):
+            return False
+
+        # Standard hedge distance (could be configurable)
+        hedge_distance = 500
+        # Calculate expected MAIN strike from hedge strike
+        if option_type.upper() in ("CE", "CALL"):
+            expected_main_strike = hedge_strike_f - hedge_distance
+        else:
+            expected_main_strike = hedge_strike_f + hedge_distance
+
+        # Look for matching MAIN position (short) in broker positions
+        for b_sym, bp in broker_positions.items():
+            b_qty = int(bp.get("qty") or 0)
+            if b_qty >= 0:  # MAIN must be short
+                continue
+
+            b_opt, b_strike = self._extract_option_hint(b_sym, None)
+            if b_opt is None or b_strike is None:
+                continue
+
+            if b_opt.upper() != option_type.upper():
+                continue
+
+            # Check if broker position strike matches expected MAIN strike
+            if abs(float(b_strike) - expected_main_strike) > 1:
+                continue
+
+            # Check expiry match
+            b_expiry = bp.get("expiry") or bp.get("expiry_date")
+            if b_expiry and str(b_expiry) != str(hedge_expiry):
+                continue
+
+            # Found matching MAIN - this is HEDGE
+            return True
+
+        return False
+
     def has_open_structure(self, strategy: str, structure_id: str, tag: str) -> bool:
         tag_u = str(tag or "").upper()
         sid = str(structure_id)
@@ -1407,6 +1477,45 @@ class PositionManager:
                             datetime.now(tz=timezone.utc)
                         )
                     self.positions[sym] = pos
+
+                    # Detect hedge position and fix metadata if CSV was wrong
+                    if (
+                        pos.net_qty > 0
+                        and claim_strategy
+                        and self._detect_hedge_position(sym, pos, broker_positions, claim_strategy)
+                    ):
+                        pos.tag = "HEDGE"
+                        # Find the MAIN position to get its structure_id
+                        for b_sym, bp in broker_positions.items():
+                            b_qty = int(bp.get("qty") or 0)
+                            if b_qty >= 0:
+                                continue
+                            b_opt, b_strike = self._extract_option_hint(b_sym, None)
+                            if b_opt and b_strike:
+                                main_strike = getattr(pos.instrument, "strike", None)
+                                try:
+                                    if main_strike is not None and abs(float(b_strike) - float(main_strike)) < 1:
+                                        # Found MAIN - use its structure_id if available
+                                        b_meta = self.position_metadata.get(b_sym, {})
+                                        if b_meta.get("structure_id"):
+                                            pos.structure_id = b_meta["structure_id"]
+                                            pos.intent_id = b_meta.get("intent_id")
+                                        break
+                                except (TypeError, ValueError):
+                                    pass
+                        # Update position_metadata with corrected hedge info
+                        self._merge_position_metadata(
+                            sym,
+                            strategy=pos.strategy,
+                            structure_id=pos.structure_id,
+                            tag="HEDGE",
+                            intent_id=pos.intent_id,
+                        )
+                        logger.info(
+                            "Reconcile: detected HEDGE leg for %s, fixed tag/structure_id",
+                            sym,
+                        )
+
                     if pos.strategy:
                         self.strategy_pos[pos.strategy][sym] = int(bqty)
                     continue
