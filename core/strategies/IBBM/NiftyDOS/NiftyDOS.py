@@ -967,6 +967,8 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             exit_intents = self._check_tp_sl_on_5min(candle, ctx)
             if exit_intents:
                 return exit_intents
+            # 5-min candles are ONLY for TP/SL monitoring - skip signal generation
+            return None
 
         # ===== REENTRY LOGIC =====
         # TP reentry: immediate on SAME 5-min candle (handled in _check_tp_sl_on_5min via on_position_exit)
