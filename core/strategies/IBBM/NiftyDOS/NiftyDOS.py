@@ -819,6 +819,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             logger.warning("NiftyDOS entry skipped: instrument missing %s", trading_symbol)
             return None
 
+        # Create intents first
         sell_intent = self.map_instrument_to_intent(
             inst=inst,
             strike_row=row,
@@ -833,11 +834,27 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         hedge_intent = self.create_hedge_intent(
             parent_sell_intent=sell_intent, candle=candle, ctx=ctx
         )
+        hedge_entry_price = float(getattr(hedge_intent, "price", 0) or 0)
+
+        # Prepare strategy metadata for position tracking (written to open_positions.csv)
+        strategy_meta = {
+            "entry_main_premium": float(premium),
+            "entry_hedge_premium": hedge_entry_price,
+            "structure_type": "CALL" if option_type in ("CE", "CALL") else "PUT",
+            "regime": regime,
+            "tp_pct": self.call_tp_pct if option_type in ("CE", "CALL") else self.put_tp_pct,
+            "sl_pct": self.call_sl_pct if option_type in ("CE", "CALL") else self.put_sl_pct,
+            "margin_per_lot": self.margin_per_lot,
+            "hedge_distance_points": self.hedge_distance_points,
+        }
+        # Update intents with metadata_extras
+        sell_intent.metadata_extras = strategy_meta
+        if hedge_intent:
+            hedge_intent.metadata_extras = strategy_meta
         self._entry_signaled_keys.add(signal_key)
 
         # Store entry prices for both MAIN and HEDGE for TP/SL tracking
         self._structure_main_entry_price[structure_id] = float(premium)
-        hedge_entry_price = float(getattr(hedge_intent, "price", 0) or 0)
         self._structure_hedge_entry_price[structure_id] = hedge_entry_price
         self._structure_type[structure_id] = "CALL" if option_type in ("CE", "CALL") else "PUT"
 
