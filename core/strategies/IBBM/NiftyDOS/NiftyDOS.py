@@ -122,8 +122,10 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         self._prev_st_signal: Optional[str] = None  # track previous supertrend for flip detection
         self._st_flip_reentry_pending: dict[str, str] = {}  # structure_id -> new_option_type (for immediate reentry on ST flip)
         # Track reentry pending after position closes at broker
-        # structure_id -> {"type": "CALL"/"PUT", "reason": "TP"/"SL"/"ST_FLIP", "original_strike": ..., "original_option_type": ...}
+        # structure_id -> {"type": "CALL"/"PUT", "reason": "TP"/"ST_FLIP", ...}
         self._reentry_after_close: dict[str, dict] = {}
+        # Exit intents sent but broker may still show open qty — keep TP/SL tracking until flat.
+        self._pending_exit_structure_ids: set[str] = set()
         self._load_config_from_yaml()
 
     def _load_config_from_yaml(self) -> None:
@@ -225,6 +227,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             # Fallback: try matching by SEM_TRADING_SYMBOL
             mask_custom2 = instrument_df['SEM_TRADING_SYMBOL'].str.startswith('NIFTY')
             combined_mask2 = mask_custom2 & mask_expiry & mask_opt & mask_strike
+            filtered2 = instrument_df[combined_mask2]
 
             if not filtered2.empty:
                 return filtered2.iloc[0]['SEM_TRADING_SYMBOL'], int(filtered2.iloc[0]['SEM_SMST_SECURITY_ID']), int(filtered2.iloc[0]['SEM_LOT_UNITS'])
@@ -441,6 +444,10 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         row = self._strike_row_from_chain(chain, hedge_strike, option_type)
         px = self._execution_price_from_chain_row(row, option_type, "BUY")
         return px if px is not None and px > 0 else None
+
+    def on_candle_rollover(self, open_positions, candle, ctx):
+        """No hedge rollover — MAIN and HEDGE always share the same weekly expiry."""
+        return []
 
     # ---------- Time / event gates ----------
 
@@ -953,7 +960,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         # (No longer blocking expiry day entries here)
 
         # ===== CHECK PENDING REENTRIES AFTER BROKER CLOSE =====
-        # Execute reentry for structures where exit has been triggered and position is now closed at broker
+        self._finalize_pending_exits(candle, ctx)
         reentry_intents = self._check_and_execute_pending_reentries(candle, ctx)
         if reentry_intents:
             return reentry_intents
@@ -978,18 +985,25 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
 
         # Handle SL reentry from PREVIOUS candle - ONLY on primary timeframe (30-min)
         if is_primary_tf and self._sl_hit_structure:
-            # Process all pending SL reentries
             for struct_id, opt_type in list(self._sl_hit_structure.items()):
-                logger.info(f"NiftyDOS: Checking SL reentry for {opt_type} on next 30-min candle")
-                # Block SL reentry after 15:15 PM
+                if self._structure_still_open_at_broker(struct_id, candle, ctx):
+                    logger.debug(
+                        "NiftyDOS: SL reentry deferred for %s - position still open at broker",
+                        struct_id,
+                    )
+                    continue
+                logger.info(
+                    "NiftyDOS: Checking SL reentry for %s on next 30-min candle",
+                    opt_type,
+                )
                 if self._is_after_315pm(candle):
-                    logger.info(f"NiftyDOS: SL reentry blocked after 15:15 PM")
+                    logger.info("NiftyDOS: SL reentry blocked after 15:15 PM")
+                    self._sl_hit_structure.pop(struct_id, None)
                     continue
                 reentry_intents = self._attempt_sl_reentry(candle, ctx, opt_type, struct_id)
+                self._sl_hit_structure.pop(struct_id, None)
                 if reentry_intents:
                     return reentry_intents
-            # Clear processed SL reentries (only one per candle to avoid multiple)
-            self._sl_hit_structure.clear()
 
         # Check 3:15 PM no-entry rule for initial entry (allows TP reentry via on_position_exit)
         adx = self._get_adx_value(candle)
@@ -1087,6 +1101,47 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         return self._build_entry_intents(candle, ctx, option_type, structure_id=structure_id, regime=regime)
 
     # ---------- Exit / TP-SL Management ----------
+
+    def _structure_still_open_at_broker(self, structure_id: str, candle, ctx) -> bool:
+        if not ctx or not ctx.position_store or not structure_id:
+            return False
+        open_positions = ctx.position_store.get_open_positions(
+            underlying=str(candle.get("symbol") or ""),
+            strategy=self.name,
+        ) or []
+        for pos in open_positions:
+            if getattr(pos, "structure_id", None) != structure_id:
+                continue
+            if int(getattr(pos, "net_qty", 0) or 0) != 0:
+                return True
+        return False
+
+    def _clear_structure_tracking(self, structure_id: str, *, clear_sl_pending: bool = False) -> None:
+        if not structure_id:
+            return
+        self._structure_main_entry_price.pop(structure_id, None)
+        self._structure_hedge_entry_price.pop(structure_id, None)
+        self._structure_type.pop(structure_id, None)
+        self._pending_exit_structure_ids.discard(structure_id)
+        if clear_sl_pending:
+            self._sl_hit_structure.pop(structure_id, None)
+
+    def _finalize_pending_exits(self, candle, ctx) -> None:
+        """Drop TP/SL tracking once broker is flat; keep SL reentry flags for 30m eval."""
+        if not self._pending_exit_structure_ids:
+            return
+        for structure_id in list(self._pending_exit_structure_ids):
+            if self._structure_still_open_at_broker(structure_id, candle, ctx):
+                continue
+            self._pending_exit_structure_ids.discard(structure_id)
+            self._structure_main_entry_price.pop(structure_id, None)
+            self._structure_hedge_entry_price.pop(structure_id, None)
+            self._structure_type.pop(structure_id, None)
+            logger.info(
+                "NiftyDOS: Broker flat after exit for structure %s (SL reentry=%s)",
+                structure_id,
+                structure_id in self._sl_hit_structure,
+            )
 
     def _get_current_premium(self, position, candle, ctx) -> Optional[float]:
         """Get current premium for position."""
@@ -1481,7 +1536,14 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
 
             structure_id = position.structure_id
 
-            # Skip if structure tracking already cleaned up (exit already triggered)
+            if structure_id in self._pending_exit_structure_ids:
+                logger.debug(
+                    "NiftyDOS: 5min skipping TP/SL for %s - exit already pending",
+                    structure_id,
+                )
+                continue
+
+            # Skip if structure tracking missing (should not happen while position open)
             if structure_id not in self._structure_main_entry_price:
                 logger.debug(f"NiftyDOS: 5min skipping TP/SL for {structure_id} - tracking already cleaned")
                 continue
@@ -1520,8 +1582,14 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
 
         # On 5-min candles: SKIP TP/SL/EOD/ST-FLIP checks (all handled on 30-min only)
         if not is_5min_tf:
-            # Skip if structure tracking already cleaned up (exit already triggered)
             structure_id = position.structure_id
+            if structure_id in self._pending_exit_structure_ids:
+                logger.debug(
+                    "NiftyDOS: 30min skipping exit check for %s - exit already pending",
+                    structure_id,
+                )
+                return False
+
             if structure_id not in self._structure_main_entry_price:
                 logger.debug(f"NiftyDOS: 30min skipping exit check for {structure_id} - tracking already cleaned")
                 return False
@@ -1606,9 +1674,10 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             intents.append(hedge_exit)
 
         structure_id = position.structure_id
+        self._pending_exit_structure_ids.add(structure_id)
 
-        # Track reentry type pending after exit - do NOT execute yet
-        # Wait for position to actually close at broker
+        # Track reentry type pending after exit - do NOT execute yet (TP/ST only).
+        # SL reentry stays in _sl_hit_structure and runs on the next 30-min bar after flat.
         exit_reentry_type = None
         if structure_id in self._tp_hit_pending:
             exit_reentry_type = self._tp_hit_pending.pop(structure_id)
@@ -1617,24 +1686,23 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             exit_reentry_type = self._st_flip_reentry_pending.pop(structure_id)
             reentry_reason = "ST_FLIP"
         elif structure_id in self._sl_hit_structure:
-            # SL reentry is handled in on_candle (next candle)
-            exit_reentry_type = self._sl_hit_structure.pop(structure_id)
-            reentry_reason = "SL"
+            logger.info(
+                "NiftyDOS: Exit triggered (SL) for %s; SL reentry on next 30-min after broker flat",
+                structure_id,
+            )
 
         if exit_reentry_type:
-            # Store reentry info to execute AFTER position closes at broker
             self._reentry_after_close[structure_id] = {
                 "type": exit_reentry_type,
                 "reason": reentry_reason,
                 "original_strike": position.instrument.strike,
                 "original_option_type": position.instrument.option_type,
             }
-            logger.info(f"NiftyDOS: Exit triggered ({reentry_reason}) for {structure_id}, reentry pending after broker close")
-
-        # Clean up tracking - but keep reentry info
-        self._structure_main_entry_price.pop(structure_id, None)
-        self._structure_hedge_entry_price.pop(structure_id, None)
-        self._structure_type.pop(structure_id, None)
+            logger.info(
+                "NiftyDOS: Exit triggered (%s) for %s, reentry pending after broker close",
+                reentry_reason,
+                structure_id,
+            )
 
         return intents
 
@@ -1652,6 +1720,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         self._structure_main_entry_price.pop(structure_id, None)
         self._structure_hedge_entry_price.pop(structure_id, None)
         self._structure_type.pop(structure_id, None)
+        self._pending_exit_structure_ids.discard(structure_id)
         self._sl_hit_structure.pop(structure_id, None)
         self._tp_hit_pending.pop(structure_id, None)
         self._st_flip_reentry_pending.pop(structure_id, None)
@@ -1708,8 +1777,6 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
                 reentry_intents = self._attempt_immediate_reentry(candle, ctx, reentry_type, structure_id)
             elif reason == "ST_FLIP":
                 reentry_intents = self._attempt_st_flip_reentry(candle, ctx, reentry_type, structure_id)
-            elif reason == "SL":
-                reentry_intents = self._attempt_sl_reentry(candle, ctx, reentry_type, structure_id)
 
             if reentry_intents:
                 executed_intents.extend(reentry_intents)
@@ -1830,7 +1897,11 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
                 self._st_flip_reentry_pending.pop(structure_id, None)
 
                 restored += 1
-                _log(f"Restored tracking for structure {structure_id} main_entry={main_entry:.2f} hedge_entry={hedge_entry:.2f if hedge_entry else 'N/A'} type={structure_type}")
+                hedge_log = f"{float(hedge_entry):.2f}" if hedge_entry is not None else "N/A"
+                _log(
+                    f"Restored tracking for structure {structure_id} "
+                    f"main_entry={float(main_entry):.2f} hedge_entry={hedge_log} type={structure_type}"
+                )
 
         except Exception as e:
             _log(f"Failed to sync tracking from broker: {e}")
