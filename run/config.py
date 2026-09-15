@@ -60,7 +60,7 @@ ENGINE_JOBS = [
         "ORDER_QTY_LOTS": 1,
         "market_ws_stall_timeout_seconds": 0,
         "strategy_timeout_seconds": 60,
-        "strategies": ["NiftyDOS"], #"NiftySMA9Weekly",, "BankNiftyBTST","LEAPS_RSI",
+        "strategies": ["NiftyDOS","LEAPS_RSI"], #"NiftySMA9Weekly",, "BankNiftyBTST","LEAPS_RSI",
         "telegram": {
             "bot_token": os.getenv(
                 "TELEGRAM_LEAPS_BOT_TOKEN",

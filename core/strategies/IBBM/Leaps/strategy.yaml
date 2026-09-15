@@ -60,11 +60,11 @@ dependencies:
 # MAIN leg toggles — each enabled leg places MAIN sell + monthly hedge bundle.
 legs:
   mini_leaps:
-    enabled: true
+    enabled: false
     expiry_pref: LEAPS_ROLL
     structure_suffix: ""
   quarterly_leaps:
-    enabled: false
+    enabled: true
     expiry_pref: QUARTERLY
     structure_suffix: ":QTR"
 

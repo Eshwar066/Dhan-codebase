@@ -60,8 +60,8 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     ema_period = 8
 
     # Toggle which MAIN+HEDGE bundles to place on entry (overridable via strategy.yaml legs:).
-    mini_leaps_enabled = True
-    quarterly_leaps_enabled = False
+    mini_leaps_enabled = False
+    quarterly_leaps_enabled = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

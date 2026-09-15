@@ -686,6 +686,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         option_type: str,
         *,
         structure_id: str,
+        regime: str,
     ) -> Optional[List[Any]]:
         signal_key = f"{structure_id}|{self._bar_open_key(candle)}"
         if signal_key in self._entry_signaled_keys:
@@ -1047,7 +1048,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
 
                 if option_type:
                     structure_id = self.build_structure_id(candle, regime)
-                    return self._build_entry_intents(candle, ctx, option_type, structure_id=structure_id)
+                    return self._build_entry_intents(candle, ctx, option_type, structure_id=structure_id, regime=regime)
 
         # New entry on Supertrend signal (no MA/ADX filter) - ONLY on primary timeframe (30-min)
         if not is_primary_tf:
@@ -1083,7 +1084,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             return None
 
         structure_id = self.build_structure_id(candle, regime)
-        return self._build_entry_intents(candle, ctx, option_type, structure_id=structure_id)
+        return self._build_entry_intents(candle, ctx, option_type, structure_id=structure_id, regime=regime)
 
     # ---------- Exit / TP-SL Management ----------
 
@@ -1930,7 +1931,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         # All conditions met - reenter
         logger.info(f"NiftyDOS: SL reentry conditions met for {option_type}")
         new_structure_id = self.build_structure_id(candle, "REENTRY_SL")
-        return self._build_entry_intents(candle, ctx, option_type, structure_id=new_structure_id)
+        return self._build_entry_intents(candle, ctx, option_type, structure_id=new_structure_id, regime="REENTRY_SL")
 
     def _attempt_immediate_reentry(self, candle, ctx, option_type: str, structure_id: str) -> Optional[List[Any]]:
         """Attempt IMMEDIATE reentry on TP hit - same candle, same direction, find strike 80-105."""
@@ -1960,7 +1961,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
 
         logger.info(f"NiftyDOS: Immediate TP reentry for {option_type} - finding strike 80-105")
         new_structure_id = self.build_structure_id(candle, "REENTRY_TP")
-        return self._build_entry_intents(candle, ctx, option_type, structure_id=new_structure_id)
+        return self._build_entry_intents(candle, ctx, option_type, structure_id=new_structure_id, regime="REENTRY_TP")
 
     def _attempt_st_flip_reentry(self, candle, ctx, option_type: str, structure_id: str) -> Optional[List[Any]]:
         """Attempt IMMEDIATE reentry on Supertrend flip - same candle, NEW direction (opposite of old).
@@ -1993,7 +1994,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
 
         logger.info(f"NiftyDOS: Immediate ST flip reentry for {option_type} - finding strike 80-105")
         new_structure_id = self.build_structure_id(candle, "REENTRY_ST_FLIP")
-        return self._build_entry_intents(candle, ctx, option_type, structure_id=new_structure_id)
+        return self._build_entry_intents(candle, ctx, option_type, structure_id=new_structure_id, regime="REENTRY_ST_FLIP")
 
     def _attempt_reentry(self, candle, ctx, option_type: str, structure_id: str, reason: str) -> Optional[List[Any]]:
         """Legacy reentry method - kept for compatibility."""
