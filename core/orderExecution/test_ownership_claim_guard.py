@@ -20,8 +20,16 @@ def _pm() -> PositionManager:
     pm.open_positions_csv_path = None
     pm.position_metadata = {}
     pm.positions = {}
-    pm.strategy_pos = defaultdict(dict)
+    pm.strategy_pos = defaultdict(lambda: defaultdict(int))
     pm._trade_led_symbol_ts = {}
+    pm._trade_led_baseline_qty = {}
+    pm._structure_slices = defaultdict(dict)
+    pm._forced_exit_partial_ts = {}
+    pm.logger = None
+    pm.open_positions_logger = None
+    pm.on_structure_exit = None
+    pm.on_main_entry_fill = None
+    pm.on_main_exit_fill = None
     pm.trading_paused = False
     pm.last_recon_time = 0
     return pm
@@ -234,6 +242,116 @@ class TestBtstExitReconcileClaim(unittest.TestCase):
             self.assertEqual(kwargs.get("claim_underlying"), "BANKNIFTY")
         finally:
             mod.RUN_MODE = prev
+
+
+class TestFillSideAndOrphanHedgePair(unittest.TestCase):
+    def test_normalize_fill_side(self):
+        from core.orderExecution.position_manager import normalize_fill_side
+
+        self.assertEqual(normalize_fill_side("buy"), "BUY")
+        self.assertEqual(normalize_fill_side("SELL"), "SELL")
+        self.assertIsNone(normalize_fill_side(""))
+        self.assertIsNone(normalize_fill_side(None))
+
+    def test_empty_side_does_not_open_short(self):
+        pm = _pm()
+        inst = _inst("NIFTY-Oct2026-24500-CE")
+        closed, pnl = pm.on_fill(
+            instrument=inst,
+            side="",
+            qty=65,
+            price=57.75,
+            tag="HEDGE",
+            action="ENTRY",
+            strategy="LEAPS_RSI",
+        )
+        self.assertFalse(closed)
+        self.assertEqual(pnl, 0.0)
+        self.assertNotIn("NIFTY-Oct2026-24500-CE", pm.positions)
+
+    def test_empty_side_then_rest_buy_stays_long(self):
+        pm = _pm()
+        inst = _inst("NIFTY-Oct2026-24500-CE")
+        pm.on_fill(
+            instrument=inst,
+            side="",
+            qty=65,
+            price=57.75,
+            tag="HEDGE",
+            action="ENTRY",
+            strategy="LEAPS_RSI",
+        )
+        pm.on_fill(
+            instrument=inst,
+            side="BUY",
+            qty=65,
+            price=57.75,
+            tag="HEDGE",
+            action="ENTRY",
+            strategy="LEAPS_RSI",
+            structure_id="LEAPS_RSI:NIFTY:RSI_LT_32:QTR",
+            intent_id="16e56e8aef594572badf499e2228701d",
+        )
+        self.assertEqual(pm.positions[inst.trading_symbol].net_qty, 65)
+
+    def test_hedge_buy_then_duplicate_buy_does_not_flatten(self):
+        pm = _pm()
+        inst = _inst("NIFTY-Oct2026-24500-CE")
+        pm.on_fill(
+            instrument=inst,
+            side="BUY",
+            qty=65,
+            price=57.75,
+            tag="HEDGE",
+            action="ENTRY",
+            strategy="LEAPS_RSI",
+            structure_id="LEAPS_RSI:NIFTY:RSI_LT_32:QTR",
+        )
+        self.assertEqual(pm.positions[inst.trading_symbol].net_qty, 65)
+        closed, _ = pm.on_fill(
+            instrument=inst,
+            side="BUY",
+            qty=65,
+            price=57.75,
+            tag="HEDGE",
+            action="ENTRY",
+            strategy="LEAPS_RSI",
+            structure_id="LEAPS_RSI:NIFTY:RSI_LT_32:QTR",
+        )
+        self.assertFalse(closed)
+        self.assertEqual(pm.positions[inst.trading_symbol].net_qty, 130)
+
+    def test_reconcile_pairs_leaps_calendar_hedge(self):
+        pm = _pm()
+        pm.merge_ownership_from_all_strategy_open_positions_csvs = MagicMock()
+        pm.position_metadata["NIFTY-Dec2026-24000-CE"] = {
+            "strategy": "LEAPS_RSI",
+            "structure_id": "LEAPS_RSI:NIFTY:RSI_LT_32:QTR",
+            "tag": "MAIN",
+            "intent_id": "47b174d9350b44969b0a6425a664d4b2",
+        }
+        pm.reconcile_with_broker(
+            {
+                "NIFTY-Dec2026-24000-CE": {
+                    "qty": -65,
+                    "avg_price": 425.95,
+                    "lot_size": 65,
+                    "segment": "NFO",
+                },
+                "NIFTY-Oct2026-24500-CE": {
+                    "qty": 65,
+                    "avg_price": 57.75,
+                    "lot_size": 65,
+                    "segment": "NFO",
+                },
+            },
+            strategy=None,
+        )
+        hedge = pm.positions["NIFTY-Oct2026-24500-CE"]
+        self.assertEqual(hedge.strategy, "LEAPS_RSI")
+        self.assertEqual(hedge.tag, "HEDGE")
+        self.assertEqual(hedge.structure_id, "LEAPS_RSI:NIFTY:RSI_LT_32:QTR")
+        self.assertEqual(hedge.net_qty, 65)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ import talib
 from run.config import RUN_MODE, RunMode
 from core.strategies.base import BaseStrategy
 from core.strategies.IndiaMktMixins import IST, IndiaMktMixins
+from core.strategies.meta import pack_strategy_meta
 from core.strategies.indicator_helpers import (
     add_ema_high_low,
     default_persisted_keys_for_ema_high_low,
@@ -290,6 +291,75 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         )
         return None
 
+    @staticmethod
+    def _iso_meta(val: Any) -> str:
+        if val is None:
+            return ""
+        iso = getattr(val, "isoformat", None)
+        if callable(iso):
+            try:
+                return str(iso())
+            except (TypeError, ValueError):
+                pass
+        return str(val)
+
+    @staticmethod
+    def _regime_from_structure_id(structure_id: str) -> str:
+        sid = str(structure_id or "")
+        if "RSI_LT_32" in sid:
+            return "RSI_LT_32"
+        if "RSI_GT_52" in sid:
+            return "RSI_GT_52"
+        return ""
+
+    def _entry_strategy_meta(
+        self,
+        candle: dict,
+        *,
+        structure_id: str,
+        option_type: str,
+        expiry_pref: str,
+        leg_label: str,
+        main_symbol: str,
+        main_strike: Any,
+        main_expiry: Any,
+        main_premium: Any,
+        hedge_intent: Any = None,
+    ) -> Dict[str, Any]:
+        hedge_inst = getattr(hedge_intent, "instrument", None) if hedge_intent else None
+        hedge_px = getattr(hedge_intent, "price", None) if hedge_intent else None
+        try:
+            hedge_px_f = float(hedge_px) if hedge_px not in (None, "") else None
+        except (TypeError, ValueError):
+            hedge_px_f = None
+        try:
+            main_px_f = float(main_premium) if main_premium not in (None, "") else None
+        except (TypeError, ValueError):
+            main_px_f = None
+        try:
+            strike_f = float(main_strike) if main_strike not in (None, "") else None
+        except (TypeError, ValueError):
+            strike_f = None
+        payload = {
+            "symbol": str(candle.get("symbol") or ""),
+            "regime": self._regime_from_structure_id(structure_id),
+            "option_type": str(option_type or "").upper(),
+            "rsi": candle.get("rsi"),
+            "prev_rsi": candle.get("prev_rsi"),
+            "timeframe": str(getattr(self, "timeframe", "")),
+            "leg": leg_label,
+            "expiry_pref": expiry_pref,
+            "main_symbol": main_symbol,
+            "main_strike": strike_f,
+            "main_expiry": self._iso_meta(main_expiry),
+            "entry_main_premium": main_px_f,
+            "hedge_symbol": getattr(hedge_inst, "trading_symbol", None),
+            "hedge_strike": getattr(hedge_inst, "strike", None),
+            "hedge_expiry": self._iso_meta(getattr(hedge_inst, "expiry", None)),
+            "entry_hedge_premium": hedge_px_f,
+        }
+        return pack_strategy_meta(self.name, payload)
+
     def _hourly_bar_open_key(self, candle: dict) -> str:
         bucket = candle.get("bucket_ts")
         if bucket is not None:
@@ -476,6 +546,21 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             candle=candle,
             ctx=ctx,
         )
+        extras = self._entry_strategy_meta(
+            candle,
+            structure_id=structure_id,
+            option_type=option_type,
+            expiry_pref=expiry_pref,
+            leg_label=leg_label,
+            main_symbol=trading_symbol,
+            main_strike=strike,
+            main_expiry=expiry_for_symbol,
+            main_premium=premium,
+            hedge_intent=hedge_intent,
+        )
+        sell_intent.metadata_extras = extras
+        if hedge_intent is not None:
+            hedge_intent.metadata_extras = extras
 
         self._entry_signaled_keys.add(signal_key)
         logger.info(
@@ -728,6 +813,23 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         qty_lots = self._order_qty_in_lots(
             position.instrument, abs(int(position.net_qty or 0))
         )
+        exit_extras = pack_strategy_meta(
+            self.name,
+            {
+                "symbol": str(candle.get("symbol") or ""),
+                "action": "EXIT",
+                "regime": self._regime_from_structure_id(
+                    getattr(position, "structure_id", "") or ""
+                ),
+                "option_type": getattr(
+                    getattr(position, "instrument", None), "option_type", None
+                ),
+                "rsi": candle.get("rsi"),
+                "main_symbol": getattr(
+                    getattr(position, "instrument", None), "trading_symbol", None
+                ),
+            },
+        )
         intents.append(
             self.create_order_intent(
                 inst=position.instrument,
@@ -741,11 +843,13 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
                 tag="MAIN_EXIT",
                 symbol=candle["symbol"],
                 action="EXIT",
+                metadata_extras=exit_extras,
             )
         )
 
         hedge_exit = self.create_hedge_exit_intent(position, candle, ctx)
         if hedge_exit:
+            hedge_exit.metadata_extras = exit_extras
             intents.append(hedge_exit)
 
         return intents

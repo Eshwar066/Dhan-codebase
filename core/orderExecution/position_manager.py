@@ -17,6 +17,20 @@ logger = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
 
 
+def normalize_fill_side(side: Any) -> Optional[str]:
+    """Map broker/intent side aliases to BUY/SELL. None if missing or unknown.
+
+    Empty/unknown must not default to SELL — that flipped hedge BUY fills to shorts
+    and a later REST BUY then flattened the local book.
+    """
+    s = str(side or "").strip().upper()
+    if s in ("BUY", "B", "LONG", "1"):
+        return "BUY"
+    if s in ("SELL", "S", "SHORT", "-1"):
+        return "SELL"
+    return None
+
+
 def _fill_clock_for_trade_log(fill_ts: Any) -> Optional[datetime]:
     """
     Normalize bar/fill time to **IST naive** for trade_log CSV display.
@@ -105,7 +119,10 @@ class Position:
         return f"<Position symbol={sym} qty={self.net_qty} avg={self.avg_price}>"
 
     def update_fill(self, side, qty, price, fill_ts=None):
-        signed_qty = qty if side == "BUY" else -qty
+        side_n = normalize_fill_side(side)
+        if side_n is None:
+            raise ValueError(f"update_fill requires BUY/SELL, got {side!r}")
+        signed_qty = qty if side_n == "BUY" else -qty
 
         # -------- ENTRY --------
         if self.net_qty == 0:
@@ -259,6 +276,16 @@ class PositionManager:
 
         hook_main_entry = None
         hook_main_exit = None
+        side_n = normalize_fill_side(side)
+        if side_n is None:
+            logger.warning(
+                "on_fill skipped: missing/invalid side=%r symbol=%s intent_id=%s",
+                side,
+                getattr(instrument, "trading_symbol", None),
+                intent_id,
+            )
+            return False, 0.0
+        side = side_n
         with self._lock:
             sym = instrument.trading_symbol
             lot_size = instrument.lot_size
@@ -679,7 +706,7 @@ class PositionManager:
             if (rec.get("action") or payload.get("action") or "") != "ENTRY":
                 continue
             tag = str(rec.get("tag") or payload.get("tag") or "MAIN").upper()
-            if tag != "MAIN":
+            if tag not in ("MAIN", "HEDGE"):
                 continue
             inst = rec.get("instrument")
             sym = getattr(inst, "trading_symbol", None) or payload.get("symbol")
@@ -1119,7 +1146,7 @@ class PositionManager:
         option_type = getattr(pos.instrument, "option_type", "")
         hedge_expiry = getattr(pos.instrument, "expiry", None)
 
-        if hedge_strike is None or not option_type or hedge_expiry is None:
+        if hedge_strike is None or not option_type:
             return False
 
         try:
@@ -1152,9 +1179,17 @@ class PositionManager:
             if abs(float(b_strike) - expected_main_strike) > 1:
                 continue
 
-            # Check expiry match
+            # Same-expiry weekly hedges (NiftyDOS). LEAPS calendar hedges
+            # (Oct vs Dec) skip this check when expiry is missing or differs.
             b_expiry = bp.get("expiry") or bp.get("expiry_date")
-            if b_expiry and str(b_expiry) != str(hedge_expiry):
+            strat_u = str(strategy or "").strip().upper()
+            calendar_ok = strat_u in ("LEAPS_RSI", "LEAPS")
+            if (
+                b_expiry
+                and hedge_expiry
+                and str(b_expiry) != str(hedge_expiry)
+                and not calendar_ok
+            ):
                 continue
 
             # Found matching MAIN - this is HEDGE
@@ -1621,6 +1656,69 @@ class PositionManager:
                         getattr(pos, "net_qty", None),
                     )
                 self.positions.pop(sym, None)
+
+            self._pair_orphan_hedge_legs_locked()
+
+    def _pair_orphan_hedge_legs_locked(self) -> None:
+        """Attach untagged long options to the unique short MAIN on the same underlying.
+
+        Recovers LEAPS calendar hedges after a false local close wiped metadata.
+        Does nothing when more than one owned MAIN exists for that underlying.
+        """
+        mains_by_root: Dict[str, list] = {}
+        for sym, pos in self.positions.items():
+            if int(getattr(pos, "net_qty", 0) or 0) >= 0:
+                continue
+            strat = str(getattr(pos, "strategy", None) or "").strip()
+            sid = str(getattr(pos, "structure_id", None) or "").strip()
+            if not strat or not sid:
+                continue
+            tag_u = str(getattr(pos, "tag", None) or "MAIN").upper()
+            if tag_u not in ("MAIN",):
+                continue
+            root = self.symbol_underlying_root(sym)
+            if not root:
+                continue
+            mains_by_root.setdefault(root, []).append((sym, pos))
+
+        for sym, pos in list(self.positions.items()):
+            if int(getattr(pos, "net_qty", 0) or 0) <= 0:
+                continue
+            existing_sid = str(getattr(pos, "structure_id", None) or "").strip()
+            existing_strat = str(getattr(pos, "strategy", None) or "").strip()
+            existing_tag = str(getattr(pos, "tag", None) or "").upper()
+            if existing_sid and existing_strat and existing_tag in ("HEDGE", "MAIN"):
+                continue
+            root = self.symbol_underlying_root(sym)
+            candidates = mains_by_root.get(root) or []
+            if len(candidates) != 1:
+                continue
+            main_sym, main = candidates[0]
+            h_opt, _h_strike = self._extract_option_hint(sym, None)
+            m_opt, _m_strike = self._extract_option_hint(main_sym, None)
+            if h_opt and m_opt and str(h_opt).upper() != str(m_opt).upper():
+                continue
+            pos.strategy = getattr(main, "strategy", None)
+            pos.structure_id = getattr(main, "structure_id", None)
+            pos.tag = "HEDGE"
+            if not getattr(pos, "intent_id", None):
+                meta_h = self.position_metadata.get(sym) or {}
+                pos.intent_id = meta_h.get("intent_id")
+            self._merge_position_metadata(
+                sym,
+                strategy=pos.strategy,
+                structure_id=pos.structure_id,
+                tag="HEDGE",
+                intent_id=pos.intent_id,
+            )
+            if pos.strategy:
+                self.strategy_pos[pos.strategy][sym] = int(pos.net_qty)
+            logger.info(
+                "Reconcile: paired orphan long %s as HEDGE of %s structure=%s",
+                sym,
+                main_sym,
+                pos.structure_id,
+            )
 
     def sync_symbol_flat_at_broker(
         self, trading_symbol: str, *, reason: str = "", clear_metadata: bool = False
