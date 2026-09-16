@@ -197,6 +197,7 @@ class NiftyDosCriticalFixTests(unittest.TestCase):
 
     def test_sync_tracking_log_handles_missing_hedge_entry(self):
         pos = SimpleNamespace(
+            strategy="NiftyDOS",
             tag="MAIN",
             structure_id="NiftyDOS:NIFTY:SUPER_BULLISH",
             net_qty=-65,
@@ -280,6 +281,59 @@ class NiftyDosCriticalFixTests(unittest.TestCase):
         strategy._structure_main_entry_price["sid"] = 90.0
         self.assertTrue(strategy.should_evaluate(candle))
         self.assertIsNone(strategy.eval_signal_log_message(candle))
+
+    def test_structure_flat_ignores_other_strategy_positions(self):
+        strategy = NiftyDOS()
+        sid = "NiftyDOS:NIFTY:SUPER_BULLISH"
+        other_main = SimpleNamespace(
+            strategy="Leaps",
+            tag="MAIN",
+            structure_id="Leaps:NIFTY:RSI",
+            net_qty=-65,
+            instrument=SimpleNamespace(custom_symbol="NIFTY"),
+        )
+        candle = {"symbol": "NIFTY", "timestamp": datetime(2026, 9, 15, 10, 0)}
+        ctx = SimpleNamespace(
+            position_store=SimpleNamespace(
+                get_open_positions=MagicMock(return_value=[other_main])
+            )
+        )
+        self.assertTrue(strategy._is_structure_flat_at_broker(sid, candle, ctx))
+
+    def test_structure_still_open_only_for_same_strategy(self):
+        strategy = NiftyDOS()
+        sid = "NiftyDOS:NIFTY:SUPER_BULLISH"
+        own_main = SimpleNamespace(
+            strategy="NiftyDOS",
+            tag="MAIN",
+            structure_id=sid,
+            net_qty=-65,
+            instrument=SimpleNamespace(custom_symbol="NIFTY"),
+        )
+        candle = {"symbol": "NIFTY", "timestamp": datetime(2026, 9, 15, 10, 0)}
+        ctx = SimpleNamespace(
+            position_store=SimpleNamespace(
+                get_open_positions=MagicMock(return_value=[own_main])
+            )
+        )
+        self.assertTrue(strategy._structure_still_open_at_broker(sid, candle, ctx))
+
+    def test_has_open_main_ignores_other_strategies(self):
+        strategy = NiftyDOS()
+        other_main = SimpleNamespace(
+            strategy="Leaps",
+            tag="MAIN",
+            structure_id="Leaps:NIFTY:RSI",
+            net_qty=-65,
+            instrument=SimpleNamespace(custom_symbol="NIFTY"),
+        )
+        candle = {"symbol": "NIFTY", "timestamp": datetime(2026, 9, 15, 10, 0)}
+        ctx = SimpleNamespace(
+            position_store=SimpleNamespace(
+                get_open_positions=MagicMock(return_value=[other_main])
+            )
+        )
+        self.assertFalse(strategy._has_open_main_for_strategy(candle, ctx))
 
 
 if __name__ == "__main__":

@@ -951,6 +951,62 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         )
         return [hedge_intent, sell_intent] if hedge_intent else [sell_intent]
 
+    def _underlying_symbol(self, candle: dict) -> str:
+        return str(candle.get("symbol") or "")
+
+    def _strategy_open_positions(
+        self,
+        ctx,
+        candle: Optional[dict] = None,
+        *,
+        underlying: Optional[str] = None,
+        structure_id: Optional[str] = None,
+        tag: Optional[str] = None,
+    ) -> list:
+        """Open broker legs for this strategy only (ignore other strategies on same underlying)."""
+        if not ctx or not ctx.position_store:
+            return []
+        und = underlying if underlying is not None else self._underlying_symbol(candle or {})
+        positions = ctx.position_store.get_open_positions(
+            underlying=und,
+            strategy=self.name,
+        ) or []
+        tag_u = str(tag or "").upper() if tag else None
+        out = []
+        for pos in positions:
+            if str(getattr(pos, "strategy", "") or "") != self.name:
+                continue
+            if structure_id and getattr(pos, "structure_id", None) != structure_id:
+                continue
+            pos_tag = str(getattr(pos, "tag", "") or "").upper()
+            if tag_u and pos_tag != tag_u:
+                continue
+            if int(getattr(pos, "net_qty", 0) or 0) == 0:
+                continue
+            out.append(pos)
+        return out
+
+    def _has_open_main_for_strategy(self, candle: dict, ctx) -> bool:
+        return bool(self._strategy_open_positions(ctx, candle, tag="MAIN"))
+
+    def _structure_still_open_at_broker(self, structure_id: str, candle, ctx) -> bool:
+        if not structure_id:
+            return False
+        still_open = self._strategy_open_positions(
+            ctx, candle, structure_id=structure_id
+        )
+        if still_open:
+            logger.debug(
+                "NiftyDOS: structure %s still open for strategy=%s legs=%s",
+                structure_id,
+                self.name,
+                [getattr(p, "tag", "?") for p in still_open],
+            )
+        return bool(still_open)
+
+    def _is_structure_flat_at_broker(self, structure_id: str, candle, ctx) -> bool:
+        return not self._structure_still_open_at_broker(structure_id, candle, ctx)
+
     def _st_flip_detected(self, candle: dict) -> bool:
         st = self._get_supertrend_signal(candle)
         if st is None or self._prev_st_signal is None:
@@ -1188,23 +1244,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
 
         # Check 9:45 AM rule - if no open position, create position on Supertrend direction
         if self._is_945am(candle):
-            # Check if there's already an open position for this strategy
-            has_open_position = False
-            if ctx and ctx.position_store:
-                try:
-                    open_positions = ctx.position_store.get_open_positions(
-                        underlying=str(candle.get("symbol") or ""),
-                        strategy=self.name,
-                    ) or []
-                    # Check for any MAIN position with non-zero qty
-                    for pos in open_positions:
-                        if getattr(pos, "tag", "") == "MAIN" and int(getattr(pos, "net_qty", 0) or 0) != 0:
-                            has_open_position = True
-                            break
-                except Exception as e:
-                    logger.warning(f"NiftyDOS: Error checking open positions at 9:45: {e}")
-
-            if not has_open_position:
+            if not self._has_open_main_for_strategy(candle, ctx):
                 logger.info(f"NiftyDOS: 9:45 AM - No open position, creating position on Supertrend direction: {st_signal}")
                 # Determine option type based on Supertrend signal
                 if st_signal == "BULLISH":
@@ -1224,24 +1264,11 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         if not is_primary_tf:
             return None
 
-        # Check if there's already an open MAIN position at broker for this strategy
-        # Prevent duplicate entries if position already open
-        has_open_position = False
-        if ctx and ctx.position_store:
-            try:
-                open_positions = ctx.position_store.get_open_positions(
-                    underlying=str(candle.get("symbol") or ""),
-                    strategy=self.name,
-                ) or []
-                for pos in open_positions:
-                    if getattr(pos, "tag", "") == "MAIN" and int(getattr(pos, "net_qty", 0) or 0) != 0:
-                        has_open_position = True
-                        logger.info(f"NiftyDOS: Skipping new entry - MAIN position already open at broker (structure={pos.structure_id})")
-                        break
-            except Exception as e:
-                logger.warning(f"NiftyDOS: Error checking open positions: {e}")
-
-        if has_open_position:
+        if self._has_open_main_for_strategy(candle, ctx):
+            logger.info(
+                "NiftyDOS: Skipping new entry - MAIN position already open for strategy=%s",
+                self.name,
+            )
             return None
 
         if self._pending_eval_reason != "ST_FLIP":
@@ -1265,20 +1292,6 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
 
     # ---------- Exit / TP-SL Management ----------
 
-    def _structure_still_open_at_broker(self, structure_id: str, candle, ctx) -> bool:
-        if not ctx or not ctx.position_store or not structure_id:
-            return False
-        open_positions = ctx.position_store.get_open_positions(
-            underlying=str(candle.get("symbol") or ""),
-            strategy=self.name,
-        ) or []
-        for pos in open_positions:
-            if getattr(pos, "structure_id", None) != structure_id:
-                continue
-            if int(getattr(pos, "net_qty", 0) or 0) != 0:
-                return True
-        return False
-
     def _clear_structure_tracking(self, structure_id: str, *, clear_sl_pending: bool = False) -> None:
         if not structure_id:
             return
@@ -1301,8 +1314,9 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             self._structure_hedge_entry_price.pop(structure_id, None)
             self._structure_type.pop(structure_id, None)
             logger.info(
-                "NiftyDOS: Broker flat after exit for structure %s (SL reentry=%s)",
+                "NiftyDOS: Broker flat after exit for structure %s strategy=%s (SL reentry=%s)",
                 structure_id,
+                self.name,
                 structure_id in self._sl_hit_structure,
             )
 
@@ -1443,9 +1457,13 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         else:
             hedge_strike = main_strike_f - gap
 
-        # Look for matching hedge position
+        # Look for matching hedge position (this strategy only)
         for pos in ctx.position_store.positions.values():
-            if pos.net_qty <= 0:  # Hedge is long
+            if str(getattr(pos, "strategy", "") or "") != self.name:
+                continue
+            if str(getattr(pos, "tag", "") or "").upper() != "HEDGE":
+                continue
+            if pos.net_qty <= 0:
                 continue
             inst = getattr(pos, "instrument", None)
             if not inst:
@@ -1688,9 +1706,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             return None
 
         symbol = str(candle.get("symbol", "") or "")
-        open_positions = ctx.position_store.get_open_positions(
-            underlying=symbol, strategy=self.name
-        ) or []
+        open_positions = self._strategy_open_positions(ctx, candle, tag="MAIN")
 
         exit_intents = []
         for position in open_positions:
@@ -1908,26 +1924,20 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         executed_intents = []
         # Iterate over copy since we modify the dict
         for structure_id, reentry_info in list(self._reentry_after_close.items()):
-            # Check if position is still open at broker
-            open_positions = ctx.position_store.get_open_positions(
-                underlying=str(candle.get("symbol", "") or ""),
-                strategy=self.name,
-            ) or []
-
-            # Check if any position with this structure_id is still open
-            still_open = False
-            for pos in open_positions:
-                if getattr(pos, "structure_id", None) == structure_id and int(getattr(pos, "net_qty", 0) or 0) != 0:
-                    still_open = True
-                    break
-
-            if still_open:
-                # Position still open at broker, skip reentry for now
-                logger.debug(f"NiftyDOS: Reentry for {structure_id} deferred - position still open at broker")
+            if self._structure_still_open_at_broker(structure_id, candle, ctx):
+                logger.debug(
+                    "NiftyDOS: Reentry for %s deferred - %s leg(s) still open at broker",
+                    structure_id,
+                    self.name,
+                )
                 continue
 
-            # Position is closed at broker - execute reentry
-            logger.info(f"NiftyDOS: Position closed at broker for {structure_id}, executing reentry ({reentry_info['reason']})")
+            logger.info(
+                "NiftyDOS: %s structure %s flat at broker, executing reentry (%s)",
+                self.name,
+                structure_id,
+                reentry_info["reason"],
+            )
             reentry_type = reentry_info["type"]
             reason = reentry_info["reason"]
 
@@ -2006,11 +2016,12 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
 
         restored = 0
         try:
-            open_positions = ctx.position_store.get_open_positions(
+            open_positions = self._strategy_open_positions(
+                ctx,
                 underlying=str(getattr(ctx, "symbol", "") or ""),
-                strategy=self.name,
-            ) or []
-            _log(f"found {len(open_positions)} open positions for strategy={self.name}")
+                tag="MAIN",
+            )
+            _log(f"found {len(open_positions)} open MAIN positions for strategy={self.name}")
 
             for position in open_positions:
                 _log(f"  checking position: symbol={getattr(position.instrument, 'trading_symbol', 'unknown')} tag={getattr(position, 'tag', 'none')} structure_id={getattr(position, 'structure_id', 'none')} net_qty={getattr(position, 'net_qty', 0)}")
@@ -2148,19 +2159,12 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             logger.info(f"NiftyDOS: SL reentry skipped - candle not in favor of {st_signal}")
             return None
 
-        # Check if position already open at broker for this strategy
-        if ctx and ctx.position_store:
-            try:
-                open_positions = ctx.position_store.get_open_positions(
-                    underlying=str(candle.get("symbol") or ""),
-                    strategy=self.name,
-                ) or []
-                for pos in open_positions:
-                    if getattr(pos, "tag", "") == "MAIN" and int(getattr(pos, "net_qty", 0) or 0) != 0:
-                        logger.info(f"NiftyDOS: SL reentry skipped - MAIN position already open at broker (structure={pos.structure_id})")
-                        return None
-            except Exception as e:
-                logger.warning(f"NiftyDOS: Error checking open positions for SL reentry: {e}")
+        if self._has_open_main_for_strategy(candle, ctx):
+            logger.info(
+                "NiftyDOS: SL reentry skipped - MAIN already open for strategy=%s",
+                self.name,
+            )
+            return None
 
         # All conditions met - reenter
         logger.info(f"NiftyDOS: SL reentry conditions met for {option_type}")
@@ -2179,19 +2183,12 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         if self._is_after_315pm(candle) and (adx is None or adx < self.reentry_adx_threshold):
             return None
 
-        # Check if position already open at broker for this strategy
-        if ctx and ctx.position_store:
-            try:
-                open_positions = ctx.position_store.get_open_positions(
-                    underlying=str(candle.get("symbol") or ""),
-                    strategy=self.name,
-                ) or []
-                for pos in open_positions:
-                    if getattr(pos, "tag", "") == "MAIN" and int(getattr(pos, "net_qty", 0) or 0) != 0:
-                        logger.info(f"NiftyDOS: TP reentry skipped - MAIN position already open at broker (structure={pos.structure_id})")
-                        return None
-            except Exception as e:
-                logger.warning(f"NiftyDOS: Error checking open positions for TP reentry: {e}")
+        if self._has_open_main_for_strategy(candle, ctx):
+            logger.info(
+                "NiftyDOS: TP reentry skipped - MAIN already open for strategy=%s",
+                self.name,
+            )
+            return None
 
         logger.info(f"NiftyDOS: Immediate TP reentry for {option_type} - finding strike 80-105")
         new_structure_id = self.build_structure_id(candle, "REENTRY_TP")
@@ -2212,19 +2209,12 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             logger.info(f"NiftyDOS: ST flip reentry blocked after 15:15 PM")
             return None
 
-        # Check if position already open at broker for this strategy
-        if ctx and ctx.position_store:
-            try:
-                open_positions = ctx.position_store.get_open_positions(
-                    underlying=str(candle.get("symbol") or ""),
-                    strategy=self.name,
-                ) or []
-                for pos in open_positions:
-                    if getattr(pos, "tag", "") == "MAIN" and int(getattr(pos, "net_qty", 0) or 0) != 0:
-                        logger.info(f"NiftyDOS: ST flip reentry skipped - MAIN position already open at broker (structure={pos.structure_id})")
-                        return None
-            except Exception as e:
-                logger.warning(f"NiftyDOS: Error checking open positions for ST flip reentry: {e}")
+        if self._has_open_main_for_strategy(candle, ctx):
+            logger.info(
+                "NiftyDOS: ST flip reentry skipped - MAIN already open for strategy=%s",
+                self.name,
+            )
+            return None
 
         logger.info(f"NiftyDOS: Immediate ST flip reentry for {option_type} - finding strike 80-105")
         new_structure_id = self.build_structure_id(candle, "REENTRY_ST_FLIP")
