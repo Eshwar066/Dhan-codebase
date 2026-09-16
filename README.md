@@ -347,3 +347,13 @@ Dhan:
     python3 utils/yfinance/refresh_nifty_indicator_history.py --only 15
     python3 utils/yfinance/refresh_nifty_indicator_history.py --only 30
     python3 utils/yfinance/refresh_nifty_indicator_history.py --only 120
+
+===
+graphify
+
+cd /root/Dhan-codebase
+graphify explain "NiftyDOS" --graph graphify-out/graph.json
+graphify path "should_evaluate" "on_candle" --graph graphify-out/graph.json
+
+graphify update .
+graphify export wiki

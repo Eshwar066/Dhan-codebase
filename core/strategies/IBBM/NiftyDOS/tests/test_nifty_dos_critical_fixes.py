@@ -157,6 +157,34 @@ class NiftyDosCriticalFixTests(unittest.TestCase):
         self.assertEqual(ts_ist.minute, 45)
         self.assertTrue(self.strategy._is_945am(candle))
 
+    def test_is_945am_accepts_close_within_3min_buffer(self):
+        """Delayed feed may stamp close between 9:46–9:48 IST."""
+        for utc_minute, ist_minute in ((16, 46), (17, 47), (18, 48)):
+            candle = {
+                "timestamp": datetime(2026, 9, 15, 4, utc_minute),
+                "timeframe": "30",
+            }
+            self.assertTrue(
+                self.strategy._is_945am(candle),
+                f"expected 9:{ist_minute:02d} IST close in 9:45 entry window",
+            )
+
+    def test_is_945am_rejects_close_after_buffer(self):
+        candle = {
+            "timestamp": datetime(2026, 9, 15, 4, 19),  # 9:49 IST
+            "timeframe": "30",
+        }
+        self.assertFalse(self.strategy._is_945am(candle))
+
+    def test_is_945am_rejects_second_30m_bar(self):
+        bucket = int(pd.Timestamp("2026-09-15 09:45:00", tz=IST).timestamp())
+        candle = {
+            "timestamp": datetime(2026, 9, 15, 4, 45),
+            "bucket_ts": bucket,
+            "timeframe": "30",
+        }
+        self.assertFalse(self.strategy._is_945am(candle))
+
     def test_candle_ts_ist_is_timezone_aware(self):
         bucket = int(pd.Timestamp("2026-09-15 09:15:00", tz=IST).timestamp())
         candle = {

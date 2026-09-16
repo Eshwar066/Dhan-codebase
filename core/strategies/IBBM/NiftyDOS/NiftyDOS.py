@@ -100,6 +100,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
     eod_exit_time = time(15, 00)  # 3:00 PM
     no_entry_time = time(15, 15)  # 3:15 PM
     morning_check_time = time(9, 15)  # 9:15 AM
+    entry_945_buffer_minutes = 3  # allow delayed first-bar delivery until 9:48 IST
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -600,22 +601,48 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         open_ts = self._candle_open_ts_ist(candle)
         return open_ts.hour == 9 and open_ts.minute == 15
 
+    def _is_in_945_close_window(self, close_ts: pd.Timestamp) -> bool:
+        """True when bar close falls in 9:45–9:48 IST (3 min buffer for delayed feed)."""
+        buf = int(getattr(self, "entry_945_buffer_minutes", 3) or 3)
+        close_minutes = close_ts.hour * 60 + close_ts.minute
+        start = 9 * 60 + 45
+        end = start + buf
+        return start <= close_minutes <= end
+
+    def _is_in_945_open_window(self, open_ts: pd.Timestamp) -> bool:
+        """First session 30m bar open: 9:15–9:18 IST (matches close buffer)."""
+        buf = int(getattr(self, "entry_945_buffer_minutes", 3) or 3)
+        open_minutes = open_ts.hour * 60 + open_ts.minute
+        start = 9 * 60 + 15
+        end = start + buf
+        return start <= open_minutes <= end
+
     def _is_945am(self, candle: dict) -> bool:
-        """First 30m bar close (9:15–9:45 candle closes at 9:45 IST)."""
+        """First 30m bar entry window: open 9:15–9:18, close 9:45–9:48 IST."""
         if not self._is_primary_timeframe_candle(candle):
             return False
-        close_ts = self._candle_close_ts_ist(candle)
-        if close_ts.hour == 9 and close_ts.minute == 45:
-            return True
-        # Fallback when engine sends bar close as timestamp without bucket_ts.
+        bar_min = self._candle_bar_minutes(candle)
+        bar_delta = pd.Timedelta(minutes=bar_min)
+
         if candle.get("bucket_ts") is not None:
-            return False
+            open_ts = self._candle_open_ts_ist(candle)
+            if not self._is_in_945_open_window(open_ts):
+                return False
+            close_ts = self._candle_close_ts_ist(candle)
+            return self._is_in_945_close_window(close_ts)
+
         ts = pd.Timestamp(candle.get("timestamp"))
         if ts.tzinfo is None:
             ts = ts.tz_localize("UTC").tz_convert(IST)
         else:
             ts = ts.tz_convert(IST)
-        return ts.hour == 9 and ts.minute == 45
+
+        # Timestamp may be bar open or bar close when bucket_ts is missing.
+        if self._is_in_945_open_window(ts):
+            return self._is_in_945_close_window(ts + bar_delta)
+        if self._is_in_945_close_window(ts):
+            return self._is_in_945_open_window(ts - bar_delta)
+        return False
 
     def _is_expiry_day_new_trade(self, candle: dict) -> bool:
         """Check if it's expiry day and we need to shift to next expiry."""
@@ -1068,13 +1095,22 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         )
         # Live: only eval shortly after bar close. Backtest: every closed bar.
         # For dummy feed testing, allow eval if candle is closed (has bucket_ts)
-        if RUN_MODE != RunMode.BACKTEST and not self._in_close_eval_window(candle):
-            # Allow dummy feed candles (simulated timestamps) to pass eval window
-            if candle.get("bucket_ts") is not None and candle.get("session_close_partial") is not True:
-                logger.debug("NiftyDOS: allowing dummy feed candle past eval window")
-            else:
-                logger.info(f"NiftyDOS: should_evaluate False - not in eval window")
-                return False
+        if RUN_MODE != RunMode.BACKTEST:
+            grace_minutes = 5
+            if self._is_primary_timeframe_candle(candle):
+                open_ts = self._candle_open_ts_ist(candle)
+                if open_ts.hour == 9 and open_ts.minute == 15:
+                    grace_minutes = max(
+                        grace_minutes,
+                        int(getattr(self, "entry_945_buffer_minutes", 3) or 3),
+                    )
+            if not self._in_close_eval_window(candle, grace_minutes=grace_minutes):
+                # Allow dummy feed candles (simulated timestamps) to pass eval window
+                if candle.get("bucket_ts") is not None and candle.get("session_close_partial") is not True:
+                    logger.debug("NiftyDOS: allowing dummy feed candle past eval window")
+                else:
+                    logger.info(f"NiftyDOS: should_evaluate False - not in eval window")
+                    return False
 
         trade_date = self._trade_date(candle)
         if self._is_event_no_trade_day(trade_date):
