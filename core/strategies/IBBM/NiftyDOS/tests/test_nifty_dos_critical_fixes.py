@@ -11,6 +11,7 @@ import pandas as pd
 
 from core.strategies.IBBM.NiftyDOS.NiftyDOS import NiftyDOS
 from core.strategies.IndiaMktMixins import IST
+from run.config import RunMode
 
 
 class NiftyDosCriticalFixTests(unittest.TestCase):
@@ -215,6 +216,70 @@ class NiftyDosCriticalFixTests(unittest.TestCase):
 
         restored = self.strategy.sync_tracking_from_broker(ctx)
         self.assertEqual(restored, 1)
+
+    @staticmethod
+    def _candle_30m(open_h, open_m, bullish: bool):
+        bucket = int(pd.Timestamp(f"2026-09-15 {open_h:02d}:{open_m:02d}:00", tz=IST).timestamp())
+        return {
+            "symbol": "NIFTY",
+            "timeframe": "30",
+            "bucket_ts": bucket,
+            "timestamp": datetime(2026, 9, 15, open_h, open_m),
+            "supertrend_is_bullish": bullish,
+            "close": 25000.0,
+        }
+
+    @patch("core.strategies.IBBM.NiftyDOS.NiftyDOS.RUN_MODE", RunMode.BACKTEST)
+    @patch.object(NiftyDOS, "_is_event_no_trade_day", return_value=False)
+    def test_should_evaluate_false_when_supertrend_unchanged(self, _event_mock):
+        strategy = NiftyDOS()
+        c1 = self._candle_30m(10, 15, True)
+        self.assertFalse(strategy.should_evaluate(c1))
+        self.assertIsNone(strategy.eval_signal_log_message(c1))
+
+        c2 = self._candle_30m(10, 45, True)
+        self.assertFalse(strategy.should_evaluate(c2))
+        self.assertIsNone(strategy.eval_signal_log_message(c2))
+
+    @patch("core.strategies.IBBM.NiftyDOS.NiftyDOS.RUN_MODE", RunMode.BACKTEST)
+    @patch.object(NiftyDOS, "_is_event_no_trade_day", return_value=False)
+    def test_should_evaluate_true_on_supertrend_flip(self, _event_mock):
+        strategy = NiftyDOS()
+        strategy.should_evaluate(self._candle_30m(10, 15, True))
+        flip_candle = self._candle_30m(10, 45, False)
+        self.assertTrue(strategy.should_evaluate(flip_candle))
+        msg = strategy.eval_signal_log_message(flip_candle)
+        self.assertIsNotNone(msg)
+        self.assertIn("ST_FLIP", msg)
+
+    @patch("core.strategies.IBBM.NiftyDOS.NiftyDOS.RUN_MODE", RunMode.BACKTEST)
+    @patch.object(NiftyDOS, "_is_event_no_trade_day", return_value=False)
+    def test_should_evaluate_true_at_945_entry(self, _event_mock):
+        strategy = NiftyDOS()
+        candle = self._candle_30m(9, 15, True)
+        self.assertTrue(strategy.should_evaluate(candle))
+        msg = strategy.eval_signal_log_message(candle)
+        self.assertIn("9:45_ENTRY", msg or "")
+
+    @patch("core.strategies.IBBM.NiftyDOS.NiftyDOS.RUN_MODE", RunMode.BACKTEST)
+    @patch.object(NiftyDOS, "_is_event_no_trade_day", return_value=False)
+    def test_should_evaluate_true_for_sl_reentry(self, _event_mock):
+        strategy = NiftyDOS()
+        strategy._sl_hit_structure["NiftyDOS:NIFTY:SUPER_BULLISH"] = "PUT"
+        candle = self._candle_30m(11, 15, True)
+        self.assertTrue(strategy.should_evaluate(candle))
+        self.assertIn("SL_REENTRY", strategy.eval_signal_log_message(candle) or "")
+
+    @patch("core.strategies.IBBM.NiftyDOS.NiftyDOS.RUN_MODE", RunMode.BACKTEST)
+    @patch.object(NiftyDOS, "_is_event_no_trade_day", return_value=False)
+    def test_should_evaluate_5min_only_for_monitoring_or_reentry(self, _event_mock):
+        strategy = NiftyDOS()
+        candle = {"symbol": "NIFTY", "timeframe": "5", "timestamp": datetime(2026, 9, 15, 10, 5)}
+        self.assertFalse(strategy.should_evaluate(candle))
+
+        strategy._structure_main_entry_price["sid"] = 90.0
+        self.assertTrue(strategy.should_evaluate(candle))
+        self.assertIsNone(strategy.eval_signal_log_message(candle))
 
 
 if __name__ == "__main__":

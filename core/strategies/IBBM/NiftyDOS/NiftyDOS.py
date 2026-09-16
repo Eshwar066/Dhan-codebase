@@ -118,6 +118,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         self._tp_hit_pending: dict[str, str] = {}  # structure_id -> option_type (for immediate reentry)
         # Track Supertrend flip for immediate reentry
         self._prev_st_signal: Optional[str] = None  # track previous supertrend for flip detection
+        self._pending_eval_reason: Optional[str] = None
         self._st_flip_reentry_pending: dict[str, str] = {}  # structure_id -> new_option_type (for immediate reentry on ST flip)
         # Track reentry pending after position closes at broker
         # structure_id -> {"type": "CALL"/"PUT", "reason": "TP"/"ST_FLIP", ...}
@@ -950,6 +951,58 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         )
         return [hedge_intent, sell_intent] if hedge_intent else [sell_intent]
 
+    def _st_flip_detected(self, candle: dict) -> bool:
+        st = self._get_supertrend_signal(candle)
+        if st is None or self._prev_st_signal is None:
+            return False
+        return self._prev_st_signal != st
+
+    def _commit_st_signal_for_bar(self, candle: dict, st_signal: str) -> None:
+        if not self._is_primary_timeframe_candle(candle):
+            return
+        self._prev_st_signal = st_signal
+
+    def _eval_signal_reason(self, candle: dict) -> Optional[str]:
+        """Return a short reason when this bar should emit signal_generated / run on_candle."""
+        candle_tf = str(candle.get("timeframe", self.timeframe) or "").strip()
+
+        if candle_tf == "5":
+            if self._reentry_after_close:
+                reasons = {
+                    str(info.get("reason") or "")
+                    for info in self._reentry_after_close.values()
+                }
+                if "TP" in reasons:
+                    return "TP_REENTRY"
+                if "ST_FLIP" in reasons:
+                    return "ST_FLIP_REENTRY"
+            # 5m runs for TP/SL monitoring; signal_generated only on reentry pending.
+            return None
+
+        if not self._is_primary_timeframe_candle(candle):
+            return None
+
+        if self._reentry_after_close:
+            reasons = {
+                str(info.get("reason") or "")
+                for info in self._reentry_after_close.values()
+            }
+            if "TP" in reasons:
+                return "TP_REENTRY"
+            if "ST_FLIP" in reasons:
+                return "ST_FLIP_REENTRY"
+
+        if self._sl_hit_structure:
+            return "SL_REENTRY"
+
+        if self._is_945am(candle):
+            return "9:45_ENTRY"
+
+        if self._st_flip_detected(candle):
+            return "ST_FLIP"
+
+        return None
+
     def should_evaluate(self, candle):
         logger.info(
             "NiftyDOS: should_evaluate tf=%s ts_ist=%s raw_ts=%s",
@@ -983,43 +1036,63 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         # For 5-min timeframe: only evaluate if we have an open position (for TP/SL monitoring)
         # Skip Supertrend signal check - TP/SL doesn't need trend signal
         if is_5min_tf:
-            has_open_position = bool(self._structure_main_entry_price)
-            logger.info(f"NiftyDOS: should_evaluate (5min) _structure_main_entry_price keys={list(self._structure_main_entry_price.keys())} has_open={has_open_position}")
-            if not has_open_position:
-                logger.info(f"NiftyDOS: should_evaluate False (5min) - no open position for TP/SL")
-                return False
-            logger.info(f"NiftyDOS: should_evaluate True (5min) - open position exists for TP/SL")
-            return True
+            monitor = bool(
+                self._structure_main_entry_price
+                or self._pending_exit_structure_ids
+                or self._reentry_after_close
+            )
+            logger.info(
+                "NiftyDOS: should_evaluate (5min) monitor=%s tracking=%s pending_exit=%s reentry=%s",
+                monitor,
+                list(self._structure_main_entry_price.keys()),
+                list(self._pending_exit_structure_ids),
+                list(self._reentry_after_close.keys()),
+            )
+            return monitor
 
-        # For primary timeframe (30-min): check Supertrend signal for entry
         st_signal = self._get_supertrend_signal(candle)
         if st_signal is None:
-            logger.info(f"NiftyDOS: should_evaluate False - no ST signal")
+            logger.info("NiftyDOS: should_evaluate False - no ST signal")
             return False
-
-        # Track Supertrend flip for signal change detection
-        if self._prev_st_signal is not None and self._prev_st_signal != st_signal:
-            # Supertrend flipped - this is a signal change
-            pass
-        self._prev_st_signal = st_signal
 
         eval_key = self._bar_open_key(candle)
         if eval_key in self._evaluated_signal_keys:
             logger.info(f"NiftyDOS: should_evaluate False - already evaluated key={eval_key}")
             return False
+
+        reason = self._eval_signal_reason(candle)
+        if not reason:
+            self._commit_st_signal_for_bar(candle, st_signal)
+            self._pending_eval_reason = None
+            logger.info(
+                "NiftyDOS: should_evaluate False (30m) - no actionable signal st=%s",
+                st_signal,
+            )
+            return False
+
         self._evaluated_signal_keys.add(eval_key)
-        logger.info(f"NiftyDOS: should_evaluate True - key={eval_key} st_signal={st_signal}")
+        self._pending_eval_reason = reason
+        self._commit_st_signal_for_bar(candle, st_signal)
+        logger.info(
+            "NiftyDOS: should_evaluate True - key=%s reason=%s st_signal=%s",
+            eval_key,
+            reason,
+            st_signal,
+        )
         return True
 
     def eval_signal_log_message(self, candle) -> Optional[str]:
+        reason = self._pending_eval_reason or self._eval_signal_reason(candle)
+        if not reason:
+            return None
         st_signal = self._get_supertrend_signal(candle)
         ma_signal = self._get_ma_signal(candle)
         adx = self._get_adx_value(candle)
         period = int(getattr(self, "sma_period", 9) or 9)
         return (
-            f"DOS Signal: ST={st_signal} MA={ma_signal} ADX={adx} "
-            f"close={candle.get('close')} sma{period}={candle.get(f'sma{period}')}"
-            f" timeframe={getattr(self, 'timeframe', '')}"
+            f"DOS Signal ({reason}): ST={st_signal} MA={ma_signal} ADX={adx} "
+            f"close={candle.get('close')} sma{period}={candle.get(f'sma{period}')} "
+            f"timeframe={getattr(self, 'timeframe', '')}"
         )
 
     def on_candle(self, candle, ctx):
@@ -1169,6 +1242,13 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
                 logger.warning(f"NiftyDOS: Error checking open positions: {e}")
 
         if has_open_position:
+            return None
+
+        if self._pending_eval_reason != "ST_FLIP":
+            logger.info(
+                "NiftyDOS: Skipping 30m entry - eval reason=%s (need ST_FLIP)",
+                self._pending_eval_reason,
+            )
             return None
 
         if st_signal == "BULLISH":
