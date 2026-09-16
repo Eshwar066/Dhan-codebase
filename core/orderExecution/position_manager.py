@@ -16,6 +16,37 @@ logger = logging.getLogger(__name__)
 
 IST = ZoneInfo("Asia/Kolkata")
 
+# Strategies whose session rules and trade logs use IST wall clock (NSE cash/FNO).
+INDIAN_IST_STRATEGIES = frozenset(
+    {
+        "NiftyDOS",
+        "NiftySMA9Weekly",
+        "LEAPS_RSI",
+        "BankNiftyBTST",
+    }
+)
+
+
+def wall_clock_ist() -> datetime:
+    return datetime.now(IST)
+
+
+def resolve_fill_candle_ts(
+    candle_ts: Any,
+    *,
+    strategy: Optional[str] = None,
+) -> datetime:
+    """Return fill/bar time for OMS hooks; IST wall clock for Indian index strategies when missing."""
+    if candle_ts is not None:
+        try:
+            if not bool(pd.isna(candle_ts)):
+                return candle_ts
+        except (TypeError, ValueError):
+            return candle_ts
+    if strategy in INDIAN_IST_STRATEGIES:
+        return wall_clock_ist()
+    return datetime.now(timezone.utc)
+
 
 def normalize_fill_side(side: Any) -> Optional[str]:
     """Map broker/intent side aliases to BUY/SELL. None if missing or unknown.
@@ -35,8 +66,8 @@ def _fill_clock_for_trade_log(fill_ts: Any) -> Optional[datetime]:
     """
     Normalize bar/fill time to **IST naive** for trade_log CSV display.
 
-    Naive inputs are interpreted as UTC because the engine canonicalizes
-    ``candle['timestamp']`` to naive UTC (see ``_normalize_candle_timestamp_utc_naive``).
+    Naive inputs are interpreted as UTC (engine ``candle['timestamp']`` convention).
+    Timezone-aware inputs (e.g. NiftyDOS intents) are converted to IST.
     """
     if fill_ts is None:
         return None
@@ -272,7 +303,7 @@ class PositionManager:
         if missing_candle_ts:
             # REST fills can carry pandas.NaT. Hooks require a real timestamp for
             # slot keys, expiry selection, and deferred/re-entry intent creation.
-            candle_ts = datetime.now(timezone.utc)
+            candle_ts = resolve_fill_candle_ts(None, strategy=strategy)
 
         hook_main_entry = None
         hook_main_exit = None
@@ -401,7 +432,7 @@ class PositionManager:
                 # Fallback to wall clock so REST fills without candle_ts still stamp a time.
                 candle_ts_eff = candle_ts
                 if candle_ts_eff is None:
-                    candle_ts_eff = datetime.now(tz=timezone.utc)
+                    candle_ts_eff = resolve_fill_candle_ts(None, strategy=strategy)
                 candle_ts_ist = _fill_clock_for_trade_log(candle_ts_eff)
                 ts_str = (
                     candle_ts_ist.strftime("%Y-%m-%d %H:%M")

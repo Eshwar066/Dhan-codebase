@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 
 from core.strategies.IBBM.NiftyDOS.NiftyDOS import NiftyDOS
+from core.strategies.IndiaMktMixins import IST
 
 
 class NiftyDosCriticalFixTests(unittest.TestCase):
@@ -121,6 +122,77 @@ class NiftyDosCriticalFixTests(unittest.TestCase):
     def test_on_candle_rollover_is_disabled(self):
         out = self.strategy.on_candle_rollover([], {"timestamp": datetime(2025, 9, 15)}, None)
         self.assertEqual(out, [])
+
+    def test_is_945am_with_bucket_ts_and_utc_naive_timestamp(self):
+        """Live engine: bucket_ts=9:15 IST open, timestamp=03:45 UTC naive."""
+        bucket = int(pd.Timestamp("2026-09-15 09:15:00", tz=IST).timestamp())
+        candle = {
+            "timestamp": datetime(2026, 9, 15, 3, 45),
+            "bucket_ts": bucket,
+            "timeframe": "30",
+        }
+        self.assertTrue(self.strategy._is_915am(candle))
+        self.assertTrue(self.strategy._is_945am(candle))
+
+    def test_is_945am_false_when_timestamp_misread_as_ist(self):
+        """Old bug: localizing UTC naive timestamp as IST shifted close to 4:15."""
+        bucket = int(pd.Timestamp("2026-09-15 09:15:00", tz=IST).timestamp())
+        candle = {
+            "timestamp": datetime(2026, 9, 15, 3, 45),
+            "bucket_ts": bucket,
+            "timeframe": "30",
+        }
+        close_ts = self.strategy._candle_close_ts_ist(candle)
+        self.assertEqual(close_ts.hour, 9)
+        self.assertEqual(close_ts.minute, 45)
+
+    def test_is_945am_fallback_when_timestamp_is_close_time(self):
+        candle = {
+            "timestamp": datetime(2026, 9, 15, 4, 15),
+            "timeframe": "30",
+        }
+        ts_ist = pd.Timestamp(candle["timestamp"]).tz_localize("UTC").tz_convert(IST)
+        self.assertEqual(ts_ist.hour, 9)
+        self.assertEqual(ts_ist.minute, 45)
+        self.assertTrue(self.strategy._is_945am(candle))
+
+    def test_candle_ts_ist_is_timezone_aware(self):
+        bucket = int(pd.Timestamp("2026-09-15 09:15:00", tz=IST).timestamp())
+        candle = {
+            "timestamp": datetime(2026, 9, 15, 3, 45),
+            "bucket_ts": bucket,
+            "timeframe": "30",
+        }
+        ts = self.strategy._candle_ts_ist(candle)
+        self.assertIsNotNone(ts.tzinfo)
+        self.assertEqual(
+            pd.Timestamp(ts).tz_convert(IST).hour,
+            9,
+        )
+        self.assertEqual(pd.Timestamp(ts).tz_convert(IST).minute, 15)
+
+    def test_create_order_intent_coerces_utc_naive_to_ist(self):
+        inst = SimpleNamespace(lot_size=65, trading_symbol="NIFTY-PE", custom_symbol="NIFTY")
+        with patch.object(
+            NiftyDOS.__bases__[0],
+            "create_order_intent",
+            return_value=SimpleNamespace(candle_ts=None),
+        ) as mock_super:
+            self.strategy.create_order_intent(
+                inst=inst,
+                side="SELL",
+                qty=1,
+                price=90.0,
+                order_type="LIMIT",
+                strategy=self.strategy.name,
+                candle_ts=datetime(2026, 9, 15, 3, 45),
+                structure_id="sid",
+                tag="MAIN",
+                symbol="NIFTY",
+                action="ENTRY",
+            )
+        passed_ts = mock_super.call_args.kwargs["candle_ts"]
+        self.assertIsNotNone(pd.Timestamp(passed_ts).tzinfo)
 
     def test_sync_tracking_log_handles_missing_hedge_entry(self):
         pos = SimpleNamespace(

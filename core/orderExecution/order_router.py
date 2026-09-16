@@ -14,7 +14,7 @@ import datetime
 logger = logging.getLogger(__name__)
 
 try:
-    from core.orderExecution.position_manager import normalize_fill_side
+    from core.orderExecution.position_manager import normalize_fill_side, resolve_fill_candle_ts
 except ImportError:
     def normalize_fill_side(side):
         s = str(side or "").strip().upper()
@@ -23,6 +23,11 @@ except ImportError:
         if s in ("SELL", "S", "SHORT", "-1"):
             return "SELL"
         return None
+
+    def resolve_fill_candle_ts(candle_ts, *, strategy=None):
+        if candle_ts is not None:
+            return candle_ts
+        return datetime.datetime.now(tz=datetime.timezone.utc)
 
 try:
     from core.utils.json_numeric import round_json_floats
@@ -4847,7 +4852,7 @@ class OrderRouter:
 
         # REST fill paths often omit candle_ts; stamp wall clock so trades.csv / trade_log get times.
         if candle_ts is None:
-            candle_ts = datetime.datetime.now(tz=datetime.timezone.utc)
+            candle_ts = resolve_fill_candle_ts(None, strategy=strategy)
 
         position_closed, realized_pnl = self.position_manager.on_fill(
             instrument=instrument,

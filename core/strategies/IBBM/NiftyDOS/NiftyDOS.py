@@ -31,8 +31,6 @@ import logging
 from datetime import date, time, timedelta
 from pathlib import Path
 from typing import Any, List, Optional, Set
-
-import numpy as np
 import pandas as pd
 
 from run.config import RUN_MODE, RunMode
@@ -451,45 +449,98 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
 
     # ---------- Time / event gates ----------
 
-    def _candle_close_ts_ist(self, candle: dict) -> pd.Timestamp:
-        ts = pd.Timestamp(candle["timestamp"])
-        if ts.tzinfo is None:
-            ts = ts.tz_localize(IST)
-        else:
-            ts = ts.tz_convert(IST)
-        bar_minutes = int(self.timeframe) if str(self.timeframe).isdigit() else 30
-        return ts + pd.Timedelta(minutes=bar_minutes)
+    def _candle_bar_minutes(self, candle: dict) -> int:
+        candle_tf = str(candle.get("timeframe", self.timeframe) or "").strip()
+        if candle_tf.isdigit():
+            return int(candle_tf)
+        if str(self.timeframe).isdigit():
+            return int(self.timeframe)
+        return 30
 
-    def _bar_open_key(self, candle: dict) -> str:
+    def _candle_open_ts_ist(self, candle: dict) -> pd.Timestamp:
+        """Bar open in IST. Prefer ``bucket_ts``; else UTC-naive ``timestamp`` from engine."""
         bucket = candle.get("bucket_ts")
         if bucket is not None:
             try:
-                ts = pd.to_datetime(int(float(bucket)), unit="s", utc=True).tz_convert(IST)
-                return ts.strftime("%Y-%m-%d %H:%M")
+                return pd.to_datetime(int(float(bucket)), unit="s", utc=True).tz_convert(IST)
             except (TypeError, ValueError):
                 pass
         ts = pd.Timestamp(candle.get("timestamp"))
         if ts.tzinfo is None:
-            ts = ts.tz_localize(IST)
+            ts = ts.tz_localize("UTC").tz_convert(IST)
         else:
             ts = ts.tz_convert(IST)
-        return ts.strftime("%Y-%m-%d %H:%M")
+        return ts
+
+    def _candle_close_ts_ist(self, candle: dict) -> pd.Timestamp:
+        """Bar close in IST = open + candle timeframe."""
+        return self._candle_open_ts_ist(candle) + pd.Timedelta(
+            minutes=self._candle_bar_minutes(candle)
+        )
+
+    def _candle_ts_ist(self, candle: dict):
+        """Timezone-aware IST bar-open time for OMS intents and fill hooks."""
+        return self._candle_open_ts_ist(candle).to_pydatetime()
+
+    def _candle_ts_ist_iso(self, candle: dict) -> str:
+        return self._candle_open_ts_ist(candle).isoformat()
+
+    def _coerce_candle_ts_ist(self, candle_ts: Any):
+        """Normalize intent/fill timestamps to timezone-aware IST."""
+        ts = pd.Timestamp(candle_ts)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC").tz_convert(IST)
+        else:
+            ts = ts.tz_convert(IST)
+        return ts.to_pydatetime()
+
+    def _candle_for_mixin(self, candle: dict) -> dict:
+        """Candle copy with IST-naive open time for mixin wall-clock helpers."""
+        out = dict(candle)
+        out["timestamp"] = (
+            self._candle_open_ts_ist(candle).tz_localize(None).to_pydatetime()
+        )
+        return out
+
+    def _candle_wall_clock_key(self, candle: dict) -> str:
+        return self._candle_open_ts_ist(candle).strftime("%Y-%m-%d %H:%M")
+
+    def _snapshot_slot_from_candle(self, candle: dict):
+        close_ts = self._candle_close_ts_ist(candle)
+        return close_ts.strftime("%Y-%m-%d"), close_ts.strftime("%H-%M")
+
+    def create_order_intent(self, *args, **kwargs):
+        candle_ts = kwargs.get("candle_ts")
+        if candle_ts is not None:
+            kwargs["candle_ts"] = self._coerce_candle_ts_ist(candle_ts)
+        return super().create_order_intent(*args, **kwargs)
+
+    def create_hedge_intent(self, parent_sell_intent, candle, ctx):
+        intent = super().create_hedge_intent(
+            parent_sell_intent, self._candle_for_mixin(candle), ctx
+        )
+        if intent is not None:
+            intent.candle_ts = self._candle_ts_ist(candle)
+        return intent
+
+    def create_hedge_exit_intent(self, position, candle, ctx):
+        intent = super().create_hedge_exit_intent(position, candle, ctx)
+        if intent is not None:
+            intent.candle_ts = self._candle_ts_ist(candle)
+        return intent
+
+    def _bar_open_key(self, candle: dict) -> str:
+        return self._candle_open_ts_ist(candle).strftime("%Y-%m-%d %H:%M")
 
     def _trade_date(self, candle: dict) -> date:
-        ts = pd.Timestamp(candle.get("timestamp"))
-        if ts.tzinfo is None:
-            ts = ts.tz_localize(IST)
-        else:
-            ts = ts.tz_convert(IST)
-        return ts.date()
+        return self._candle_open_ts_ist(candle).date()
 
     def _candle_time_ist(self, candle: dict) -> time:
-        ts = pd.Timestamp(candle.get("timestamp"))
-        if ts.tzinfo is None:
-            ts = ts.tz_localize(IST)
-        else:
-            ts = ts.tz_convert(IST)
-        return ts.time()
+        return self._candle_open_ts_ist(candle).time()
+
+    def _is_primary_timeframe_candle(self, candle: dict) -> bool:
+        candle_tf = str(candle.get("timeframe", self.timeframe) or "").strip()
+        return candle_tf == str(self.timeframe).strip()
 
     def _is_event_no_trade_day(self, trade_date: date) -> bool:
         if trade_date in self._event_no_trade_dates:
@@ -513,18 +564,22 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         return day - timedelta(days=1)
 
     def _in_close_eval_window(self, candle: dict, grace_minutes: int = 5) -> bool:
-        """Check if we're within grace period after candle close. Uses strategy timeframe."""
-        ts = pd.Timestamp(candle["timestamp"])
-        if ts.tzinfo is None:
-            ts = ts.tz_localize(IST)
-        else:
-            ts = ts.tz_convert(IST)
-        # Get timeframe in minutes (handles "1", "5", "30", "60", etc.)
-        tf_min = int(str(self.timeframe).strip())
-        close_ts = ts + pd.Timedelta(minutes=tf_min)
+        """Check if we're within grace period after candle close."""
+        close_ts = self._candle_close_ts_ist(candle)
         now_ist = pd.Timestamp.now(tz=IST)
         diff_minutes = (now_ist - close_ts).total_seconds() / 60
-        logger.info(f"NiftyDOS: _in_close_eval_window tf={tf_min}min ts={ts} close_ts={close_ts} now_ist={now_ist} diff={diff_minutes:.2f}min grace={grace_minutes}")
+        tf_min = self._candle_bar_minutes(candle)
+        open_ts = self._candle_open_ts_ist(candle)
+        logger.info(
+            "NiftyDOS: _in_close_eval_window tf=%smin open_ts=%s close_ts=%s "
+            "now_ist=%s diff=%.2fmin grace=%s",
+            tf_min,
+            open_ts,
+            close_ts,
+            now_ist,
+            diff_minutes,
+            grace_minutes,
+        )
         return diff_minutes <= grace_minutes
 
     def _is_after_3pm(self, candle: dict) -> bool:
@@ -538,13 +593,28 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         return close_ts.time() >= self.no_entry_time
 
     def _is_915am(self, candle: dict) -> bool:
-        t = self._candle_time_ist(candle)
-        return t.hour == 9 and t.minute == 15
+        """First 30m bar of the session (opens 9:15 IST)."""
+        if not self._is_primary_timeframe_candle(candle):
+            return False
+        open_ts = self._candle_open_ts_ist(candle)
+        return open_ts.hour == 9 and open_ts.minute == 15
 
     def _is_945am(self, candle: dict) -> bool:
-        """Check if the candle CLOSE time is 9:45 AM (i.e., the 9:15-9:45 candle just closed)."""
+        """First 30m bar close (9:15–9:45 candle closes at 9:45 IST)."""
+        if not self._is_primary_timeframe_candle(candle):
+            return False
         close_ts = self._candle_close_ts_ist(candle)
-        return close_ts.hour == 9 and close_ts.minute == 45
+        if close_ts.hour == 9 and close_ts.minute == 45:
+            return True
+        # Fallback when engine sends bar close as timestamp without bucket_ts.
+        if candle.get("bucket_ts") is not None:
+            return False
+        ts = pd.Timestamp(candle.get("timestamp"))
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC").tz_convert(IST)
+        else:
+            ts = ts.tz_convert(IST)
+        return ts.hour == 9 and ts.minute == 45
 
     def _is_expiry_day_new_trade(self, candle: dict) -> bool:
         """Check if it's expiry day and we need to shift to next expiry."""
@@ -834,7 +904,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             strategy=self.name,
             side="SELL",
             structure_id=structure_id,
-            candle_ts=candle["timestamp"],
+            candle_ts=self._candle_ts_ist(candle),
             tag="MAIN",
             symbol=candle["symbol"],
             action="ENTRY",
@@ -854,6 +924,8 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             "sl_pct": self.call_sl_pct if option_type in ("CE", "CALL") else self.put_sl_pct,
             "margin_per_lot": self.margin_per_lot,
             "hedge_distance_points": self.hedge_distance_points,
+            "signal_ts_ist": self._candle_open_ts_ist(candle).strftime("%Y-%m-%d %H:%M:%S"),
+            "signal_tz": "Asia/Kolkata",
         }
         # Update intents with metadata_extras
         sell_intent.metadata_extras = strategy_meta
@@ -879,7 +951,12 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         return [hedge_intent, sell_intent] if hedge_intent else [sell_intent]
 
     def should_evaluate(self, candle):
-        logger.info(f"NiftyDOS: should_evaluate tf={candle.get('timeframe')} ts={candle.get('timestamp')}")
+        logger.info(
+            "NiftyDOS: should_evaluate tf=%s ts_ist=%s raw_ts=%s",
+            candle.get("timeframe"),
+            self._candle_ts_ist_iso(candle),
+            candle.get("timestamp"),
+        )
         # Live: only eval shortly after bar close. Backtest: every closed bar.
         # For dummy feed testing, allow eval if candle is closed (has bucket_ts)
         if RUN_MODE != RunMode.BACKTEST and not self._in_close_eval_window(candle):
@@ -946,7 +1023,13 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         )
 
     def on_candle(self, candle, ctx):
-        logger.info(f"NiftyDOS: on_candle called tf={candle.get('timeframe')} ts={candle.get('timestamp')} close={candle.get('close')} candle={candle}")
+        logger.info(
+            "NiftyDOS: on_candle tf=%s ts_ist=%s close=%s st=%s",
+            candle.get("timeframe"),
+            self._candle_ts_ist_iso(candle),
+            candle.get("close"),
+            self._get_supertrend_signal(candle),
+        )
         trade_date = self._trade_date(candle)
         if self._is_event_no_trade_day(trade_date):
             return None
@@ -1662,7 +1745,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
                 price=price,
                 order_type="LIMIT",
                 strategy=self.name,
-                candle_ts=candle["timestamp"],
+                candle_ts=self._candle_ts_ist(candle),
                 structure_id=position.structure_id,
                 tag="MAIN_EXIT",
                 symbol=candle["symbol"],
