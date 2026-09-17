@@ -2572,6 +2572,17 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     }
                 )
             except Exception as exc:
+                logger.exception(
+                    "Strategy evaluation failed strategy=%s: %s",
+                    strategy_id,
+                    exc,
+                )
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "strategy_eval_failed",
+                        f"Strategy evaluation failed: {exc}",
+                        strategy_id=strategy_id,
+                    )
                 response_q.put({"strategy": strategy, "error": exc})
             finally:
                 q.task_done()

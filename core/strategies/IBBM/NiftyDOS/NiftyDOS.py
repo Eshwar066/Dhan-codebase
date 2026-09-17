@@ -28,6 +28,7 @@ Check at 9:15: if price is opposite to signal, exit trade and enter in 30min can
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from datetime import date, time, timedelta
 from pathlib import Path
 from typing import Any, List, Optional, Set
@@ -522,13 +523,13 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             parent_sell_intent, self._candle_for_mixin(candle), ctx
         )
         if intent is not None:
-            intent.candle_ts = self._candle_ts_ist(candle)
+            intent = replace(intent, candle_ts=self._candle_ts_ist(candle))
         return intent
 
     def create_hedge_exit_intent(self, position, candle, ctx):
         intent = super().create_hedge_exit_intent(position, candle, ctx)
         if intent is not None:
-            intent.candle_ts = self._candle_ts_ist(candle)
+            intent = replace(intent, candle_ts=self._candle_ts_ist(candle))
         return intent
 
     def _bar_open_key(self, candle: dict) -> str:
@@ -940,6 +941,14 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         hedge_intent = self.create_hedge_intent(
             parent_sell_intent=sell_intent, candle=candle, ctx=ctx
         )
+        if hedge_intent is None:
+            logger.warning(
+                "NiftyDOS entry skipped: hedge intent missing structure=%s opt=%s ts=%s",
+                structure_id,
+                option_type,
+                candle.get("timestamp"),
+            )
+            return None
         hedge_entry_price = float(getattr(hedge_intent, "price", 0) or 0)
 
         # Prepare strategy metadata for position tracking (written to open_positions.csv)
@@ -955,10 +964,8 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             "signal_ts_ist": self._candle_open_ts_ist(candle).strftime("%Y-%m-%d %H:%M:%S"),
             "signal_tz": "Asia/Kolkata",
         }
-        # Update intents with metadata_extras
-        sell_intent.metadata_extras = strategy_meta
-        if hedge_intent:
-            hedge_intent.metadata_extras = strategy_meta
+        sell_intent = replace(sell_intent, metadata_extras=strategy_meta)
+        hedge_intent = replace(hedge_intent, metadata_extras=strategy_meta)
         self._entry_signaled_keys.add(signal_key)
 
         # Store entry prices for both MAIN and HEDGE for TP/SL tracking
@@ -1280,6 +1287,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
 
         # Check 9:45 AM rule - if no open position, create position on Supertrend direction
         if self._is_945am(candle):
+            logger.info(f"NiftyDOS: 9:45 CHECK PASSED ts={candle.get('timestamp')} bucket_ts={candle.get('bucket_ts')} st_signal={st_signal}")
             if not self._has_open_main_for_strategy(candle, ctx):
                 logger.info(f"NiftyDOS: 9:45 AM - No open position, creating position on Supertrend direction: {st_signal}")
                 # Determine option type based on Supertrend signal

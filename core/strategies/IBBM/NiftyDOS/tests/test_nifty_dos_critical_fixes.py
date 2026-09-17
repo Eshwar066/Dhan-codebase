@@ -363,6 +363,80 @@ class NiftyDosCriticalFixTests(unittest.TestCase):
         )
         self.assertFalse(strategy._has_open_main_for_strategy(candle, ctx))
 
+    @patch("core.strategies.IBBM.NiftyDOS.NiftyDOS.RUN_MODE", RunMode.LIVE)
+    def test_build_entry_intents_sets_metadata_on_frozen_intent(self):
+        strategy = NiftyDOS()
+        candle = {
+            "symbol": "NIFTY",
+            "timestamp": datetime(2026, 9, 17, 3, 45),
+            "bucket_ts": 1789616700,
+            "close": 23252.3,
+            "timeframe": "30",
+        }
+        inst = SimpleNamespace(
+            trading_symbol="NIFTY25SEP23000PE",
+            custom_symbol="NIFTY-23000-PE",
+            strike=23000,
+            option_type="PE",
+            expiry=date(2026, 9, 24),
+        )
+        ctx = SimpleNamespace(
+            exchange="NSE",
+            instrument_store=SimpleNamespace(
+                intent_creation_details=MagicMock(return_value=inst)
+            ),
+            position_store=SimpleNamespace(
+                has_open_structure=MagicMock(return_value=False)
+            ),
+            intent_store=SimpleNamespace(
+                has_pending_intent=MagicMock(return_value=False),
+                has_entry_for_structure=MagicMock(return_value=False),
+            ),
+        )
+        row = pd.Series({"PE_LTP": 95.0})
+        with patch.object(
+            strategy,
+            "find_strike_in_premium_range",
+            return_value=(23000, 95.0, row),
+        ), patch.object(
+            strategy,
+            "_resolve_main_expiry",
+            return_value=date(2026, 9, 24),
+        ), patch.object(
+            strategy,
+            "create_hedge_intent",
+        ) as hedge_mock:
+            def _fake_hedge(parent_sell_intent, candle, ctx):
+                return strategy.map_instrument_to_intent(
+                    inst=inst,
+                    strike_row=row,
+                    strategy=strategy.name,
+                    side="BUY",
+                    structure_id=parent_sell_intent.structure_id,
+                    candle_ts=strategy._candle_ts_ist(candle),
+                    tag="HEDGE",
+                    symbol=candle["symbol"],
+                    action="ENTRY",
+                    parent_intent_id=parent_sell_intent.intent_id,
+                )
+
+            hedge_mock.side_effect = _fake_hedge
+            out = strategy._build_entry_intents(
+                candle,
+                ctx,
+                "PUT",
+                structure_id="NiftyDOS:NIFTY:SUPER_BULLISH_945",
+                regime="SUPER_BULLISH_945",
+            )
+
+        self.assertIsNotNone(out)
+        self.assertEqual(len(out), 2)
+        sell_intent, hedge_intent = out[1], out[0]
+        self.assertIsNotNone(sell_intent.metadata_extras)
+        self.assertEqual(hedge_intent.metadata_extras, sell_intent.metadata_extras)
+        self.assertEqual(sell_intent.metadata_extras["regime"], "SUPER_BULLISH_945")
+        self.assertEqual(sell_intent.metadata_extras["structure_type"], "PUT")
+
 
 if __name__ == "__main__":
     unittest.main()
