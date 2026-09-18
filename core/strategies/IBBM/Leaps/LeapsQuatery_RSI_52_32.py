@@ -1,5 +1,5 @@
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -410,23 +410,25 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     def _resolve_main_expiry(
         self, candle: dict, ctx, expiry_pref: str
     ) -> Optional[date]:
-        chain_exp = self._expiry_from_option_chain()
-        if chain_exp is not None:
-            return chain_exp
+        pref = str(expiry_pref or self.expiryType or "").strip().upper()
         trade_date = pd.to_datetime(candle["timestamp"]).date()
         try:
             resolved = ExpiryResolver.resolve(
                 expiry_list=ctx.get_expiry_list() if ctx is not None else [],
                 trade_date=trade_date,
                 api=self.api,
-                expiry_pref=str(expiry_pref or self.expiryType),
+                expiry_pref=pref,
             )
         except (TypeError, ValueError):
-            return None
-        if resolved is None:
-            return None
-        if ExpiryResolver.is_calendar_expiry(resolved):
+            resolved = None
+        if resolved is not None and ExpiryResolver.is_calendar_expiry(resolved):
             return ExpiryResolver.as_calendar_date(resolved)
+        # Calendar-driven MAIN legs must not inherit Dhan chain expiry (can snap to weekly).
+        if pref in ("QUARTERLY", "LEAPS_ROLL"):
+            return None
+        chain_exp = self._expiry_from_option_chain()
+        if chain_exp is not None:
+            return chain_exp
         return None
 
     def _build_entry_intents(
@@ -526,6 +528,19 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             )
             return None
 
+        chain_exp = self._expiry_from_option_chain()
+        if chain_exp is not None and chain_exp != expiry_for_symbol:
+            logger.warning(
+                "LEAPS %s entry skipped: option chain expiry=%s != resolved MAIN expiry=%s "
+                "pref=%s sym=%s (refetch chain for correct series)",
+                leg_label,
+                chain_exp,
+                expiry_for_symbol,
+                expiry_pref,
+                candle.get("symbol"),
+            )
+            return None
+
         trading_symbol = ExpiryResolver.build_option_symbol(
             candle["symbol"],
             expiry_for_symbol,
@@ -584,9 +599,9 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             main_premium=premium,
             hedge_intent=hedge_intent,
         )
-        sell_intent.metadata_extras = extras
+        sell_intent = replace(sell_intent, metadata_extras=extras)
         if hedge_intent is not None:
-            hedge_intent.metadata_extras = extras
+            hedge_intent = replace(hedge_intent, metadata_extras=extras)
 
         self._entry_signaled_keys.add(signal_key)
         logger.info(
@@ -875,7 +890,6 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
 
         hedge_exit = self.create_hedge_exit_intent(position, candle, ctx)
         if hedge_exit:
-            hedge_exit.metadata_extras = exit_extras
-            intents.append(hedge_exit)
+            intents.append(replace(hedge_exit, metadata_extras=exit_extras))
 
         return intents
