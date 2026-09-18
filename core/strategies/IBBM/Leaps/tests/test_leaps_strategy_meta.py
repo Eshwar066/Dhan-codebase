@@ -7,7 +7,10 @@ from datetime import date
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
+
 from core.strategies.IBBM.Leaps.LeapsQuatery_RSI_52_32 import LeapsQuarterly
+from core.strategies.IndiaMktMixins import IST
 from core.strategies.meta import unpack_strategy_meta
 
 
@@ -107,6 +110,30 @@ class LeapsStrategyMetaTests(unittest.TestCase):
         self.assertEqual(body["entry_main_premium"], 425.95)
         self.assertEqual(body["hedge_symbol"], "NIFTY-Oct2026-24500-CE")
         self.assertEqual(hedge.metadata_extras, sell.metadata_extras)
+
+    def test_should_roll_hedge_skips_when_hedge_is_next_month(self):
+        s = LeapsQuarterly()
+        hedge = SimpleNamespace(
+            structure_id="LEAPS_RSI:NIFTY:RSI_LT_32:QTR",
+            tag="HEDGE",
+            net_qty=65,
+            instrument=SimpleNamespace(expiry=date(2026, 10, 27)),
+        )
+        ts = pd.Timestamp("2026-09-18 10:15:00", tz=IST)
+        self.assertFalse(s.should_roll_hedge(hedge, ts))
+
+    def test_should_roll_hedge_allows_current_month_hedge(self):
+        s = LeapsQuarterly()
+        trade_date = date(2026, 9, 18)
+        current_month_exp = s._hedge_current_month_expiry(trade_date)
+        hedge = SimpleNamespace(
+            structure_id="LEAPS_RSI:NIFTY:RSI_LT_32:QTR",
+            tag="HEDGE",
+            net_qty=65,
+            instrument=SimpleNamespace(expiry=current_month_exp),
+        )
+        ts = pd.Timestamp("2026-09-18 10:15:00", tz=IST)
+        self.assertTrue(s.should_roll_hedge(hedge, ts))
 
 
 if __name__ == "__main__":

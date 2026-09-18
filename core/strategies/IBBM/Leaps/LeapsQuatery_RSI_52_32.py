@@ -123,6 +123,32 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             return ExpiryResolver.current_month_expiry(trade_date, weekday=exp_wd)
         return ExpiryResolver.next_month_expiry(trade_date, weekday=exp_wd)
 
+    def _hedge_current_month_expiry(self, trade_date: date) -> date:
+        exp_wd = int(getattr(self, "hedge_monthly_expiry_weekday", 1) or 1) % 7
+        return ExpiryResolver.current_month_expiry(trade_date, weekday=exp_wd)
+
+    def should_roll_hedge(self, hedge, ts):
+        """
+        Roll monthly hedge only when the open hedge is on this calendar month's
+        expiry. After the 15th, new hedges already land on next month — skip.
+        """
+        if not super().should_roll_hedge(hedge, ts):
+            return False
+        trade_date = pd.to_datetime(ts).date()
+        hedge_expiry = pd.to_datetime(hedge.instrument.expiry).date()
+        current_month_exp = self._hedge_current_month_expiry(trade_date)
+        if (hedge_expiry.year, hedge_expiry.month) != (
+            current_month_exp.year,
+            current_month_exp.month,
+        ):
+            logger.info(
+                "LEAPS hedge rollover skipped: hedge expiry=%s is not current month (%s)",
+                hedge_expiry,
+                current_month_exp,
+            )
+            return False
+        return True
+
     def calculate_hedge_strike(self, sold_strike, option_type):
         step = int(getattr(self, "option_chain_strike_step", 500) or 500)
         sold = int(sold_strike)
