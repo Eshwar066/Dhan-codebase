@@ -796,6 +796,83 @@ class IndiaMktMixins:
         except (TypeError, ValueError):
             return None
 
+    def _chain_expiry_matches_selected(self, chain: Any, ctx) -> bool:
+        """True when chain payload expiry matches ctx.selected_expiry (calendar date)."""
+        cached_exp = self._expiry_from_option_chain(chain)
+        want_exp = self._selected_expiry_calendar_date(ctx)
+        if cached_exp is None or want_exp is None:
+            return True
+        return cached_exp == want_exp
+
+    def _may_use_cached_chain_fallback(
+        self, expiry_pref: Optional[str], chain: Any, ctx
+    ) -> bool:
+        """
+        Refuse stale ``_last_option_chain`` when an explicit expiry_pref was requested
+        and the cached chain is for a different expiry (e.g. NEXT_WEEKLY after WEEKLY).
+        """
+        if chain is None:
+            return False
+        pref = str(expiry_pref or "").strip().upper()
+        if not pref:
+            return True
+        return self._chain_expiry_matches_selected(chain, ctx)
+
+    def _remember_chain_fetch_expiry(self, ctx, chain: Any) -> None:
+        """Track requested vs response expiry for strategy entry_skipped logging."""
+        self._last_chain_fetch_requested_expiry = self._selected_expiry_calendar_date(
+            ctx
+        )
+        self._last_chain_fetch_response_expiry = self._expiry_from_option_chain(chain)
+
+    def _fetch_live_option_chain_with_retry(
+        self,
+        ctx,
+        params: dict,
+        *,
+        expiry_pref: Optional[str] = None,
+        max_retries: int = 3,
+        base_delay: float = 2.0,
+    ) -> Optional[Any]:
+        """Fetch DHAN live chain with backoff; reject expiry mismatches vs selected_expiry."""
+        import time
+
+        requested = self._selected_expiry_calendar_date(ctx)
+        last_chain: Optional[Any] = None
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                delay = base_delay * (2 ** (attempt - 1))
+                logger.warning(
+                    "DHAN chain fetch retry %s/%s expiry_pref=%s requested=%s after %.1fs",
+                    attempt,
+                    max_retries,
+                    expiry_pref,
+                    requested,
+                    delay,
+                )
+                time.sleep(delay)
+            chain = ctx.option_chain_service.get_chain(
+                api=self.api, ctx=ctx, params=params
+            )
+            last_chain = chain
+            if chain is None:
+                continue
+            if requested is not None and expiry_pref is not None:
+                got = self._expiry_from_option_chain(chain)
+                if got is not None and got != requested:
+                    logger.warning(
+                        "DHAN chain expiry mismatch: requested=%s got=%s expiry_pref=%s attempt=%s",
+                        requested,
+                        got,
+                        expiry_pref,
+                        attempt,
+                    )
+                    if attempt < max_retries:
+                        continue
+                    return None
+            return chain
+        return last_chain
+
     def _can_reuse_cached_option_chain(self, ctx, expiry_pref=None) -> bool:
         """
         Reuse DHAN chain cache when safe.
@@ -915,7 +992,9 @@ class IndiaMktMixins:
         if target:
             self._last_option_chain_snapshot_target = str(target).strip().lower()
 
-    def _resolve_option_chain_data(self, candle, ctx) -> Optional[dict]:
+    def _resolve_option_chain_data(
+        self, candle, ctx, expiry_pref: Optional[str] = None
+    ) -> Optional[dict]:
         """
         Option chain for the current bar: in-memory cache from main strike selection,
         else the LEAPS (or other) snapshot CSV for the same slot — no extra API call.
@@ -923,6 +1002,15 @@ class IndiaMktMixins:
         cached = getattr(self, "_last_option_chain", None)
         df = self._option_chain_df(cached, option_type="")
         if df is not None and not df.empty:
+            if not self._may_use_cached_chain_fallback(expiry_pref, cached, ctx):
+                logger.warning(
+                    "Refusing stale option chain cache for expiry_pref=%s "
+                    "requested=%s cached_expiry=%s",
+                    expiry_pref,
+                    self._selected_expiry_calendar_date(ctx),
+                    self._expiry_from_option_chain(cached),
+                )
+                return None
             return cached
 
         slot = getattr(self, "_last_option_chain_snapshot_slot", None)
@@ -1099,6 +1187,13 @@ class IndiaMktMixins:
         if not otm_strikes:
             return None
 
+        close = candle.get("close") if isinstance(candle, dict) else None
+        if close is not None:
+            try:
+                ctx.spot_price = float(close)
+            except (TypeError, ValueError):
+                pass
+
         d_min = (
             delta_min
             if delta_min is not None
@@ -1165,12 +1260,19 @@ class IndiaMktMixins:
 
         if reuse_cached_chain:
             chain = getattr(self, "_last_option_chain", None)
+        elif str(self.api or "").upper() == "DHAN" and RUN_MODE != RunMode.BACKTEST:
+            chain = self._fetch_live_option_chain_with_retry(
+                ctx, params, expiry_pref=expiry_pref
+            )
         else:
             chain = ctx.option_chain_service.get_chain(
                 api=self.api, ctx=ctx, params=params
             )
         if chain is None:
-            chain = self._resolve_option_chain_data(candle, ctx)
+            chain = self._resolve_option_chain_data(
+                candle, ctx, expiry_pref=expiry_pref
+            )
+        self._remember_chain_fetch_expiry(ctx, chain)
         if bool(params.get("snapshot", False)):
             try:
                 log_option_chain_snapshot(
@@ -1187,7 +1289,10 @@ class IndiaMktMixins:
 
         skip_premium_check = False
         if RUN_MODE == RunMode.LIVE or RUN_MODE == RunMode.PAPER:
-            self._last_option_chain = chain
+            if chain is not None and (
+                expiry_pref is None or self._chain_expiry_matches_selected(chain, ctx)
+            ):
+                self._last_option_chain = chain
             if chain is None:
                 print(">>no option chain data", ctx, params)
                 return None

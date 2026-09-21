@@ -438,5 +438,46 @@ class NiftyDosCriticalFixTests(unittest.TestCase):
         self.assertEqual(sell_intent.metadata_extras["structure_type"], "PUT")
 
 
+class TestChainFetchGuard(unittest.TestCase):
+    def test_rejects_stale_cache_when_next_weekly_differs(self):
+        strategy = NiftyDOS()
+        ctx = SimpleNamespace(selected_expiry=date(2026, 9, 29))
+        stale = {
+            "expiry": date(2026, 9, 22),
+            "chain": pd.DataFrame({"Strike Price": [23000], "PE LTP": [30.0]}),
+        }
+        self.assertFalse(
+            strategy._may_use_cached_chain_fallback("NEXT_WEEKLY", stale, ctx)
+        )
+
+    def test_allows_stale_cache_when_expiry_matches(self):
+        strategy = NiftyDOS()
+        ctx = SimpleNamespace(selected_expiry=date(2026, 9, 29))
+        chain = {
+            "expiry": date(2026, 9, 29),
+            "chain": pd.DataFrame({"Strike Price": [23000], "PE LTP": [95.0]}),
+        }
+        self.assertTrue(
+            strategy._may_use_cached_chain_fallback("NEXT_WEEKLY", chain, ctx)
+        )
+
+    def test_log_entry_skipped_writes_engine_event(self):
+        strategy = NiftyDOS()
+        strategy._last_chain_fetch_requested_expiry = date(2026, 9, 29)
+        strategy._last_chain_fetch_response_expiry = date(2026, 9, 22)
+        engine_logger = MagicMock()
+        ctx = SimpleNamespace(
+            order_router=SimpleNamespace(engine_logger=engine_logger)
+        )
+        strategy._log_entry_skipped(ctx, "no OTM strike", option_type="PUT")
+        engine_logger.log.assert_called_once()
+        args = engine_logger.log.call_args
+        self.assertEqual(args[0][0], "entry_skipped")
+        self.assertIn("requested_expiry=2026-09-29", args[0][1])
+        self.assertIn("chain_expiry=2026-09-22", args[0][1])
+        self.assertEqual(args[1]["requested_expiry"], "2026-09-29")
+        self.assertEqual(args[1]["chain_expiry"], "2026-09-22")
+
+
 if __name__ == "__main__":
     unittest.main()

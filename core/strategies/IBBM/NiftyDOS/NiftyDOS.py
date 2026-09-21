@@ -785,6 +785,33 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         else:
             return close_price < open_price
 
+    def _engine_logger(self, ctx):
+        if ctx and hasattr(ctx, "order_router"):
+            return getattr(ctx.order_router, "engine_logger", None)
+        return None
+
+    def _log_strategy_event(self, ctx, event_type: str, message: str, **fields) -> None:
+        engine_logger = self._engine_logger(ctx)
+        if engine_logger:
+            engine_logger.log(event_type, message, strategy_id=self.name, **fields)
+        logger.info("NiftyDOS: %s", message)
+
+    def _log_entry_skipped(self, ctx, reason: str, **fields) -> None:
+        req = getattr(self, "_last_chain_fetch_requested_expiry", None)
+        chain_exp = getattr(self, "_last_chain_fetch_response_expiry", None)
+        msg = (
+            f"entry_skipped: {reason} requested_expiry={req} chain_expiry={chain_exp}"
+        )
+        self._log_strategy_event(
+            ctx,
+            "entry_skipped",
+            msg,
+            reason=reason,
+            requested_expiry=str(req) if req is not None else None,
+            chain_expiry=str(chain_exp) if chain_exp is not None else None,
+            **fields,
+        )
+
     def _build_entry_intents(
         self,
         candle: dict,
@@ -855,6 +882,12 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
                     option_type,
                     candle.get("timestamp"),
                 )
+                self._log_entry_skipped(
+                    ctx,
+                    f"no OTM strike prem={min_prem}-{max_prem} NEXT_WEEKLY expiry_day opt={option_type}",
+                    option_type=option_type,
+                    expiry_pref="NEXT_WEEKLY",
+                )
                 return None
         else:
             # Normal logic: prefer current weekly; if no OTM in premium band, roll to next weekly
@@ -902,6 +935,13 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
                 max_prem,
                 candle.get("timestamp"),
             )
+            self._log_entry_skipped(
+                ctx,
+                f"no OTM strike prem={min_prem}-{max_prem} on WEEKLY or NEXT_WEEKLY opt={option_type}",
+                option_type=option_type,
+                premium_min=min_prem,
+                premium_max=max_prem,
+            )
             return None
 
         strike, premium, row = result
@@ -909,11 +949,19 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         expiry_for_symbol = self._resolve_main_expiry(candle, ctx, expiry_pref)
         if expiry_for_symbol is None:
             logger.warning("NiftyDOS entry skipped: no weekly expiry pref=%s", expiry_pref)
+            self._log_entry_skipped(
+                ctx, f"no weekly expiry resolved pref={expiry_pref}", expiry_pref=expiry_pref
+            )
             return None
 
         # Do not open a new weekly on expiry day or past expiry.
         if self._trade_date(candle) >= expiry_for_symbol:
             logger.info("NiftyDOS entry skipped: trade_date>=expiry %s", expiry_for_symbol)
+            self._log_entry_skipped(
+                ctx,
+                f"trade_date>=expiry {expiry_for_symbol}",
+                expiry=str(expiry_for_symbol),
+            )
             return None
 
         trading_symbol = ExpiryResolver.build_option_symbol(
@@ -924,6 +972,9 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         )
         if inst is None:
             logger.warning("NiftyDOS entry skipped: instrument missing %s", trading_symbol)
+            self._log_entry_skipped(
+                ctx, f"instrument missing {trading_symbol}", trading_symbol=trading_symbol
+            )
             return None
 
         # Create intents first
@@ -947,6 +998,12 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
                 structure_id,
                 option_type,
                 candle.get("timestamp"),
+            )
+            self._log_entry_skipped(
+                ctx,
+                f"hedge intent missing structure={structure_id} opt={option_type}",
+                structure_id=structure_id,
+                option_type=option_type,
             )
             return None
         hedge_entry_price = float(getattr(hedge_intent, "price", 0) or 0)

@@ -808,7 +808,9 @@ class Tradehull:
                 self.logger.exception(f"Error processing {name}: {e}")
                 # print(f"Error processing {name}: {e}")
 
-    def get_ltp_data(self, names, debug="NO"):
+    def get_ltp_data(self, names, debug="NO", max_retries=3, base_delay=2.0):
+        import time as _time
+
         try:
             instrument_df = self.instrument_df.copy()
             instruments = {
@@ -836,7 +838,28 @@ class Tradehull:
             }
             if not isinstance(names, list):
                 names = [names]
-            for name in names:
+
+            cache_ttl = float(getattr(self, "_ltp_cache_ttl_sec", 2.0) or 2.0)
+            ltp_cache = getattr(self, "_ltp_cache", None)
+            if ltp_cache is None:
+                ltp_cache = {}
+                self._ltp_cache = ltp_cache
+            now_mono = _time.monotonic()
+            cached_out: dict = {}
+            names_to_fetch: list = []
+            for raw_name in names:
+                key = str(raw_name).upper()
+                hit = ltp_cache.get(key)
+                if hit is not None:
+                    price, ts = hit
+                    if now_mono - ts <= cache_ttl:
+                        cached_out[key] = price
+                        continue
+                names_to_fetch.append(raw_name)
+            if not names_to_fetch:
+                return cached_out
+
+            for name in names_to_fetch:
                 try:
                     name = name.upper()
                     if name in exchange_index.keys():
@@ -922,25 +945,40 @@ class Tradehull:
                 except Exception as e:
                     print(f"Exception for instrument name {name} as {e}")
                     continue
-            time.sleep(0.4)
-            data = self.Dhan.ticker_data(instruments)
-            ltp_data = dict()
+            attempt = 0
+            while True:
+                if attempt > 0:
+                    delay = base_delay * (2 ** (attempt - 1))
+                    self.logger.warning(
+                        "[get_ltp_data] Rate limited, retry %s/%s after %.1fs",
+                        attempt,
+                        max_retries,
+                        delay,
+                    )
+                    _time.sleep(delay)
+                _time.sleep(0.4)
+                data = self.Dhan.ticker_data(instruments)
+                ltp_data = dict()
 
-            if debug.upper() == "YES":
-                print(data)
+                if debug.upper() == "YES":
+                    print(data)
 
-            if data["status"] != "failure":
-                inner = data["data"]["data"]
+                if data["status"] != "failure":
+                    inner = data["data"]["data"]
 
-                for exchange, sec_dict in inner.items():
-                    for sec_id, quotes in sec_dict.items():
-                        if sec_id in instrument_names:
-                            symbol = instrument_names[sec_id]
-                            ltp_data[symbol] = float(quotes["last_price"])
-            else:
+                    for exchange, sec_dict in inner.items():
+                        for sec_id, quotes in sec_dict.items():
+                            if sec_id in instrument_names:
+                                symbol = instrument_names[sec_id]
+                                ltp_data[symbol] = float(quotes["last_price"])
+                    for sym, px in ltp_data.items():
+                        ltp_cache[str(sym).upper()] = (px, _time.monotonic())
+                    ltp_data.update(cached_out)
+                    return ltp_data
+                if _dhan_is_rate_limited(data) and attempt < max_retries:
+                    attempt += 1
+                    continue
                 raise Exception(data)
-
-            return ltp_data
         except Exception as e:
             print(f"Exception at calling ltp as {e}")
             self.logger.exception(f"Exception at calling ltp as {e}")
@@ -3114,7 +3152,16 @@ class Tradehull:
             print(f"Exception at getting Expiry list as {e}")
             return list()
 
-    def get_option_chain(self, Underlying, exchange, expiry, num_strikes=10, max_retries=3, base_delay=2.0):
+    def get_option_chain(
+        self,
+        Underlying,
+        exchange,
+        expiry,
+        num_strikes=10,
+        max_retries=3,
+        base_delay=2.0,
+        spot_fallback=None,
+    ):
         """
         Fetch option chain with retry on rate limit (Dhan error 805).
 
@@ -3125,6 +3172,7 @@ class Tradehull:
             num_strikes: Number of strikes around ATM
             max_retries: Max retry attempts for rate limit (default 3)
             base_delay: Base delay in seconds for exponential backoff (default 2.0)
+            spot_fallback: Use this spot when index LTP is rate-limited/unavailable
         """
         import time as _time
         Underlying = Underlying.upper()
@@ -3219,6 +3267,18 @@ class Tradehull:
                 oc_df = self.format_option_chain(oc)
 
                 atm_price = self.get_ltp_data(Underlying)
+                if (
+                    (not atm_price or Underlying not in atm_price)
+                    and spot_fallback is not None
+                ):
+                    try:
+                        atm_price = {Underlying: float(spot_fallback)}
+                    except (TypeError, ValueError):
+                        pass
+                if not atm_price or Underlying not in atm_price:
+                    raise KeyError(
+                        f"No LTP for {Underlying} and no spot_fallback; cannot compute ATM"
+                    )
                 oc_df["Strike Price"] = pd.to_numeric(
                     oc_df["Strike Price"], errors="coerce"
                 )
