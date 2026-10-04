@@ -1,0 +1,21 @@
+[Unit]
+Description=Dhan LEAPS_RSI engine (LIVE) — python -m run.main --engine-id dhan
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=86400
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/ubuntu/Dhan-codebase
+EnvironmentFile=-/home/ubuntu/Dhan-codebase/.env
+ExecStart=/home/ubuntu/Dhan-codebase/.venv/bin/python -m run.main --engine-id dhan
+Restart=always
+RestartSec=300
+TimeoutStopSec=120
+StandardOutput=append:/home/ubuntu/Dhan-codebase/logs/dhan.log
+StandardError=append:/home/ubuntu/Dhan-codebase/logs/dhan.err.log
+
+[Install]
+WantedBy=multi-user.target

@@ -282,7 +282,7 @@ python -m run.main --engine-id kotak
 ```bash
 sudo systemctl daemon-reload          # after editing unit files
 ps aux | grep 'run.main.*dhan' | grep -v grep
-sudo systemctl restart dhan-leaps-rsi.service
+sudo systemctl start dhan
 
 
 sudo systemctl enable --now delta.service
@@ -320,7 +320,7 @@ sudo systemctl list-units 'dhan*' 'option-buildup*' 'delta*'
 ## most repeated
 sudo systemctl daemon-reload
 source .venv/bin/activate
-sudo systemctl start dhan-oi-positional-buy.service
+sudo systemctl start dhan
 sudo systemctl start dhan-leaps-rsi.service
 sudo systemctl enable option-buildup-scheduler.service
 

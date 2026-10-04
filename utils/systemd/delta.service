@@ -1,11 +1,14 @@
 [Unit]
 Description=Delta Engine
 After=network.target
+Wants=network-online.target
+StartLimitIntervalSec=86400
+StartLimitBurst=5
 
 [Service]
 User=root
-WorkingDirectory=/root/Dhan-codebase
-ExecStart=/root/Dhan-codebase/.venv/bin/python -m run.main --venue DELTA
+WorkingDirectory=/home/ubuntu/Dhan-codebase
+ExecStart=/home/ubuntu/Dhan-codebase/.venv/bin/python -m run.main --venue DELTA
 Restart=always
 RestartSec=5
 StandardOutput=append:/root/delta.log
