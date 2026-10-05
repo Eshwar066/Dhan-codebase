@@ -22,6 +22,10 @@ from core.utils.option_chain_snapshot_log import log_option_chain_snapshot
 
 logger = logging.getLogger(__name__)
 
+# New entries only. Existing positions still exit on the RSI flip.
+ENTER_CALL_SIDE = False  # RSI < 32 → sell CALL
+ENTER_PUT_SIDE = True  # RSI > 52 → sell PUT
+
 # (class flag attr, MAIN expiry_pref, structure_id suffix)
 LEG_SPECS: Tuple[Tuple[str, str, str], ...] = (
     ("mini_leaps_enabled", "LEAPS_ROLL", ""),
@@ -73,6 +77,8 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         self._snapshot_expiry_pref: Optional[str] = None
         # RSI flip: exit runs first while MAIN still open → defer reverse ENTRY.
         self._pending_rsi_reversal: Optional[_PendingRsiReversal] = None
+        self.enter_call_side = ENTER_CALL_SIDE
+        self.enter_put_side = ENTER_PUT_SIDE
         self._load_legs_config_from_yaml()
 
     def _load_legs_config_from_yaml(self) -> None:
@@ -95,6 +101,11 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             self.mini_leaps_enabled = bool(mini.get("enabled"))
         if "enabled" in qtr:
             self.quarterly_leaps_enabled = bool(qtr.get("enabled"))
+        entries = raw.get("entries") or {}
+        if "call_side" in entries:
+            self.enter_call_side = bool(entries.get("call_side"))
+        if "put_side" in entries:
+            self.enter_put_side = bool(entries.get("put_side"))
 
     def get_warmup_period(self):
         return 0
@@ -720,6 +731,21 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             option_type = "PUT"
             regime = "RSI_GT_52"
         else:
+            return None
+
+        if option_type == "CALL" and not self.enter_call_side:
+            logger.info(
+                "LEAPS CALL entry skipped: entries.call_side is false sym=%s rsi=%s",
+                candle.get("symbol"),
+                rsi,
+            )
+            return None
+        if option_type == "PUT" and not self.enter_put_side:
+            logger.info(
+                "LEAPS PUT entry skipped: entries.put_side is false sym=%s rsi=%s",
+                candle.get("symbol"),
+                rsi,
+            )
             return None
 
         if not self.mini_leaps_enabled and not self.quarterly_leaps_enabled:
