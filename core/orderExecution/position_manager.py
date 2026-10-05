@@ -553,6 +553,13 @@ class PositionManager:
 
             if self.open_positions_logger is not None and prev_qty != new_qty:
                 _pm = self.position_metadata.get(sym) or {}
+                strategy_meta = self._strategy_meta_with_contract(
+                    _pm.get("strategy_meta"), pos
+                )
+                if strategy_meta is not None:
+                    _pm = dict(_pm)
+                    _pm["strategy_meta"] = strategy_meta
+                    self.position_metadata[sym] = _pm
                 self.open_positions_logger.record_fill(
                     symbol=sym,
                     prev_qty=int(prev_qty),
@@ -562,7 +569,7 @@ class PositionManager:
                     structure_id=structure_id,
                     tag=tag,
                     intent_id=intent_id,
-                    strategy_meta=_pm.get("strategy_meta"),
+                    strategy_meta=strategy_meta,
                 )
 
             position_closed = prev_qty != 0 and new_qty == 0
@@ -1063,8 +1070,9 @@ class PositionManager:
                 opt_type, strike = self._extract_option_hint(
                     sym, row.get("structure_id")
                 )
+                expiry, lookup_sym = self._contract_hint_from_open_row(row, sym)
                 inst = instrument_store.intent_creation_details(
-                    sym, exchange, None, opt_type, strike
+                    lookup_sym, exchange, expiry, opt_type, strike
                 )
                 if inst is None:
                     logger.warning(
@@ -1114,6 +1122,52 @@ class PositionManager:
                 "Restored %s open position(s) from %s", restored, path
             )
         return restored
+
+    @staticmethod
+    def _strategy_meta_with_contract(strategy_meta, pos) -> Optional[dict]:
+        """Keep the filled contract's calendar expiry. Compact symbols omit the day."""
+        meta = dict(strategy_meta) if isinstance(strategy_meta, dict) else {}
+        inst = getattr(pos, "instrument", None)
+        if inst is None:
+            return meta or None
+        exp = getattr(inst, "expiry", None)
+        if exp is not None and not meta.get("expiry"):
+            try:
+                meta["expiry"] = pd.Timestamp(exp).date().isoformat()
+            except (TypeError, ValueError):
+                pass
+        custom = str(getattr(inst, "custom_symbol", "") or "").strip()
+        if custom and not meta.get("custom_symbol"):
+            meta["custom_symbol"] = custom
+        sec = getattr(inst, "instrument_id", None)
+        if sec not in (None, "") and not meta.get("security_id"):
+            meta["security_id"] = str(sec)
+        return meta or None
+
+    @staticmethod
+    def _contract_hint_from_open_row(row: dict, symbol: str) -> tuple[Optional[str], str]:
+        """Expiry and lookup symbol from a CSV row. Compact ``NIFTY-Oct2026-…`` is not a date."""
+        raw = row.get("strategy_meta") or ""
+        meta = None
+        if isinstance(raw, dict):
+            meta = raw
+        elif str(raw).strip():
+            try:
+                import json
+
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    meta = parsed
+            except json.JSONDecodeError:
+                meta = None
+        expiry = None
+        lookup = str(symbol or "").strip()
+        if isinstance(meta, dict):
+            expiry = meta.get("expiry") or None
+            custom = str(meta.get("custom_symbol") or "").strip()
+            if custom:
+                lookup = custom
+        return expiry, lookup
 
     @staticmethod
     def _extract_option_hint(

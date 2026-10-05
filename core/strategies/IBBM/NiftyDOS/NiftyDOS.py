@@ -93,7 +93,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
     # Capital per lot for the hedged structure (approximate SPAN margin for MAIN + HEDGE)
     # This should be configured based on broker's margin requirement for the hedged position
     # Example: If broker requires ₹50,000 margin per lot for the hedged structure, set to 50000
-    margin_per_lot = 50000  # Approximate margin required per lot for hedged position
+    margin_per_lot = 70000  # Approximate margin required per lot for hedged position
 
     # Reentry parameters
     reentry_adx_threshold = 25
@@ -115,6 +115,8 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         self._structure_main_entry_price: dict[str, float] = {}  # structure_id -> main entry premium
         self._structure_hedge_entry_price: dict[str, float] = {}  # structure_id -> hedge entry premium
         self._structure_type: dict[str, str] = {}  # structure_id -> "CALL" or "PUT"
+        # Quoted once when the entry is built. 5m SL/TP reads this and does not call the margin API.
+        self._structure_margin_used: dict[str, float] = {}
         # Track SL/TP hit for reentry timing
         self._sl_hit_structure: dict[str, str] = {}  # structure_id -> option_type (for next candle reentry)
         self._tp_hit_pending: dict[str, str] = {}  # structure_id -> option_type (for immediate reentry)
@@ -267,8 +269,8 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
 
             margin_result = tradehull.margin_calculator_multi(
                 scrip_list=scrip_list,
-                include_position=True,
-                include_orders=True
+                include_position=False,
+                include_orders=False,
             )
 
             if margin_result and isinstance(margin_result, dict):
@@ -796,6 +798,12 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             engine_logger.log(event_type, message, strategy_id=self.name, **fields)
         logger.info("NiftyDOS: %s", message)
 
+    def _log_strategy_file(self, ctx, event_type: str, message: str, **fields) -> None:
+        """Strategy JSON log only (logs/NiftyDOS/NiftyDOS.log), not process stderr."""
+        engine_logger = self._engine_logger(ctx)
+        if engine_logger:
+            engine_logger.log(event_type, message, strategy_id=self.name, **fields)
+
     def _log_entry_skipped(self, ctx, reason: str, **fields) -> None:
         req = getattr(self, "_last_chain_fetch_requested_expiry", None)
         chain_exp = getattr(self, "_last_chain_fetch_response_expiry", None)
@@ -1018,17 +1026,21 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             "sl_pct": self.call_sl_pct if option_type in ("CE", "CALL") else self.put_sl_pct,
             "margin_per_lot": self.margin_per_lot,
             "hedge_distance_points": self.hedge_distance_points,
+            "expiry": str(expiry_for_symbol),
             "signal_ts_ist": self._candle_open_ts_ist(candle).strftime("%Y-%m-%d %H:%M:%S"),
             "signal_tz": "Asia/Kolkata",
         }
-        sell_intent = replace(sell_intent, metadata_extras=strategy_meta)
-        hedge_intent = replace(hedge_intent, metadata_extras=strategy_meta)
-        self._entry_signaled_keys.add(signal_key)
-
         # Store entry prices for both MAIN and HEDGE for TP/SL tracking
         self._structure_main_entry_price[structure_id] = float(premium)
         self._structure_hedge_entry_price[structure_id] = hedge_entry_price
         self._structure_type[structure_id] = "CALL" if option_type in ("CE", "CALL") else "PUT"
+        margin_used = self._quote_structure_margin_once(
+            structure_id, sell_intent, hedge_intent, ctx
+        )
+        strategy_meta["margin_used"] = margin_used
+        sell_intent = replace(sell_intent, metadata_extras=strategy_meta)
+        hedge_intent = replace(hedge_intent, metadata_extras=strategy_meta)
+        self._entry_signaled_keys.add(signal_key)
 
         logger.info(
             "NiftyDOS entry structure=%s main=%s premium=%s hedge_premium=%s expiry=%s expiry_pref=%s hedge=%s",
@@ -1238,7 +1250,13 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         return True
 
     def eval_signal_log_message(self, candle) -> Optional[str]:
-        reason = self._pending_eval_reason or self._eval_signal_reason(candle)
+        candle_tf = str(candle.get("timeframe", self.timeframe) or "").strip()
+        if candle_tf == "5":
+            # 5m is TP/SL monitoring. Do not reuse the 30m entry reason
+            # (that was re-sending 9:45_ENTRY on every 5-minute bar).
+            reason = self._eval_signal_reason(candle)
+        else:
+            reason = self._pending_eval_reason or self._eval_signal_reason(candle)
         if not reason:
             return None
         st_signal = self._get_supertrend_signal(candle)
@@ -1399,6 +1417,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         self._structure_main_entry_price.pop(structure_id, None)
         self._structure_hedge_entry_price.pop(structure_id, None)
         self._structure_type.pop(structure_id, None)
+        self._structure_margin_used.pop(structure_id, None)
         self._pending_exit_structure_ids.discard(structure_id)
         if clear_sl_pending:
             self._sl_hit_structure.pop(structure_id, None)
@@ -1414,12 +1433,65 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             self._structure_main_entry_price.pop(structure_id, None)
             self._structure_hedge_entry_price.pop(structure_id, None)
             self._structure_type.pop(structure_id, None)
+            self._structure_margin_used.pop(structure_id, None)
             logger.info(
                 "NiftyDOS: Broker flat after exit for structure %s strategy=%s (SL reentry=%s)",
                 structure_id,
                 self.name,
                 structure_id in self._sl_hit_structure,
             )
+
+    def _position_fill_price(self, position) -> float:
+        """Broker average fill. Signal quotes are not position P&L."""
+        if position is None:
+            return 0.0
+        for attr in ("avg_price", "entry_price"):
+            raw = getattr(position, attr, None)
+            try:
+                px = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if px > 0:
+                return px
+        return 0.0
+
+    def _dhan_marketfeed(self, ctx):
+        """Dhan v2 quote client. Live broker keeps it on api._source, not broker._source."""
+        if ctx is None:
+            return None
+        brokers = []
+        router = getattr(ctx, "order_router", None)
+        if router is not None:
+            brokers.append(getattr(router, "broker", None))
+        brokers.append(getattr(ctx, "broker", None))
+        for broker in brokers:
+            if broker is None:
+                continue
+            source = getattr(broker, "_source", None)
+            if source is None:
+                source = getattr(getattr(broker, "api", None), "_source", None)
+            feed = getattr(source, "_marketfeed", None) if source is not None else None
+            if feed is not None and hasattr(feed, "ltp"):
+                return feed
+        return None
+
+    def _ltp_from_chain_row(self, row, option_type: str) -> Optional[float]:
+        """Mark from chain LTP. Bid/ask is an order price, not position P&L."""
+        if row is None:
+            return None
+        opt_u = str(option_type or "").upper()
+        col = "PE LTP" if opt_u in ("PE", "PUT") else "CE LTP"
+        try:
+            if col in getattr(row, "index", []):
+                px = float(row[col])
+                if px > 0:
+                    return px
+        except (TypeError, ValueError):
+            pass
+        px = self._execution_price_from_chain_row(row, option_type, side="BUY")
+        if px is not None and px > 0:
+            return float(px)
+        return None
 
     def _get_current_premium(self, position, candle, ctx) -> Optional[float]:
         """Get current premium for position."""
@@ -1431,58 +1503,45 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
                 position.instrument.option_type,
                 position.instrument.expiry,
             )
-        # For live/paper, fetch LTP via Dhan marketfeed (more efficient than full option chain)
-        if ctx and hasattr(ctx, "order_router"):
+        instrument = position.instrument
+        security_id = getattr(instrument, "instrument_id", None)
+        marketfeed = self._dhan_marketfeed(ctx)
+        if marketfeed is not None and security_id:
             try:
-                # Get security ID from instrument
-                instrument = position.instrument
-                security_id = getattr(instrument, "instrument_id", None)
-                if not security_id:
-                    # Fallback: try to get from trading symbol via instrument store
-                    if ctx and ctx.instrument_store:
-                        pass  # Could resolve here if needed
+                from core.library.dhan_marketfeed import parse_ltp_response
 
-                if security_id:
-                    # Access marketfeed via order_router -> broker -> source
-                    order_router = ctx.order_router
-                    broker = getattr(order_router, "broker", None)
-                    if broker and hasattr(broker, "_source"):
-                        source = broker._source
-                        marketfeed = getattr(source, "_marketfeed", None)
-                        if marketfeed:
-                            # Fetch LTP for the option instrument
-                            # NSE_FNO segment for Nifty options
-                            instruments = {"NSE_FNO": [int(security_id)]}
-                            response = marketfeed.ltp(instruments)
-                            if response.get("status") == "success":
-                                data = response.get("data", {})
-                                nse_fno = data.get("NSE_FNO", {})
-                                sec_data = nse_fno.get(str(security_id), {})
-                                ltp = sec_data.get("last_price")
-                                if ltp is not None:
-                                    premium = float(ltp)
-                                    logger.info(f"NiftyDOS: 5min premium fetch (marketfeed) struct={position.structure_id} strike={instrument.strike} opt={instrument.option_type} premium={premium:.2f}")
-                                    return premium
+                response = marketfeed.ltp({"NSE_FNO": [int(security_id)]})
+                ltp = parse_ltp_response(response).get(str(int(security_id)))
+                if ltp is not None and float(ltp) > 0:
+                    premium = float(ltp)
+                    logger.info(
+                        "NiftyDOS: 5min premium fetch (marketfeed) struct=%s strike=%s opt=%s premium=%.2f",
+                        position.structure_id,
+                        instrument.strike,
+                        instrument.option_type,
+                        premium,
+                    )
+                    return premium
+                logger.warning(
+                    "NiftyDOS: marketfeed LTP missing struct=%s security_id=%s status=%s",
+                    position.structure_id,
+                    security_id,
+                    (response or {}).get("status") if isinstance(response, dict) else None,
+                )
             except Exception as e:
-                logger.warning(f"NiftyDOS: Failed to fetch premium from marketfeed: {e}")
+                logger.warning("NiftyDOS: Failed to fetch premium from marketfeed: %s", e)
+        elif marketfeed is None:
+            logger.warning(
+                "NiftyDOS: marketfeed client unavailable for struct=%s",
+                getattr(position, "structure_id", None),
+            )
 
-        # Fallback: try option chain service (for cases where marketfeed not available)
-        if ctx and hasattr(ctx, "option_chain_service"):
+        # Fresh chain only. _last_option_chain is the entry snapshot and must not be the mark.
+        if ctx and hasattr(ctx, "option_chain_service") and ctx.option_chain_service:
             try:
-                strike = position.instrument.strike
-                option_type = position.instrument.option_type
-                expiry = position.instrument.expiry
-
-                # Try to get cached chain first (from previous fetch in this candle)
-                cached_chain = getattr(self, "_last_option_chain", None)
-                if cached_chain is not None:
-                    row = self._strike_row_from_chain(cached_chain, strike, option_type)
-                    if row is not None:
-                        px = self._execution_price_from_chain_row(row, option_type, side="BUY")
-                        if px is not None and px > 0:
-                            return float(px)
-
-                # Fetch fresh chain from service
+                strike = instrument.strike
+                option_type = instrument.option_type
+                expiry = instrument.expiry
                 params = {
                     "exchange": ctx.exchange,
                     "interval": self._option_data_interval(),
@@ -1496,16 +1555,19 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
                 }
                 chain = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
                 if chain is not None:
-                    self._last_option_chain = chain
                     row = self._strike_row_from_chain(chain, strike, option_type)
-                    if row is not None:
-                        px = self._execution_price_from_chain_row(row, option_type, side="BUY")
-                        if px is not None and px > 0:
-                            premium = float(px)
-                            logger.info(f"NiftyDOS: 5min premium fetch (option_chain) struct={position.structure_id} strike={strike} opt={option_type} premium={premium:.2f}")
-                            return premium
+                    premium = self._ltp_from_chain_row(row, option_type)
+                    if premium is not None and premium > 0:
+                        logger.info(
+                            "NiftyDOS: 5min premium fetch (option_chain) struct=%s strike=%s opt=%s premium=%.2f",
+                            position.structure_id,
+                            strike,
+                            option_type,
+                            premium,
+                        )
+                        return premium
             except Exception as e:
-                logger.warning(f"NiftyDOS: Failed to fetch premium from option chain: {e}")
+                logger.warning("NiftyDOS: Failed to fetch premium from option chain: %s", e)
         return None
 
     def _get_structure_positions(self, position, ctx):
@@ -1587,123 +1649,131 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
 
         return None
 
-    def _get_structure_capital(self, structure_id: str, main_position, ctx=None) -> float:
-        """Calculate total capital/margin deployed for the hedged structure.
-
-        First tries direct Dhan API margin calculation (like emergency file),
-        then falls back to broker's calculate_structure_margin,
-        finally falls back to configured margin_per_lot.
-        """
-        qty = abs(int(main_position.net_qty or 0))
+    def _structure_lots(self, position) -> int:
+        """Whole lots. Broker net_qty is units (65 for one NIFTY lot), not lot count."""
+        if position is None:
+            return 0
+        qty = abs(int(getattr(position, "net_qty", 0) or 0))
         if qty <= 0:
+            return 0
+        inst = getattr(position, "instrument", None)
+        lot = int(getattr(inst, "lot_size", 0) or 0)
+        sym = str(
+            getattr(inst, "trading_symbol", None)
+            or getattr(inst, "custom_symbol", None)
+            or ""
+        ).upper()
+        if lot <= 1 and "NIFTY" in sym and qty % 65 == 0:
+            lot = 65
+        if lot > 1 and qty % lot == 0:
+            return qty // lot
+        return self._order_qty_in_lots(inst, qty)
+
+    def _fallback_structure_capital(self, main_position) -> float:
+        lots = self._structure_lots(main_position)
+        if lots <= 0:
             return 0.0
+        return float(self.margin_per_lot) * lots
 
-        # Try direct Dhan API margin calculation first (like emergency file)
-        try:
-            # Load Dhan credentials from environment
-            import os
-            from dotenv import load_dotenv
-            load_dotenv('/root/Dhan-codebase/.env')
-            client_id = os.getenv("DHAN_CLIENT_CODE") or os.getenv("DHAN_CLIENT_ID")
-            access_token = os.getenv("DHAN_ACCESS_TOKEN")
+    def _tradehull_client(self, ctx):
+        brokers = []
+        router = getattr(ctx, "order_router", None) if ctx is not None else None
+        if router is not None:
+            brokers.append(getattr(router, "broker", None))
+        if ctx is not None:
+            brokers.append(getattr(ctx, "broker", None))
+        for broker in brokers:
+            source = getattr(getattr(broker, "api", None), "_source", None)
+            tradehull = getattr(source, "tsl", None) if source is not None else None
+            if tradehull is not None and hasattr(tradehull, "margin_calculator_multi"):
+                return tradehull
+        return None
 
-            if client_id and access_token:
-                dhan = dhanhq(client_id, access_token)
-                tradehull = Tradehull(client_id, access_token)
+    def _intent_symbol(self, intent) -> str:
+        inst = getattr(intent, "instrument", None)
+        return str(
+            getattr(inst, "tradingsymbol", None)
+            or getattr(inst, "trading_symbol", None)
+            or ""
+        )
 
-                # Get position details for margin calculation
-                main_symbol = getattr(main_position.instrument, 'tradingsymbol', '')
-                hedge_position = None
-                if ctx and ctx.position_store:
-                    hedge_position = ctx.position_store.get_hedge_for(main_position)
-                hedge_symbol = getattr(hedge_position.instrument, 'tradingsymbol', '') if hedge_position else ''
+    def _intent_units(self, intent) -> int:
+        """Order qty is lots. Margin API quantity is units."""
+        qty = abs(int(getattr(intent, "qty", 0) or 0))
+        if qty <= 0:
+            return 0
+        inst = getattr(intent, "instrument", None)
+        lot = int(getattr(inst, "lot_size", 0) or 0)
+        sym = self._intent_symbol(intent).upper()
+        if lot <= 1 and "NIFTY" in sym:
+            lot = 65
+        if lot > 1 and qty < lot:
+            return qty * lot
+        return qty
 
-                # Get entry prices
-                main_entry = self._structure_main_entry_price.get(structure_id, 0.0)
-                hedge_entry = self._structure_hedge_entry_price.get(structure_id, 0.0)
+    def _quote_structure_margin_once(self, structure_id, sell_intent, hedge_intent, ctx) -> float:
+        """Call the margin API once, when the entry order is built."""
+        cached = float(self._structure_margin_used.get(structure_id) or 0)
+        if cached > 0:
+            return cached
 
-                # Get strike prices from positions
-                main_strike = getattr(main_position.instrument, 'strike', 0.0)
-                hedge_strike = getattr(hedge_position.instrument, 'strike', 0.0) if hedge_position else 0.0
-
-                # Get option types
-                main_option_type = getattr(main_position.instrument, 'option_type', '')
-                # Hedge option type is same as main for this strategy
-                hedge_option_type = main_option_type
-
-                # Get quantities
-                main_qty = abs(int(getattr(main_position, 'net_qty', 0) or 0))
-                hedge_qty = abs(int(getattr(hedge_position, 'net_qty', 0) or 0)) if hedge_position else main_qty
-
-                # Calculate margin using direct Dhan API
+        margin = 0.0
+        source = "margin_per_lot"
+        tradehull = self._tradehull_client(ctx)
+        sell_inst = getattr(sell_intent, "instrument", None)
+        hedge_inst = getattr(hedge_intent, "instrument", None)
+        if tradehull is not None and sell_inst is not None:
+            try:
                 margin_result = self.calculate_margin_dhan(
-                    dhan=dhan,
+                    dhan=getattr(tradehull, "Dhan", None),
                     tradehull=tradehull,
-                    main_symbol=main_symbol,
-                    hedge_symbol=hedge_symbol,
-                    main_expiry=getattr(main_position.instrument, 'expiry', None),
-                    hedge_expiry=getattr(hedge_position.instrument, 'expiry', None) if hedge_position else None,
-                    main_strike=main_strike,
-                    hedge_strike=hedge_strike,
-                    option_type=main_option_type,
-                    main_qty=main_qty,
-                    hedge_qty=hedge_qty,
-                    main_price=main_entry,
-                    hedge_price=hedge_entry
+                    main_symbol=self._intent_symbol(sell_intent),
+                    hedge_symbol=self._intent_symbol(hedge_intent),
+                    main_expiry=getattr(sell_inst, "expiry", None),
+                    hedge_expiry=getattr(hedge_inst, "expiry", None) if hedge_inst else None,
+                    main_strike=getattr(sell_inst, "strike", 0.0),
+                    hedge_strike=getattr(hedge_inst, "strike", 0.0) if hedge_inst else 0.0,
+                    option_type=getattr(sell_inst, "option_type", ""),
+                    main_qty=self._intent_units(sell_intent),
+                    hedge_qty=self._intent_units(hedge_intent) or self._intent_units(sell_intent),
+                    main_price=float(getattr(sell_intent, "price", 0) or 0),
+                    hedge_price=float(getattr(hedge_intent, "price", 0) or 0),
                 )
+                if margin_result and float(margin_result.get("final_margin") or 0) > 0:
+                    margin = float(margin_result["final_margin"])
+                    source = "dhan"
+            except Exception as e:
+                logger.warning("NiftyDOS: entry margin quote failed, using margin_per_lot: %s", e)
 
-                if margin_result and margin_result.get('final_margin', 0) > 0:
-                    final_margin = margin_result['final_margin']
-                    logger.debug(
-                        "NiftyDOS: Using direct Dhan API margin for structure %s: final_margin=%.2f",
-                        structure_id,
-                        final_margin
-                    )
-                    return final_margin
-        except Exception as e:
-            logger.warning("NiftyDOS: Direct Dhan API margin calculation failed, trying broker method: %s", e)
+        if margin <= 0:
+            units = self._intent_units(sell_intent)
+            lot = 65 if "NIFTY" in self._intent_symbol(sell_intent).upper() else 1
+            lots = units // lot if lot > 1 and units % lot == 0 else max(units, 1)
+            margin = float(self.margin_per_lot) * lots
 
-        # Try to get broker-calculated margin for the hedged structure
-        if ctx and hasattr(ctx, "broker") and ctx.broker:
-            broker = ctx.broker
-            # Find the hedge position for this structure
-            hedge_position = None
-            if ctx.position_store:
-                hedge_position = ctx.position_store.get_hedge_for(main_position)
+        self._structure_margin_used[structure_id] = margin
+        self._log_strategy_file(
+            ctx,
+            "structure_margin",
+            (
+                f"structure margin locked at entry struct={structure_id} "
+                f"margin_used={margin:.2f} source={source}"
+            ),
+            structure_id=structure_id,
+            margin_used=margin,
+            margin_source=source,
+        )
+        return margin
 
-            if hedge_position and hasattr(broker, "calculate_structure_margin"):
-                try:
-                    # Get entry prices for margin calculation
-                    main_entry = self._structure_main_entry_price.get(structure_id, 0)
-                    hedge_entry = self._structure_hedge_entry_price.get(structure_id, 0)
-
-                    if main_entry > 0 and hedge_entry > 0:
-                        margin_result = broker.calculate_structure_margin(
-                            main_leg=main_position,
-                            hedge_leg=hedge_position,
-                            main_execution_price=main_entry,
-                            hedge_execution_price=hedge_entry,
-                            include_position=True,
-                            include_orders=True,
-                        )
-                        if margin_result and margin_result.get("final_margin", 0) > 0:
-                            # Return margin per lot * qty
-                            final_margin = margin_result["final_margin"]
-                            margin_per_lot = final_margin / qty if qty > 0 else final_margin
-                            logger.debug(
-                                "NiftyDOS: Using broker margin for structure %s: "
-                                "final_margin=%.2f margin_per_lot=%.2f hedge_benefit=%.2f",
-                                structure_id,
-                                final_margin,
-                                margin_per_lot,
-                                margin_result.get("hedge_benefit", 0)
-                            )
-                            return final_margin
-                except Exception as e:
-                    logger.warning("NiftyDOS: Broker margin calculation failed, using fallback: %s", e)
-
-        # Fallback to configured margin_per_lot
-        return self.margin_per_lot * qty
+    def _get_structure_capital(self, structure_id: str, main_position, ctx=None) -> float:
+        """Margin locked at entry. Never calls the margin API from the 5m check."""
+        cached = float(self._structure_margin_used.get(structure_id) or 0)
+        if cached > 0:
+            return cached
+        capital = self._fallback_structure_capital(main_position)
+        if capital > 0:
+            self._structure_margin_used[structure_id] = capital
+        return capital
 
     def _calculate_structure_pnl(self, main_position, hedge_position, candle, ctx) -> float:
         """Calculate combined P&L for the hedged structure (MAIN + HEDGE).
@@ -1713,12 +1783,14 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         """
         structure_id = main_position.structure_id
 
-        # Get entry prices
-        main_entry = self._structure_main_entry_price.get(structure_id, 0)
-        hedge_entry = self._structure_hedge_entry_price.get(structure_id, 0)
-
+        # Fill price is the entry. The signal quote stored at intent time is not the fill.
+        stored_main = float(self._structure_main_entry_price.get(structure_id, 0) or 0)
+        fill_main = self._position_fill_price(main_position)
+        main_entry = fill_main if fill_main > 0 else stored_main
         if main_entry <= 0:
             return 0.0
+        if fill_main > 0:
+            self._structure_main_entry_price[structure_id] = fill_main
 
         # Get current prices
         main_current = self._get_current_premium(main_position, candle, ctx)
@@ -1732,14 +1804,44 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
 
         # Calculate HEDGE P&L if hedge exists (long: profit when premium rises)
         hedge_pnl = 0.0
-        if hedge_position and hedge_position.net_qty != 0:
+        hedge_current = None
+        hedge_entry = float(self._structure_hedge_entry_price.get(structure_id, 0) or 0)
+        if hedge_position and int(getattr(hedge_position, "net_qty", 0) or 0) != 0:
+            fill_hedge = self._position_fill_price(hedge_position)
+            if fill_hedge > 0:
+                hedge_entry = fill_hedge
+                self._structure_hedge_entry_price[structure_id] = fill_hedge
             hedge_current = self._get_current_premium(hedge_position, candle, ctx)
             if hedge_current is not None and hedge_entry > 0:
                 hedge_qty = abs(int(hedge_position.net_qty or 0))
                 hedge_pnl = (hedge_current - hedge_entry) * hedge_qty
+            else:
+                logger.warning(
+                    "NiftyDOS: hedge P&L omitted struct=%s hedge_entry=%.2f hedge_premium=%s",
+                    structure_id,
+                    hedge_entry,
+                    f"{hedge_current:.2f}" if hedge_current is not None else "none",
+                )
 
         structure_pnl = main_pnl + hedge_pnl
-        logger.info(f"NiftyDOS: 5min structure P&L struct={structure_id} main_premium={main_current:.2f} main_entry={main_entry:.2f} main_pnl={main_pnl:.2f} hedge_pnl={hedge_pnl:.2f} total_pnl={structure_pnl:.2f}")
+        hedge_px = f"{hedge_current:.2f}" if hedge_current is not None else "none"
+        self._log_strategy_file(
+            ctx,
+            "structure_pnl",
+            (
+                f"5min structure P&L struct={structure_id} main_premium={main_current:.2f} "
+                f"main_entry={main_entry:.2f} main_pnl={main_pnl:.2f} hedge_premium={hedge_px} "
+                f"hedge_entry={hedge_entry:.2f} hedge_pnl={hedge_pnl:.2f} total_pnl={structure_pnl:.2f}"
+            ),
+            structure_id=structure_id,
+            main_premium=main_current,
+            main_entry=main_entry,
+            main_pnl=main_pnl,
+            hedge_premium=None if hedge_current is None else hedge_current,
+            hedge_entry=hedge_entry,
+            hedge_pnl=hedge_pnl,
+            pnl=structure_pnl,
+        )
         return structure_pnl
 
     def _check_tp_sl(self, position, candle, ctx) -> Optional[str]:
@@ -1770,14 +1872,56 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         # Calculate SL and TP amounts based on capital deployed
         sl_amount = capital_used * sl_pct / 100.0
         tp_amount = capital_used * tp_pct / 100.0
+        self._log_strategy_file(
+            ctx,
+            "structure_snapshot",
+            (
+                f"5min SL/TP levels struct={structure_id} pnl={structure_pnl:.2f} "
+                f"sl_pct={sl_pct:.2f} sl_amount={sl_amount:.2f} "
+                f"tp_pct={tp_pct:.2f} tp_amount={tp_amount:.2f} "
+                f"margin_used={capital_used:.2f}"
+            ),
+            structure_id=structure_id,
+            pnl=structure_pnl,
+            capital=capital_used,
+            margin_used=capital_used,
+            sl_pct=sl_pct,
+            sl_amount=sl_amount,
+            tp_pct=tp_pct,
+            tp_amount=tp_amount,
+        )
 
         # SL hit when loss exceeds SL amount
         if structure_pnl <= -sl_amount:
-            logger.info(f"NiftyDOS: SL hit for structure {structure_id}, P&L={structure_pnl:.2f}, SL={sl_amount:.2f}, Capital={capital_used:.2f}")
+            self._log_strategy_file(
+                ctx,
+                "structure_pnl",
+                (
+                    f"SL hit for structure {structure_id} pnl={structure_pnl:.2f} "
+                    f"sl_amount={sl_amount:.2f} margin_used={capital_used:.2f}"
+                ),
+                structure_id=structure_id,
+                pnl=structure_pnl,
+                sl_amount=sl_amount,
+                margin_used=capital_used,
+                exit_reason="SL",
+            )
             return "SL"
         # TP hit when profit exceeds TP amount
         if structure_pnl >= tp_amount:
-            logger.info(f"NiftyDOS: TP hit for structure {structure_id}, P&L={structure_pnl:.2f}, TP={tp_amount:.2f}, Capital={capital_used:.2f}")
+            self._log_strategy_file(
+                ctx,
+                "structure_pnl",
+                (
+                    f"TP hit for structure {structure_id} pnl={structure_pnl:.2f} "
+                    f"tp_amount={tp_amount:.2f} margin_used={capital_used:.2f}"
+                ),
+                structure_id=structure_id,
+                pnl=structure_pnl,
+                tp_amount=tp_amount,
+                margin_used=capital_used,
+                exit_reason="TP",
+            )
             return "TP"
         return None
 
@@ -1919,8 +2063,71 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
 
         return False
 
+    def _exit_instrument(self, position, ctx):
+        """Re-resolve the open contract by its calendar expiry.
+
+        Compact symbols such as ``NIFTY-Oct2026-22350-PE`` do not carry the day, so a
+        restart was mapping them to the monthly expiry (27 Oct) and closing that instead.
+        """
+        inst = getattr(position, "instrument", None)
+        if inst is None or ctx is None:
+            return inst
+        store = getattr(ctx, "instrument_store", None)
+        pm = getattr(ctx, "position_store", None)
+        meta = {}
+        if pm is not None and hasattr(pm, "get_position_metadata"):
+            raw = pm.get_position_metadata(getattr(inst, "trading_symbol", "") or "") or {}
+            sm = raw.get("strategy_meta") if isinstance(raw, dict) else None
+            if isinstance(sm, dict):
+                meta = sm
+        expiry = meta.get("expiry") or getattr(inst, "expiry", None)
+        custom = str(meta.get("custom_symbol") or getattr(inst, "custom_symbol", "") or "").strip()
+        lookup = custom or getattr(inst, "trading_symbol", None)
+        if store is None or not lookup or expiry is None:
+            return inst
+        resolved = store.intent_creation_details(
+            lookup,
+            getattr(inst, "exchange", None) or getattr(ctx, "exchange", None),
+            expiry,
+            getattr(inst, "option_type", None),
+            getattr(inst, "strike", None),
+        )
+        if resolved is None:
+            logger.warning(
+                "NiftyDOS: exit kept original instrument; resolve failed lookup=%s expiry=%s",
+                lookup,
+                expiry,
+            )
+            return inst
+        try:
+            want = pd.Timestamp(expiry).date()
+            got = pd.Timestamp(resolved.expiry).date()
+        except (TypeError, ValueError):
+            return resolved
+        if got != want:
+            logger.warning(
+                "NiftyDOS: exit resolve expiry mismatch want=%s got=%s symbol=%s",
+                want,
+                got,
+                getattr(resolved, "custom_symbol", None),
+            )
+            return inst
+        if getattr(resolved, "custom_symbol", None) != getattr(inst, "custom_symbol", None):
+            logger.info(
+                "NiftyDOS: exit instrument %s -> %s expiry=%s",
+                getattr(inst, "custom_symbol", None) or getattr(inst, "trading_symbol", None),
+                resolved.custom_symbol,
+                want,
+            )
+        return resolved
+
     def on_position_exit(self, position, candle, ctx):
         """Generate exit intents for TP/SL/ST-flip hits. Reentry is deferred until position is actually closed at broker."""
+        position.instrument = self._exit_instrument(position, ctx)
+        if ctx is not None and getattr(ctx, "position_store", None) is not None:
+            hedge = ctx.position_store.get_hedge_for(position)
+            if hedge is not None and getattr(hedge, "instrument", None) is not None:
+                hedge.instrument = self._exit_instrument(hedge, ctx)
         intents = []
         price = (
             self.get_option_price_at_candle(
@@ -2000,6 +2207,7 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         self._structure_main_entry_price.pop(structure_id, None)
         self._structure_hedge_entry_price.pop(structure_id, None)
         self._structure_type.pop(structure_id, None)
+        self._structure_margin_used.pop(structure_id, None)
         self._pending_exit_structure_ids.discard(structure_id)
         self._sl_hit_structure.pop(structure_id, None)
         self._tp_hit_pending.pop(structure_id, None)
@@ -2165,6 +2373,25 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
                     self._structure_hedge_entry_price[structure_id] = float(hedge_entry)
                 if structure_type:
                     self._structure_type[structure_id] = structure_type
+
+                margin_used = 0.0
+                meta = {}
+                pm = getattr(ctx, "position_store", None)
+                if pm is not None and hasattr(pm, "get_position_metadata"):
+                    raw = pm.get_position_metadata(
+                        getattr(position.instrument, "trading_symbol", "") or ""
+                    ) or {}
+                    sm = raw.get("strategy_meta") if isinstance(raw, dict) else None
+                    if isinstance(sm, dict):
+                        meta = sm
+                try:
+                    margin_used = float(meta.get("margin_used") or 0)
+                except (TypeError, ValueError):
+                    margin_used = 0.0
+                if margin_used <= 0:
+                    margin_used = self._fallback_structure_capital(position)
+                if margin_used > 0:
+                    self._structure_margin_used[structure_id] = margin_used
 
                 # Clear any stale reentry flags (fresh start after restart)
                 self._sl_hit_structure.pop(structure_id, None)

@@ -91,6 +91,7 @@ TELEGRAM_ALERT_EVENTS = {
     "order_rejected",
     "risk_block",
     "kill_switch",
+    "structure_snapshot",
     # "candle_closed" - disabled to prevent Telegram spam
 }
 

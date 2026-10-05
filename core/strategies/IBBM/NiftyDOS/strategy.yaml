@@ -79,7 +79,7 @@ params:
   # Capital per lot for the hedged structure (fallback if broker margin calculation unavailable).
   # When broker supports calculate_structure_margin, the actual hedged margin with
   # hedge benefit is used. This fallback approximates SPAN margin for MAIN + HEDGE.
-  margin_per_lot: 50000
+  margin_per_lot: 70000
 
   # Reentry parameters
   reentry_adx_threshold: 25

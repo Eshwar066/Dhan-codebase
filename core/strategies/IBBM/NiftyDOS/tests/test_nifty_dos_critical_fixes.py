@@ -479,5 +479,256 @@ class TestChainFetchGuard(unittest.TestCase):
         self.assertEqual(args[1]["chain_expiry"], "2026-09-22")
 
 
+class TestExitExpiry(unittest.TestCase):
+    def test_csv_hint_prefers_saved_expiry_over_compact_symbol(self):
+        from core.orderExecution.position_manager import PositionManager
+
+        expiry, lookup = PositionManager._contract_hint_from_open_row(
+            {
+                "strategy_meta": (
+                    '{"expiry": "2026-10-13", '
+                    '"custom_symbol": "NIFTY 13 OCT 22350 PUT"}'
+                )
+            },
+            "NIFTY-Oct2026-22350-PE",
+        )
+        self.assertEqual(expiry, "2026-10-13")
+        self.assertEqual(lookup, "NIFTY 13 OCT 22350 PUT")
+
+    def test_exit_rebinds_monthly_symbol_to_saved_weekly_expiry(self):
+        strategy = NiftyDOS()
+        weekly = SimpleNamespace(
+            trading_symbol="NIFTY-Oct2026-22350-PE",
+            custom_symbol="NIFTY 13 OCT 22350 PUT",
+            exchange="NSE",
+            expiry=date(2026, 10, 13),
+            option_type="PE",
+            strike=22350,
+        )
+        monthly = SimpleNamespace(
+            trading_symbol="NIFTY-Oct2026-22350-PE",
+            custom_symbol="NIFTY 27 OCT 22350 PUT",
+            exchange="NSE",
+            expiry=date(2026, 10, 27),
+            option_type="PE",
+            strike=22350,
+        )
+        store = MagicMock()
+        store.intent_creation_details.return_value = weekly
+        pos = SimpleNamespace(instrument=monthly, net_qty=-65, structure_id="sid", tag="MAIN")
+        ctx = SimpleNamespace(
+            instrument_store=store,
+            exchange="NSE",
+            position_store=SimpleNamespace(
+                get_position_metadata=lambda _s: {
+                    "strategy_meta": {
+                        "expiry": "2026-10-13",
+                        "custom_symbol": "NIFTY 13 OCT 22350 PUT",
+                    }
+                },
+                get_hedge_for=lambda _p: None,
+            ),
+        )
+        rebound = strategy._exit_instrument(pos, ctx)
+        self.assertIs(rebound, weekly)
+        store.intent_creation_details.assert_called_once()
+        self.assertEqual(store.intent_creation_details.call_args[0][2], "2026-10-13")
+
+
+class TestStructureSlCapital(unittest.TestCase):
+    def test_sl_is_3_5_percent_of_margin_per_lot_not_unit_qty(self):
+        strategy = NiftyDOS()
+        strategy.margin_per_lot = 50000
+        strategy.put_sl_pct = 3.5
+        strategy.put_tp_pct = 3.7
+        sid = "NiftyDOS:NIFTY:SUPER_BULLISH_945"
+        strategy._structure_type[sid] = "PUT"
+        strategy._structure_main_entry_price[sid] = 84.95
+        strategy._structure_hedge_entry_price[sid] = 23.55
+        main = SimpleNamespace(
+            tag="MAIN",
+            structure_id=sid,
+            net_qty=-65,
+            avg_price=84.95,
+            instrument=SimpleNamespace(
+                trading_symbol="NIFTY-Oct2026-22350-PE",
+                lot_size=1,
+                strike=22350,
+                option_type="PE",
+                expiry=date(2026, 10, 13),
+                instrument_id=111,
+            ),
+        )
+        hedge = SimpleNamespace(
+            tag="HEDGE",
+            structure_id=sid,
+            net_qty=65,
+            avg_price=23.55,
+            instrument=SimpleNamespace(
+                trading_symbol="NIFTY-Oct2026-21850-PE",
+                lot_size=1,
+                strike=21850,
+                option_type="PE",
+                instrument_id=222,
+            ),
+        )
+        ctx = SimpleNamespace(position_store=SimpleNamespace(get_hedge_for=lambda _p: hedge))
+
+        capital = strategy._get_structure_capital(sid, main, ctx)
+        self.assertEqual(capital, 50000)
+        self.assertAlmostEqual(capital * 3.5 / 100.0, 1750)
+
+        # Loss of 1800 on the short leg crosses the 1750 stop. Mark 112.65:
+        # (84.95 - 112.65) * 65 = -1800.50, hedge unchanged so hedge pnl 0.
+        with patch.object(
+            strategy,
+            "_get_current_premium",
+            side_effect=lambda pos, candle, ctx: 112.65 if pos is main else 23.55,
+        ):
+            self.assertEqual(strategy._check_tp_sl(main, {"symbol": "NIFTY"}, ctx), "SL")
+
+        with patch.object(
+            strategy,
+            "_get_current_premium",
+            side_effect=lambda pos, candle, ctx: 90.0 if pos is main else 23.55,
+        ):
+            # (84.95 - 90) * 65 = -328.25, inside the 1750 stop
+            self.assertIsNone(strategy._check_tp_sl(main, {"symbol": "NIFTY"}, ctx))
+
+
+class TestStructurePnl(unittest.TestCase):
+    def test_pnl_uses_fills_and_live_ltp_not_signal_quote(self):
+        strategy = NiftyDOS()
+        sid = "NiftyDOS:NIFTY:SUPER_BULLISH_945"
+        strategy._structure_main_entry_price[sid] = 87.15
+        strategy._structure_hedge_entry_price[sid] = 0.0
+        strategy._last_option_chain = {
+            "chain": pd.DataFrame(
+                {
+                    "Strike Price": [22350.0, 21850.0],
+                    "PE Ask": [87.10, 24.10],
+                    "PE LTP": [99.0, 30.0],
+                }
+            )
+        }
+        main = SimpleNamespace(
+            structure_id=sid,
+            net_qty=-65,
+            avg_price=84.95,
+            instrument=SimpleNamespace(
+                strike=22350,
+                option_type="PE",
+                expiry=date(2026, 10, 13),
+                instrument_id=111,
+            ),
+        )
+        hedge = SimpleNamespace(
+            structure_id=sid,
+            net_qty=65,
+            avg_price=23.55,
+            instrument=SimpleNamespace(
+                strike=21850,
+                option_type="PE",
+                expiry=date(2026, 10, 13),
+                instrument_id=222,
+            ),
+        )
+        feed = MagicMock()
+        feed.ltp.return_value = {
+            "status": "success",
+            "data": {
+                "NSE_FNO": {
+                    "111": {"last_price": 80.0},
+                    "222": {"last_price": 20.0},
+                }
+            },
+        }
+        broker = SimpleNamespace(api=SimpleNamespace(_source=SimpleNamespace(_marketfeed=feed)))
+        ctx = SimpleNamespace(
+            order_router=SimpleNamespace(broker=broker),
+            option_chain_service=MagicMock(),
+            position_store=SimpleNamespace(get_hedge_for=lambda _p: hedge),
+        )
+
+        with patch("core.strategies.IBBM.NiftyDOS.NiftyDOS.RUN_MODE", RunMode.LIVE):
+            pnl = strategy._calculate_structure_pnl(main, hedge, {"symbol": "NIFTY"}, ctx)
+
+        # short (84.95 - 80) * 65 + long (20 - 23.55) * 65
+        self.assertAlmostEqual(pnl, (84.95 - 80.0) * 65 + (20.0 - 23.55) * 65)
+        self.assertEqual(strategy._structure_main_entry_price[sid], 84.95)
+        self.assertEqual(strategy._structure_hedge_entry_price[sid], 23.55)
+        ctx.option_chain_service.get_chain.assert_not_called()
+        self.assertEqual(feed.ltp.call_count, 2)
+
+
+class TestMarginAndTelegram(unittest.TestCase):
+    def test_5min_monitor_does_not_repeat_945_signal(self):
+        strategy = NiftyDOS()
+        strategy._pending_eval_reason = "9:45_ENTRY"
+        strategy._structure_main_entry_price["sid"] = 84.95
+        candle = {
+            "symbol": "NIFTY",
+            "timeframe": "5",
+            "timestamp": datetime(2026, 10, 5, 10, 5),
+            "close": 22600,
+        }
+        self.assertIsNone(strategy.eval_signal_log_message(candle))
+
+    def test_5min_capital_uses_locked_margin_not_api(self):
+        strategy = NiftyDOS()
+        sid = "NiftyDOS:NIFTY:SUPER_BULLISH_945"
+        strategy._structure_margin_used[sid] = 60870.94
+        main = SimpleNamespace(
+            net_qty=-65,
+            instrument=SimpleNamespace(
+                trading_symbol="NIFTY-Oct2026-22350-PE",
+                lot_size=1,
+            ),
+        )
+        tradehull = SimpleNamespace(margin_calculator_multi=MagicMock())
+        ctx = SimpleNamespace(
+            order_router=SimpleNamespace(
+                broker=SimpleNamespace(
+                    api=SimpleNamespace(_source=SimpleNamespace(tsl=tradehull))
+                )
+            )
+        )
+        with patch.object(strategy, "calculate_margin_dhan") as quote:
+            capital = strategy._get_structure_capital(sid, main, ctx)
+        self.assertEqual(capital, 60870.94)
+        quote.assert_not_called()
+        tradehull.margin_calculator_multi.assert_not_called()
+
+    def test_margin_api_runs_once_when_entry_is_built(self):
+        strategy = NiftyDOS()
+        inst = lambda sym, strike: SimpleNamespace(
+            trading_symbol=sym,
+            lot_size=1,
+            strike=strike,
+            option_type="PE",
+            expiry=date(2026, 10, 13),
+        )
+        sell = SimpleNamespace(qty=1, price=84.95, instrument=inst("NIFTY-Oct2026-22350-PE", 22350))
+        hedge = SimpleNamespace(qty=1, price=23.55, instrument=inst("NIFTY-Oct2026-21850-PE", 21850))
+        tradehull = SimpleNamespace(margin_calculator_multi=MagicMock(), Dhan=None)
+        ctx = SimpleNamespace(
+            order_router=SimpleNamespace(
+                broker=SimpleNamespace(
+                    api=SimpleNamespace(_source=SimpleNamespace(tsl=tradehull))
+                )
+            )
+        )
+        with patch.object(
+            strategy, "calculate_margin_dhan", return_value={"final_margin": 60870.94}
+        ) as quote:
+            first = strategy._quote_structure_margin_once("sid", sell, hedge, ctx)
+            second = strategy._quote_structure_margin_once("sid", sell, hedge, ctx)
+        self.assertEqual(first, 60870.94)
+        self.assertEqual(second, 60870.94)
+        quote.assert_called_once()
+        self.assertEqual(quote.call_args.kwargs["main_qty"], 65)
+        self.assertEqual(quote.call_args.kwargs["hedge_qty"], 65)
+
+
 if __name__ == "__main__":
     unittest.main()
