@@ -28,6 +28,7 @@ Check at 9:15: if price is opposite to signal, exit trade and enter in 30min can
 from __future__ import annotations
 
 import logging
+import time as time_module
 from dataclasses import replace
 from datetime import date, time, timedelta
 from pathlib import Path
@@ -1536,39 +1537,64 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
                 getattr(position, "structure_id", None),
             )
 
-        # Fresh chain only. _last_option_chain is the entry snapshot and must not be the mark.
-        if ctx and hasattr(ctx, "option_chain_service") and ctx.option_chain_service:
-            try:
-                strike = instrument.strike
-                option_type = instrument.option_type
-                expiry = instrument.expiry
-                params = {
-                    "exchange": ctx.exchange,
-                    "interval": self._option_data_interval(),
-                    "expiry_code": expiry,
-                    "strike": [str(int(float(strike)))],
-                    "option_type": option_type,
-                    "instrument": "OPTIDX",
-                    "exchangeSegment": "NSE_FNO",
-                    "expiry_flag": self._dhan_expiry_flag(),
-                    "securityId": self._dhan_option_security_id(),
-                }
-                chain = ctx.option_chain_service.get_chain(api=self.api, ctx=ctx, params=params)
-                if chain is not None:
-                    row = self._strike_row_from_chain(chain, strike, option_type)
-                    premium = self._ltp_from_chain_row(row, option_type)
-                    if premium is not None and premium > 0:
-                        logger.info(
-                            "NiftyDOS: 5min premium fetch (option_chain) struct=%s strike=%s opt=%s premium=%.2f",
-                            position.structure_id,
-                            strike,
-                            option_type,
-                            premium,
-                        )
-                        return premium
-            except Exception as e:
-                logger.warning("NiftyDOS: Failed to fetch premium from option chain: %s", e)
+        # Do not mark from the option chain. WEEK chain is the current weekly, so on
+        # expiry day a 13 Oct hedge was priced as the 6 Oct 21900 put (~1.05).
         return None
+
+    def _position_security_id(self, position) -> Optional[int]:
+        inst = getattr(position, "instrument", None)
+        if inst is None:
+            return None
+        raw = getattr(inst, "instrument_id", None)
+        if raw in (None, "", 0):
+            raw = getattr(inst, "security_id", None)
+        try:
+            sid = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return sid if sid > 0 else None
+
+    def _fetch_mark_ltps(self, positions, ctx) -> dict[int, float]:
+        """One marketfeed call for the whole structure. A second call hits HTTP 429."""
+        ids: list[int] = []
+        for pos in positions:
+            if pos is None:
+                continue
+            sid = self._position_security_id(pos)
+            if sid and sid not in ids:
+                ids.append(sid)
+        if not ids:
+            return {}
+        marketfeed = self._dhan_marketfeed(ctx)
+        if marketfeed is None:
+            return {}
+        from core.library.dhan_marketfeed import parse_ltp_response
+
+        last_error: Any = None
+        for attempt in (1, 2):
+            try:
+                response = marketfeed.ltp({"NSE_FNO": ids})
+                parsed = parse_ltp_response(response)
+                out: dict[int, float] = {}
+                for sid in ids:
+                    px = parsed.get(str(sid))
+                    if px is not None and float(px) > 0:
+                        out[sid] = float(px)
+                if len(out) == len(ids):
+                    logger.info(
+                        "NiftyDOS: 5min structure marks security_ids=%s premiums=%s",
+                        ids,
+                        {k: round(v, 2) for k, v in out.items()},
+                    )
+                    return out
+                last_error = f"partial marks got={list(out)} want={ids}"
+            except Exception as e:
+                last_error = e
+            if attempt == 1:
+                logger.warning("NiftyDOS: mark LTP retry after %s", last_error)
+                time_module.sleep(1.1)
+        logger.warning("NiftyDOS: mark LTP unavailable ids=%s error=%s", ids, last_error)
+        return {}
 
     def _get_structure_positions(self, position, ctx):
         """Get both MAIN and HEDGE positions for a structure."""
@@ -1775,11 +1801,13 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             self._structure_margin_used[structure_id] = capital
         return capital
 
-    def _calculate_structure_pnl(self, main_position, hedge_position, candle, ctx) -> float:
+    def _calculate_structure_pnl(self, main_position, hedge_position, candle, ctx) -> Optional[float]:
         """Calculate combined P&L for the hedged structure (MAIN + HEDGE).
 
         MAIN: Short option - profit when premium decreases
         HEDGE: Long option - profit when premium increases
+        Returns None when a live mark is missing so a wrong chain price cannot
+        be treated as the structure P&L.
         """
         structure_id = main_position.structure_id
 
@@ -1792,10 +1820,40 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
         if fill_main > 0:
             self._structure_main_entry_price[structure_id] = fill_main
 
-        # Get current prices
-        main_current = self._get_current_premium(main_position, candle, ctx)
+        hedge_open = bool(
+            hedge_position and int(getattr(hedge_position, "net_qty", 0) or 0) != 0
+        )
+        hedge_entry = float(self._structure_hedge_entry_price.get(structure_id, 0) or 0)
+        if hedge_open:
+            fill_hedge = self._position_fill_price(hedge_position)
+            if fill_hedge > 0:
+                hedge_entry = fill_hedge
+                self._structure_hedge_entry_price[structure_id] = fill_hedge
+
+        use_batch = RUN_MODE != RunMode.BACKTEST and self._dhan_marketfeed(ctx) is not None
+        if use_batch:
+            marks = self._fetch_mark_ltps(
+                [main_position, hedge_position if hedge_open else None], ctx
+            )
+            main_sid = self._position_security_id(main_position)
+            main_current = marks.get(main_sid) if main_sid else None
+            hedge_sid = self._position_security_id(hedge_position) if hedge_open else None
+            hedge_current = marks.get(hedge_sid) if hedge_sid else None
+        else:
+            main_current = self._get_current_premium(main_position, candle, ctx)
+            hedge_current = (
+                self._get_current_premium(hedge_position, candle, ctx) if hedge_open else None
+            )
         if main_current is None:
-            return 0.0
+            logger.warning("NiftyDOS: main mark missing struct=%s", structure_id)
+            return None
+        if hedge_open and hedge_entry > 0 and hedge_current is None:
+            logger.warning(
+                "NiftyDOS: hedge mark missing struct=%s hedge_entry=%.2f",
+                structure_id,
+                hedge_entry,
+            )
+            return None
 
         # Calculate MAIN P&L (short: profit when premium drops)
         # net_qty from broker is already total quantity (lots × lot_size), so don't multiply by lot_size again
@@ -1804,24 +1862,9 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
 
         # Calculate HEDGE P&L if hedge exists (long: profit when premium rises)
         hedge_pnl = 0.0
-        hedge_current = None
-        hedge_entry = float(self._structure_hedge_entry_price.get(structure_id, 0) or 0)
-        if hedge_position and int(getattr(hedge_position, "net_qty", 0) or 0) != 0:
-            fill_hedge = self._position_fill_price(hedge_position)
-            if fill_hedge > 0:
-                hedge_entry = fill_hedge
-                self._structure_hedge_entry_price[structure_id] = fill_hedge
-            hedge_current = self._get_current_premium(hedge_position, candle, ctx)
-            if hedge_current is not None and hedge_entry > 0:
-                hedge_qty = abs(int(hedge_position.net_qty or 0))
-                hedge_pnl = (hedge_current - hedge_entry) * hedge_qty
-            else:
-                logger.warning(
-                    "NiftyDOS: hedge P&L omitted struct=%s hedge_entry=%.2f hedge_premium=%s",
-                    structure_id,
-                    hedge_entry,
-                    f"{hedge_current:.2f}" if hedge_current is not None else "none",
-                )
+        if hedge_open and hedge_current is not None and hedge_entry > 0:
+            hedge_qty = abs(int(hedge_position.net_qty or 0))
+            hedge_pnl = (hedge_current - hedge_entry) * hedge_qty
 
         structure_pnl = main_pnl + hedge_pnl
         hedge_px = f"{hedge_current:.2f}" if hedge_current is not None else "none"
@@ -1868,6 +1911,8 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
 
         # Calculate combined structure P&L
         structure_pnl = self._calculate_structure_pnl(main_pos, hedge_pos, candle, ctx)
+        if structure_pnl is None:
+            return None
 
         # Calculate SL and TP amounts based on capital deployed
         sl_amount = capital_used * sl_pct / 100.0
@@ -1938,6 +1983,8 @@ class NiftyDOS(IndiaMktMixins, BaseStrategy):
             return False
 
         structure_pnl = self._calculate_structure_pnl(main_pos, hedge_pos, candle, ctx)
+        if structure_pnl is None:
+            return False
 
         eod_exit_amount = capital_used * self.eod_exit_pct / 100.0
         if abs(structure_pnl) >= eod_exit_amount:

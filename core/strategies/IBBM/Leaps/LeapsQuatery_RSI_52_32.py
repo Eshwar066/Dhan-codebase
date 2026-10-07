@@ -23,7 +23,7 @@ from core.utils.option_chain_snapshot_log import log_option_chain_snapshot
 logger = logging.getLogger(__name__)
 
 # New entries only. Existing positions still exit on the RSI flip.
-ENTER_CALL_SIDE = False  # RSI < 32 → sell CALL
+ENTER_CALL_SIDE = True  # RSI < 32 → sell CALL
 ENTER_PUT_SIDE = True  # RSI > 52 → sell PUT
 
 # (class flag attr, MAIN expiry_pref, structure_id suffix)

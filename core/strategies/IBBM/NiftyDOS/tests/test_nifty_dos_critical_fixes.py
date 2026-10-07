@@ -658,7 +658,51 @@ class TestStructurePnl(unittest.TestCase):
         self.assertEqual(strategy._structure_main_entry_price[sid], 84.95)
         self.assertEqual(strategy._structure_hedge_entry_price[sid], 23.55)
         ctx.option_chain_service.get_chain.assert_not_called()
-        self.assertEqual(feed.ltp.call_count, 2)
+        self.assertEqual(feed.ltp.call_count, 1)
+        self.assertEqual(feed.ltp.call_args.args[0]["NSE_FNO"], [111, 222])
+
+    def test_ltp_failure_does_not_mark_hedge_from_option_chain(self):
+        strategy = NiftyDOS()
+        sid = "NiftyDOS:NIFTY:SUPER_BULLISH_945"
+        strategy._structure_main_entry_price[sid] = 85.70
+        strategy._structure_hedge_entry_price[sid] = 18.95
+        main = SimpleNamespace(
+            structure_id=sid,
+            net_qty=-65,
+            avg_price=85.70,
+            instrument=SimpleNamespace(
+                strike=22400,
+                option_type="PE",
+                expiry=date(2026, 10, 13),
+                instrument_id=44601,
+            ),
+        )
+        hedge = SimpleNamespace(
+            structure_id=sid,
+            net_qty=65,
+            avg_price=18.95,
+            instrument=SimpleNamespace(
+                strike=21900,
+                option_type="PE",
+                expiry=date(2026, 10, 13),
+                instrument_id=44569,
+            ),
+        )
+        feed = MagicMock()
+        feed.ltp.side_effect = Exception("429 Client Error")
+        chain = MagicMock()
+        ctx = SimpleNamespace(
+            order_router=SimpleNamespace(
+                broker=SimpleNamespace(api=SimpleNamespace(_source=SimpleNamespace(_marketfeed=feed)))
+            ),
+            option_chain_service=chain,
+        )
+        with patch("core.strategies.IBBM.NiftyDOS.NiftyDOS.RUN_MODE", RunMode.LIVE), patch(
+            "core.strategies.IBBM.NiftyDOS.NiftyDOS.time_module.sleep"
+        ):
+            pnl = strategy._calculate_structure_pnl(main, hedge, {"symbol": "NIFTY"}, ctx)
+        self.assertIsNone(pnl)
+        chain.get_chain.assert_not_called()
 
 
 class TestMarginAndTelegram(unittest.TestCase):

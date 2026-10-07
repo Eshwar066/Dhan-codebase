@@ -59,7 +59,7 @@ dependencies:
 
 # New entries only. Existing positions still exit on the RSI flip.
 entries:
-  call_side: false   # RSI < 32 → sell CALL
+  call_side: true   # RSI < 32 → sell CALL
   put_side: true    # RSI > 52 → sell PUT
 
 # MAIN leg toggles — each enabled leg places MAIN sell + monthly hedge bundle.
