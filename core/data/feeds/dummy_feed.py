@@ -43,6 +43,7 @@ class DummyRealtimeFeed(RealtimeFeed):
         spike_amount: float = 0.0,
         out_of_order_at_tick: Optional[int] = None,
         out_of_order_delay_seconds: float = 10.0,
+        max_ticks: Optional[int] = None,  # Stop after this many ticks (per symbol)
     ) -> None:
         self.symbols: List[str] = [str(s).strip().upper() for s in symbols if str(s).strip()]
         if not self.symbols:
@@ -71,6 +72,7 @@ class DummyRealtimeFeed(RealtimeFeed):
         self._spike_amount = float(spike_amount)
         self._out_of_order_at_tick = out_of_order_at_tick
         self._out_of_order_delay_seconds = max(0.0, float(out_of_order_delay_seconds))
+        self._max_ticks = max_ticks
 
     def set_tick_queue(self, queue: Any) -> None:
         self._tick_queue = queue
@@ -184,6 +186,13 @@ class DummyRealtimeFeed(RealtimeFeed):
             tick_count += 1
             with self._state_lock:
                 self._tick_count = tick_count
+
+            # If max_ticks set, stop after that many ticks
+            if self._max_ticks is not None and tick_count >= self._max_ticks:
+                self._running = False
+                self._connected = False
+                break
+
             time.sleep(self.tick_interval)
 
     def _next_price(self, symbol: str, tick_count: int) -> float:

@@ -46,8 +46,8 @@ class ExpiryResolver:
                 )
             return ExpiryResolver._select_nse_expiry(expiry_list, trade_date)
 
-        # ---------- DHAN path ----------
-        if api.upper() == "DHAN":
+        # ---------- DHAN / KOTAK path (same NSE weekly/monthly calendar) ----------
+        if api.upper() in {"DHAN", "KOTAK"}:
             if expiry_pref == "MONTHLY":
                 return ExpiryResolver._derive_monthly_series(
                     trade_date,

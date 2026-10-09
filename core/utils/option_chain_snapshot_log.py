@@ -288,6 +288,10 @@ def log_option_chain_snapshot(
     elif isinstance(chain, pd.DataFrame):
         df = chain.copy()
 
+    requested_expiry = (params or {}).get("expiry_code")
+    if requested_expiry is not None:
+        meta["requested_expiry"] = requested_expiry
+
     if df is None or df.empty:
         if target in ("option_buildup", "oi_positional_buy"):
             logger.warning(
@@ -323,6 +327,7 @@ def log_option_chain_snapshot(
             "_api": [api or ""] * n,
             "_ctx_symbol": [getattr(ctx, "symbol", "") or ""] * n,
             "_ctx_exchange": [getattr(ctx, "exchange", "") or ""] * n,
+            "_requested_expiry": [meta.get("requested_expiry", "")] * n,
             "_chain_expiry": [meta.get("snapshot_expiry", "")] * n,
             "_atm_strike": [meta.get("snapshot_atm_strike", "")] * n,
         }
@@ -335,7 +340,7 @@ def log_option_chain_snapshot(
     if target in _NAMED_SNAPSHOT_TARGETS:
         fname = f"{time_token}.csv"
     else:
-        exp_part = meta.get("snapshot_expiry") or "exp"
+        exp_part = meta.get("requested_expiry") or meta.get("snapshot_expiry") or "exp"
         fname = f"chain_{strat}_{sym}_{_safe_filename_part(str(exp_part))}_{time_token}.csv"
     path = out_dir / fname
 

@@ -183,8 +183,7 @@ sudo cp utils/systemd/dhan-leaps-rsi.service /etc/systemd/system/
 sudo cp utils/systemd/dhan-oi-positional-buy.service /etc/systemd/system/
 sudo cp utils/systemd/dhan-dual.target /etc/systemd/system/
 sudo cp utils/systemd/option-buildup-scheduler.service /etc/systemd/system/
-# Optional / legacy:
-sudo cp utils/systemd/dhan-trading.service /etc/systemd/system/
+sudo cp utils/systemd/kotak-trading.service /etc/systemd/system/
 sudo cp utils/systemd/delta.service /etc/systemd/system/
 sudo cp utils/systemd/delta-instrument-refresh.service /etc/systemd/system/
 sudo cp utils/systemd/delta-instrument-refresh.timer /etc/systemd/system/
@@ -252,9 +251,16 @@ sudo systemctl stop delta.service
 
 Runs `python -m run.main --venue DELTA`.
 
-### Legacy unit
+### Kotak Neo engine
 
-`dhan-trading.service` is a legacy alias for LEAPS RSI only. Prefer `dhan-dual.target` or the two separate services above.
+```bash
+sudo systemctl enable --now kotak-trading.service
+sudo systemctl status kotak-trading.service
+tail -f /root/kotak-trading.log /root/kotak-trading.err.log
+sudo systemctl stop kotak-trading.service
+```
+
+Runs `python -m run.main --engine-id kotak` (LIVE strategies on Kotak).
 
 ### Run without systemd (same as the units)
 
@@ -262,10 +268,13 @@ Runs `python -m run.main --venue DELTA`.
 cd /root/Dhan-codebase
 source .venv/bin/activate
 
+python3 utils/yfinance/refresh_nifty_indicator_history.py --only 30
+
 python -m run.main --engine-id dhan_leaps_rsi
 python -m run.main --engine-id dhan_oi_positional_buy
 PYTHONPATH=/root/Dhan-codebase python run/option_buildup_scheduler.py --symbols NIFTY --exchange NSE
 python -m run.main --venue DELTA
+python -m run.main --engine-id kotak
 ```
 
 ### Maintenance
@@ -273,7 +282,7 @@ python -m run.main --venue DELTA
 ```bash
 sudo systemctl daemon-reload          # after editing unit files
 ps aux | grep 'run.main.*dhan' | grep -v grep
-sudo systemctl restart dhan-leaps-rsi.service
+sudo systemctl start dhan
 
 
 sudo systemctl enable --now delta.service
@@ -310,9 +319,41 @@ sudo systemctl list-units 'dhan*' 'option-buildup*' 'delta*'
 
 ## most repeated
 sudo systemctl daemon-reload
-sudo systemctl start dhan-oi-positional-buy.service
+source .venv/bin/activate
+sudo systemctl start dhan
 sudo systemctl start dhan-leaps-rsi.service
 sudo systemctl enable option-buildup-scheduler.service
 
 python utils/delta/refresh_crypto_indicator_history.py --only 60,4h,1d
 python -m core.strategies.crypto.LiquiditySweepStrategy.rebuild_liquidity_zones
+
+Kotak:
+systemctl status kotak-trading.service
+tail -f /root/kotak-trading.err.log
+
+Delta:
+sudo systemctl daemon-reload
+sudo systemctl start --now delta.service
+python utils/delta/sync_crypto_indicator_gaps.py              # once (startup)
+python utils/delta/sync_crypto_indicator_gaps.py --dry-run
+python utils/delta/sync_crypto_indicator_gaps.py --loop --interval 3600
+
+python -m core.strategies.crypto.LiquiditySweepStrategy.rebuild_liquidity_zones --symbols BTCUSD, PAXGUSD
+
+Dhan:
+   python3 utils/yfinance/refresh_nifty_indicator_history.py
+    python3 utils/yfinance/refresh_nifty_indicator_history.py --period 60d --dry-run
+    python3 utils/yfinance/refresh_nifty_indicator_history.py --only 60
+    python3 utils/yfinance/refresh_nifty_indicator_history.py --only 15
+    python3 utils/yfinance/refresh_nifty_indicator_history.py --only 30
+    python3 utils/yfinance/refresh_nifty_indicator_history.py --only 120
+
+===
+graphify
+
+cd /root/Dhan-codebase
+graphify explain "NiftyDOS" --graph graphify-out/graph.json
+graphify path "should_evaluate" "on_candle" --graph graphify-out/graph.json
+
+graphify update .
+graphify export wiki

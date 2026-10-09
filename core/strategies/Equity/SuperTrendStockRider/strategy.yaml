@@ -1,0 +1,72 @@
+id: "SuperTrendStockRider"
+implementation:
+  module: "core.strategies.Equity.SuperTrendStockRider.SuperTrendStockRider"
+  class: "SuperTrendStockRider"
+instrument: EQUITY
+allowed_modes:
+  - BACKTEST
+  - PAPER
+  - LIVE
+broker:
+  venue: DHAN
+  api: DHAN
+symbols:
+  - "NUVAMA"
+  - "SG"
+exchange: NSE
+timeframe: "DAY"
+schedule:
+  eval_mode: scheduled
+  times: ["15:15"]
+data:
+  backtest:
+    data:
+      exchange: NSE
+      interval: "DAY"
+      sector: EQ
+  paper:
+    data:
+      exchange: NSE
+      interval: "DAY"
+      sector: EQ
+  live:
+    data:
+      exchange: NSE
+      interval: "DAY"
+      sector: EQ
+profile:
+  live:
+    exchange: NSE
+    sector: EQ
+  backtest:
+    start_date: "2024-01-01"
+    end_date: "2024-12-31"
+    timeframe: "DAY"
+    exchange: NSE
+    sector: EQ
+dependencies:
+  mixins: []
+  required_context: []
+params:
+  supertrend_length: 16
+  supertrend_factor: 1.7
+  check_time: "15:15"
+  reduce_pct: 0.5
+  base_qty: 100
+  max_position_per_symbol: 1000
+  max_portfolio_exposure: 500000
+documentation:
+  title: "SuperTrend Stock Rider"
+  overview: >
+    Equity swing strategy for Nuvama & SG Mart stocks.
+    Timeframe: 1D
+    Supertrend(16, 1.7)
+    Entry: Supertrend green signal at 15:15 if close > prev close
+    Risk: Entry candle low break -> reduce 50% qty
+    Exit: Supertrend red -> full exit
+rules: |
+  - Timeframe: 1D, scheduled eval at 15:15
+  - Supertrend(16, 1.7) on daily candles
+  - Green signal + close > yesterday's close -> ENTRY
+  - Entry candle low breaks on any day -> REDUCE 50%
+  - Supertrend turns RED -> FULL EXIT

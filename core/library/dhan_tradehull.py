@@ -696,19 +696,29 @@ class Tradehull:
         global instrument_df
         current_date = time.strftime("%Y-%m-%d")
         expected_file = "all_instrument" + str(current_date) + ".csv"
-        for item in os.listdir("Dependencies"):
-            path = os.path.join(item)
+        deps_dir = os.path.join("Dependencies")
+        os.makedirs(deps_dir, exist_ok=True)
+        expected_path = os.path.join(deps_dir, expected_file)
 
-            # if (item.startswith('all_instrument')) and (current_date not in item.split(" ")[1]):
-            if os.path.isfile("Dependencies\\" + path):
-                os.remove("Dependencies\\" + path)
+        # Drop stale daily masters only (keep today's file; leave log_files /
+        # equity_universe / delta_instrument_* alone). Use os.path.join so this
+        # works on Linux — the old ``Dependencies\\`` paths never matched here.
+        for name in os.listdir(deps_dir):
+            if not name.startswith("all_instrument") or not name.endswith(".csv"):
+                continue
+            if name == expected_file:
+                continue
+            stale = os.path.join(deps_dir, name)
+            if os.path.isfile(stale):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
 
-        if expected_file in os.listdir("Dependencies"):
+        if os.path.isfile(expected_path):
             try:
                 print(f"reading existing file {expected_file}")
-                instrument_df = pd.read_csv(
-                    "Dependencies\\" + expected_file, low_memory=False
-                )
+                instrument_df = pd.read_csv(expected_path, low_memory=False)
             except Exception as e:
                 print(
                     "This BOT Is Instrument file is not generated completely, Picking New File from Dhan Again"
@@ -722,7 +732,7 @@ class Tradehull:
                     .str.strip()
                     .str.replace(r"\s+", " ", regex=True)
                 )
-                instrument_df.to_csv("Dependencies\\" + expected_file, float_format="%.2f")
+                instrument_df.to_csv(expected_path, float_format="%.2f")
         else:
             # this will fetch instrument_df file from Dhan
             print("This BOT Is Picking New File From Dhan")
@@ -734,7 +744,7 @@ class Tradehull:
                 .str.strip()
                 .str.replace(r"\s+", " ", regex=True)
             )
-            instrument_df.to_csv("Dependencies\\" + expected_file, float_format="%.2f")
+            instrument_df.to_csv(expected_path, float_format="%.2f")
         return instrument_df
 
     def correct_step_df_creation(self):
@@ -798,7 +808,9 @@ class Tradehull:
                 self.logger.exception(f"Error processing {name}: {e}")
                 # print(f"Error processing {name}: {e}")
 
-    def get_ltp_data(self, names, debug="NO"):
+    def get_ltp_data(self, names, debug="NO", max_retries=3, base_delay=2.0):
+        import time as _time
+
         try:
             instrument_df = self.instrument_df.copy()
             instruments = {
@@ -826,7 +838,28 @@ class Tradehull:
             }
             if not isinstance(names, list):
                 names = [names]
-            for name in names:
+
+            cache_ttl = float(getattr(self, "_ltp_cache_ttl_sec", 2.0) or 2.0)
+            ltp_cache = getattr(self, "_ltp_cache", None)
+            if ltp_cache is None:
+                ltp_cache = {}
+                self._ltp_cache = ltp_cache
+            now_mono = _time.monotonic()
+            cached_out: dict = {}
+            names_to_fetch: list = []
+            for raw_name in names:
+                key = str(raw_name).upper()
+                hit = ltp_cache.get(key)
+                if hit is not None:
+                    price, ts = hit
+                    if now_mono - ts <= cache_ttl:
+                        cached_out[key] = price
+                        continue
+                names_to_fetch.append(raw_name)
+            if not names_to_fetch:
+                return cached_out
+
+            for name in names_to_fetch:
                 try:
                     name = name.upper()
                     if name in exchange_index.keys():
@@ -912,25 +945,40 @@ class Tradehull:
                 except Exception as e:
                     print(f"Exception for instrument name {name} as {e}")
                     continue
-            time.sleep(0.4)
-            data = self.Dhan.ticker_data(instruments)
-            ltp_data = dict()
+            attempt = 0
+            while True:
+                if attempt > 0:
+                    delay = base_delay * (2 ** (attempt - 1))
+                    self.logger.warning(
+                        "[get_ltp_data] Rate limited, retry %s/%s after %.1fs",
+                        attempt,
+                        max_retries,
+                        delay,
+                    )
+                    _time.sleep(delay)
+                _time.sleep(0.4)
+                data = self.Dhan.ticker_data(instruments)
+                ltp_data = dict()
 
-            if debug.upper() == "YES":
-                print(data)
+                if debug.upper() == "YES":
+                    print(data)
 
-            if data["status"] != "failure":
-                inner = data["data"]["data"]
+                if data["status"] != "failure":
+                    inner = data["data"]["data"]
 
-                for exchange, sec_dict in inner.items():
-                    for sec_id, quotes in sec_dict.items():
-                        if sec_id in instrument_names:
-                            symbol = instrument_names[sec_id]
-                            ltp_data[symbol] = float(quotes["last_price"])
-            else:
+                    for exchange, sec_dict in inner.items():
+                        for sec_id, quotes in sec_dict.items():
+                            if sec_id in instrument_names:
+                                symbol = instrument_names[sec_id]
+                                ltp_data[symbol] = float(quotes["last_price"])
+                    for sym, px in ltp_data.items():
+                        ltp_cache[str(sym).upper()] = (px, _time.monotonic())
+                    ltp_data.update(cached_out)
+                    return ltp_data
+                if _dhan_is_rate_limited(data) and attempt < max_retries:
+                    attempt += 1
+                    continue
                 raise Exception(data)
-
-            return ltp_data
         except Exception as e:
             print(f"Exception at calling ltp as {e}")
             self.logger.exception(f"Exception at calling ltp as {e}")
@@ -3104,102 +3152,136 @@ class Tradehull:
             print(f"Exception at getting Expiry list as {e}")
             return list()
 
-    def get_option_chain(self, Underlying, exchange, expiry, num_strikes=10):
-        try:
-            Underlying = Underlying.upper()
-            exchange = exchange.upper()
-            script_exchange = {
-                "NSE": self.Dhan.NSE,
-                "NFO": self.Dhan.FNO,
-                "BFO": "BSE_FNO",
-                "CUR": self.Dhan.CUR,
-                "BSE": self.Dhan.BSE,
-                "MCX": self.Dhan.MCX,
-                "INDEX": self.Dhan.INDEX,
-            }
-            instrument_exchange = {
-                "NSE": "NSE",
-                "BSE": "BSE",
-                "NFO": "NSE",
-                "BFO": "BSE",
-                "MCX": "MCX",
-                "CUR": "NSE",
-            }
-            exchange_segment = script_exchange[exchange]
-            index_exchange = {
-                "NIFTY": "NSE",
-                "BANKNIFTY": "NSE",
-                "FINNIFTY": "NSE",
-                "MIDCPNIFTY": "NSE",
-                "BANKEX": "BSE",
-                "SENSEX": "BSE",
-            }
+    def get_option_chain(
+        self,
+        Underlying,
+        exchange,
+        expiry,
+        num_strikes=10,
+        max_retries=3,
+        base_delay=2.0,
+        spot_fallback=None,
+    ):
+        """
+        Fetch option chain with retry on rate limit (Dhan error 805).
 
-            if Underlying in index_exchange:
-                exchange = index_exchange[Underlying]
+        Args:
+            Underlying: Symbol (e.g., NIFTY)
+            exchange: Exchange (e.g., INDEX)
+            expiry: Expiry date
+            num_strikes: Number of strikes around ATM
+            max_retries: Max retry attempts for rate limit (default 3)
+            base_delay: Base delay in seconds for exponential backoff (default 2.0)
+            spot_fallback: Use this spot when index LTP is rate-limited/unavailable
+        """
+        import time as _time
+        Underlying = Underlying.upper()
+        exchange = exchange.upper()
+        script_exchange = {
+            "NSE": self.Dhan.NSE,
+            "NFO": self.Dhan.FNO,
+            "BFO": "BSE_FNO",
+            "CUR": self.Dhan.CUR,
+            "BSE": self.Dhan.BSE,
+            "MCX": self.Dhan.MCX,
+            "INDEX": self.Dhan.INDEX,
+        }
+        instrument_exchange = {
+            "NSE": "NSE",
+            "BSE": "BSE",
+            "NFO": "NSE",
+            "BFO": "BSE",
+            "MCX": "MCX",
+            "CUR": "NSE",
+        }
+        exchange_segment = script_exchange[exchange]
+        index_exchange = {
+            "NIFTY": "NSE",
+            "BANKNIFTY": "NSE",
+            "FINNIFTY": "NSE",
+            "MIDCPNIFTY": "NSE",
+            "BANKEX": "BSE",
+            "SENSEX": "BSE",
+        }
 
-            if Underlying in self.commodity_step_dict.keys():
-                security_check = instrument_df[
-                    (instrument_df["SEM_EXM_EXCH_ID"] == "MCX")
-                    & (instrument_df["SM_SYMBOL_NAME"] == Underlying.upper())
-                    & (instrument_df["SEM_INSTRUMENT_NAME"] == "FUTCOM")
-                ]
-                if security_check.empty:
-                    raise Exception("Check the Tradingsymbol")
-                security_id = security_check.sort_values(by="SEM_EXPIRY_DATE").iloc[0][
-                    "SEM_SMST_SECURITY_ID"
-                ]
-            else:
-                security_check = instrument_df[
-                    (
-                        (instrument_df["SEM_TRADING_SYMBOL"] == Underlying)
-                        | (instrument_df["SEM_CUSTOM_SYMBOL"] == Underlying)
-                    )
-                    & (
-                        instrument_df["SEM_EXM_EXCH_ID"]
-                        == instrument_exchange[exchange]
-                    )
-                ]
-                if security_check.empty:
-                    raise Exception("Check the Tradingsymbol")
-                security_id = security_check.iloc[-1]["SEM_SMST_SECURITY_ID"]
+        if Underlying in index_exchange:
+            exchange = index_exchange[Underlying]
 
-            if Underlying in index_exchange:
-                expiry_exchange = "INDEX"
-            elif Underlying in self.commodity_step_dict.keys():
-                exchange = "MCX"
-                expiry_exchange = exchange
-            else:
-                # exchange = instrument_df[((instrument_df['SEM_TRADING_SYMBOL']==Underlying)|(instrument_df['SEM_CUSTOM_SYMBOL']==Underlying))].iloc[0]['SEM_EXM_EXCH_ID']
-                exchange = "NSE"
-                expiry_exchange = exchange
+        if Underlying in self.commodity_step_dict.keys():
+            security_check = instrument_df[
+                (instrument_df["SEM_EXM_EXCH_ID"] == "MCX")
+                & (instrument_df["SM_SYMBOL_NAME"] == Underlying.upper())
+                & (instrument_df["SEM_INSTRUMENT_NAME"] == "FUTCOM")
+            ]
+            if security_check.empty:
+                raise Exception("Check the Tradingsymbol")
+            security_id = security_check.sort_values(by="SEM_EXPIRY_DATE").iloc[0][
+                "SEM_SMST_SECURITY_ID"
+            ]
+        else:
+            security_check = instrument_df[
+                (
+                    (instrument_df["SEM_TRADING_SYMBOL"] == Underlying)
+                    | (instrument_df["SEM_CUSTOM_SYMBOL"] == Underlying)
+                )
+                & (
+                    instrument_df["SEM_EXM_EXCH_ID"]
+                    == instrument_exchange[exchange]
+                )
+            ]
+            if security_check.empty:
+                raise Exception("Check the Tradingsymbol")
+            security_id = security_check.iloc[-1]["SEM_SMST_SECURITY_ID"]
 
-            # expiry_list = self.get_expiry_list(Underlying=Underlying, exchange = expiry_exchange)
-            # if len(expiry_list)==0:
-            # 	print(f"Unable to find the correct Expiry for {Underlying}")
-            # 	return None
-            # if len(expiry_list)<expiry:
-            # 	Expiry_date = expiry_list[-1]
-            # else:
-            Expiry_date = expiry.strftime("%Y-%m-%d")
-            # pdb.set_trace()
+        if Underlying in index_exchange:
+            expiry_exchange = "INDEX"
+        elif Underlying in self.commodity_step_dict.keys():
+            exchange = "MCX"
+            expiry_exchange = exchange
+        else:
+            # exchange = instrument_df[((instrument_df['SEM_TRADING_SYMBOL']==Underlying)|(instrument_df['SEM_CUSTOM_SYMBOL']==Underlying))].iloc[0]['SEM_EXM_EXCH_ID']
+            exchange = "NSE"
+            expiry_exchange = exchange
 
-            time.sleep(2)
+        Expiry_date = expiry.strftime("%Y-%m-%d")
+
+        # Retry loop with exponential backoff for rate limits
+        attempt = 0
+        while True:
+            if attempt > 0:
+                delay = base_delay * (2 ** (attempt - 1))  # 2, 4, 8, ...
+                self.logger.warning(
+                    f"[get_option_chain] Rate limited for {Underlying}, retry {attempt}/{max_retries} "
+                    f"after {delay:.1f}s"
+                )
+                _time.sleep(delay)
+
             response = self.Dhan.option_chain(
                 under_security_id=int(security_id),
                 under_exchange_segment=exchange_segment,
                 expiry=Expiry_date,
             )
-            # pdb.set_trace()
-            if response["status"] == "success":
+
+            if response.get("status") == "success":
                 oc = response["data"]["data"]
                 oc_df = self.format_option_chain(oc)
 
                 atm_price = self.get_ltp_data(Underlying)
+                if (
+                    (not atm_price or Underlying not in atm_price)
+                    and spot_fallback is not None
+                ):
+                    try:
+                        atm_price = {Underlying: float(spot_fallback)}
+                    except (TypeError, ValueError):
+                        pass
+                if not atm_price or Underlying not in atm_price:
+                    raise KeyError(
+                        f"No LTP for {Underlying} and no spot_fallback; cannot compute ATM"
+                    )
                 oc_df["Strike Price"] = pd.to_numeric(
                     oc_df["Strike Price"], errors="coerce"
                 )
-                # strike_step = self.stock_step_df[Underlying]
                 if Underlying in self.index_step_dict:
                     strike_step = self.index_step_dict[Underlying]
                 elif Underlying in self.stock_step_df:
@@ -3210,7 +3292,6 @@ class Tradehull:
                     raise Exception(
                         f"No option chain data available for the {Underlying}"
                     )
-                # atm_strike = oc_df.loc[(oc_df['Strike Price'] - atm_price[Underlying]).abs().idxmin(), 'Strike Price']
                 atm_strike = round(atm_price[Underlying] / strike_step) * strike_step
 
                 use_full_chain = num_strikes is None or int(num_strikes) <= 0
@@ -3234,7 +3315,6 @@ class Tradehull:
                         .sort_values(by="Strike Price")
                         .reset_index(drop=True)
                     )
-                    # LTP-based ATM can disagree with chain strikes; empty window yields no CSVs.
                     if df.empty and not oc_df.empty:
                         print(
                             f"[get_option_chain] ATM window empty for {Underlying} "
@@ -3245,12 +3325,15 @@ class Tradehull:
                             oc_df.sort_values(by="Strike Price")
                             .reset_index(drop=True)
                         )
-                # pdb.set_trace()
                 return atm_strike, df, Expiry_date
-            else:
-                raise Exception(response)
-        except Exception as e:
-            print(f"Getting Error at Option Chain as {e}")
+
+            # Check for rate limit error
+            if _dhan_is_rate_limited(response) and attempt < max_retries:
+                attempt += 1
+                continue
+
+            # Non-rate-limit error or max retries exceeded
+            raise Exception(response)
 
     def format_option_chain(self, data):
         """

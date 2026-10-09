@@ -194,7 +194,7 @@ STRATEGY_PROFILES: dict = {
         'backtest': {
             'start_date': '2026-07-24',
             'end_date': '2026-08-01',
-            'timeframe': '5',
+            'timeframe': '1',
             'exchange': 'DELTA',
             'sector': 'YES',
         },
@@ -212,6 +212,23 @@ STRATEGY_PROFILES: dict = {
             'start_date': '2026-01-01',
             'end_date': '2026-02-19',
             'timeframe': 'DAY',
+            'exchange': 'INDEX',
+            'sector': 'YES',
+        },
+    },
+    'NiftyDOS': {
+        'symbols': [
+            'NIFTY',
+        ],
+        'exchange': 'NSE',
+        'live': {
+            'exchange': 'INDEX',
+            'sector': 'YES',
+        },
+        'backtest': {
+            'start_date': '2026-01-01',
+            'end_date': '2026-08-19',
+            'timeframe': '30',
             'exchange': 'INDEX',
             'sector': 'YES',
         },
@@ -340,6 +357,25 @@ STRATEGY_PROFILES: dict = {
             'timeframe': '1',
             'exchange': 'INDEX',
             'sector': 'YES',
+        },
+    },
+    'SuperTrendStockRider': {
+        'symbols': [
+            'NUVAMA',
+            'SG',
+        ],
+        'exchange': 'NSE',
+        'eval_mode': 'scheduled',
+        'live': {
+            'exchange': 'NSE',
+            'sector': 'EQ',
+        },
+        'backtest': {
+            'start_date': '2024-01-01',
+            'end_date': '2024-12-31',
+            'timeframe': 'DAY',
+            'exchange': 'NSE',
+            'sector': 'EQ',
         },
     },
 }

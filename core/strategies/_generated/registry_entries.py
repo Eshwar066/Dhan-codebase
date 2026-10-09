@@ -5,9 +5,11 @@ from run.config import RunMode
 
 from core.strategies.BTST.BankNiftyBTST.BankNiftyBTST import BankNiftyBTST
 from core.strategies.Equity.IPOBreakout.IPOBreakout import IPOBreakout
+from core.strategies.Equity.SuperTrendStockRider.SuperTrendStockRider import SuperTrendStockRider
 from core.strategies.Futures.Futures_EMA.Futures_EMA import FuturesEMAHighLow
 from core.strategies.Futures.Futures_EMA_Momentum.Futures_EMA_Momentum import FuturesEMAMomentum
 from core.strategies.IBBM.Leaps.LeapsQuatery_RSI_52_32 import LeapsQuarterly
+from core.strategies.IBBM.NiftyDOS.NiftyDOS import NiftyDOS
 from core.strategies.IBBM.SMA9Weekly.NiftySMA9Weekly import NiftySMA9Weekly
 from core.strategies.MagicalLines.MagicalLines import MagicalLines
 from core.strategies.MagicalLines.NiftyIntradayMagicalLine.NiftyIntradayMagicalLine import NiftyIntradayMagicalLine
@@ -112,6 +114,15 @@ GENERATED_STRATEGY_MAP = {
             RunMode.LIVE,
         ],
     },
+    'NiftyDOS': {
+        "strategy": NiftyDOS,
+        "instrument": 'OPTION',
+        "allowed_modes": [
+            RunMode.BACKTEST,
+            RunMode.PAPER,
+            RunMode.LIVE,
+        ],
+    },
     'NiftyIntradayMagicalLine': {
         "strategy": NiftyIntradayMagicalLine,
         "instrument": 'OPTION',
@@ -170,6 +181,15 @@ GENERATED_STRATEGY_MAP = {
         "strategy": SignalFloodTestStrategy,
         "instrument": 'FUTURE',
         "allowed_modes": [
+            RunMode.PAPER,
+            RunMode.LIVE,
+        ],
+    },
+    'SuperTrendStockRider': {
+        "strategy": SuperTrendStockRider,
+        "instrument": 'EQUITY',
+        "allowed_modes": [
+            RunMode.BACKTEST,
             RunMode.PAPER,
             RunMode.LIVE,
         ],

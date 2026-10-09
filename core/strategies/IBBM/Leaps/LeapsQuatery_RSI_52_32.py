@@ -1,5 +1,5 @@
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -10,6 +10,7 @@ import talib
 from run.config import RUN_MODE, RunMode
 from core.strategies.base import BaseStrategy
 from core.strategies.IndiaMktMixins import IST, IndiaMktMixins
+from core.strategies.meta import pack_strategy_meta
 from core.strategies.indicator_helpers import (
     add_ema_high_low,
     default_persisted_keys_for_ema_high_low,
@@ -20,6 +21,10 @@ from core.utils.indicator_history import nse_60m_bar_close_eval_window
 from core.utils.option_chain_snapshot_log import log_option_chain_snapshot
 
 logger = logging.getLogger(__name__)
+
+# New entries only. Existing positions still exit on the RSI flip.
+ENTER_CALL_SIDE = True  # RSI < 32 → sell CALL
+ENTER_PUT_SIDE = True  # RSI > 52 → sell PUT
 
 # (class flag attr, MAIN expiry_pref, structure_id suffix)
 LEG_SPECS: Tuple[Tuple[str, str, str], ...] = (
@@ -60,8 +65,8 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     ema_period = 8
 
     # Toggle which MAIN+HEDGE bundles to place on entry (overridable via strategy.yaml legs:).
-    mini_leaps_enabled = True
-    quarterly_leaps_enabled = False
+    mini_leaps_enabled = False
+    quarterly_leaps_enabled = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -72,6 +77,8 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         self._snapshot_expiry_pref: Optional[str] = None
         # RSI flip: exit runs first while MAIN still open → defer reverse ENTRY.
         self._pending_rsi_reversal: Optional[_PendingRsiReversal] = None
+        self.enter_call_side = ENTER_CALL_SIDE
+        self.enter_put_side = ENTER_PUT_SIDE
         self._load_legs_config_from_yaml()
 
     def _load_legs_config_from_yaml(self) -> None:
@@ -94,6 +101,11 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             self.mini_leaps_enabled = bool(mini.get("enabled"))
         if "enabled" in qtr:
             self.quarterly_leaps_enabled = bool(qtr.get("enabled"))
+        entries = raw.get("entries") or {}
+        if "call_side" in entries:
+            self.enter_call_side = bool(entries.get("call_side"))
+        if "put_side" in entries:
+            self.enter_put_side = bool(entries.get("put_side"))
 
     def get_warmup_period(self):
         return 0
@@ -121,6 +133,32 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         if trade_date.day < cutoff:
             return ExpiryResolver.current_month_expiry(trade_date, weekday=exp_wd)
         return ExpiryResolver.next_month_expiry(trade_date, weekday=exp_wd)
+
+    def _hedge_current_month_expiry(self, trade_date: date) -> date:
+        exp_wd = int(getattr(self, "hedge_monthly_expiry_weekday", 1) or 1) % 7
+        return ExpiryResolver.current_month_expiry(trade_date, weekday=exp_wd)
+
+    def should_roll_hedge(self, hedge, ts):
+        """
+        Roll monthly hedge only when the open hedge is on this calendar month's
+        expiry. After the 15th, new hedges already land on next month — skip.
+        """
+        if not super().should_roll_hedge(hedge, ts):
+            return False
+        trade_date = pd.to_datetime(ts).date()
+        hedge_expiry = pd.to_datetime(hedge.instrument.expiry).date()
+        current_month_exp = self._hedge_current_month_expiry(trade_date)
+        if (hedge_expiry.year, hedge_expiry.month) != (
+            current_month_exp.year,
+            current_month_exp.month,
+        ):
+            logger.info(
+                "LEAPS hedge rollover skipped: hedge expiry=%s is not current month (%s)",
+                hedge_expiry,
+                current_month_exp,
+            )
+            return False
+        return True
 
     def calculate_hedge_strike(self, sold_strike, option_type):
         step = int(getattr(self, "option_chain_strike_step", 500) or 500)
@@ -290,6 +328,75 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         )
         return None
 
+    @staticmethod
+    def _iso_meta(val: Any) -> str:
+        if val is None:
+            return ""
+        iso = getattr(val, "isoformat", None)
+        if callable(iso):
+            try:
+                return str(iso())
+            except (TypeError, ValueError):
+                pass
+        return str(val)
+
+    @staticmethod
+    def _regime_from_structure_id(structure_id: str) -> str:
+        sid = str(structure_id or "")
+        if "RSI_LT_32" in sid:
+            return "RSI_LT_32"
+        if "RSI_GT_52" in sid:
+            return "RSI_GT_52"
+        return ""
+
+    def _entry_strategy_meta(
+        self,
+        candle: dict,
+        *,
+        structure_id: str,
+        option_type: str,
+        expiry_pref: str,
+        leg_label: str,
+        main_symbol: str,
+        main_strike: Any,
+        main_expiry: Any,
+        main_premium: Any,
+        hedge_intent: Any = None,
+    ) -> Dict[str, Any]:
+        hedge_inst = getattr(hedge_intent, "instrument", None) if hedge_intent else None
+        hedge_px = getattr(hedge_intent, "price", None) if hedge_intent else None
+        try:
+            hedge_px_f = float(hedge_px) if hedge_px not in (None, "") else None
+        except (TypeError, ValueError):
+            hedge_px_f = None
+        try:
+            main_px_f = float(main_premium) if main_premium not in (None, "") else None
+        except (TypeError, ValueError):
+            main_px_f = None
+        try:
+            strike_f = float(main_strike) if main_strike not in (None, "") else None
+        except (TypeError, ValueError):
+            strike_f = None
+        payload = {
+            "symbol": str(candle.get("symbol") or ""),
+            "regime": self._regime_from_structure_id(structure_id),
+            "option_type": str(option_type or "").upper(),
+            "rsi": candle.get("rsi"),
+            "prev_rsi": candle.get("prev_rsi"),
+            "timeframe": str(getattr(self, "timeframe", "")),
+            "leg": leg_label,
+            "expiry_pref": expiry_pref,
+            "main_symbol": main_symbol,
+            "main_strike": strike_f,
+            "main_expiry": self._iso_meta(main_expiry),
+            "entry_main_premium": main_px_f,
+            "hedge_symbol": getattr(hedge_inst, "trading_symbol", None),
+            "hedge_strike": getattr(hedge_inst, "strike", None),
+            "hedge_expiry": self._iso_meta(getattr(hedge_inst, "expiry", None)),
+            "entry_hedge_premium": hedge_px_f,
+        }
+        return pack_strategy_meta(self.name, payload)
+
     def _hourly_bar_open_key(self, candle: dict) -> str:
         bucket = candle.get("bucket_ts")
         if bucket is not None:
@@ -314,23 +421,25 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
     def _resolve_main_expiry(
         self, candle: dict, ctx, expiry_pref: str
     ) -> Optional[date]:
-        chain_exp = self._expiry_from_option_chain()
-        if chain_exp is not None:
-            return chain_exp
+        pref = str(expiry_pref or self.expiryType or "").strip().upper()
         trade_date = pd.to_datetime(candle["timestamp"]).date()
         try:
             resolved = ExpiryResolver.resolve(
                 expiry_list=ctx.get_expiry_list() if ctx is not None else [],
                 trade_date=trade_date,
                 api=self.api,
-                expiry_pref=str(expiry_pref or self.expiryType),
+                expiry_pref=pref,
             )
         except (TypeError, ValueError):
-            return None
-        if resolved is None:
-            return None
-        if ExpiryResolver.is_calendar_expiry(resolved):
+            resolved = None
+        if resolved is not None and ExpiryResolver.is_calendar_expiry(resolved):
             return ExpiryResolver.as_calendar_date(resolved)
+        # Calendar-driven MAIN legs must not inherit Dhan chain expiry (can snap to weekly).
+        if pref in ("QUARTERLY", "LEAPS_ROLL"):
+            return None
+        chain_exp = self._expiry_from_option_chain()
+        if chain_exp is not None:
+            return chain_exp
         return None
 
     def _build_entry_intents(
@@ -430,6 +539,19 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             )
             return None
 
+        chain_exp = self._expiry_from_option_chain()
+        if chain_exp is not None and chain_exp != expiry_for_symbol:
+            logger.warning(
+                "LEAPS %s entry skipped: option chain expiry=%s != resolved MAIN expiry=%s "
+                "pref=%s sym=%s (refetch chain for correct series)",
+                leg_label,
+                chain_exp,
+                expiry_for_symbol,
+                expiry_pref,
+                candle.get("symbol"),
+            )
+            return None
+
         trading_symbol = ExpiryResolver.build_option_symbol(
             candle["symbol"],
             expiry_for_symbol,
@@ -476,6 +598,21 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             candle=candle,
             ctx=ctx,
         )
+        extras = self._entry_strategy_meta(
+            candle,
+            structure_id=structure_id,
+            option_type=option_type,
+            expiry_pref=expiry_pref,
+            leg_label=leg_label,
+            main_symbol=trading_symbol,
+            main_strike=strike,
+            main_expiry=expiry_for_symbol,
+            main_premium=premium,
+            hedge_intent=hedge_intent,
+        )
+        sell_intent = replace(sell_intent, metadata_extras=extras)
+        if hedge_intent is not None:
+            hedge_intent = replace(hedge_intent, metadata_extras=extras)
 
         self._entry_signaled_keys.add(signal_key)
         logger.info(
@@ -594,6 +731,21 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
             option_type = "PUT"
             regime = "RSI_GT_52"
         else:
+            return None
+
+        if option_type == "CALL" and not self.enter_call_side:
+            logger.info(
+                "LEAPS CALL entry skipped: entries.call_side is false sym=%s rsi=%s",
+                candle.get("symbol"),
+                rsi,
+            )
+            return None
+        if option_type == "PUT" and not self.enter_put_side:
+            logger.info(
+                "LEAPS PUT entry skipped: entries.put_side is false sym=%s rsi=%s",
+                candle.get("symbol"),
+                rsi,
+            )
             return None
 
         if not self.mini_leaps_enabled and not self.quarterly_leaps_enabled:
@@ -728,6 +880,23 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
         qty_lots = self._order_qty_in_lots(
             position.instrument, abs(int(position.net_qty or 0))
         )
+        exit_extras = pack_strategy_meta(
+            self.name,
+            {
+                "symbol": str(candle.get("symbol") or ""),
+                "action": "EXIT",
+                "regime": self._regime_from_structure_id(
+                    getattr(position, "structure_id", "") or ""
+                ),
+                "option_type": getattr(
+                    getattr(position, "instrument", None), "option_type", None
+                ),
+                "rsi": candle.get("rsi"),
+                "main_symbol": getattr(
+                    getattr(position, "instrument", None), "trading_symbol", None
+                ),
+            },
+        )
         intents.append(
             self.create_order_intent(
                 inst=position.instrument,
@@ -741,11 +910,12 @@ class LeapsQuarterly(IndiaMktMixins, BaseStrategy):
                 tag="MAIN_EXIT",
                 symbol=candle["symbol"],
                 action="EXIT",
+                metadata_extras=exit_extras,
             )
         )
 
         hedge_exit = self.create_hedge_exit_intent(position, candle, ctx)
         if hedge_exit:
-            intents.append(hedge_exit)
+            intents.append(replace(hedge_exit, metadata_extras=exit_extras))
 
         return intents

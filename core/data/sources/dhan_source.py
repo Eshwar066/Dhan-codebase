@@ -631,6 +631,7 @@ class DhanSource:
         expiry_flag,
         expiry_date=None,
         expiry_match_same_month: bool = False,
+        spot_fallback=None,
     ):
         """
         Engine-friendly option chain.
@@ -726,6 +727,9 @@ class DhanSource:
                 exchange=exchange,
                 expiry=expiry_date,
                 num_strikes=strikes_around_atm,
+                max_retries=3,
+                base_delay=2.0,
+                spot_fallback=spot_fallback,
             )
         except Exception:
             return None

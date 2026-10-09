@@ -28,6 +28,13 @@ class DhanAdapter(BaseAdapter):
                 expiry_index = 0
 
         strikes = int(params.get("strikes", 60) or 60)
+        spot_fallback = None
+        try:
+            spot = float(getattr(ctx, "spot_price", 0) or 0)
+            if spot > 0:
+                spot_fallback = spot
+        except (TypeError, ValueError):
+            spot_fallback = None
 
         return self.data.get_live_option_chain(
             symbol=ctx.symbol,
@@ -37,6 +44,7 @@ class DhanAdapter(BaseAdapter):
             expiry_flag=params.get("expiry_flag", "MONTH"),
             expiry_date=expiry_date,
             expiry_match_same_month=bool(params.get("expiry_match_same_month", False)),
+            spot_fallback=spot_fallback,
         )
 
     def get_historical_option_chain(self, ctx: StrategyContext, params: dict):

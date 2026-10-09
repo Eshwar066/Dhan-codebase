@@ -366,9 +366,19 @@ class IndicatorManager:
 
     @staticmethod
     def _strategy_sma_lengths(strategy: Any) -> tuple:
-        """Return ``(period, periods)`` from strategy attrs; either may be None."""
+        """Return ``(period, periods, column)`` from strategy attrs; either may be None."""
         periods = getattr(strategy, "sma_periods", None)
         period = getattr(strategy, "sma_period", None)
+        column = None
+        if period is not None:
+            # Strategy may define column name like f"sma{period}" (e.g., "sma9")
+            column = getattr(strategy, "sma_column", None)
+            if column is None:
+                # Default to sma{period} format (e.g., "sma9") to match persisted_indicator_keys
+                try:
+                    column = f"sma{int(period)}"
+                except Exception:
+                    column = None
         if periods is not None:
             try:
                 periods = [int(p) for p in list(periods) if p is not None]
@@ -381,7 +391,7 @@ class IndicatorManager:
                 period = int(period)
             except Exception:
                 period = None
-        return period, periods
+        return period, periods, column
 
     @staticmethod
     def _compute_supertrend_columns(
@@ -415,6 +425,35 @@ class IndicatorManager:
         if length < 1 or factor <= 0:
             return None, None
         return length, factor
+
+    @staticmethod
+    def _strategy_adx_params(strategy: Any) -> Optional[int]:
+        """
+        Return strategy ``adx_period`` if declared.
+
+        A strategy that declares ``adx_period`` opts into automatic ADX computation.
+        """
+        period = getattr(strategy, "adx_period", None)
+        if period is None:
+            return None
+        try:
+            period = int(period)
+        except (TypeError, ValueError):
+            return None
+        if period < 1:
+            return None
+        return period
+
+    @staticmethod
+    def _compute_adx_columns(
+        df: Any,
+        *,
+        period: int,
+    ) -> Any:
+        """Compute ADX, DI+, DI- using parameters declared by the strategy."""
+        from core.utils.structure.adx import add_adx
+
+        return add_adx(df, period=period)
 
     @staticmethod
     def _timeframe_to_seconds(tf: str) -> int:
@@ -1533,13 +1572,14 @@ class IndicatorManager:
                     work_df = strategy.prepare_indicators(work_df)
                 except Exception:
                     pass
-                sma_period, sma_periods = self._strategy_sma_lengths(strategy)
+                sma_period, sma_periods, sma_column = self._strategy_sma_lengths(strategy)
                 if sma_period is not None or sma_periods is not None:
                     try:
                         work_df = self._compute_sma_columns(
                             work_df,
                             period=sma_period,
                             periods=sma_periods,
+                            column=sma_column,
                         )
                     except Exception:
                         pass
@@ -1553,6 +1593,13 @@ class IndicatorManager:
                             length=supertrend_length,
                             factor=supertrend_factor,
                         )
+                    except Exception:
+                        pass
+                # Compute ADX if strategy declares adx_period
+                adx_period = self._strategy_adx_params(strategy)
+                if adx_period is not None:
+                    try:
+                        work_df = self._compute_adx_columns(work_df, period=adx_period)
                     except Exception:
                         pass
                 df = work_df

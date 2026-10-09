@@ -144,3 +144,8 @@ def add_supertrend(
     df[names[4]] = final_lower.where(direction > 0)
     df[names[5]] = atr
     return df
+
+
+def default_persisted_keys_for_supertrend(*, prefix: str = "supertrend") -> List[str]:
+    """Persisted keys matching :func:`add_supertrend`."""
+    return supertrend_column_names(prefix=prefix)

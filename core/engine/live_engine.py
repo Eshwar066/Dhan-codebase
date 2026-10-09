@@ -996,6 +996,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             strategy_name = str(
                 getattr(strategy_obj, "name", type(strategy_obj).__name__)
             )
+            if self.engine_logger:
+                self.engine_logger.reconciliation(
+                    f"Calling restore_state_on_startup for strategy={strategy_name}"
+                )
             try:
                 restore_fn(
                     self.position_manager,
@@ -1662,6 +1666,17 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 if isinstance(meta_map, dict):
                     meta_map.pop(sid, None)
 
+                # Clean up strategy-specific tracking for manual close
+                cleanup_fn = getattr(strategy_obj, "cleanup_manual_close", None)
+                if callable(cleanup_fn):
+                    try:
+                        cleanup_fn(sid)
+                    except Exception as exc:
+                        if self.engine_logger:
+                            self.engine_logger.reconciliation(
+                                f"Strategy cleanup_manual_close failed for {sid}: {exc}"
+                            )
+
             cancelled = 0
             if callable(sync_fn):
                 cancelled = int(
@@ -2016,6 +2031,10 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                 intent_id = None
         if not intent_id:
             return None
+        # Fetch intent from store to get metadata (structure_id, tag, strategy, etc.)
+        intent = None
+        if intent_id and getattr(self.order_router, "intent_store", None):
+            intent = self.order_router.intent_store.get(intent_id)
         try:
             delta = int(payload.get("delta_qty") or 0)
         except (TypeError, ValueError):
@@ -2032,18 +2051,27 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         except (TypeError, ValueError):
             cum = 0
         lu = str(payload.get("last_updated") or "").strip()
-        lu_key = lu.replace(" ", "_").replace(":", "-") if lu else ""
-        if lu_key:
-            trade_id = f"DHAN_WS:{order_no}:{cum}:{lu_key}"
+        # Canonical trade_id: DHAN:{order_id}:{delta_qty}:{slice_price}
+        # Matches REST format (DHAN:{oid}:{sz}:{pr}) for duplicate detection
+        delta_qty = int(payload.get("delta_qty") or 0)
+        slice_price = float(payload.get("slice_price") or 0)
+        if delta_qty > 0 and slice_price > 0:
+            trade_id = f"DHAN:{order_no}:{delta_qty}:{slice_price:.2f}"
         else:
-            trade_id = f"DHAN_WS:{order_no}:{cum}:{int(time.time() * 1000)}"
+            # Fallback if delta/price missing
+            lu_key = lu.replace(" ", "_").replace(":", "-") if lu else ""
+            cum = int(payload.get("cumulative_tq") or 0)
+            if lu_key:
+                trade_id = f"DHAN:{order_no}:{cum}:{lu_key}"
+            else:
+                trade_id = f"DHAN:{order_no}:{cum}:{int(time.time() * 1000)}"
         out = {
             "trade_id": trade_id,
             "id": trade_id,
             "order_id": order_no,
             "intent_id": intent_id,
             "client_order_id": intent_id,
-            "tag": intent_id,
+            "tag": intent.get("tag") if intent else intent_id,
             "price": price,
             "size": float(delta),
             "side": side,
@@ -2051,6 +2079,23 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
             "execution_source": "DHAN_WS_ORDER_UPDATE",
             "fill_confidence": "HIGH",
         }
+        # Include metadata from intent for process_trade to use
+        if intent:
+            payload_dict = intent.get("payload") or {}
+            out["structure_id"] = (
+                intent.get("structure_id")
+                or payload_dict.get("structure_id")
+            )
+            out["strategy"] = (
+                intent.get("strategy")
+                or payload_dict.get("strategy_id")
+            )
+            out["action"] = (
+                intent.get("action")
+                or payload_dict.get("action")
+            )
+            out["instrument"] = intent.get("instrument")
+            out["candle_ts"] = intent.get("candle_ts")
         ws_ts = payload.get("ws_received_at")
         if isinstance(ws_ts, (int, float)) and self.engine_logger:
             try:
@@ -2527,6 +2572,17 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
                     }
                 )
             except Exception as exc:
+                logger.exception(
+                    "Strategy evaluation failed strategy=%s: %s",
+                    strategy_id,
+                    exc,
+                )
+                if self.engine_logger:
+                    self.engine_logger.log(
+                        "strategy_eval_failed",
+                        f"Strategy evaluation failed: {exc}",
+                        strategy_id=strategy_id,
+                    )
                 response_q.put({"strategy": strategy, "error": exc})
             finally:
                 q.task_done()
@@ -3849,7 +3905,8 @@ class LiveEngine(LiveEngineHelpersMixin, BaseEngine):
         while not self._shutdown_requested:
             # pdb.set_trace()
             loop_count += 1
-            _now = dt.datetime.utcnow()
+            # For dummy feed, use simulated time; otherwise wall clock
+            _now = self._current_ist_now().astimezone(dt.timezone.utc).replace(tzinfo=None)
             if risk_manager and risk_manager.is_engine_blocked():
                 if self.engine_logger:
                     self.engine_logger.log(

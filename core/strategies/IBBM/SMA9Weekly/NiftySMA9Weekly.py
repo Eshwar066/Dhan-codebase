@@ -41,7 +41,7 @@ class NiftySMA9Weekly(IndiaMktMixins, BaseStrategy):
     underlying_symbols = ["NIFTY"]
     timeframe = "120"
     required_context = ["option_chain"]
-    api = "DHAN"
+    api = "KOTAK"
     expiryType = "WEEKLY"
     dhan_expiry_flag = "WEEK"
     weekly_expiry_weekday = 1  # Nifty weekly = Tuesday

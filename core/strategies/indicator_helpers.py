@@ -4,13 +4,21 @@ from __future__ import annotations
 
 from typing import Any, List, Optional
 
+import pandas as pd
+
 from core.utils.structure import (
     MarketStructureConfig,
+    add_adx,
     add_market_structure,
     add_sma,
+    add_supertrend,
+    adx_column_names,
+    default_persisted_keys_for_adx,
+    default_persisted_keys_for_supertrend,
     market_structure_column_names,
     sma_column_names,
     structure_signature,
+    supertrend_column_names,
 )
 
 
@@ -89,3 +97,11 @@ def shared_signature_for_market_structure(
     config: Optional[MarketStructureConfig] = None,
 ) -> str:
     return structure_signature(config)
+
+
+def shared_signature_for_adx(period: int = 14) -> str:
+    return f"adx_{period}"
+
+
+def shared_signature_for_supertrend(length: int = 10, factor: float = 3.0) -> str:
+    return f"supertrend_{length}_{factor}"

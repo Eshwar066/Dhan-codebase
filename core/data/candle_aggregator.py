@@ -107,7 +107,7 @@ def _bucket_ts(
 
     - Default: wall-clock epoch bucketing.
     - Session mode: if session boundaries are provided, reject timestamps outside the
-      session for intraday TFs and anchor >=1h buckets to session start.
+      session for intraday TFs and anchor ALL intraday buckets to session start.
     """
     t = int(ts_sec)
     if tf_seconds <= 0:
@@ -123,13 +123,13 @@ def _bucket_ts(
         if sec_of_day < session_start_sec or sec_of_day >= session_end_sec:
             return None
 
-        # For hourly+ bars, anchor buckets to market open (e.g., 09:15 for NSE/BSE).
-        if tf_seconds >= 3600:
-            offset = sec_of_day - session_start_sec
-            bucket_start_sec = session_start_sec + (offset // tf_seconds) * tf_seconds
-            day_start_ist = dt_ist.replace(hour=0, minute=0, second=0, microsecond=0)
-            bucket_dt_ist = day_start_ist + timedelta(seconds=bucket_start_sec)
-            return int(bucket_dt_ist.astimezone(timezone.utc).timestamp())
+        # For all intraday bars (1m to < 1d), anchor buckets to market open (e.g., 09:15 for NSE/BSE).
+        # This ensures 30m candles align to 09:15, 09:45, 10:15... instead of epoch boundaries.
+        offset = sec_of_day - session_start_sec
+        bucket_start_sec = session_start_sec + (offset // tf_seconds) * tf_seconds
+        day_start_ist = dt_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+        bucket_dt_ist = day_start_ist + timedelta(seconds=bucket_start_sec)
+        return int(bucket_dt_ist.astimezone(timezone.utc).timestamp())
 
     return t - (t % tf_seconds)
 

@@ -83,26 +83,51 @@ def diff_against_previous(
     return out
 
 
+def prune_stale_instrument_csvs(deps_dir: Path, keep: Path) -> int:
+    """Delete ``all_instrument*.csv`` files in ``deps_dir`` except ``keep``. Returns count removed."""
+    removed = 0
+    keep_resolved = keep.resolve()
+    for p in deps_dir.glob("all_instrument*.csv"):
+        try:
+            if p.resolve() == keep_resolved:
+                continue
+            p.unlink()
+            removed += 1
+        except OSError as e:
+            logger.warning("Could not remove stale instrument file %s: %s", p, e)
+    return removed
+
+
 def sync_with_alert(
     deps_dir: Path,
     current_date_str: str,
     alert_fn: Optional[Callable[[str], None]] = None,
+    *,
+    prune_stale: bool = True,
 ) -> Tuple[Path, Dict[str, Any]]:
     """
     Download to ``all_instrument{date}.csv``, diff vs previous day's file if present.
+    By default removes older ``all_instrument*.csv`` after the diff.
     alert_fn: optional callback(str) e.g. Telegram.
     """
+    deps_dir = Path(deps_dir)
+    deps_dir.mkdir(parents=True, exist_ok=True)
     name = f"all_instrument{current_date_str}.csv"
     dest = deps_dir / name
-    download_scrip_master(dest)
     prev_candidates = [
         p
         for p in sorted(deps_dir.glob("all_instrument*.csv"), reverse=True)
         if p.resolve() != dest.resolve()
     ]
     previous = prev_candidates[0] if prev_candidates else None
+    download_scrip_master(dest)
     info = diff_against_previous(dest, previous)
-    msg = f"Dhan instrument sync: {info.get('message')} rows={info.get('new_rows')} changed={info.get('changed')}"
+    if prune_stale:
+        info["pruned"] = prune_stale_instrument_csvs(deps_dir, dest)
+    msg = (
+        f"Dhan instrument sync: {info.get('message')} rows={info.get('new_rows')} "
+        f"changed={info.get('changed')} pruned={info.get('pruned', 0)}"
+    )
     logger.info(msg)
     if info.get("changed") and alert_fn:
         try:

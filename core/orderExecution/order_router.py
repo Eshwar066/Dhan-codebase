@@ -14,6 +14,22 @@ import datetime
 logger = logging.getLogger(__name__)
 
 try:
+    from core.orderExecution.position_manager import normalize_fill_side, resolve_fill_candle_ts
+except ImportError:
+    def normalize_fill_side(side):
+        s = str(side or "").strip().upper()
+        if s in ("BUY", "B", "LONG", "1"):
+            return "BUY"
+        if s in ("SELL", "S", "SHORT", "-1"):
+            return "SELL"
+        return None
+
+    def resolve_fill_candle_ts(candle_ts, *, strategy=None):
+        if candle_ts is not None:
+            return candle_ts
+        return datetime.datetime.now(tz=datetime.timezone.utc)
+
+try:
     from core.utils.json_numeric import round_json_floats
 except ImportError:
     round_json_floats = None  # type: ignore
@@ -838,7 +854,7 @@ class OrderRouter:
                 avg = 0.0
             inst = None
             if self.instrument_store:
-                from core.orderExecution.position_manager import PositionManager
+                from core.orderExecution.position_manager import PositionManager, normalize_fill_side
 
                 opt, strike = PositionManager._extract_option_hint(sym, structure_id)
                 inst = self.instrument_store.intent_creation_details(
@@ -4719,6 +4735,28 @@ class OrderRouter:
         Updates position via PositionManager.on_fill(); if position closed, records realized PnL
         with RiskManager for daily_max_loss enforcement. Then logs and runs slippage check.
         """
+        if intent_id and self.intent_store:
+            rec_side = self.intent_store.get(intent_id) or {}
+            pay_side = rec_side.get("payload") or {}
+            side = (
+                normalize_fill_side(side)
+                or normalize_fill_side(rec_side.get("side"))
+                or normalize_fill_side(pay_side.get("side"))
+            )
+        else:
+            side = normalize_fill_side(side)
+        if not side:
+            if self.engine_logger:
+                self.engine_logger.log(
+                    "oms",
+                    f"process_fill skipped: missing side intent_id={intent_id}",
+                )
+            logger.warning(
+                "process_fill skipped: missing/invalid side intent_id=%s symbol=%s",
+                intent_id,
+                self._instrument_trading_symbol(instrument) if instrument else None,
+            )
+            return
         if not self.position_manager:
             self.report_fill(
                 self._instrument_trading_symbol(instrument),
@@ -4814,7 +4852,7 @@ class OrderRouter:
 
         # REST fill paths often omit candle_ts; stamp wall clock so trades.csv / trade_log get times.
         if candle_ts is None:
-            candle_ts = datetime.datetime.now(tz=datetime.timezone.utc)
+            candle_ts = resolve_fill_candle_ts(None, strategy=strategy)
 
         position_closed, realized_pnl = self.position_manager.on_fill(
             instrument=instrument,
@@ -4974,7 +5012,20 @@ class OrderRouter:
         size = float(trade.get("size") or 0)
         if price <= 0 or size <= 0:
             return False
-        side = (trade.get("side") or "").upper()
+        payload_pre = (self.intent_store.get(intent_id) or {}).get("payload") or {} if self.intent_store else {}
+        intent_pre = self.intent_store.get(intent_id) if self.intent_store else None
+        side = (
+            normalize_fill_side(trade.get("side"))
+            or normalize_fill_side((intent_pre or {}).get("side"))
+            or normalize_fill_side(payload_pre.get("side"))
+        )
+        if not side:
+            if self.engine_logger:
+                self.engine_logger.log(
+                    "oms",
+                    f"process_trade skipped: missing side intent_id={intent_id} trade_id={trade_id}",
+                )
+            return False
         order_id = trade.get("order_id")
         # Resolve instrument and metadata from intent_store
         intent = self.intent_store.get(intent_id) if self.intent_store else None
@@ -5715,9 +5766,9 @@ class OrderRouter:
                 sz = float(f.get("size") or 0)
                 pr = float(f.get("price") or 0)
                 is_dhan = type(self.broker).__name__ == "DhanBroker"
-                # Canonical REST reconciliation id for Dhan (distinct from DHAN_WS:* incremental keys).
+                # Canonical trade_id for Dhan (matches WS format: DHAN:{order_id}:{size}:{price})
                 if is_dhan:
-                    trade_id = f"DHAN_REST:{oid}:{int(sz)}:{pr}"
+                    trade_id = f"DHAN:{oid}:{int(sz)}:{pr:.2f}"
                 else:
                     tid = f.get("id") or f.get("trade_id")
                     trade_id = str(tid) if tid else f"{oid}_{int(sz)}_{pr}"

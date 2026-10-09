@@ -52,15 +52,15 @@ DEBUG_MODE = False
 
 ENGINE_JOBS = [
     {
-        "engine_id": "dhan_leaps_rsi",
+        "engine_id": "dhan",
         "venue": "DHAN",
         "enabled": True,
         "run_mode": "LIVE",
-        "capital": 200_000,
+        "capital": 200000,
         "ORDER_QTY_LOTS": 1,
         "market_ws_stall_timeout_seconds": 0,
         "strategy_timeout_seconds": 60,
-        "strategies": ["LEAPS_RSI", "BankNiftyBTST"], #"NiftySMA9Weekly"
+        "strategies": ["NiftyDOS","LEAPS_RSI"], #"NiftySMA9Weekly",, "BankNiftyBTST","LEAPS_RSI",
         "telegram": {
             "bot_token": os.getenv(
                 "TELEGRAM_LEAPS_BOT_TOKEN",
@@ -74,6 +74,62 @@ ENGINE_JOBS = [
         "latency_critical_cycles": 6,
 
     },
+        {
+
+        "engine_id": "dhan_stocks",
+
+        "venue": "DHAN",
+
+        "enabled": True,
+
+        "run_mode": "BACKTEST",
+
+        "capital": 500000,
+
+        "symbols": ["NUVAMA"],
+
+        "exchange": "NSE",
+
+        "sector": "EQ",
+
+        "market_ws_stall_timeout_seconds": 0,
+
+        "strategy_timeout_seconds": 60,
+
+        "strategies": ["SuperTrendStockRider"],
+
+        "telegram": {
+            "bot_token": os.getenv(
+                "TELEGRAM_EQUITY_BOT_TOKEN",
+                "8389724629:AAHY_CGcBF8HZCexedsEJFw80Mf6SxH5Bkk",
+            ),
+            "chat_id": os.getenv("TELEGRAM_EQUITY_CHAT_ID", "1021479950"),
+        },
+
+    },
+
+    {
+        "engine_id": "kotak",
+        "venue": "DHAN",
+        "enabled": False,
+        "run_mode": "LIVE",
+        "capital": 200000,
+        "ORDER_QTY_LOTS": 1,
+        "market_ws_stall_timeout_seconds": 0,
+        "strategy_timeout_seconds": 60,
+        "strategies": ["NiftyDOS"],
+         "telegram": {
+            "bot_token": os.getenv(
+                "TELEGRAM_KOTAK_TOKEN",
+                "8892391321:AAHOxQ2vRrXEe0Pz5Rn7hJRHX-GWYrbUOh4",
+            ),
+            "chat_id": os.getenv("TELEGRAM_OI_CHAT_ID", "1021479950"),
+        },
+          # Factory default is 150ms; Dhan LIMIT round-trips are ~1s and were
+        # leaving entries paused all session after the morning spike.
+        "latency_critical_ms": 6000,
+        "latency_critical_cycles": 6,
+    },
     {
         "engine_id": "delta_engine_one",
         "venue": "DELTA",
@@ -84,7 +140,7 @@ ENGINE_JOBS = [
             # "BTCZeroDTE",
             # "BTCZeroDTEElevenPM",
             "DirectionalOptionSelling",
-            "LiquiditySweepStrategy",
+            # "LiquiditySweepStrategy",
             # "RSIBreadAndButter",
         ],
         "max_open_positions": 15,
@@ -97,7 +153,7 @@ ENGINE_JOBS = [
         # Delta OMS: reject ENTRY / MAIN_SL when book or mark is unsafe.
         "execution_validator": {
             "enabled": True,
-            "max_spread_pct": 0.10,
+            "max_spread_pct": 0.15,
             "max_mark_mid_pct": 0.50,
             "max_quote_age_sec": 30.0,
             "require_bid_ask": True,
@@ -129,24 +185,7 @@ ENGINE_JOBS = [
             "chat_id": "1021479950",
         },
     },
-    {
-        "engine_id": "dhan_sma9_weekly",
-        "venue": "DHAN",
-        "enabled": False,
-        "run_mode": "LIVE",
-        "capital": 200_000,
-        "ORDER_QTY_LOTS": 1,
-        "market_ws_stall_timeout_seconds": 0,
-        "strategy_timeout_seconds": 60,
-        "strategies": ["NiftySMA9Weekly"],
-        "telegram": {
-            "bot_token": os.getenv(
-                "TELEGRAM_LEAPS_BOT_TOKEN",
-                "8663481671:AAHY-OnE8OiaJmkOfXbwqoe4InosJVblAtM",
-            ),
-            "chat_id": os.getenv("TELEGRAM_LEAPS_CHAT_ID", "1021479950"),
-        },
-    },
+    
     {
         "engine_id": "dhan_oi_positional_buy",
         "venue": "DHAN",
@@ -254,6 +293,7 @@ ENGINE_JOBS = [
         "strategies": ["IPOBreakout"],
 
     },
+
 
     {
 

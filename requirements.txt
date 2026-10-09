@@ -1,0 +1,47 @@
+# Core dependencies
+python-dotenv==1.0.1
+requests==2.34.2
+pandas>=2.3.1,<3
+numpy==2.5.3
+python-dateutil==2.9.0.post0
+pytz==2026.5
+PyYAML==6.0.2
+psutil==7.0.0
+pyotp==2.10.0
+
+# Trading & Market Data
+dhanhq==2.2.0
+Dhan-Tradehull==3.3.2
+kotakneoapi==3.0.7
+yfinance==1.7.0
+TA-Lib==0.8.1
+
+# WebSocket & Async
+websockets==17.2
+websocket-client>=1.9.0
+
+# Crypto/Delta dependencies
+curl_cffi==0.16.3
+lxml==6.1.3
+beautifulsoup4==4.15.0
+soupsieve==2.10
+protobuf==7.36.2
+multitasking==0.0.13
+
+# Database (if used)
+peewee==4.5.2
+
+# Utils
+typing-extensions==4.16.0
+platformdirs==4.12.3
+
+# Security
+cryptography==50.0.2
+pyOpenSSL==26.4.0
+cffi==2.1.1
+pycparser==3.0
+certifi==2026.7.22
+idna==3.20
+charset-normalizer==3.5.2
+urllib3==2.8.0
+six==1.17.0

@@ -195,6 +195,41 @@ STRATEGY_RUNTIME_SPEC: dict = {
             },
         },
     },
+    'NiftyDOS': {
+        RunMode.BACKTEST: {
+            'data': {
+                'option_chain': {
+                    'exchange': 'NSE',
+                    'interval': '30',
+                    'segment': 'OPT',
+                    'api': 'KOTAK',
+                    'expiry_flag': 'WEEK',
+                },
+            },
+        },
+        RunMode.PAPER: {
+            'data': {
+                'option_chain': {
+                    'exchange': 'NSE',
+                    'interval': '30',
+                    'segment': 'OPT',
+                    'api': 'KOTAK',
+                    'expiry_flag': 'WEEK',
+                },
+            },
+        },
+        RunMode.LIVE: {
+            'data': {
+                'option_chain': {
+                    'exchange': 'NSE',
+                    'interval': '1',
+                    'segment': 'OPT',
+                    'api': 'KOTAK',
+                    'expiry_flag': 'WEEK',
+                },
+            },
+        },
+    },
     'NiftyIntradayMagicalLine': {
         RunMode.BACKTEST: {
             'data': {
@@ -235,7 +270,7 @@ STRATEGY_RUNTIME_SPEC: dict = {
                     'exchange': 'NSE',
                     'interval': '120',
                     'segment': 'OPT',
-                    'api': 'DHAN',
+                    'api': 'KOTAK',
                     'expiry_flag': 'WEEK',
                 },
             },
@@ -246,7 +281,7 @@ STRATEGY_RUNTIME_SPEC: dict = {
                     'exchange': 'NSE',
                     'interval': '120',
                     'segment': 'OPT',
-                    'api': 'DHAN',
+                    'api': 'KOTAK',
                     'expiry_flag': 'WEEK',
                 },
             },
@@ -257,7 +292,7 @@ STRATEGY_RUNTIME_SPEC: dict = {
                     'exchange': 'NSE',
                     'interval': '1',
                     'segment': 'OPT',
-                    'api': 'DHAN',
+                    'api': 'KOTAK',
                     'expiry_flag': 'WEEK',
                 },
             },
@@ -361,6 +396,29 @@ STRATEGY_RUNTIME_SPEC: dict = {
         },
         RunMode.LIVE: {
             'data': {},
+        },
+    },
+    'SuperTrendStockRider': {
+        RunMode.BACKTEST: {
+            'data': {
+                'exchange': 'NSE',
+                'interval': 'DAY',
+                'sector': 'EQ',
+            },
+        },
+        RunMode.PAPER: {
+            'data': {
+                'exchange': 'NSE',
+                'interval': 'DAY',
+                'sector': 'EQ',
+            },
+        },
+        RunMode.LIVE: {
+            'data': {
+                'exchange': 'NSE',
+                'interval': 'DAY',
+                'sector': 'EQ',
+            },
         },
     },
 }

@@ -368,6 +368,45 @@ GENERATED_STRATEGY_SUBSCRIPTIONS: dict = {
             ],
         },
     },
+    'NiftyDOS': {
+        'BarClosed': {
+            'enabled': True,
+            'timeframes': [
+                '30',
+                '5',
+            ],
+            'symbols': [
+                'NIFTY',
+            ],
+        },
+        'FeedDisconnected': {
+            'enabled': True,
+        },
+        'FeedRecovered': {
+            'enabled': True,
+        },
+        'IntentCreated': {
+            'enabled': True,
+        },
+        'IntentFilled': {
+            'enabled': True,
+        },
+        'PositionClosed': {
+            'enabled': True,
+        },
+        'QuoteUpdated': {
+            'enabled': False,
+            'symbols': [
+                'NIFTY',
+            ],
+        },
+        'ScheduledSlot': {
+            'enabled': False,
+            'symbols': [
+                'NIFTY',
+            ],
+        },
+    },
     'NiftyIntradayMagicalLine': {
         'BarClosed': {
             'enabled': True,
@@ -623,6 +662,47 @@ GENERATED_STRATEGY_SUBSCRIPTIONS: dict = {
         },
         'ScheduledSlot': {
             'enabled': False,
+        },
+    },
+    'SuperTrendStockRider': {
+        'BarClosed': {
+            'enabled': False,
+            'timeframes': [
+                'DAY',
+            ],
+            'symbols': [
+                'NUVAMA',
+                'SG',
+            ],
+        },
+        'FeedDisconnected': {
+            'enabled': True,
+        },
+        'FeedRecovered': {
+            'enabled': True,
+        },
+        'IntentCreated': {
+            'enabled': True,
+        },
+        'IntentFilled': {
+            'enabled': True,
+        },
+        'PositionClosed': {
+            'enabled': True,
+        },
+        'QuoteUpdated': {
+            'enabled': False,
+            'symbols': [
+                'NUVAMA',
+                'SG',
+            ],
+        },
+        'ScheduledSlot': {
+            'enabled': True,
+            'symbols': [
+                'NUVAMA',
+                'SG',
+            ],
         },
     },
 }

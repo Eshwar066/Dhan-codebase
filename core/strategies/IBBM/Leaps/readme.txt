@@ -2,27 +2,48 @@ LEAPS RSI – Strategy module
 ======================================
 Implementation: LeapsQuatery_RSI_52_32.py (class LeapsQuarterly)
 Shared logic:   core/strategies/IndiaMktMixins.py (IndiaMktMixins)
-Registry:       core/strategies/registry.STRATEGY_MAP["LEAPS_RSI"]
-Engine job:     run/config.py → dhan_leaps_rsi
+Config YAML:    core/strategies/IBBM/Leaps/strategy.yaml
+Registry:       STRATEGY_MAP / strategy id "LEAPS_RSI"
+Engine job:     run/config.py → engine_id dhan_leaps_rsi
+                strategies: ["LEAPS_RSI", ...]
+systemd:        utils/systemd/dhan-leaps-rsi.service
+                python -m run.main --engine-id dhan_leaps_rsi
 
-Emergency (manual only; NOT loaded by live engine):
-  core/strategies/Leaps/emergency/force_leaps_cycle.py
-  core/strategies/Leaps/emergency/retry_leaps_main.py
-  Run with engine stopped:
+Emergency (manual only; stop live engine first):
+  core/strategies/IBBM/Leaps/emergency/force_leaps_cycle.py
+  core/strategies/IBBM/Leaps/emergency/retry_leaps_main.py
+  core/strategies/IBBM/Leaps/emergency/roll_leaps_hedge.py
+  Run:
     .venv/bin/python -m core.strategies.IBBM.Leaps.emergency.force_leaps_cycle
     .venv/bin/python -m core.strategies.IBBM.Leaps.emergency.retry_leaps_main
+    .venv/bin/python -m core.strategies.IBBM.Leaps.emergency.roll_leaps_hedge [--dry-run]
 
 ==========================================================================================
 STRATEGY OVERVIEW
 ==========================================================================================
 
-Regime-based NIFTY option selling on 1-hour RSI with monthly hedge protection.
+Regime-based NIFTY option selling on 1-hour RSI(14) with monthly hedge protection.
 
 - RSI crosses below 32  → SELL CALL (MAIN) + BUY monthly CALL hedge
 - RSI crosses above 52  → SELL PUT  (MAIN) + BUY monthly PUT hedge
-- Exit when RSI crosses opposite band (MAIN + hedge)
+- Exit MAIN when RSI crosses opposite band; hedge exits with MAIN
 
-Strategy is signal-only. Execution, risk, fills, and SL are handled by LiveEngine + OrderRouter.
+Optional dual MAIN bundles on the same RSI signal (separate structure_id each):
+  mini_leaps      — expiry_pref LEAPS_ROLL (default ON)
+  quarterly_leaps — expiry_pref QUARTERLY  (default OFF)
+
+Strategy is signal-only. Execution, risk, fills, and SL are handled by
+LiveEngine + OrderRouter (venue DHAN for dhan_leaps_rsi).
+
+==========================================================================================
+INDICATORS
+==========================================================================================
+
+prepare_indicators:
+  - rsi / prev_rsi  — TA-Lib RSI(14)
+  - EMA high/low    — ema_period = 8 (persisted via indicator_helpers)
+
+requires_live_rsi_patch = True  (live RSI enrichment on closed 60m bars)
 
 ==========================================================================================
 EVALUATION (LIVE)
@@ -30,14 +51,15 @@ EVALUATION (LIVE)
 
 Timeframe: 60m NIFTY bars (closed bar only).
 
-NSE hourly bar close window (IST) — evaluation allowed after bar close + grace:
-  10:15, 11:15, 12:15, 13:15, 14:15, 15:15, 16:15
+NSE hourly bar close window (IST) — should_evaluate uses
+nse_60m_bar_close_eval_window(grace_minutes=8):
+  after closes near 10:15, 11:15, 12:15, 13:15, 14:15, 15:15 (+ grace)
 
 Entry requires RSI CROSSOVER (not sustained level):
   CALL entry: prev_rsi >= 32 and rsi < 32
   PUT  entry: prev_rsi <= 52 and rsi > 52
 
-One evaluation per closed hourly bar (deduped by bar open key).
+One evaluation per closed hourly bar (deduped by bar open key IST).
 
 Live path:
   1. CandleAggregator closed 60m bar
@@ -49,95 +71,129 @@ Backtest path:
   BacktestEngine runs exit + rollover every candle; gates entry on should_evaluate.
 
 ==========================================================================================
-MAIN LEG EXPIRY — dual MAIN bundles (toggle in strategy.yaml → legs:)
+MAIN LEGS — dual MAIN+HEDGE bundles (strategy.yaml → legs:)
 ==========================================================================================
 
-Two optional MAIN+HEDGE bundles on the same RSI signal (separate structure_id):
+Toggle in core/strategies/IBBM/Leaps/strategy.yaml:
 
-  mini_leaps (default on):
-    expiry_pref: LEAPS_ROLL — monthly rollover table (16th cutoff in resolver)
-    structure_id: LEAPS_RSI:NIFTY:{regime}
+  legs:
+    mini_leaps:
+      enabled: true          # class: mini_leaps_enabled
+      expiry_pref: LEAPS_ROLL
+      structure_suffix: ""
+    quarterly_leaps:
+      enabled: false         # class: quarterly_leaps_enabled
+      expiry_pref: QUARTERLY
+      structure_suffix: ":QTR"
 
-  quarterly_leaps (default off):
-    expiry_pref: QUARTERLY — Mar/Jun/Sep/Dec last Tuesday
-    structure_id: LEAPS_RSI:NIFTY:{regime}:QTR
-    Quarterly mid-month cutoff: 15th (Feb/May/Aug/Nov)
+On each RSI signal, each enabled leg:
+  1. Builds structure_id = LEAPS_RSI:NIFTY:{regime}{suffix}
+  2. Finds MAIN strike in premium band 200–400 (ideal ~350), 500-pt grid
+  3. Creates MAIN SELL ENTRY + monthly HEDGE BUY ENTRY
 
-Toggle in core/strategies/Leaps/strategy.yaml → legs: → enabled: true/false
-Or class attrs: mini_leaps_enabled / quarterly_leaps_enabled
-
-Hedge is unchanged for both: monthly BUY ~2% OTM (15th calendar cutoff).
-
-==========================================================================================
-MAIN LEG EXPIRY — LEAPS_ROLL detail (mini leg)
-==========================================================================================
-
-Code: expiryType = "LEAPS_ROLL" (ExpiryResolver._leaps_rollover_month_year)
-
-Monthly stepping calendar (cutoff = day 16 onward in code):
-
-  Month   Days 1–15 → sell expiry in   Days 16–end → sell expiry in
-  Jan     February                  March
-  Feb     March                     April
-  Jul     August                    September
-  Nov     December                  January (next year)
-  …       (see ExpiryResolver.LEAPS_ROLL roll table)
-
-Expiry date = last Tuesday of target month.
-
-NOTE: Older docs described Mar/Jun/Sep/Dec quarterly — that is QUARTERLY mode,
-not what LEAPS_RSI runs today. To use classic quarterly, change expiryType to
-"QUARTERLY" in LeapsQuatery_RSI_52_32.py (separate strategy decision).
+Blocks new ENTRY if that structure (or same leg family) already has open MAIN,
+pending ENTRY intent, or prior entry for structure (unless RSI-reversal defer).
 
 ==========================================================================================
-STRIKE SELECTION
+MAIN LEG EXPIRY — LEAPS_ROLL (mini)
 ==========================================================================================
 
-- NIFTY LEAPS grid: 500-point steps (22000, 22500, 23000, …)
-- Premium bands (on_candle):
-    CALL → 200–400 (ideal ~350)
-    PUT  → 200–400 (ideal ~350)
-- Closest to ideal premium in band is selected.
+expiry_pref = LEAPS_ROLL → ExpiryResolver._leaps_rollover_month_year
+Cutoff day = 16 in resolver (days 1–15 vs 16–end).
+
+Expiry date = last Tuesday of the target month from the LEAPS_ROLL table
+(see ExpiryResolver.LEAPS_ROLL).
+
+==========================================================================================
+MAIN LEG EXPIRY — QUARTERLY (optional)
+==========================================================================================
+
+expiry_pref = QUARTERLY → Mar / Jun / Sep / Dec last Tuesday.
+Mid-month style cutoffs live in ExpiryResolver.quarterly_target_expiry_date.
+
+structure_id suffix: :QTR
+  Example: LEAPS_RSI:NIFTY:RSI_LT_32:QTR
+
+==========================================================================================
+STRIKE SELECTION (MAIN)
+==========================================================================================
+
+- NIFTY LEAPS grid: option_chain_strike_step = 500
+- Premium band: 200–400 (option_chain_ideal_premium = 350)
+- find_strike_in_premium_range + closest-to-ideal sort (IndiaMktMixins)
+- Snapshot logs: leaps_rsi / leaps_rsi_quarterly under option_chain_snapshots/
 
 ==========================================================================================
 HEDGING
 ==========================================================================================
 
-- BUY monthly option (~2% OTM from sold strike; 500-step grid)
-  CALL main 24500 → hedge ~25000
-  PUT  main 24500 → hedge ~24000
+- BUY monthly option ~2% OTM from sold strike, snapped to 500-step grid
+    CALL MAIN K → hedge ~ round(K * 1.02 / 500) * 500
+    PUT  MAIN K → hedge ~ round(K * 0.98 / 500) * 500
 
-- Hedge expiry (resolve_hedge_expiry):
-    trade before 15th → current month (last Tuesday)
-    trade on/after 15th → next month
+- Hedge expiry (resolve_hedge_expiry) — ignores MAIN mini vs quarterly:
+    trade_date.day < 15 → current month last Tuesday (weekday=1)
+    trade_date.day >= 15 → next month last Tuesday
+  Config: hedge_monthly_rollover_after_calendar_day = 15
+          hedge_monthly_expiry_weekday = 1
 
-- Separate option chain fetch for hedge (hedge_option_chain_snapshots/).
-
+- Separate hedge chain fetch (expiry_flag MONTH, ±60 strikes).
+- Snapshot target: leaps_rsi_hedge
 - parent_intent_id links hedge ENTRY to MAIN sell intent.
 
 ==========================================================================================
 HEDGE ROLLOVER (LIVE + BACKTEST)
 ==========================================================================================
 
-IndiaMktMixins.on_candle_rollover — wired in LiveEngine._run_exits_and_rollover.
+IndiaMktMixins.on_candle_rollover — LiveEngine._run_exits_and_rollover.
 
 Window: calendar days 15–18 of month.
-Roll when: current date >= adjusted 18th (weekends + NSE holidays → prior session).
-Action: new HEDGE ENTRY (next month) first, then HEDGE_EXIT (sell old).
-  Buying first avoids a margin spike from briefly unhedged MAIN.
-Deduped: one roll per structure per calendar day (rolled_hedges set).
+Roll when: date >= adjusted 18th (weekends + NSE holidays → prior session).
+Action: new HEDGE ENTRY (next month) first, then HEDGE_EXIT (sell old)
+  — buy-first avoids a margin spike from briefly unhedged MAIN.
+Deduped: one roll per structure per calendar day.
 
 ==========================================================================================
-EXECUTION (LIVE)
+RSI REVERSAL DEFERRAL (same-bar flip)
 ==========================================================================================
 
-- HEDGE + MAIN ENTRY: fill-gated bundle on Dhan (hedge BUY → wait fill → MAIN SELL)
-- Hedge auto-retry with refreshed bid/ask (LEAPS_RSI only, up to 3 attempts)
+If on_candle wants the opposite side but MAIN is still open (exit already
+enqueued this bar), entry is deferred:
+
+  1. _arm_pending_rsi_reversal prebuilds reverse HEDGE+MAIN intents
+     (ignore_open_main=True) while option chain is warm
+  2. on_main_exit_filled fires after MAIN_EXIT fill → place deferred ENTRY
+
+Guards: MAIN_EXIT tag; optional structure_id match to pending.exit_structure_id.
+Tests: core/strategies/IBBM/Leaps/tests/test_rsi_reversal_defer.py
+
+==========================================================================================
+EXIT RULES
+==========================================================================================
+
+should_exit (MAIN only):
+  Short CALL → exit when RSI > 52
+  Short PUT  → exit when RSI < 32
+
+on_position_exit:
+  MAIN_EXIT (BUY to cover short) + HEDGE_EXIT (sell hedge)
+
+==========================================================================================
+EXECUTION (LIVE / DHAN)
+==========================================================================================
+
+- HEDGE + MAIN ENTRY: fill-gated bundle (hedge BUY → wait fill → MAIN SELL)
+- Hedge auto-retry with refreshed bid/ask (LEAPS_RSI, up to 3 attempts)
 - LIMIT prices from live depth (engine price_map → OrderRouter)
 - Hedge exit / MAIN exit: depth-based limit at eval bar
 
+Run:
+  sudo systemctl start dhan-leaps-rsi.service
+  # or
+  python -m run.main --engine-id dhan_leaps_rsi
+
 ==========================================================================================
-EMERGENCY HEDGE ROLLOVER (manual, after market open)
+EMERGENCY HEDGE ROLLOVER (manual)
 ==========================================================================================
 
 Stop dhan-leaps-rsi.service first, then:
@@ -150,31 +206,30 @@ Default target expiry = next month (last Tuesday). Use --use-calendar for 15th c
 Optional: --structure-id <sid> (repeatable).
 
 ==========================================================================================
-EXIT RULES
+INTENT REFERENCE
 ==========================================================================================
 
-MAIN (should_exit):
-  Short CALL → exit when RSI > 52
-  Short PUT  → exit when RSI < 32
+Structure ID (mini):
+  LEAPS_RSI:NIFTY:{RSI_LT_32|RSI_GT_52}
 
-on_position_exit: MAIN_EXIT + HEDGE_EXIT intents (structure unwind).
+Structure ID (quarterly):
+  LEAPS_RSI:NIFTY:{RSI_LT_32|RSI_GT_52}:QTR
+
+Tags / actions:
+  MAIN       ENTRY  SELL
+  HEDGE      ENTRY  BUY
+  MAIN_EXIT  EXIT   BUY (cover)
+  HEDGE_EXIT EXIT   SELL
+
+trade_type: MARGIN (India equity options via Dhan mapping)
 
 ==========================================================================================
 ROADMAP / NOT YET IMPLEMENTED
 ==========================================================================================
 
-- Regime lock (one open structure per regime globally)
+- Global regime lock across both mini and quarterly legs
 - Hedge PnL attribution
 - Delta-aware hedge distance
-
-==========================================================================================
-INTENT REFERENCE
-==========================================================================================
-
-Structure ID: LEAPS_RSI:NIFTY:{RSI_LT_32|RSI_GT_52}
-Tags: MAIN (sell), HEDGE (buy), HEDGE_EXIT, MAIN_EXIT
-
-Example MAIN sell intent fields: side=SELL, action=ENTRY, tag=MAIN, trade_type=MARGIN
 
 ==========================================================================================
 END OF STRATEGY SPEC

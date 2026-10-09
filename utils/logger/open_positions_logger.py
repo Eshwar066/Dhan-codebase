@@ -377,14 +377,15 @@ class OpenPositionsLogger:
             self._write_snapshot(snap)
 
             # Also maintain strategy-specific snapshot.
-            row_strategy = str(finalized.get("strategy") or "").strip() or self.strategy
-            strategy_path = self._path_for_strategy(row_strategy)
-            strat_snap = self._read_open_snapshot(strategy_path)
-            if new_qty == 0:
-                strat_snap.pop(symbol, None)
-            else:
-                strat_snap[symbol] = finalized
-            self._write_snapshot(strat_snap, strategy_path)
+            row_strategy = str(finalized.get("strategy") or "").strip()
+            if row_strategy:
+                strategy_path = self._path_for_strategy(row_strategy)
+                strat_snap = self._read_open_snapshot(strategy_path)
+                if new_qty == 0:
+                    strat_snap.pop(symbol, None)
+                else:
+                    strat_snap[symbol] = finalized
+                self._write_snapshot(strat_snap, strategy_path)
 
     def record_broker_reconcile_snapshot(self, position_manager: Any) -> None:
         """
@@ -491,9 +492,15 @@ class OpenPositionsLogger:
 
             self._write_snapshot(snap)
             by_strategy: Dict[str, Dict[str, Dict[str, Any]]] = {}
+            unowned: Dict[str, Dict[str, Any]] = {}
             for sym, row in snap.items():
-                strategy_name = str(row.get("strategy") or "").strip() or self.strategy
+                strategy_name = str(row.get("strategy") or "").strip()
+                if not strategy_name:
+                    unowned[sym] = row
+                    continue
                 bucket = by_strategy.setdefault(strategy_name, {})
                 bucket[sym] = row
             for strategy_name, strategy_rows in by_strategy.items():
                 self._write_snapshot(strategy_rows, self._path_for_strategy(strategy_name))
+            if unowned:
+                self._write_snapshot(unowned, self._path_for_strategy("UNOWNED"))

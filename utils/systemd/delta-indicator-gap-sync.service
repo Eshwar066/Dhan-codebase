@@ -1,0 +1,10 @@
+[Unit]
+Description=Sync crypto indicator history gaps (BTCUSD/PAXGUSD)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/Dhan-codebase
+ExecStart=/root/Dhan-codebase/.venv/bin/python /root/Dhan-codebase/utils/delta/sync_crypto_indicator_gaps.py

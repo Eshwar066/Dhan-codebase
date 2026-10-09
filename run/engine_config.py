@@ -12,15 +12,34 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from zoneinfo import ZoneInfo
 
 from run.config import (
     DEFAULT_LIBRARY_LOG_LEVEL,
     DEFAULT_ROOT_LOG_LEVEL,
     RunMode,
 )
+
+IST = ZoneInfo("Asia/Kolkata")
+
+
+class ISTFormatter(logging.Formatter):
+    """Logging formatter that outputs timestamps in IST (Asia/Kolkata)."""
+
+    def converter(self, timestamp: float) -> time.struct_time:
+        dt = datetime.fromtimestamp(timestamp, tz=IST)
+        return dt.timetuple()
+
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
+        dt = datetime.fromtimestamp(record.created, tz=IST)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
 BrokerName = Literal["DHAN", "DELTA", "KOTAK"]
@@ -198,10 +217,13 @@ def configure_process_logging(
     )
 
     fmt = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+    # Use ISTFormatter for IST timestamps
+    handler = logging.StreamHandler()
+    handler.setFormatter(ISTFormatter(fmt, datefmt="%Y-%m-%d %H:%M:%S"))
+
     logging.basicConfig(
         level=root_level,
-        format=fmt,
-        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[handler],
         force=force or not _logging_configured,
     )
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -55,6 +55,9 @@ from .constants import (
     symbol_config,
     underlying_from_option_symbol,
 )
+
+# End-of-day reset time (IST) — clear all position state after 17:25 rollover.
+EOD_RESET_TIME = time(17, 30)
 from .htf import DosHtfMixin
 from .trail_sl import DosTrailSlMixin, PendingTrailRetry as _PendingTrailRetry
 
@@ -63,9 +66,9 @@ logger = logging.getLogger(__name__)
 # Sleeve entry switches (flip to False to stop new entries / SL re-entries for
 # that sleeve globally). Open positions still trail SL, force-exit, and roll.
 # Per-symbol enable_* in SYMBOL_CONFIG can further disable a sleeve.
-ENABLE_WEEKLY_TRADES = True
-ENABLE_MONTHLY_TRADES = True
-ENABLE_INTRADAY_TRADES = True
+ENABLE_WEEKLY_TRADES = False
+ENABLE_MONTHLY_TRADES = False
+ENABLE_INTRADAY_TRADES = False
 ENABLE_MORNING_0DTE_TRADES = True
 # Per-underlying master switches (False = no new entries / SL re-entries for that
 # symbol). Open risk still trails, force-exits, and rolls.
@@ -1261,6 +1264,8 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         trade_date: date,
         min_dte: int,
         target_expiry: Optional[str] = None,
+        *,
+        allow_next_expiry_fallback: bool = True,
     ) -> List[str]:
         dated = []
         for code in set(expiries):
@@ -1277,8 +1282,10 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                     if expiry == target_d or code == target:
                         ordered.append(code)
                         break
-                # Fallback: next listed expiry after the weekly target.
-                if not ordered:
+                # Weekly may roll to the next listed Friday when the exact
+                # code is missing. Morning / strict 0DTE must NOT fall through
+                # to a weekly — empty list → skip the order.
+                if not ordered and allow_next_expiry_fallback:
                     for expiry, code in dated:
                         if expiry > target_d:
                             ordered.append(code)
@@ -1309,6 +1316,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         min_premium: Optional[float] = None,
         otm_skip: int = 0,
         min_strike_spot_distance: float = 0.0,
+        allow_next_expiry_fallback: bool = True,
     ) -> Optional[tuple[float, float, pd.Series, str]]:
         source = _delta_source_from_ctx(ctx)
         if source is None:
@@ -1340,7 +1348,52 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             trade_date,
             min_dte,
             target_expiry=target_expiry,
+            allow_next_expiry_fallback=allow_next_expiry_fallback,
         )
+        # Strict target (morning 0DTE): if missing from cached products, refresh
+        # once from the API before giving up — never substitute a weekly.
+        if (
+            target_expiry
+            and not allow_next_expiry_fallback
+            and str(target_expiry).strip() not in set(expiry_order)
+        ):
+            logger.warning(
+                "%s target expiry %s missing from product cache; "
+                "refreshing Delta products once (strict, no weekly fallback)",
+                self.name,
+                target_expiry,
+            )
+            products = source.get_products(use_cache=False) or []
+            matching = [
+                product
+                for product in products
+                if str(product.get("symbol") or "").upper().startswith(prefix)
+            ]
+            expiry_order = self._ordered_expiries(
+                [self._product_expiry(product) for product in matching],
+                trade_date,
+                min_dte,
+                target_expiry=target_expiry,
+                allow_next_expiry_fallback=False,
+            )
+            if str(target_expiry).strip() not in set(expiry_order):
+                logger.warning(
+                    "%s skip ENTRY: strict target expiry %s still not listed "
+                    "after product refresh",
+                    self.name,
+                    target_expiry,
+                )
+                return None
+            # Keep instrument CSV in sync when the store supports refresh.
+            store = getattr(ctx, "instrument_store", None)
+            refresh_fn = getattr(store, "refresh_products", None)
+            if callable(refresh_fn):
+                try:
+                    refresh_fn()
+                except Exception:
+                    logger.exception(
+                        "%s instrument_store.refresh_products failed", self.name
+                    )
         for expiry in expiry_order:
             candidates = []
             for product in matching:
@@ -1408,6 +1461,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         min_premium: Optional[float] = None,
         otm_skip: int = 0,
         min_strike_spot_distance: float = 0.0,
+        allow_next_expiry_fallback: bool = True,
     ) -> Optional[tuple[float, float, pd.Series, str]]:
         df = self.load_delta_data_for_candle(candle, ctx)
         if df is None or df.empty:
@@ -1447,6 +1501,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             self._timestamp_ist(candle["timestamp"]).date(),
             min_dte,
             target_expiry=target_expiry,
+            allow_next_expiry_fallback=allow_next_expiry_fallback,
         )
         for expiry in expiry_order:
             latest = (
@@ -1495,6 +1550,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         min_premium: Optional[float] = None,
         otm_skip: int = 0,
         min_strike_spot_distance: float = 0.0,
+        allow_next_expiry_fallback: bool = True,
     ) -> Optional[tuple[float, float, pd.Series, str]]:
         option_type = self._option_type(direction)
         if RUN_MODE == RunMode.BACKTEST:
@@ -1509,6 +1565,7 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 min_premium=min_premium,
                 otm_skip=otm_skip,
                 min_strike_spot_distance=min_strike_spot_distance,
+                allow_next_expiry_fallback=allow_next_expiry_fallback,
             )
         return self._select_live_contract(
             candle,
@@ -1521,7 +1578,40 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
             min_premium=min_premium,
             otm_skip=otm_skip,
             min_strike_spot_distance=min_strike_spot_distance,
+            allow_next_expiry_fallback=allow_next_expiry_fallback,
         )
+
+    def _notify_premium_entry_skip(
+        self,
+        ctx: Any,
+        *,
+        sleeve: str,
+        option_type: str,
+        min_premium: float,
+        supertrend: float,
+        spot_gate: float,
+        symbol: str,
+        reason: str,
+        direction: int,
+    ) -> None:
+        """Telegram when ENTRY is skipped because no contract clears the premium floor."""
+        msg = (
+            f"⚠️ {self.name} ENTRY skipped (premium/strike gate)\n"
+            f"sleeve={sleeve} symbol={symbol} reason={reason}\n"
+            f"opt={option_type} dir={direction} min_premium=${min_premium:.2f}\n"
+            f"ST={supertrend:.2f} min_|strike-spot|={spot_gate:.0f}\n"
+            f"No qualifying contract — order not placed."
+        )
+        eng = getattr(ctx, "engine_logger", None) if ctx is not None else None
+        notify = getattr(eng, "notify_operator", None) if eng is not None else None
+        if not callable(notify):
+            return
+        try:
+            notify(msg)
+        except Exception:
+            logger.debug(
+                "%s telegram premium-skip notify failed", self.name, exc_info=True
+            )
 
     def _build_entry(
         self,
@@ -1631,7 +1721,8 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 )
                 return None
         elif sleeve_u == SLEEVE_MORNING:
-            # Prefer today's daily expiry; never roll morning slot to next day.
+            # Prefer today's daily expiry; never roll morning slot to next day /
+            # weekly — if 0DTE is missing after refresh, skip the order.
             target_expiry = self._0dte_expiry_code(candle)
             entry_min_dte = 0
             if self._open_main_has_expiry(ctx, target_expiry, underlying=under):
@@ -1672,18 +1763,33 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                 else 0
             ),
             min_strike_spot_distance=spot_gate,
+            # Morning 0DTE must not silently land on the next weekly.
+            allow_next_expiry_fallback=sleeve_u != SLEEVE_MORNING,
         )
         if selected is None:
+            opt = self._option_type(direction)
+            floor = self._min_premium_for_sleeve(sleeve_u, under)
             logger.warning(
                 "%s: no %s %s contract premium >= %.2f near SuperTrend %.2f"
                 " (min |strike-spot|=%.0f) symbol=%s",
                 self.name,
                 sleeve_u,
-                self._option_type(direction),
-                self._min_premium_for_sleeve(sleeve_u, under),
+                opt,
+                floor,
                 supertrend,
                 spot_gate,
                 under,
+            )
+            self._notify_premium_entry_skip(
+                ctx,
+                sleeve=sleeve_u,
+                option_type=opt,
+                min_premium=floor,
+                supertrend=supertrend,
+                spot_gate=spot_gate,
+                symbol=under,
+                reason=reason,
+                direction=int(direction),
             )
             return None
         strike, premium, row, expiry = selected
@@ -1803,6 +1909,37 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         self._sl_reentry_direction = None
         self._sl_reentry_after = None
         self._sl_reentry_sleeve = None
+
+    def _daily_reset(self, now_ist: pd.Timestamp) -> None:
+        """
+        End-of-day reset at 17:30 IST for ENABLE_MORNING_0DTE_TRADES only.
+        Clears morning sleeve position state for the next trading day.
+        """
+        # Only run if morning 0DTE trades are enabled
+        if not ENABLE_MORNING_0DTE_TRADES:
+            return
+
+        # Only run once per day per symbol
+        reset_date = now_ist.date()
+        for sym, rt in self._runtime_by_symbol.items():
+            # Use a marker to track if we've reset for this date
+            if not hasattr(rt, '_last_eod_reset_date') or rt._last_eod_reset_date != reset_date:
+                # Clear SL reentry state only if it's for morning sleeve
+                if rt._sl_reentry_sleeve == SLEEVE_MORNING:
+                    rt._sl_reentry_direction = None
+                    rt._sl_reentry_after = None
+                    rt._sl_reentry_sleeve = None
+                # Clear morning entry dates (new day = new morning slot)
+                rt._morning_entry_dates.clear()
+                # Note: Do NOT clear _pending_transition, _pending_closed_entry, _rollover_dates
+                # as those are used by weekly/monthly/daily sleeves
+                rt._last_eod_reset_date = reset_date
+                logger.info(
+                    "%s EOD reset (morning sleeve) completed symbol=%s date=%s",
+                    self.name,
+                    sym,
+                    reset_date,
+                )
 
     def _sl_reentry_ready(self, candle: dict) -> bool:
         """True once this candle's close time is after the SL fill time."""
@@ -2458,6 +2595,8 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
                     getattr(getattr(position, "instrument", None), "expiry", None),
                     direction,
                 )
+                # Clear SL reentry state so subsequent bars don't attempt re-entry.
+                self._clear_sl_reentry()
             return intent
 
         # Daily / weekly today-expiry: exit + re-enter next listed daily.
@@ -2758,6 +2897,12 @@ class DirectionalOptionSelling(DosHtfMixin, DosTrailSlMixin, IndiaMktMixins, Del
         if sym not in SUPPORTED_UNDERLYINGS:
             return None
         self._bind_symbol(sym)
+
+        # End-of-day reset at 17:30 IST — clear all position state for next day.
+        now_ist = self._closed_bar_time_ist(candle)
+        if now_ist.time() >= EOD_RESET_TIME:
+            self._daily_reset(now_ist)
+
         tf = self._candle_timeframe(candle)
         tf_l = tf.lower()
         # 1D closed bars: trail HTF sleeves only.

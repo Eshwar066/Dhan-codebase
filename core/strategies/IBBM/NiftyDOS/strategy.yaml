@@ -1,0 +1,117 @@
+id: NiftyDOS
+implementation:
+  module: core.strategies.IBBM.NiftyDOS.NiftyDOS
+  class: NiftyDOS
+instrument: OPTION
+allowed_modes:
+- BACKTEST
+- PAPER
+- LIVE
+broker:
+  venue: KOTAK
+  api: KOTAK
+symbols:
+- NIFTY
+exchange: NSE
+timeframe: '30'
+schedule:
+  eval_mode: live_feed
+data:
+  backtest:
+    data:
+      option_chain:
+        exchange: NSE
+        interval: '30'
+        segment: OPT
+        api: KOTAK
+        expiry_flag: WEEK
+  paper:
+    data:
+      option_chain:
+        exchange: NSE
+        interval: '30'
+        segment: OPT
+        api: KOTAK
+        expiry_flag: WEEK
+  live:
+    data:
+      option_chain:
+        exchange: NSE
+        interval: '1'
+        segment: OPT
+        api: KOTAK
+        expiry_flag: WEEK
+profile:
+  live:
+    exchange: INDEX
+    sector: 'YES'
+  backtest:
+    start_date: '2026-01-01'
+    end_date: '2026-08-19'
+    timeframe: '30'
+    exchange: INDEX
+    sector: 'YES'
+dependencies:
+  mixins:
+  - IndiaMktMixins
+  required_context:
+  - option_chain
+  expiry_type: WEEKLY
+  meta_key: nifty_dos
+
+params:
+  supertrend_atr_period: 16
+  supertrend_multiplier: 2.0
+  ma_period: 9
+  adx_period: 14
+  premium_min: 80
+  premium_max: 105
+  hedge_distance_points: 500
+  weekly_expiry_weekday: 1
+  hedge_rollover_days_before_expiry: 1
+
+  # TP/SL parameters (percentage of capital deployed for the hedged structure)
+  call_sl_pct: 3.5
+  call_tp_pct: 3.7
+  put_sl_pct: 3.5
+  put_tp_pct: 3.7
+
+  # Capital per lot for the hedged structure (fallback if broker margin calculation unavailable).
+  # When broker supports calculate_structure_margin, the actual hedged margin with
+  # hedge benefit is used. This fallback approximates SPAN margin for MAIN + HEDGE.
+  margin_per_lot: 70000
+
+  # Reentry parameters
+  reentry_adx_threshold: 25
+  eod_exit_pct: 3.0
+
+event_no_trade_dates: []
+
+documentation:
+  title: Nifty-DOS (Supertrend + MA9 + ADX Directional Option Selling)
+  overview: >
+    NIFTY 30m Supertrend(16, 2) directional option selling with MA9 trend filter and ADX strength confirmation.
+    On Supertrend green (bullish): SELL OTM PUT with premium 80-105.
+    On Supertrend red (bearish): SELL OTM CALL with premium 80-105.
+    If current weekly has no OTM strike in premium band, rolls to next weekly expiry.
+    Hedge: 500 points OTM from MAIN on same weekly expiry.
+    Rollover: 1 trading day before weekly expiry.
+    No new entries on NSE holidays, event_no_trade_dates, or weekly expiry day.
+  rules: |
+    - Timeframe: 30m, closed-bar eval
+    - Studies: Supertrend(ATR=16, Mult=2), SMA 9, ADX 14
+    - Supertrend Green (close > Supertrend line) + MA9 bullish + ADX > 20 → SELL OTM PUT
+    - Supertrend Red (close < Supertrend line) + MA9 bearish + ADX > 20 → SELL OTM CALL
+    - Main premium band: 80–105 (OTM only); else next weekly same band
+    - Hedge: same side, same weekly expiry, 500 points OTM from MAIN
+      (CALL short K → long K+500; PUT short K → long K-500)
+    - Rollover: 1 trading day before weekly expiry
+    - No new entries on NSE holidays, event_no_trade_dates, or weekly expiry day
+  run_command: python -m run.main --engine-id nifty_dos
+  generate_readme: false
+
+subscriptions:
+  BarClosed:
+    enabled: true
+    timeframes: ['30', '5']
+    symbols: [NIFTY]

@@ -85,6 +85,7 @@ class DhanDataProvider(IDataProvider):
         expiry_flag: str,
         expiry_date=None,
         expiry_match_same_month: bool = False,
+        spot_fallback=None,
     ) -> Optional[dict]:
         return self._source.get_live_option_chain(
             symbol=symbol,
@@ -94,6 +95,7 @@ class DhanDataProvider(IDataProvider):
             expiry_flag=expiry_flag,
             expiry_date=expiry_date,
             expiry_match_same_month=expiry_match_same_month,
+            spot_fallback=spot_fallback,
         )
 
     def get_expired_optionchain(

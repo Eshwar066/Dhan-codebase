@@ -16,13 +16,58 @@ logger = logging.getLogger(__name__)
 
 IST = ZoneInfo("Asia/Kolkata")
 
+# Strategies whose session rules and trade logs use IST wall clock (NSE cash/FNO).
+INDIAN_IST_STRATEGIES = frozenset(
+    {
+        "NiftyDOS",
+        "NiftySMA9Weekly",
+        "LEAPS_RSI",
+        "BankNiftyBTST",
+    }
+)
+
+
+def wall_clock_ist() -> datetime:
+    return datetime.now(IST)
+
+
+def resolve_fill_candle_ts(
+    candle_ts: Any,
+    *,
+    strategy: Optional[str] = None,
+) -> datetime:
+    """Return fill/bar time for OMS hooks; IST wall clock for Indian index strategies when missing."""
+    if candle_ts is not None:
+        try:
+            if not bool(pd.isna(candle_ts)):
+                return candle_ts
+        except (TypeError, ValueError):
+            return candle_ts
+    if strategy in INDIAN_IST_STRATEGIES:
+        return wall_clock_ist()
+    return datetime.now(timezone.utc)
+
+
+def normalize_fill_side(side: Any) -> Optional[str]:
+    """Map broker/intent side aliases to BUY/SELL. None if missing or unknown.
+
+    Empty/unknown must not default to SELL — that flipped hedge BUY fills to shorts
+    and a later REST BUY then flattened the local book.
+    """
+    s = str(side or "").strip().upper()
+    if s in ("BUY", "B", "LONG", "1"):
+        return "BUY"
+    if s in ("SELL", "S", "SHORT", "-1"):
+        return "SELL"
+    return None
+
 
 def _fill_clock_for_trade_log(fill_ts: Any) -> Optional[datetime]:
     """
     Normalize bar/fill time to **IST naive** for trade_log CSV display.
 
-    Naive inputs are interpreted as UTC because the engine canonicalizes
-    ``candle['timestamp']`` to naive UTC (see ``_normalize_candle_timestamp_utc_naive``).
+    Naive inputs are interpreted as UTC (engine ``candle['timestamp']`` convention).
+    Timezone-aware inputs (e.g. NiftyDOS intents) are converted to IST.
     """
     if fill_ts is None:
         return None
@@ -105,7 +150,10 @@ class Position:
         return f"<Position symbol={sym} qty={self.net_qty} avg={self.avg_price}>"
 
     def update_fill(self, side, qty, price, fill_ts=None):
-        signed_qty = qty if side == "BUY" else -qty
+        side_n = normalize_fill_side(side)
+        if side_n is None:
+            raise ValueError(f"update_fill requires BUY/SELL, got {side!r}")
+        signed_qty = qty if side_n == "BUY" else -qty
 
         # -------- ENTRY --------
         if self.net_qty == 0:
@@ -255,10 +303,20 @@ class PositionManager:
         if missing_candle_ts:
             # REST fills can carry pandas.NaT. Hooks require a real timestamp for
             # slot keys, expiry selection, and deferred/re-entry intent creation.
-            candle_ts = datetime.now(timezone.utc)
+            candle_ts = resolve_fill_candle_ts(None, strategy=strategy)
 
         hook_main_entry = None
         hook_main_exit = None
+        side_n = normalize_fill_side(side)
+        if side_n is None:
+            logger.warning(
+                "on_fill skipped: missing/invalid side=%r symbol=%s intent_id=%s",
+                side,
+                getattr(instrument, "trading_symbol", None),
+                intent_id,
+            )
+            return False, 0.0
+        side = side_n
         with self._lock:
             sym = instrument.trading_symbol
             lot_size = instrument.lot_size
@@ -374,7 +432,7 @@ class PositionManager:
                 # Fallback to wall clock so REST fills without candle_ts still stamp a time.
                 candle_ts_eff = candle_ts
                 if candle_ts_eff is None:
-                    candle_ts_eff = datetime.now(tz=timezone.utc)
+                    candle_ts_eff = resolve_fill_candle_ts(None, strategy=strategy)
                 candle_ts_ist = _fill_clock_for_trade_log(candle_ts_eff)
                 ts_str = (
                     candle_ts_ist.strftime("%Y-%m-%d %H:%M")
@@ -495,6 +553,13 @@ class PositionManager:
 
             if self.open_positions_logger is not None and prev_qty != new_qty:
                 _pm = self.position_metadata.get(sym) or {}
+                strategy_meta = self._strategy_meta_with_contract(
+                    _pm.get("strategy_meta"), pos
+                )
+                if strategy_meta is not None:
+                    _pm = dict(_pm)
+                    _pm["strategy_meta"] = strategy_meta
+                    self.position_metadata[sym] = _pm
                 self.open_positions_logger.record_fill(
                     symbol=sym,
                     prev_qty=int(prev_qty),
@@ -504,7 +569,7 @@ class PositionManager:
                     structure_id=structure_id,
                     tag=tag,
                     intent_id=intent_id,
-                    strategy_meta=_pm.get("strategy_meta"),
+                    strategy_meta=strategy_meta,
                 )
 
             position_closed = prev_qty != 0 and new_qty == 0
@@ -679,7 +744,7 @@ class PositionManager:
             if (rec.get("action") or payload.get("action") or "") != "ENTRY":
                 continue
             tag = str(rec.get("tag") or payload.get("tag") or "MAIN").upper()
-            if tag != "MAIN":
+            if tag not in ("MAIN", "HEDGE"):
                 continue
             inst = rec.get("instrument")
             sym = getattr(inst, "trading_symbol", None) or payload.get("symbol")
@@ -768,12 +833,94 @@ class PositionManager:
             for sym, slices in acc.items():
                 self._structure_slices[sym] = dict(slices)
 
-    def _merge_open_positions_csv_dict(self, file_meta: dict) -> None:
+    @staticmethod
+    def symbol_underlying_root(trading_symbol: str) -> str:
+        """Best-effort underlying root (BANKNIFTY before NIFTY)."""
+        compact = "".join(
+            ch for ch in str(trading_symbol or "").upper() if ch.isalnum()
+        )
+        if compact.startswith("BANKNIFTY"):
+            return "BANKNIFTY"
+        if compact.startswith("FINNIFTY"):
+            return "FINNIFTY"
+        if compact.startswith("MIDCPNIFTY"):
+            return "MIDCPNIFTY"
+        if compact.startswith("NIFTY"):
+            return "NIFTY"
+        if compact.startswith("SENSEX"):
+            return "SENSEX"
+        if compact.startswith("BANKEX"):
+            return "BANKEX"
+        return ""
+
+    # Strategy CSV / reconcile claim domains. Prevents e.g. BankNiftyBTST from
+    # adopting bare NIFTY LEAPS legs after ownership metadata was lost.
+    _STRATEGY_CLAIM_UNDERLYINGS: Dict[str, tuple] = {
+        "BankNiftyBTST": ("BANKNIFTY",),
+        "LEAPS_RSI": ("NIFTY",),
+        "NiftySMA9Weekly": ("NIFTY",),
+        "NiftyIntradayMagicalLine": ("NIFTY",),
+    }
+
+    @classmethod
+    def strategy_may_claim_symbol(cls, strategy: Optional[str], trading_symbol: str) -> bool:
+        strat = str(strategy or "").strip()
+        if not strat:
+            return False
+        allowed = cls._STRATEGY_CLAIM_UNDERLYINGS.get(strat)
+        if not allowed:
+            return True
+        root = cls.symbol_underlying_root(trading_symbol)
+        return bool(root) and root in allowed
+
+    @classmethod
+    def _ownership_row_compatible_with_folder(
+        cls, folder_name: str, trading_symbol: str, meta: dict
+    ) -> bool:
+        """Drop poisoned rows (e.g. NIFTY PE parked under BankNiftyBTST CSV)."""
+        folder = str(folder_name or "").strip()
+        strat = str((meta or {}).get("strategy") or "").strip()
+        if strat and folder and strat != folder:
+            # Strategy-named folders must not contribute another strategy's rows.
+            if folder in cls._STRATEGY_CLAIM_UNDERLYINGS or strat in cls._STRATEGY_CLAIM_UNDERLYINGS:
+                return False
+        claim_strat = strat or folder
+        if claim_strat and not cls.strategy_may_claim_symbol(claim_strat, trading_symbol):
+            return False
+        return True
+
+    def _merge_open_positions_csv_dict(
+        self, file_meta: dict, *, protect_existing_strategy: bool = True
+    ) -> None:
         for sym, meta in file_meta.items():
+            if not meta:
+                continue
             cur = dict(self.position_metadata.get(sym) or {})
+            cur_strat = str(cur.get("strategy") or "").strip()
+            incoming_strat = str(meta.get("strategy") or "").strip()
+            if (
+                protect_existing_strategy
+                and cur_strat
+                and incoming_strat
+                and cur_strat != incoming_strat
+            ):
+                # Another strategy's CSV must not steal ownership.
+                continue
             for k, v in meta.items():
-                if v not in (None, ""):
-                    cur[k] = v
+                if v in (None, ""):
+                    continue
+                existing = cur.get(k)
+                if (
+                    protect_existing_strategy
+                    and k in ("strategy", "structure_id", "tag", "intent_id")
+                    and existing not in (None, "")
+                    and str(existing) != str(v)
+                    and cur_strat
+                    and incoming_strat
+                    and cur_strat != incoming_strat
+                ):
+                    continue
+                cur[k] = v
             self.position_metadata[sym] = cur
 
     def merge_ownership_from_all_strategy_open_positions_csvs(
@@ -819,10 +966,22 @@ class PositionManager:
             file_meta = load_position_metadata_from_csv(path)
             if not file_meta:
                 continue
-            before = len(self.position_metadata)
-            self._merge_open_positions_csv_dict(file_meta)
-            merged += max(0, len(file_meta))
-            _ = before
+            filtered = {
+                sym: meta
+                for sym, meta in file_meta.items()
+                if self._ownership_row_compatible_with_folder(name, sym, meta or {})
+            }
+            skipped = len(file_meta) - len(filtered)
+            if skipped:
+                logger.warning(
+                    "Skipping %s incompatible ownership row(s) from %s",
+                    skipped,
+                    path,
+                )
+            if not filtered:
+                continue
+            self._merge_open_positions_csv_dict(filtered)
+            merged += len(filtered)
         # Also re-apply ownership onto any already-open positions that lost meta.
         applied = 0
         with self._lock:
@@ -911,8 +1070,9 @@ class PositionManager:
                 opt_type, strike = self._extract_option_hint(
                     sym, row.get("structure_id")
                 )
+                expiry, lookup_sym = self._contract_hint_from_open_row(row, sym)
                 inst = instrument_store.intent_creation_details(
-                    sym, exchange, None, opt_type, strike
+                    lookup_sym, exchange, expiry, opt_type, strike
                 )
                 if inst is None:
                     logger.warning(
@@ -964,6 +1124,52 @@ class PositionManager:
         return restored
 
     @staticmethod
+    def _strategy_meta_with_contract(strategy_meta, pos) -> Optional[dict]:
+        """Keep the filled contract's calendar expiry. Compact symbols omit the day."""
+        meta = dict(strategy_meta) if isinstance(strategy_meta, dict) else {}
+        inst = getattr(pos, "instrument", None)
+        if inst is None:
+            return meta or None
+        exp = getattr(inst, "expiry", None)
+        if exp is not None and not meta.get("expiry"):
+            try:
+                meta["expiry"] = pd.Timestamp(exp).date().isoformat()
+            except (TypeError, ValueError):
+                pass
+        custom = str(getattr(inst, "custom_symbol", "") or "").strip()
+        if custom and not meta.get("custom_symbol"):
+            meta["custom_symbol"] = custom
+        sec = getattr(inst, "instrument_id", None)
+        if sec not in (None, "") and not meta.get("security_id"):
+            meta["security_id"] = str(sec)
+        return meta or None
+
+    @staticmethod
+    def _contract_hint_from_open_row(row: dict, symbol: str) -> tuple[Optional[str], str]:
+        """Expiry and lookup symbol from a CSV row. Compact ``NIFTY-Oct2026-…`` is not a date."""
+        raw = row.get("strategy_meta") or ""
+        meta = None
+        if isinstance(raw, dict):
+            meta = raw
+        elif str(raw).strip():
+            try:
+                import json
+
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    meta = parsed
+            except json.JSONDecodeError:
+                meta = None
+        expiry = None
+        lookup = str(symbol or "").strip()
+        if isinstance(meta, dict):
+            expiry = meta.get("expiry") or None
+            custom = str(meta.get("custom_symbol") or "").strip()
+            if custom:
+                lookup = custom
+        return expiry, lookup
+
+    @staticmethod
     def _extract_option_hint(
         trading_symbol: str, structure_id: Optional[str]
     ) -> tuple[Optional[str], Optional[int]]:
@@ -997,6 +1203,84 @@ class PositionManager:
                     except (TypeError, ValueError):
                         continue
         return opt, strike
+
+    def _detect_hedge_position(
+        self,
+        sym: str,
+        pos: "Position",
+        broker_positions: Dict[str, Any],
+        strategy: Optional[str] = None,
+    ) -> bool:
+        """
+        Detect if a position is a HEDGE leg based on structure characteristics.
+
+        Hedge is a LONG option with:
+        - Same underlying, expiry, option_type as MAIN (short)
+        - Strike offset by hedge_distance_points (CE: +, PE: -) from MAIN
+        - Positive qty (long)
+
+        This fixes metadata for positions loaded from broker where CSV has wrong tag.
+        """
+        if pos.net_qty <= 0:  # Hedge must be long
+            return False
+
+        if not pos.instrument:
+            return False
+
+        hedge_strike = getattr(pos.instrument, "strike", None)
+        option_type = getattr(pos.instrument, "option_type", "")
+        hedge_expiry = getattr(pos.instrument, "expiry", None)
+
+        if hedge_strike is None or not option_type:
+            return False
+
+        try:
+            hedge_strike_f = float(hedge_strike)
+        except (TypeError, ValueError):
+            return False
+
+        # Standard hedge distance (could be configurable)
+        hedge_distance = 500
+        # Calculate expected MAIN strike from hedge strike
+        if option_type.upper() in ("CE", "CALL"):
+            expected_main_strike = hedge_strike_f - hedge_distance
+        else:
+            expected_main_strike = hedge_strike_f + hedge_distance
+
+        # Look for matching MAIN position (short) in broker positions
+        for b_sym, bp in broker_positions.items():
+            b_qty = int(bp.get("qty") or 0)
+            if b_qty >= 0:  # MAIN must be short
+                continue
+
+            b_opt, b_strike = self._extract_option_hint(b_sym, None)
+            if b_opt is None or b_strike is None:
+                continue
+
+            if b_opt.upper() != option_type.upper():
+                continue
+
+            # Check if broker position strike matches expected MAIN strike
+            if abs(float(b_strike) - expected_main_strike) > 1:
+                continue
+
+            # Same-expiry weekly hedges (NiftyDOS). LEAPS calendar hedges
+            # (Oct vs Dec) skip this check when expiry is missing or differs.
+            b_expiry = bp.get("expiry") or bp.get("expiry_date")
+            strat_u = str(strategy or "").strip().upper()
+            calendar_ok = strat_u in ("LEAPS_RSI", "LEAPS")
+            if (
+                b_expiry
+                and hedge_expiry
+                and str(b_expiry) != str(hedge_expiry)
+                and not calendar_ok
+            ):
+                continue
+
+            # Found matching MAIN - this is HEDGE
+            return True
+
+        return False
 
     def has_open_structure(self, strategy: str, structure_id: str, tag: str) -> bool:
         tag_u = str(tag or "").upper()
@@ -1115,14 +1399,48 @@ class PositionManager:
     # ---------------------
     # BROKER RECONCILIATION
     # ---------------------
+    def _claim_strategy_for_symbol(
+        self,
+        sym: str,
+        *,
+        meta_strategy: Optional[str],
+        strategy: Optional[str],
+        claim_underlying: Optional[str] = None,
+    ) -> Optional[str]:
+        """Resolve ownership stamp for a broker-adopted / empty-strategy leg.
+
+        ``strategy`` is only applied when the symbol is in that strategy's claim
+        domain (and optional ``claim_underlying`` filter). Prevents BankNiftyBTST
+        exit reconcile from tagging orphan NIFTY LEAPS legs.
+        """
+        if meta_strategy:
+            return meta_strategy
+        strat = str(strategy or "").strip() or None
+        if not strat:
+            return None
+        if claim_underlying:
+            root = self.symbol_underlying_root(sym)
+            if root != str(claim_underlying).strip().upper():
+                return None
+        if not self.strategy_may_claim_symbol(strat, sym):
+            return None
+        return strat
+
     def reconcile_with_broker(
-        self, broker_positions, drift_threshold: int = 0, strategy: str = None
+        self,
+        broker_positions,
+        drift_threshold: int = 0,
+        strategy: str = None,
+        *,
+        claim_underlying: Optional[str] = None,
     ):
         """
         Sync PositionManager to broker truth.
         broker_positions: { symbol: { "qty": int, "avg_price": float, "segment": str, "lot_size": int } }
         drift_threshold: if |local_qty - broker_qty| > this, set trading_paused.
-        strategy: strategy name to associate with newly discovered positions.
+        strategy: strategy name to associate with newly discovered positions
+            (only when the symbol is in that strategy's claim domain).
+        claim_underlying: optional hard filter (e.g. ``BANKNIFTY``) for ``strategy``.
         """
         file_meta = None
         if self.open_positions_csv_path and os.path.isfile(
@@ -1255,13 +1573,19 @@ class PositionManager:
                 structure_id_m = meta.get("structure_id")
                 intent_id_m = meta.get("intent_id")
                 meta_strategy = meta.get("strategy")
+                claim_strategy = self._claim_strategy_for_symbol(
+                    sym,
+                    meta_strategy=meta_strategy,
+                    strategy=strategy,
+                    claim_underlying=claim_underlying,
+                )
 
                 if sym not in self.positions:
                     pos = Position(inst)
                     pos.net_qty = bqty
                     pos.avg_price = float(bp.get("avg_price", 0))
-                    pos.strategy = meta_strategy or strategy
-                    pos.tag = tag_m or ("MAIN" if meta_strategy or strategy else None)
+                    pos.strategy = claim_strategy
+                    pos.tag = tag_m or ("MAIN" if claim_strategy else None)
                     pos.structure_id = structure_id_m
                     pos.intent_id = intent_id_m
                     # Adopted broker legs must still produce complete trade_log rows on exit.
@@ -1273,6 +1597,45 @@ class PositionManager:
                             datetime.now(tz=timezone.utc)
                         )
                     self.positions[sym] = pos
+
+                    # Detect hedge position and fix metadata if CSV was wrong
+                    if (
+                        pos.net_qty > 0
+                        and claim_strategy
+                        and self._detect_hedge_position(sym, pos, broker_positions, claim_strategy)
+                    ):
+                        pos.tag = "HEDGE"
+                        # Find the MAIN position to get its structure_id
+                        for b_sym, bp in broker_positions.items():
+                            b_qty = int(bp.get("qty") or 0)
+                            if b_qty >= 0:
+                                continue
+                            b_opt, b_strike = self._extract_option_hint(b_sym, None)
+                            if b_opt and b_strike:
+                                main_strike = getattr(pos.instrument, "strike", None)
+                                try:
+                                    if main_strike is not None and abs(float(b_strike) - float(main_strike)) < 1:
+                                        # Found MAIN - use its structure_id if available
+                                        b_meta = self.position_metadata.get(b_sym, {})
+                                        if b_meta.get("structure_id"):
+                                            pos.structure_id = b_meta["structure_id"]
+                                            pos.intent_id = b_meta.get("intent_id")
+                                        break
+                                except (TypeError, ValueError):
+                                    pass
+                        # Update position_metadata with corrected hedge info
+                        self._merge_position_metadata(
+                            sym,
+                            strategy=pos.strategy,
+                            structure_id=pos.structure_id,
+                            tag="HEDGE",
+                            intent_id=pos.intent_id,
+                        )
+                        logger.info(
+                            "Reconcile: detected HEDGE leg for %s, fixed tag/structure_id",
+                            sym,
+                        )
+
                     if pos.strategy:
                         self.strategy_pos[pos.strategy][sym] = int(bqty)
                     continue
@@ -1332,14 +1695,14 @@ class PositionManager:
 
                 if not getattr(local, "tag", None):
                     local.tag = tag_m or (
-                        "MAIN" if (meta_strategy or strategy or local.strategy) else None
+                        "MAIN" if (claim_strategy or local.strategy) else None
                     )
                 if not getattr(local, "structure_id", None):
                     local.structure_id = structure_id_m
                 if not getattr(local, "intent_id", None):
                     local.intent_id = intent_id_m
                 if not getattr(local, "strategy", None):
-                    local.strategy = meta_strategy or strategy
+                    local.strategy = claim_strategy
                 if int(local.net_qty or 0) != 0:
                     if not getattr(local, "trade_id", None):
                         local.trade_id = f"T-{uuid.uuid4().hex[:10]}"
@@ -1378,6 +1741,69 @@ class PositionManager:
                         getattr(pos, "net_qty", None),
                     )
                 self.positions.pop(sym, None)
+
+            self._pair_orphan_hedge_legs_locked()
+
+    def _pair_orphan_hedge_legs_locked(self) -> None:
+        """Attach untagged long options to the unique short MAIN on the same underlying.
+
+        Recovers LEAPS calendar hedges after a false local close wiped metadata.
+        Does nothing when more than one owned MAIN exists for that underlying.
+        """
+        mains_by_root: Dict[str, list] = {}
+        for sym, pos in self.positions.items():
+            if int(getattr(pos, "net_qty", 0) or 0) >= 0:
+                continue
+            strat = str(getattr(pos, "strategy", None) or "").strip()
+            sid = str(getattr(pos, "structure_id", None) or "").strip()
+            if not strat or not sid:
+                continue
+            tag_u = str(getattr(pos, "tag", None) or "MAIN").upper()
+            if tag_u not in ("MAIN",):
+                continue
+            root = self.symbol_underlying_root(sym)
+            if not root:
+                continue
+            mains_by_root.setdefault(root, []).append((sym, pos))
+
+        for sym, pos in list(self.positions.items()):
+            if int(getattr(pos, "net_qty", 0) or 0) <= 0:
+                continue
+            existing_sid = str(getattr(pos, "structure_id", None) or "").strip()
+            existing_strat = str(getattr(pos, "strategy", None) or "").strip()
+            existing_tag = str(getattr(pos, "tag", None) or "").upper()
+            if existing_sid and existing_strat and existing_tag in ("HEDGE", "MAIN"):
+                continue
+            root = self.symbol_underlying_root(sym)
+            candidates = mains_by_root.get(root) or []
+            if len(candidates) != 1:
+                continue
+            main_sym, main = candidates[0]
+            h_opt, _h_strike = self._extract_option_hint(sym, None)
+            m_opt, _m_strike = self._extract_option_hint(main_sym, None)
+            if h_opt and m_opt and str(h_opt).upper() != str(m_opt).upper():
+                continue
+            pos.strategy = getattr(main, "strategy", None)
+            pos.structure_id = getattr(main, "structure_id", None)
+            pos.tag = "HEDGE"
+            if not getattr(pos, "intent_id", None):
+                meta_h = self.position_metadata.get(sym) or {}
+                pos.intent_id = meta_h.get("intent_id")
+            self._merge_position_metadata(
+                sym,
+                strategy=pos.strategy,
+                structure_id=pos.structure_id,
+                tag="HEDGE",
+                intent_id=pos.intent_id,
+            )
+            if pos.strategy:
+                self.strategy_pos[pos.strategy][sym] = int(pos.net_qty)
+            logger.info(
+                "Reconcile: paired orphan long %s as HEDGE of %s structure=%s",
+                sym,
+                main_sym,
+                pos.structure_id,
+            )
 
     def sync_symbol_flat_at_broker(
         self, trading_symbol: str, *, reason: str = "", clear_metadata: bool = False

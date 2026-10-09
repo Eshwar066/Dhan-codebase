@@ -8,8 +8,8 @@ allowed_modes:
 - PAPER
 - LIVE
 broker:
-  venue: DHAN
-  api: DHAN
+  venue: KOTAK
+  api: KOTAK
 symbols:
 - NIFTY
 exchange: NSE
@@ -23,7 +23,7 @@ data:
         exchange: NSE
         interval: '120'
         segment: OPT
-        api: DHAN
+        api: KOTAK
         expiry_flag: WEEK
   paper:
     data:
@@ -31,7 +31,7 @@ data:
         exchange: NSE
         interval: '120'
         segment: OPT
-        api: DHAN
+        api: KOTAK
         expiry_flag: WEEK
   live:
     data:
@@ -39,7 +39,7 @@ data:
         exchange: NSE
         interval: '1'
         segment: OPT
-        api: DHAN
+        api: KOTAK
         expiry_flag: WEEK
 profile:
   live:

@@ -1,19 +1,57 @@
 """
 Kotak Neo live market feed implementing RealtimeFeed.
 
-Uses NeoAPI.subscribe / NeoWebSocket callbacks; normalizes ticks onto the
-CandleAggregator queue (same shape as DhanWebSocketFeed).
+Uses NeoAPI.create_websocket() (SFeed, neo_api_client >= 2.2.0) on a
+background asyncio thread; normalizes ticks onto the CandleAggregator queue
+(same shape as DhanWebSocketFeed).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
 from core.data.feeds.base_feed import RealtimeFeed
 
 logger = logging.getLogger(__name__)
+
+
+def _as_dict(message: Any) -> Any:
+    """Best-effort convert SFeed pydantic models / envelopes to dict."""
+    if message is None:
+        return None
+    if isinstance(message, dict):
+        return message
+    dump = getattr(message, "model_dump", None)
+    if callable(dump):
+        try:
+            return dump(mode="python")
+        except TypeError:
+            return dump()
+    # Plain object with attributes
+    out: Dict[str, Any] = {}
+    for key in (
+        "instrument_token",
+        "exchange_segment",
+        "trading_symbol",
+        "last_traded_price",
+        "volume_traded_today",
+        "last_trade_qty",
+        "last_trade_time",
+        "last_update_time",
+        "ltp",
+        "tok",
+        "token",
+        "symbol",
+        "trdSym",
+        "data",
+    ):
+        if hasattr(message, key):
+            out[key] = getattr(message, key)
+    return out or None
 
 
 def normalize_kotak_tick(message: Any, symbol_by_token: Dict[str, str]) -> Optional[Dict[str, Any]]:
@@ -24,16 +62,16 @@ def normalize_kotak_tick(message: Any, symbol_by_token: Dict[str, str]) -> Optio
     if message is None:
         return None
     if isinstance(message, list):
-        # Prefer first parseable item
         for item in message:
             tick = normalize_kotak_tick(item, symbol_by_token)
             if tick:
                 return tick
         return None
+
+    message = _as_dict(message)
     if not isinstance(message, dict):
         return None
 
-    # Unwrap common envelopes
     data = message.get("data") if isinstance(message.get("data"), dict) else message
     if isinstance(message.get("data"), list) and message["data"]:
         return normalize_kotak_tick(message["data"], symbol_by_token)
@@ -48,7 +86,7 @@ def normalize_kotak_tick(message: Any, symbol_by_token: Dict[str, str]) -> Optio
     ).strip()
     symbol = (
         symbol_by_token.get(token)
-        or str(data.get("symbol") or data.get("trdSym") or data.get("tsym") or "").strip()
+        or str(data.get("symbol") or data.get("trdSym") or data.get("tsym") or data.get("trading_symbol") or "").strip()
     )
     if not symbol and token:
         symbol = symbol_by_token.get(token, "")
@@ -57,12 +95,14 @@ def normalize_kotak_tick(message: Any, symbol_by_token: Dict[str, str]) -> Optio
 
     price = None
     for key in (
+        "last_traded_price",
         "ltp",
         "LTP",
         "last_price",
         "lastPrice",
         "lp",
         "close",
+        "close_price",
         "avgPrice",
         "ap",
     ):
@@ -76,7 +116,7 @@ def normalize_kotak_tick(message: Any, symbol_by_token: Dict[str, str]) -> Optio
         return None
 
     volume = 0.0
-    for key in ("volume", "v", "vol", "ltq", "last_quantity"):
+    for key in ("volume_traded_today", "volume", "v", "vol", "ltq", "last_quantity", "last_trade_qty"):
         if data.get(key) is not None:
             try:
                 volume = float(data.get(key) or 0)
@@ -85,7 +125,7 @@ def normalize_kotak_tick(message: Any, symbol_by_token: Dict[str, str]) -> Optio
                 continue
 
     ts = time.time()
-    for key in ("timestamp", "t", "ltt", "last_trade_time", "ft"):
+    for key in ("timestamp", "t", "ltt", "last_trade_time", "last_update_time", "ft"):
         raw = data.get(key)
         if raw is None:
             continue
@@ -108,7 +148,7 @@ def normalize_kotak_tick(message: Any, symbol_by_token: Dict[str, str]) -> Optio
 
 
 class KotakWebSocketFeed(RealtimeFeed):
-    """Realtime Neo market feed → optional tick queue for CandleAggregator."""
+    """Realtime Neo SFeed market feed → optional tick queue for CandleAggregator."""
 
     def __init__(
         self,
@@ -133,6 +173,10 @@ class KotakWebSocketFeed(RealtimeFeed):
         self._connected = False
         self._last_ticker: Dict[str, Dict[str, Any]] = {}
         self._symbol_by_token: Dict[str, str] = {}
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._ws: Any = None
         for inst in self.instruments:
             tok = str(inst.get("instrument_token") or inst.get("token") or "").strip()
             sym = str(inst.get("symbol") or "").strip().upper()
@@ -142,7 +186,7 @@ class KotakWebSocketFeed(RealtimeFeed):
     def set_tick_queue(self, queue: Any) -> None:
         self._tick_queue = queue
 
-    def _on_message(self, message: Any) -> None:
+    def _emit_tick(self, message: Any) -> None:
         tick = normalize_kotak_tick(message, self._symbol_by_token)
         if not tick:
             return
@@ -163,78 +207,115 @@ class KotakWebSocketFeed(RealtimeFeed):
                     if self._debug_mode:
                         logger.debug("Kotak tick queue full/drop: %s", e)
 
-    def _on_error(self, message: Any) -> None:
-        logger.warning("KotakWebSocketFeed error: %s", message)
-        self._connected = False
+    def _build_ws_tokens(self) -> tuple[List[Any], List[Any]]:
+        from neo_api_client.websocket.feed import WsToken
 
-    def _on_close(self, message: Any = None) -> None:
-        logger.info("KotakWebSocketFeed closed: %s", message)
-        self._connected = False
+        index_tokens: List[Any] = []
+        other_tokens: List[Any] = []
+        for inst in self.instruments:
+            tok = str(inst.get("instrument_token") or inst.get("token") or "").strip()
+            seg = str(inst.get("exchange_segment") or "nse_cm").strip()
+            if not tok:
+                continue
+            ws_tok = WsToken(seg, tok)
+            if inst.get("isIndex"):
+                index_tokens.append(ws_tok)
+            else:
+                other_tokens.append(ws_tok)
+        return index_tokens, other_tokens
 
-    def _on_open(self, message: Any = None) -> None:
-        logger.info("KotakWebSocketFeed open")
-        self._connected = True
+    async def _run_feed(self) -> None:
+        index_tokens, other_tokens = self._build_ws_tokens()
+        if not index_tokens and not other_tokens:
+            logger.warning("KotakWebSocketFeed: no tokens to subscribe")
+            return
+
+        while not self._stop.is_set():
+            try:
+                async with self._api.create_websocket() as ws:
+                    self._ws = ws
+                    if index_tokens:
+                        try:
+                            await ws.snapshot(index_tokens, intent="index")
+                        except Exception as e:
+                            logger.debug("Kotak index snapshot: %s", e)
+                        await ws.subscribe_index(index_tokens)
+                    if other_tokens:
+                        try:
+                            await ws.snapshot(other_tokens, intent="scrips")
+                        except Exception as e:
+                            logger.debug("Kotak scrips snapshot: %s", e)
+                        await ws.subscribe_scrips(other_tokens)
+                    self._connected = True
+                    logger.info(
+                        "KotakWebSocketFeed SFeed subscribed index=%s other=%s",
+                        len(index_tokens),
+                        len(other_tokens),
+                    )
+                    async for msg in ws:
+                        if self._stop.is_set():
+                            break
+                        self._emit_tick(msg)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._connected = False
+                if self._stop.is_set():
+                    break
+                logger.warning("KotakWebSocketFeed disconnected: %s; reconnecting in 5s", e)
+                await asyncio.sleep(5.0)
+            finally:
+                self._ws = None
+                self._connected = False
+
+    def _thread_main(self) -> None:
+        loop = asyncio.new_event_loop()
+        self._loop = loop
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._run_feed())
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+            self._loop = None
+            self._connected = False
 
     def start(self) -> None:
         if not self.instruments:
             logger.warning("KotakWebSocketFeed start skipped: no instruments")
             return
-        self._api.on_message = self._on_message
-        self._api.on_error = self._on_error
-        self._api.on_close = self._on_close
-        self._api.on_open = self._on_open
-
-        # Group by isIndex for Neo subscribe API
-        index_tokens = []
-        other_tokens = []
-        for inst in self.instruments:
-            tok = {
-                "instrument_token": str(
-                    inst.get("instrument_token") or inst.get("token") or ""
-                ),
-                "exchange_segment": str(
-                    inst.get("exchange_segment") or "nse_cm"
-                ),
-            }
-            if not tok["instrument_token"]:
-                continue
-            if inst.get("isIndex"):
-                index_tokens.append(tok)
-            else:
-                other_tokens.append(tok)
-
-        try:
-            if index_tokens:
-                self._api.subscribe(index_tokens, isIndex=True, isDepth=False)
-            if other_tokens:
-                self._api.subscribe(other_tokens, isIndex=False, isDepth=False)
-            self._connected = True
-            logger.info(
-                "KotakWebSocketFeed subscribed index=%s other=%s",
-                len(index_tokens),
-                len(other_tokens),
-            )
-        except Exception as e:
-            self._connected = False
-            logger.exception("KotakWebSocketFeed subscribe failed: %s", e)
-            raise
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._thread_main,
+            name="KotakWebSocketFeed",
+            daemon=True,
+        )
+        self._thread.start()
+        # Brief wait so factory can observe early auth/connect failures in logs
+        deadline = time.time() + 3.0
+        while time.time() < deadline and not self._connected and self._thread.is_alive():
+            time.sleep(0.05)
+        if not self._thread.is_alive():
+            raise RuntimeError("KotakWebSocketFeed thread exited during start")
+        logger.info("KotakWebSocketFeed thread started")
 
     def stop(self) -> None:
-        try:
-            tokens = [
-                {
-                    "instrument_token": str(
-                        i.get("instrument_token") or i.get("token") or ""
-                    ),
-                    "exchange_segment": str(i.get("exchange_segment") or "nse_cm"),
-                }
-                for i in self.instruments
-                if i.get("instrument_token") or i.get("token")
-            ]
-            if tokens and hasattr(self._api, "un_subscribe"):
-                self._api.un_subscribe(tokens)
-        except Exception as e:
-            logger.debug("KotakWebSocketFeed unsubscribe: %s", e)
+        self._stop.set()
+        loop = self._loop
+        ws = self._ws
+        if loop and ws is not None:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(ws.close(), loop)
+                fut.result(timeout=5.0)
+            except Exception as e:
+                logger.debug("KotakWebSocketFeed close: %s", e)
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=8.0)
+        self._thread = None
         self._connected = False
 
     def is_connected(self) -> bool:

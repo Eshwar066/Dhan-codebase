@@ -60,6 +60,7 @@ class BaseEngine:
             recent_candles=recent_candles,
             intent_store=intent_store,
             order_router=order_router,
+            engine_logger=getattr(self, "engine_logger", None),
         )
 
         # Lag diagnosis: data delay before strategy (set ALGO_LAG_DIAG=1). See cursor.md
@@ -91,6 +92,7 @@ class BaseEngine:
             recent_candles=recent_candles,
             intent_store=intent_store,
             order_router=order_router,
+            engine_logger=getattr(self, "engine_logger", None),
         )
 
     def evaluate_sim_broker_stops(self, candle: Dict[str, Any], ctx: Any) -> None:

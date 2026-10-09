@@ -52,6 +52,9 @@ class StrategyContext:
     intent_store: Optional[Any] = None
     order_router: Optional[Any] = None
 
+    # ---- Optional; EngineLogger for operator Telegram (notify_operator) ----
+    engine_logger: Optional[Any] = None
+
     def get_expiry_list(self) -> Optional[List[Any]]:
         """Safe access for expiry_list (may not be set yet)."""
         return self.expiry_list

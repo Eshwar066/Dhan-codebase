@@ -310,6 +310,7 @@ class DeltaWebSocket:
         on_candle: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         on_feed_stall: Optional[Callable[[float], None]] = None,
         on_feed_recovered: Optional[Callable[[], None]] = None,
+        on_unavailable: Optional[Callable[[str], None]] = None,
         on_user_trade: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
         self.api_key = api_key
@@ -327,6 +328,7 @@ class DeltaWebSocket:
         self.on_close_cb = on_close
         self.on_feed_stall = on_feed_stall
         self.on_feed_recovered = on_feed_recovered
+        self.on_unavailable = on_unavailable
         self.on_user_trade = on_user_trade
 
         self._ws: Optional[websocket.WebSocketApp] = None
@@ -340,6 +342,7 @@ class DeltaWebSocket:
         self._connect_failures = 0
         self._gave_up = False
         self._reconnecting = False
+        self._unavailable_notified = False
         self._feed_data_logged = False
         self._last_feed_log_time = 0.0
         self._last_tick_time = 0.0
@@ -469,9 +472,39 @@ class DeltaWebSocket:
         self._last_heartbeat = time.time()
         self._schedule_heartbeat_check()
 
+    def _notify_unavailable(self, reason: str) -> None:
+        """Log once when WS is down and cannot reconnect; invoke on_unavailable."""
+        with self._lock:
+            if self._unavailable_notified or self._stop.is_set():
+                return
+            self._unavailable_notified = True
+            self._gave_up = True
+        msg = f"Delta WebSocket disconnected and unable to reconnect: {reason}"
+        logger.error(msg)
+        if self.on_unavailable:
+            try:
+                self.on_unavailable(reason)
+            except Exception as e:
+                logger.debug("Delta WS on_unavailable callback error: %s", e)
+
+    def _clear_unavailable(self) -> None:
+        with self._lock:
+            self._unavailable_notified = False
+            self._gave_up = False
+            self._connect_failures = 0
+
+    def _ensure_run_thread(self) -> None:
+        """Start or restart the run_forever thread if it died during reconnect."""
+        if self._stop.is_set() or self._gave_up:
+            return
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run_forever, daemon=True)
+        self._thread.start()
+
     def _schedule_heartbeat_check(self) -> None:
         def check():
-            if self._stop.is_set():
+            if self._stop.is_set() or self._gave_up:
                 return
             with self._lock:
                 elapsed = time.time() - self._last_heartbeat
@@ -770,7 +803,7 @@ class DeltaWebSocket:
             self.on_message(msg)
 
     def _on_open(self, _ws) -> None:
-        self._connect_failures = 0  # reset on successful connect
+        self._clear_unavailable()  # reset give-up / notify latch on successful connect
         self._reset_private_ws_state()
         with self._lock:
             self._connect_generation += 1
@@ -801,12 +834,10 @@ class DeltaWebSocket:
                 error,
             )
         elif self._connect_failures >= MAX_CONNECT_FAILURES:
-            if not self._gave_up:
-                self._gave_up = True
-                logger.info(
-                    "Delta WebSocket unavailable after %s attempts. Using REST/candle fallback; reconnect stopped.",
-                    MAX_CONNECT_FAILURES,
-                )
+            self._notify_unavailable(
+                f"connection failed {self._connect_failures} times "
+                f"(last={error})"
+            )
         else:
             logger.debug(
                 "Delta WebSocket reconnect attempt %s failed: %s",
@@ -843,35 +874,59 @@ class DeltaWebSocket:
         """Start WebSocket connection in a background thread."""
         logger.info("Delta WebSocket URL: %s", self.ws_url)
         self._stop.clear()
-        if self._thread is None:
-            self._gave_up = False
-            self._connect_failures = 0
+        self._clear_unavailable()
         self._ws = self._make_ws_app()
-        self._thread = threading.Thread(target=self._run_forever, daemon=True)
-        self._thread.start()
+        self._ensure_run_thread()
 
     def _reconnect(self) -> None:
-        """Replace WebSocket app and let the same thread run run_forever again (no second thread)."""
+        """
+        Close the current socket and install a new WebSocketApp.
+
+        Always ensure the run_forever thread is alive — a prior bug set
+        ``_ws = None`` while the loop condition required ``_ws``, which killed
+        the thread permanently after heartbeat reconnects.
+        """
         if self._reconnecting:
+            return
+        if self._stop.is_set() or self._gave_up:
             return
         self._reconnecting = True
         if self._heartbeat_timer:
             self._heartbeat_timer.cancel()
             self._heartbeat_timer = None
         try:
-            if self._ws:
+            old = self._ws
+            # Install the next app before closing so _run_forever never sees None.
+            self._ws = self._make_ws_app()
+            if old is not None:
                 try:
-                    self._ws.close()
+                    old.close()
                 except Exception as e:
                     logger.debug("Delta WS close during reconnect: %s", e)
-                self._ws = None
-            logger.debug("Delta WebSocket: reconnecting in 2s...")
+            logger.info("Delta WebSocket: reconnecting...")
             time.sleep(2)
             if self._stop.is_set() or self._gave_up:
                 return
-            self._ws = self._make_ws_app()
+            self._ensure_run_thread()
+            self._schedule_reconnect_watchdog()
         finally:
             self._reconnecting = False
+
+    def _schedule_reconnect_watchdog(self, wait_sec: float = 60.0) -> None:
+        """If still disconnected after wait_sec, log + notify (Telegram via feed)."""
+
+        def check() -> None:
+            if self._stop.is_set() or self._unavailable_notified:
+                return
+            if self.is_connected():
+                return
+            self._notify_unavailable(
+                f"still disconnected {wait_sec:.0f}s after reconnect attempt"
+            )
+
+        timer = threading.Timer(float(wait_sec), check)
+        timer.daemon = True
+        timer.start()
 
     def request_reconnect(self, reason: str = "manual") -> None:
         """Public reconnect trigger used by feed watchdog/recovery logic."""
@@ -881,15 +936,27 @@ class DeltaWebSocket:
         self._reconnect()
 
     def _run_forever(self) -> None:
-        while not self._stop.is_set() and self._ws and not self._gave_up:
+        while not self._stop.is_set() and not self._gave_up:
+            ws = self._ws
+            if ws is None:
+                time.sleep(0.5)
+                continue
             try:
-                self._ws.run_forever(ping_interval=30, ping_timeout=5)
+                ws.run_forever(ping_interval=30, ping_timeout=5)
             except Exception as e:
                 if not self._gave_up:
                     logger.warning("Delta WebSocket run_forever: %s", e)
             if self._stop.is_set() or self._gave_up:
                 break
+            # Socket ended without an explicit give-up — brief pause then retry
+            # the current (or replacement) WebSocketApp.
             time.sleep(2)
+        if not self._stop.is_set() and self._gave_up:
+            # Already notified via _notify_unavailable in most paths; ensure log.
+            logger.error(
+                "Delta WebSocket run loop stopped (unable to reconnect). "
+                "Engine remains up on REST/candle fallback only."
+            )
 
     def disconnect(self) -> None:
         """Stop the WebSocket connection."""

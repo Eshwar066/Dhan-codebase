@@ -57,14 +57,19 @@ dependencies:
   - option_chain
   expiry_type: MONTHLY
 
+# New entries only. Existing positions still exit on the RSI flip.
+entries:
+  call_side: true   # RSI < 32 → sell CALL
+  put_side: true    # RSI > 52 → sell PUT
+
 # MAIN leg toggles — each enabled leg places MAIN sell + monthly hedge bundle.
 legs:
   mini_leaps:
-    enabled: true
+    enabled: false
     expiry_pref: LEAPS_ROLL
     structure_suffix: ""
   quarterly_leaps:
-    enabled: false
+    enabled: true
     expiry_pref: QUARTERLY
     structure_suffix: ":QTR"
 

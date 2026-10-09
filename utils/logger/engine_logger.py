@@ -91,7 +91,8 @@ TELEGRAM_ALERT_EVENTS = {
     "order_rejected",
     "risk_block",
     "kill_switch",
-    "candle_closed",
+    "structure_snapshot",
+    # "candle_closed" - disabled to prevent Telegram spam
 }
 
 # DELTA: 24/7 1m bars — candle_closed Telegram spam is not useful; file logs remain.

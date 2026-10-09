@@ -22,6 +22,20 @@ from core.data.option_chain.kotak_chain import (
 )
 from core.utils.expiry_resolver import ExpiryResolver
 
+# Column mapping from live API to SEM_* format expected by build_dhan_shaped_chain
+_LIVE_API_TO_SEM = {
+    "pTrdSymbol": "SEM_TRADING_SYMBOL",
+    "pSymbolName": "SEM_CUSTOM_SYMBOL",
+    "dStrikePrice;": "SEM_STRIKE_PRICE",
+    "pOptionType": "SEM_OPTION_TYPE",
+    "pAssetCode": "SEM_SMST_SECURITY_ID",
+    "lLotSize": "SEM_LOT_UNITS",
+    "lExpiryDate ": "SEM_EXPIRY_DATE",
+    "pExchSeg": "SEM_EXM_EXCH_ID",
+    "pInstType": "SEM_EXCH_INSTRUMENT_TYPE",
+    "pExpiryDate": "SEM_EXPIRY_DATE",  # string format
+}
+
 from .base import IDataProvider
 
 logger = logging.getLogger(__name__)
@@ -70,6 +84,68 @@ class KotakDataProvider(IDataProvider):
             logger.warning("Kotak get_live_expiry: no instrument store bound")
             return []
         return list_option_expiries(df, symbol, monthly_only=False)
+
+    def _convert_live_api_to_sem(self, live_rows: List[Dict[str, Any]]) -> pd.DataFrame:
+        """Convert live API response to SEM_* format expected by build_dhan_shaped_chain."""
+        if not live_rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(live_rows)
+
+        # Rename columns to SEM_* format
+        rename_map = {
+            "pTrdSymbol": "SEM_TRADING_SYMBOL",
+            "pSymbolName": "SEM_CUSTOM_SYMBOL",
+            "dStrikePrice;": "SEM_STRIKE_PRICE",
+            "pOptionType": "SEM_OPTION_TYPE",
+            "pAssetCode": "SEM_SMST_SECURITY_ID",
+            "lLotSize": "SEM_LOT_UNITS",
+            "lExpiryDate ": "SEM_EXPIRY_DATE",
+            "pExchSeg": "SEM_EXM_EXCH_ID",
+            "pInstType": "SEM_EXCH_INSTRUMENT_TYPE",
+            "pExpiryDate": "SEM_EXPIRY_DATE_STR",
+        }
+        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+        # Ensure required columns exist with correct types
+        if "SEM_STRIKE_PRICE" in df.columns:
+            df["SEM_STRIKE_PRICE"] = pd.to_numeric(df["SEM_STRIKE_PRICE"], errors="coerce")
+        if "SEM_LOT_UNITS" in df.columns:
+            df["SEM_LOT_UNITS"] = pd.to_numeric(df["SEM_LOT_UNITS"], errors="coerce")
+        if "SEM_EXPIRY_DATE" in df.columns:
+            df["SEM_EXPIRY_DATE"] = pd.to_numeric(df["SEM_EXPIRY_DATE"], errors="coerce")
+        if "SEM_OPTION_TYPE" in df.columns:
+            df["SEM_OPTION_TYPE"] = df["SEM_OPTION_TYPE"].astype(str).str.upper().str.strip()
+        if "SEM_EXCH_INSTRUMENT_TYPE" in df.columns:
+            df["SEM_EXCH_INSTRUMENT_TYPE"] = df["SEM_EXCH_INSTRUMENT_TYPE"].astype(str).str.upper().str.strip()
+        if "SEM_EXM_EXCH_ID" in df.columns:
+            df["SEM_EXM_EXCH_ID"] = df["SEM_EXM_EXCH_ID"].astype(str).str.strip().str.lower()
+
+        # Convert expiry date string to timestamp if needed
+        if "SEM_EXPIRY_DATE_STR" in df.columns:
+            df["SEM_EXPIRY_DATE"] = pd.to_datetime(df["SEM_EXPIRY_DATE_STR"], errors="coerce").astype("int64") // 10**9
+
+        # Fill missing SEM_EXM_EXCH_ID
+        if "SEM_EXM_EXCH_ID" not in df.columns:
+            df["SEM_EXM_EXCH_ID"] = "nse_fo"
+
+        # Fill missing SEM_EXCH_INSTRUMENT_TYPE
+        if "SEM_EXCH_INSTRUMENT_TYPE" not in df.columns:
+            df["SEM_EXCH_INSTRUMENT_TYPE"] = "OPTIDX"
+
+        # Ensure required columns exist
+        required = ["SEM_TRADING_SYMBOL", "SEM_CUSTOM_SYMBOL", "SEM_STRIKE_PRICE",
+                    "SEM_OPTION_TYPE", "SEM_SMST_SECURITY_ID", "SEM_LOT_UNITS",
+                    "SEM_EXPIRY_DATE", "SEM_EXM_EXCH_ID", "SEM_EXCH_INSTRUMENT_TYPE"]
+        for col in required:
+            if col not in df.columns:
+                df[col] = None
+
+        # Convert SEM_EXPIRY_DATE to datetime.date for filtering
+        if "SEM_EXPIRY_DATE" in df.columns:
+            df["SEM_EXPIRY_DATE"] = pd.to_datetime(df["SEM_EXPIRY_DATE"], unit="s", errors="coerce").dt.date
+
+        return df
 
     def get_live_option_chain(
         self,
@@ -122,14 +198,31 @@ class KotakDataProvider(IDataProvider):
         if resolved is None:
             return None
 
-        if store is not None and hasattr(store, "list_options_for_expiry"):
-            opt_rows = store.list_options_for_expiry(
-                symbol, resolved, monthly_only=False
+        # Check if the resolved expiry exists in the static CSV
+        opt_rows = option_rows_for_expiry(df, symbol, resolved, monthly_only=False)
+        use_live_api = opt_rows is None or opt_rows.empty
+
+        if use_live_api:
+            # Fetch live option chain from Kotak API for the resolved expiry
+            logger.info("Kotak get_live_option_chain: fetching live data for expiry %s", resolved)
+            expiry_fmt = resolved.strftime("%d%b%y").upper()  # e.g., 25AUG26
+            live_rows = self._source.get_option_chain_for_expiry(
+                exchange_segment="nse_fo",
+                symbol=symbol,
+                expiry=resolved.strftime("%d%b%y").upper(),
+                option_type=None,  # Fetch both CE and PE
             )
-        else:
-            opt_rows = option_rows_for_expiry(
-                df, symbol, resolved, monthly_only=False
-            )
+            if not live_rows:
+                logger.warning("Kotak get_live_option_chain: no live data for expiry %s", resolved)
+                return None
+
+            # Convert live API data to SEM format
+            opt_rows = self._convert_live_api_to_sem(live_rows)
+
+            # Filter for the symbol (exclude FINNIFTY, NIFTYNXT50, etc.)
+            if "SEM_CUSTOM_SYMBOL" in opt_rows.columns:
+                opt_rows = opt_rows[opt_rows["SEM_CUSTOM_SYMBOL"].astype(str).str.upper().str.startswith(symbol.upper())]
+
         if opt_rows is None or opt_rows.empty:
             logger.warning(
                 "Kotak get_live_option_chain: no option rows symbol=%s expiry=%s",
