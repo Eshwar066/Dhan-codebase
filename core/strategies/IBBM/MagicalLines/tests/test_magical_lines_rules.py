@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pandas as pd
 
 from core.strategies.IndiaMktMixins import IST
-from core.strategies.MagicalLines.MagicalLines import MagicalLines
+from core.strategies.IBBM.MagicalLines.MagicalLines import MagicalLines
 
 
 def _candle(day: str, hhmm: str, close: float, symbol: str = "NIFTY") -> dict:
@@ -123,7 +123,7 @@ class MagicalLinesRuleTests(unittest.TestCase):
         self.assertEqual(self.strategy._exit_reason(position, candle, None), "EXPIRY_WEEK")
 
     def test_structure_id_round_trip(self):
-        from core.strategies.MagicalLines.MagicalLines import _MlMeta
+        from core.strategies.IBBM.MagicalLines.MagicalLines import _MlMeta
 
         meta = _MlMeta(
             symbol="NIFTY",

@@ -1,7 +1,7 @@
-id: NiftyIntradayMagicalLine
+id: MagicalLines
 implementation:
-  module: core.strategies.MagicalLines.NiftyIntradayMagicalLine.NiftyIntradayMagicalLine
-  class: NiftyIntradayMagicalLine
+  module: core.strategies.IBBM.MagicalLines.MagicalLines
+  class: MagicalLines
 instrument: OPTION
 allowed_modes:
 - BACKTEST
@@ -13,7 +13,7 @@ broker:
 symbols:
 - NIFTY
 exchange: NSE
-timeframe: '15'
+timeframe: '30'
 schedule:
   eval_mode: live_feed
 data:
@@ -21,7 +21,7 @@ data:
     data:
       option_chain:
         exchange: NSE
-        interval: '15'
+        interval: '30'
         segment: OPT
         api: DHAN
         expiry_flag: MONTHLY
@@ -29,7 +29,7 @@ data:
     data:
       option_chain:
         exchange: NSE
-        interval: '15'
+        interval: '30'
         segment: OPT
         api: DHAN
         expiry_flag: MONTHLY
@@ -44,15 +44,16 @@ profile:
     exchange: INDEX
     sector: 'YES'
   backtest:
-    start_date: '2026-01-02'
+    start_date: '2026-01-01'
     end_date: '2026-02-19'
-    timeframe: '15'
+    timeframe: '30'
     exchange: INDEX
     sector: 'YES'
 dependencies:
   mixins:
   - IndiaMktMixins
-  meta_key: nifty_intraday_magical_line
+  expiry_type: QUARTERLY
+  meta_key: magical_lines
 documentation:
-  title: Nifty Intraday Magical Line
-  overview: 15m NIFTY intraday magical-line options.
+  title: Magical Lines
+  overview: NIFTY quarterly magical-line option selling. Entry on the 15:15 30m bar, hedge 500 points on the same expiry.

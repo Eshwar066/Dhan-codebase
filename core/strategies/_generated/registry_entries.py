@@ -9,10 +9,10 @@ from core.strategies.Equity.SuperTrendStockRider.SuperTrendStockRider import Sup
 from core.strategies.Futures.Futures_EMA.Futures_EMA import FuturesEMAHighLow
 from core.strategies.Futures.Futures_EMA_Momentum.Futures_EMA_Momentum import FuturesEMAMomentum
 from core.strategies.IBBM.Leaps.LeapsQuatery_RSI_52_32 import LeapsQuarterly
+from core.strategies.IBBM.MagicalLines.MagicalLines import MagicalLines
+from core.strategies.IBBM.MagicalLines.NiftyIntradayMagicalLine.NiftyIntradayMagicalLine import NiftyIntradayMagicalLine
 from core.strategies.IBBM.NiftyDOS.NiftyDOS import NiftyDOS
 from core.strategies.IBBM.SMA9Weekly.NiftySMA9Weekly import NiftySMA9Weekly
-from core.strategies.MagicalLines.MagicalLines import MagicalLines
-from core.strategies.MagicalLines.NiftyIntradayMagicalLine.NiftyIntradayMagicalLine import NiftyIntradayMagicalLine
 from core.strategies.OpenIntrest.OIPostionalBuy.OIPosBuy import OIPositionalBuy
 from core.strategies.OpenIntrest.optionbuildup.optionbuildup import OptionBuildup
 from core.strategies.PipelineTest.signal_flood_test import SignalFloodTestStrategy

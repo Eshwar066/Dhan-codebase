@@ -20,8 +20,8 @@ Resolve unknown names: `resolve_registry_key(name)` in `core/strategies/registry
 |--------------|-------|------------|-------|---------|--------------|--------|
 | `LEAPS_RSI` | `LeapsQuarterly` | OPTION | DHAN | yes | yes | `Leaps/readme.txt` |
 | `BankNiftyBTST` | `BankNiftyBTST` | OPTION | DHAN | yes | yes | `BTST/BankNiftyBTST/readme.md` |
-| `MagicalLines` | `MagicalLines` | OPTION | DHAN | yes | yes | `MagicalLines/readme.md` |
-| `NiftyIntradayMagicalLine` | `NiftyIntradayMagicalLine` | OPTION | DHAN | yes | yes | `MagicalLines/NiftyIntradayMagicalLine/readme.md` |
+| `MagicalLines` | `MagicalLines` | OPTION | DHAN | yes | yes | `IBBM/MagicalLines/readme.md` |
+| `NiftyIntradayMagicalLine` | `NiftyIntradayMagicalLine` | OPTION | DHAN | yes | yes | `IBBM/MagicalLines/NiftyIntradayMagicalLine/readme.md` |
 | `OneDayMagicalLine` | `OneDayMagicalLine` | OPTION | DELTA | yes | yes | `crypto/oneDayMagicalLine/readme.md` |
 | `OIPositionalBuy` | `OIPositionalBuy` | OPTION | DHAN | yes | yes | `OpenIntrest/OIPostionalBuy/readme.md` |
 | `OptionBuildup` | `OptionBuildup` | OPTION | DHAN | yes | yes | `OpenIntrest/optionbuildup/readme.md` |

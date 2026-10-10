@@ -13,9 +13,9 @@ _AUTO-GENERATED table — run `python -m tools.strategy_manifest generate` to re
 | `IPOBreakout` | `IPOBreakout` | EQUITY | DHAN | `core/strategies/Equity/IPOBreakout/strategy.yaml` |
 | `LEAPS_RSI` | `LeapsQuarterly` | OPTION | DHAN | `core/strategies/IBBM/Leaps/strategy.yaml` |
 | `LiquiditySweepStrategy` | `LiquiditySweepStrategy` | FUTURE | DELTA | `core/strategies/crypto/LiquiditySweepStrategy/strategy.yaml` |
-| `MagicalLines` | `MagicalLines` | OPTION | DHAN | `core/strategies/MagicalLines/strategy.yaml` |
+| `MagicalLines` | `MagicalLines` | OPTION | DHAN | `core/strategies/IBBM/MagicalLines/strategy.yaml` |
 | `NiftyDOS` | `NiftyDOS` | OPTION | KOTAK | `core/strategies/IBBM/NiftyDOS/strategy.yaml` |
-| `NiftyIntradayMagicalLine` | `NiftyIntradayMagicalLine` | OPTION | DHAN | `core/strategies/MagicalLines/NiftyIntradayMagicalLine/strategy.yaml` |
+| `NiftyIntradayMagicalLine` | `NiftyIntradayMagicalLine` | OPTION | DHAN | `core/strategies/IBBM/MagicalLines/NiftyIntradayMagicalLine/strategy.yaml` |
 | `NiftySMA9Weekly` | `NiftySMA9Weekly` | OPTION | KOTAK | `core/strategies/IBBM/SMA9Weekly/strategy.yaml` |
 | `OIPositionalBuy` | `OIPositionalBuy` | OPTION | DHAN | `core/strategies/OpenIntrest/OIPostionalBuy/strategy.yaml` |
 | `OneDayMagicalLine` | `OneDayMagicalLine` | OPTION | DELTA | `core/strategies/crypto/oneDayMagicalLine/strategy.yaml` |
