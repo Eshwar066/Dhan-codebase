@@ -292,7 +292,6 @@ GENERATED_STRATEGY_SUBSCRIPTIONS: dict = {
             'timeframes': [
                 '1',
                 '5',
-                '5',
                 '4h',
             ],
             'symbols': [
@@ -334,7 +333,7 @@ GENERATED_STRATEGY_SUBSCRIPTIONS: dict = {
         'BarClosed': {
             'enabled': True,
             'timeframes': [
-                'DAY',
+                '30',
             ],
             'symbols': [
                 'NIFTY',

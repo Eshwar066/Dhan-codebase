@@ -167,7 +167,7 @@ STRATEGY_RUNTIME_SPEC: dict = {
             'data': {
                 'option_chain': {
                     'exchange': 'NSE',
-                    'interval': 'DAY',
+                    'interval': '30',
                     'segment': 'OPT',
                     'api': 'DHAN',
                     'expiry_flag': 'MONTHLY',
@@ -178,7 +178,7 @@ STRATEGY_RUNTIME_SPEC: dict = {
             'data': {
                 'option_chain': {
                     'exchange': 'NSE',
-                    'interval': 'DAY',
+                    'interval': '30',
                     'segment': 'OPT',
                     'api': 'DHAN',
                     'expiry_flag': 'MONTHLY',

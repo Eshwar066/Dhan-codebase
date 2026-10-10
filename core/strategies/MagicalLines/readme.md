@@ -6,25 +6,26 @@ Engine job: `run/config.py` → `dhan_magicallines` (disabled by default)
 
 ## Overview
 
-Time-anchored **3:20 PM IST** option selling on NIFTY. Intraday candle color (9:15–15:20) sets direction; magical line levels drive strike selection and reversals.
+Quarterly **NIFTY** short options. The daily decision is the NSE **30-minute** bar that opens **15:15 IST** (the bar that contains 15:20). Candle colour is that bar's close versus the **09:15** session open.
 
 ## Evaluation
 
 | Item | Value |
 |------|-------|
-| Eval mode | `live_feed` with `valid_times = {"15:20"}` |
-| Timeframe | `60` |
-| API | NSE option chain via `required_context = ["option_chain"]` |
+| Eval mode | `live_feed` |
+| Timeframe | `30` |
+| API | Dhan option chain (`expiryType = QUARTERLY`) |
 
 ## Rules
 
-- **Green day** → short PE; **red day** → short CE.
-- **Magical line:** MLG = spot × 0.9975 (green), MLR = spot × 1.0025 (red).
-- **Main leg:** 100-point strikes, premium **200–400** (`TARGET_PREMIUM_MIN/MAX`).
-- **Hedge:** within 500 points of main, net credit **90–120**.
-- **Expiry:** monthly; after **13th** → next month series; rollover **one week before** expiry (Wednesday).
-- **Reversal:** at 15:20 if price closes opposite magical line → exit and reverse.
-- **Pyramid:** up to 3 levels when price moves 2% from first line (`MAX_MAGICAL_LEVELS`).
+- **Green day** (close > 09:15 open) → short PE. **Red day** → short CE.
+- **Magical line:** put = spot − spot × 0.25%; call = spot + spot × 0.25%.
+- **Main strike:** nearest 50-point strike to the magical line.
+- **Hedge:** 500 points further OTM, **same quarterly expiry** as the main leg.
+- **Spacing:** no new line while an open magical line sits inside ±3% of spot. After the first line, the next line is the same direction once spot has moved 3% beyond that first line and the 15:15 candle still matches (green → put, red → call).
+- **Expiry exit:** flat from 7 calendar days before the position's quarterly expiry. No new entries in that week.
+- **Next-day cross (15:15):** spot through the magical line by more than **0.2%** → exit and sell the opposite side. A close inside the 0.2% buffer is held until the next day.
+- **30-minute stop:** spot **0.5% or more** through the magical line → exit immediately, no reverse.
 
 ## Related
 
