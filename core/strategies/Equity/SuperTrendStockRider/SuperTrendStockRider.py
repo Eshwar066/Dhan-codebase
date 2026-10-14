@@ -124,14 +124,16 @@ class SuperTrendStockRider(IndiaMktMixins, BaseStrategy):
     # -------------------------------------------------------------------------
     # Main evaluation
     # -------------------------------------------------------------------------
+    def configure_run_mode(self, run_mode: RunMode) -> None:
+        """Store the run mode for use in strategy logic."""
+        self._run_mode = run_mode
+
     def should_evaluate(self, candle: Dict[str, Any]) -> bool:
         """Evaluate on daily candles - in backtest mode evaluate all, in live only at 15:15."""
-        tf = str(candle.get("timeframe", "")).strip()
-        if tf not in ("D", "DAY"):
-            return False
         # In backtest mode, evaluate every daily candle
-        if RUN_MODE == RunMode.BACKTEST:
+        if hasattr(self, '_run_mode') and self._run_mode == RunMode.BACKTEST:
             return True
+        # In live/paper mode, only check at 15:15
         return self._is_check_time(candle)
 
     def on_candle(self, candle: Dict[str, Any], ctx) -> Optional[List[Any]]:
@@ -176,10 +178,14 @@ class SuperTrendStockRider(IndiaMktMixins, BaseStrategy):
         # 3. ENTRY: Green signal
         # -----------------------------------------------------------------
         if pos.qty == 0 and signal == "GREEN":
+            logger.debug(f"[{symbol}] ENTRY CONDITION MET: pos.qty={pos.qty}, signal={signal}, RUN_MODE={RUN_MODE}")
             # In backtest: enter on green signal
             # In live: require close > prev_close at 15:15
             if RUN_MODE == RunMode.BACKTEST:
-                return self._build_entry_intent(symbol, ctx, candle, pos)
+                logger.debug(f"[{symbol}] Attempting to build entry intent for backtest")
+                result = self._build_entry_intent(symbol, ctx, candle, pos)
+                logger.debug(f"[{symbol}] _build_entry_intent returned: {result}")
+                return result
             else:
                 # Live: check close > prev_close at 15:15
                 prev_close = self._get_prev_close(candle, ctx, symbol)
@@ -223,6 +229,7 @@ class SuperTrendStockRider(IndiaMktMixins, BaseStrategy):
 
     def _build_entry_intent(self, symbol: str, ctx, candle: Dict[str, Any], pos: PositionState):
         """Create entry intent."""
+        logger.debug(f"[{symbol}] _build_entry_intent called: pos.qty={pos.qty}, signal=GREEN")
         # Get instrument for the symbol using equity-specific method
         instrument = ctx.instrument_store.equity_intent_creation_details(symbol, ctx.exchange)
         if instrument is None:
@@ -258,153 +265,5 @@ class SuperTrendStockRider(IndiaMktMixins, BaseStrategy):
         pos.supertrend_green = True
         pos.reduced = False
 
-        return [intent] if intent else None
-
-    def _build_reduce_intent(self, symbol: str, ctx, pos: PositionState):
-        """Create 50% reduction intent."""
-        # Get instrument for the symbol using equity-specific method
-        instrument = ctx.instrument_store.equity_intent_creation_details(symbol, ctx.exchange)
-        if instrument is None:
-            logger.warning(f"[{symbol}] Could not find instrument for symbol")
-            return None
-
-        # Calculate reduce quantity (50% of current position)
-        reduce_qty = max(1, int(pos.qty * self.reduce_pct))
-
-        # Create the intent using inherited method (following Leaps pattern for exits)
-        intent = self.create_order_intent(
-            inst=instrument,                    # Fixed: correct parameter name
-            side="SELL",
-            qty=reduce_qty,                     # Calculate reduce qty
-            price=0,                            # Market order
-            order_type="MARKET",
-            strategy=self.name,
-            structure_id=f"{symbol}_{self.name}_REDUCE",
-            tag="ST_LOW_BREAK_50",
-            symbol=symbol,
-            action="EXIT",
-            candle_ts=pd.Timestamp.now(tz=IST),
-            metadata_extras={                   # Optional metadata
-                "reason": "entry_low_broken",
-                "original_qty": pos.qty,
-                "reduce_qty": reduce_qty,
-            }
-        )
-
-        # Update position state
-        pos.qty -= reduce_qty
-        pos.reduced = True
-
-        return [intent] if intent else None
-
-    def _build_exit_intent(self, symbol: str, ctx, pos: PositionState, reason: str):
-        """Create full exit intent."""
-        # Get instrument for the symbol using equity-specific method
-        instrument = ctx.instrument_store.equity_intent_creation_details(symbol, ctx.exchange)
-        if instrument is None:
-            logger.warning(f"[{symbol}] Could not find instrument for symbol")
-            return None
-
-        # Create the intent using inherited method (following Leaps pattern for exits)
-        intent = self.create_order_intent(
-            inst=instrument,                    # Fixed: correct parameter name
-            side="SELL",
-            qty=pos.qty,                        # Full position
-            price=0,                            # Market order
-            order_type="MARKET",
-            strategy=self.name,
-            structure_id=f"{symbol}_{self.name}_EXIT",
-            tag=f"ST_{reason.upper()}",
-            symbol=symbol,
-            action="EXIT",
-            candle_ts=pd.Timestamp.now(tz=IST),
-            metadata_extras={                   # Optional metadata
-                "reason": reason,
-                "original_qty": pos.qty,
-            }
-        )
-
-        # Reset position
-        pos.qty = 0
-        pos.entry_price = 0.0
-        pos.entry_candle_low = 0.0
-        pos.entry_date = None
-        pos.reduced = False
-        pos.supertrend_green = False
-
-        return [intent] if intent else None
-
-    def on_structure_exit(self, *args, **kwargs):
-        """Required by backtest engine - when position structure exits."""
-        return None
-
-    def get_warmup_period(self) -> int:
-        return max(self.supertrend_length * 3, 60)  # ~60 days
-
-    # -------------------------------------------------------------------------
-    # Backtest engine required methods
-    # -------------------------------------------------------------------------
-    def on_candle_rollover(self, *args, **kwargs):
-        """Required by backtest engine - called on candle rollover."""
-        return None
-
-    def on_structure_exit(self, *args, **kwargs):
-        """Required by backtest engine - called when position structure exits."""
-        return None
-
-    def should_exit(self, pos, candle, ctx) -> bool:
-        """Check if position should be exited."""
-        symbol = pos.symbol if hasattr(pos, "symbol") else pos.get("symbol", "")
-        signal = self._get_supertrend_signal(candle)
-
-        # Exit on Supertrend red
-        if signal == "RED":
-            return True
-
-        # Exit if entry candle low broken (full exit after 50% reduction)
-        pos_state = self._positions.get(symbol)
-        if pos_state and pos_state.reduced and pos_state.entry_candle_low > 0:
-            if float(candle.get("low", 0)) < pos_state.entry_candle_low:
-                return True
-
-        return False
-
-    def on_position_exit(self, pos, candle, ctx):
-        """Generate exit intents for position."""
-        symbol = pos.symbol if hasattr(pos, "symbol") else pos.get("symbol", "")
-        pos_state = self._positions.get(symbol)
-
-        if not pos_state:
-            return []
-
-        # Get instrument for the symbol using equity-specific method
-        instrument = ctx.instrument_store.equity_intent_creation_details(symbol, ctx.exchange)
-        if instrument is None:
-            logger.warning(f"[{symbol}] Could not find instrument for symbol")
-            return []
-
-        # Create the exit intent using inherited method (following Leaps pattern)
-        intent = self.create_order_intent(
-            inst=instrument,                    # Fixed: correct parameter name
-            side="SELL",
-            qty=pos_state.qty,
-            price=0,  # Market
-            order_type="MARKET",
-            strategy=self.name,
-            structure_id=f"{symbol}_{self.name}_EXIT",
-            tag="ST_EXIT",
-            symbol=symbol,
-            action="EXIT",
-            candle_ts=pd.Timestamp(candle.get("timestamp")) if candle.get("timestamp") else pd.Timestamp.now(tz=IST),
-            metadata_extras={"reason": "supertrend_exit"}
-        )
-
-        # Reset position state
-        pos_state.qty = 0
-        pos_state.entry_price = 0.0
-        pos_state.entry_candle_low = 0.0
-        pos_state.entry_date = None
-        pos_state.reduced = False
-        pos_state.supertrend_green = False
-
+        logger.debug(f"[{symbol}] _build_entry_intent returning: {intent}")
         return [intent] if intent else None
