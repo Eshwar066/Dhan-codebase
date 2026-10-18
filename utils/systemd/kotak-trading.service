@@ -7,15 +7,15 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-User=root
+User=ubuntu
 WorkingDirectory=/home/ubuntu/Dhan-codebase
 EnvironmentFile=-/home/ubuntu/Dhan-codebase/.env
 ExecStart=/home/ubuntu/Dhan-codebase/.venv/bin/python -m run.main --engine-id kotak
 Restart=on-failure
 RestartSec=300
 TimeoutStopSec=120
-StandardOutput=append:/root/kotak-trading.log
-StandardError=append:/root/kotak-trading.err.log
+StandardOutput=append:/home/ubuntu/Dhan-codebase/logs/kotak-trading.log
+StandardError=append:/home/ubuntu/Dhan-codebase/logs/kotak-trading.err.log
 
 [Install]
 WantedBy=multi-user.target

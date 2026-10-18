@@ -6,13 +6,15 @@ StartLimitIntervalSec=86400
 StartLimitBurst=5
 
 [Service]
-User=root
+Type=simple
+User=ubuntu
 WorkingDirectory=/home/ubuntu/Dhan-codebase
+EnvironmentFile=-/home/ubuntu/Dhan-codebase/.env
 ExecStart=/home/ubuntu/Dhan-codebase/.venv/bin/python -m run.main --venue DELTA
 Restart=always
 RestartSec=5
-StandardOutput=append:/root/delta.log
-StandardError=append:/root/delta.err.log
+StandardOutput=append:/home/ubuntu/Dhan-codebase/logs/delta.log
+StandardError=append:/home/ubuntu/Dhan-codebase/logs/delta.err.log
 
 [Install]
 WantedBy=multi-user.target

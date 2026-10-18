@@ -7,7 +7,7 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-User=root
+User=ubuntu
 WorkingDirectory=/home/ubuntu/Dhan-codebase
 EnvironmentFile=-/home/ubuntu/Dhan-codebase/.env
 ExecStart=/home/ubuntu/Dhan-codebase/.venv/bin/python -m run.main --engine-id dhan
