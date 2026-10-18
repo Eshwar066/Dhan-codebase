@@ -139,7 +139,8 @@ ENGINE_JOBS = [
         "strategies": [
             # "BTCZeroDTE",
             # "BTCZeroDTEElevenPM",
-            "DirectionalOptionSelling",
+            # "DirectionalOptionSelling",
+            "ETHZeroDteReverseStraddle",
             # "LiquiditySweepStrategy",
             # "RSIBreadAndButter",
         ],
