@@ -6,6 +6,7 @@ GENERATED_LEGACY_META_KEYS: dict = {
     'BTCZeroDTEElevenPM': 'btc_zero_dte_eleven_pm',
     'BankNiftyBTST': 'banknifty_btst',
     'DirectionalOptionSelling': 'directional_option_selling',
+    'ETHZeroDteReverseStraddle': 'eth_zero_dte_reverse_straddle',
     'LiquiditySweepStrategy': 'liquidity_sweep',
     'MagicalLines': 'magical_lines',
     'NiftyDOS': 'nifty_dos',

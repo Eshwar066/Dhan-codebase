@@ -90,6 +90,28 @@ STRATEGY_PROFILES: dict = {
             'sector': 'YES',
         },
     },
+    'ETHZeroDteReverseStraddle': {
+        'symbols': [
+            'ETHUSD',
+        ],
+        'exchange': 'NSE',
+        'delta': {
+            'india': True,
+            'testnet': False,
+            'leverage': 100,
+        },
+        'live': {
+            'exchange': 'DELTA',
+            'sector': 'YES',
+        },
+        'backtest': {
+            'start_date': '2026-02-01',
+            'end_date': '2026-02-28',
+            'timeframe': '15',
+            'exchange': 'DELTA',
+            'sector': 'YES',
+        },
+    },
     'FuturesEMAHighLow': {
         'symbols': [
             'NIFTY',
@@ -362,7 +384,6 @@ STRATEGY_PROFILES: dict = {
     'SuperTrendStockRider': {
         'symbols': [
             'NUVAMA',
-            'SG',
         ],
         'exchange': 'NSE',
         'eval_mode': 'scheduled',
@@ -371,8 +392,8 @@ STRATEGY_PROFILES: dict = {
             'sector': 'EQ',
         },
         'backtest': {
-            'start_date': '2024-01-01',
-            'end_date': '2024-12-31',
+            'start_date': '2023-09-26',
+            'end_date': '2026-10-10',
             'timeframe': 'DAY',
             'exchange': 'NSE',
             'sector': 'EQ',

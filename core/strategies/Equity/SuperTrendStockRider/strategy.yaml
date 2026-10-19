@@ -12,7 +12,6 @@ broker:
   api: DHAN
 symbols:
   - "NUVAMA"
-  - "SG"
 exchange: NSE
 timeframe: "DAY"
 schedule:

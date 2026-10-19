@@ -19,6 +19,7 @@ from core.strategies.PipelineTest.signal_flood_test import SignalFloodTestStrate
 from core.strategies.crypto.BTCZeroDteElevenPM.BTCZeroDTEElevenPM import BTCZeroDTEElevenPM
 from core.strategies.crypto.BTCZeroDteThreeFifteen.BTCZeroDTE import BTCZeroDTE
 from core.strategies.crypto.DirectionalOptionSelling.DirectionalOptionSelling import DirectionalOptionSelling
+from core.strategies.crypto.ETHZeroDteReverseStraddle.ETHZeroDteReverseStraddle import ETHZeroDteReverseStraddle
 from core.strategies.crypto.LiquiditySweepStrategy.LiquiditySweepStrategy import LiquiditySweepStrategy
 from core.strategies.crypto.RSIBreadAndButter.RSIBreadAndButter import RSIBreadAndButter
 from core.strategies.crypto.oneDayMagicalLine.oneDayMagicalLine import OneDayMagicalLine
@@ -53,6 +54,15 @@ GENERATED_STRATEGY_MAP = {
     },
     'DirectionalOptionSelling': {
         "strategy": DirectionalOptionSelling,
+        "instrument": 'OPTION',
+        "allowed_modes": [
+            RunMode.BACKTEST,
+            RunMode.PAPER,
+            RunMode.LIVE,
+        ],
+    },
+    'ETHZeroDteReverseStraddle': {
+        "strategy": ETHZeroDteReverseStraddle,
         "instrument": 'OPTION',
         "allowed_modes": [
             RunMode.BACKTEST,

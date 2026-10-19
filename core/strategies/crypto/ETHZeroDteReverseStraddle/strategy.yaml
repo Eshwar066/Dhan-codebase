@@ -1,0 +1,52 @@
+id: ETHZeroDteReverseStraddle
+implementation:
+  module: core.strategies.crypto.ETHZeroDteReverseStraddle.ETHZeroDteReverseStraddle
+  class: ETHZeroDteReverseStraddle
+instrument: OPTION
+allowed_modes:
+- BACKTEST
+- PAPER
+- LIVE
+broker:
+  venue: DELTA
+  api: DELTA
+  delta:
+    india: true
+    testnet: false
+    leverage: 100
+symbols:
+- ETHUSD
+exchange: NSE
+timeframe: '15'
+schedule:
+  eval_mode: live_feed
+data:
+  default:
+    data: {}
+profile:
+  live:
+    exchange: DELTA
+    sector: 'YES'
+  backtest:
+    start_date: '2026-02-01'
+    end_date: '2026-02-28'
+    timeframe: '15'
+    exchange: DELTA
+    sector: 'YES'
+dependencies:
+  mixins:
+  - IndiaMktMixins
+  - DeltaMktMixins
+  required_context:
+  - option_chain
+  expiry_type: Daily
+  meta_key: eth_zero_dte_reverse_straddle
+documentation:
+  title: ETH Zero DTE Reverse Straddle
+  overview: ETH Daily Expiry Reverse Straddle (short strangle) on 15m candles. Entry at 12:00 PM IST, exit at 5:00 PM IST.
+  rules: |
+    - 12:00 PM IST: Buy ATM CE + Buy ATM PE, Sell OTM CE (80 pts) + Sell OTM PE (80 pts)
+    - All legs: 1 lot each
+    - 5:00 PM IST: Exit all positions (time-based)
+    - Uses daily (0DTE) expiry
+  run_command: python -m run.main --engine-id delta_engine_one

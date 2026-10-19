@@ -70,6 +70,17 @@ STRATEGY_RUNTIME_SPEC: dict = {
             'data': {},
         },
     },
+    'ETHZeroDteReverseStraddle': {
+        RunMode.BACKTEST: {
+            'data': {},
+        },
+        RunMode.PAPER: {
+            'data': {},
+        },
+        RunMode.LIVE: {
+            'data': {},
+        },
+    },
     'FuturesEMAHighLow': {
         RunMode.BACKTEST: {
             'data': {},

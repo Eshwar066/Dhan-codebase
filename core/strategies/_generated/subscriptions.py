@@ -143,6 +143,44 @@ GENERATED_STRATEGY_SUBSCRIPTIONS: dict = {
             ],
         },
     },
+    'ETHZeroDteReverseStraddle': {
+        'BarClosed': {
+            'enabled': True,
+            'timeframes': [
+                '15',
+            ],
+            'symbols': [
+                'ETHUSD',
+            ],
+        },
+        'FeedDisconnected': {
+            'enabled': True,
+        },
+        'FeedRecovered': {
+            'enabled': True,
+        },
+        'IntentCreated': {
+            'enabled': True,
+        },
+        'IntentFilled': {
+            'enabled': True,
+        },
+        'PositionClosed': {
+            'enabled': True,
+        },
+        'QuoteUpdated': {
+            'enabled': False,
+            'symbols': [
+                'ETHUSD',
+            ],
+        },
+        'ScheduledSlot': {
+            'enabled': False,
+            'symbols': [
+                'ETHUSD',
+            ],
+        },
+    },
     'FuturesEMAHighLow': {
         'BarClosed': {
             'enabled': True,
@@ -671,7 +709,6 @@ GENERATED_STRATEGY_SUBSCRIPTIONS: dict = {
             ],
             'symbols': [
                 'NUVAMA',
-                'SG',
             ],
         },
         'FeedDisconnected': {
@@ -693,14 +730,12 @@ GENERATED_STRATEGY_SUBSCRIPTIONS: dict = {
             'enabled': False,
             'symbols': [
                 'NUVAMA',
-                'SG',
             ],
         },
         'ScheduledSlot': {
             'enabled': True,
             'symbols': [
                 'NUVAMA',
-                'SG',
             ],
         },
     },
