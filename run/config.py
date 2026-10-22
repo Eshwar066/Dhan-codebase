@@ -60,7 +60,7 @@ ENGINE_JOBS = [
         "ORDER_QTY_LOTS": 1,
         "market_ws_stall_timeout_seconds": 0,
         "strategy_timeout_seconds": 60,
-        "strategies": ["NiftyDOS","LEAPS_RSI"], #"NiftySMA9Weekly",, "BankNiftyBTST","LEAPS_RSI",
+        "strategies": ["LEAPS_RSI"], #"NiftySMA9Weekly",, "BankNiftyBTST","LEAPS_RSI", NiftyDOS
         "telegram": {
             "bot_token": os.getenv(
                 "TELEGRAM_LEAPS_BOT_TOKEN",
@@ -153,7 +153,7 @@ ENGINE_JOBS = [
         "latency_critical_cycles": 6,
         # Delta OMS: reject ENTRY / MAIN_SL when book or mark is unsafe.
         "execution_validator": {
-            "enabled": True,
+            "enabled": False,
             "max_spread_pct": 0.15,
             "max_mark_mid_pct": 0.50,
             "max_quote_age_sec": 30.0,

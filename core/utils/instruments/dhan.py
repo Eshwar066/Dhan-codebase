@@ -251,7 +251,7 @@ class DhanInstrumentStore(BaseInstrumentStore):
         if len(out) > 1:
             out = out.assign(
                 _dd=out["SEM_EXPIRY_DATE"].apply(
-                    lambda v: abs((_row_expiry(v) or exp_dt) - exp_dt).days
+                    lambda v: abs((self._sem_expiry_to_date(v) or exp_dt) - exp_dt).days
                 )
             ).sort_values("_dd", ascending=True)
             out = out.drop(columns=["_dd"], errors="ignore")

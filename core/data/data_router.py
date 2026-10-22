@@ -1,6 +1,7 @@
 from core.data.adapters.nse_adapter import NSEAdapter
 from core.data.adapters.dhan_adapter import DhanAdapter
 from core.data.adapters.kotak_adapter import KotakAdapter
+from core.data.adapters.delta_adapter import DeltaAdapter
 
 
 class DataRouter:
@@ -16,6 +17,7 @@ class DataRouter:
             "NSE": NSEAdapter(data_service),
             "DHAN": DhanAdapter(data_service),
             "KOTAK": KotakAdapter(data_service),
+            "DELTA": DeltaAdapter(data_service),
         }
         self.default_api = (default_api or "").strip().upper() or None
 

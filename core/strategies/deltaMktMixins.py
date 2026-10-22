@@ -195,6 +195,21 @@ def _delta_source_from_ctx(ctx: Any):
     dr = getattr(ocs, "data_router", None)
     if dr is None:
         return None
+
+    # Try DELTA adapter first (for Delta engines)
+    ad = dr.adapters.get("DELTA")
+    if ad is not None:
+        data = getattr(ad, "data", None)
+        if data is not None:
+            # Try _source first (for DeltaDataProvider)
+            src = getattr(data, "_source", None)
+            if src is not None and hasattr(src, "get_products"):
+                return src
+            # Fallback: DeltaSource has get_products directly
+            if hasattr(data, "get_products"):
+                return data
+
+    # Fallback to DHAN adapter (for Dhan engines)
     ad = dr.adapters.get("DHAN")
     if ad is None:
         return None

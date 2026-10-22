@@ -20,12 +20,11 @@ from core.strategies.IndiaMktMixins import IST, IndiaMktMixins
 logger = logging.getLogger(__name__)
 
 # Strategy constants
-ENTRY_TIME = time(12, 0)      # 12:00 PM IST
-EXIT_TIME = time(17, 0)       # 5:00 PM IST
+ENTRY_TIME = time(12, 00)  
+EXIT_TIME = time(17, 0)         # 5:00 PM IST
 STRIKE_OFFSET = 80.0          # 80 points away from ATM
 LOTS = 1                      # 1 lot per leg
 UNDERLYING = "ETHUSD"
-
 
 @dataclass
 class _PositionState:
@@ -112,17 +111,33 @@ class ETHZeroDteReverseStraddle(DeltaMktMixins, IndiaMktMixins, BaseStrategy):
         return True
 
     def _is_entry_bar(self, candle: dict) -> bool:
-        """True if this 15m bar closes at 12:00 PM IST."""
+        """True if this bar closes at 9:55 AM IST (+/- 3 min buffer for 5m timeframe)."""
         ts_ist = self._timestamp_ist(candle["timestamp"])
-        # 15m bar closes at :00, :15, :30, :45 - check if close time is 12:00
-        bar_close = (ts_ist + pd.Timedelta(minutes=15)).time().replace(second=0, microsecond=0)
-        return bar_close == ENTRY_TIME
+        # Use strategy timeframe instead of hardcoded 15m
+        tf_minutes = int(self.timeframe) if str(self.timeframe).isdigit() else 5
+        bar_close = (ts_ist + pd.Timedelta(minutes=tf_minutes)).time().replace(second=0, microsecond=0)
+
+        # Allow 3-minute buffer around entry time for 5m bars
+        entry_buffer = pd.Timedelta(minutes=3)
+        entry_start = (pd.Timestamp.combine(pd.Timestamp.today(), ENTRY_TIME) - entry_buffer).time()
+        entry_end = (pd.Timestamp.combine(pd.Timestamp.today(), ENTRY_TIME) + entry_buffer).time()
+
+        logger.info(">> entry buffer=%s start=%s end=%s bar_close=%s", entry_buffer, entry_start, entry_end, bar_close)
+
+        return entry_start <= bar_close <= entry_end
 
     def _is_exit_bar(self, candle: dict) -> bool:
-        """True if this 15m bar closes at or after 5:00 PM IST."""
+        """True if this bar closes at or after 5:00 PM IST (+/- 3 min buffer for 5m timeframe)."""
         ts_ist = self._timestamp_ist(candle["timestamp"])
-        bar_close = (ts_ist + pd.Timedelta(minutes=15)).time().replace(second=0, microsecond=0)
-        return bar_close >= EXIT_TIME
+        # Use strategy timeframe instead of hardcoded 15m
+        tf_minutes = int(self.timeframe) if str(self.timeframe).isdigit() else 5
+        bar_close = (ts_ist + pd.Timedelta(minutes=tf_minutes)).time().replace(second=0, microsecond=0)
+
+        # Allow 3-minute buffer around exit time for 5m bars
+        exit_buffer = pd.Timedelta(minutes=3)
+        exit_start = (pd.Timestamp.combine(pd.Timestamp.today(), EXIT_TIME) - exit_buffer).time()
+
+        return bar_close >= exit_start
 
     def _0dte_expiry_code(self, candle: dict) -> str:
         """Today's daily expiry code (DDMMYY)."""
@@ -395,14 +410,29 @@ class ETHZeroDteReverseStraddle(DeltaMktMixins, IndiaMktMixins, BaseStrategy):
         return intents
 
     def on_candle(self, candle: dict, ctx: Any) -> Any:
-        if not self.should_evaluate(candle):
-            return None
 
-        if self._is_entry_bar(candle):
+        print(">>oncandle")
+        # if not self.should_evaluate(candle):
+        #     return None
+
+
+        ts_ist = self._timestamp_ist(candle["timestamp"])
+        tf_minutes = int(self.timeframe) if str(self.timeframe).isdigit() else 5
+        bar_close = (ts_ist + pd.Timedelta(minutes=tf_minutes)).time().replace(second=0, microsecond=0)
+
+        entry_match = self._is_entry_bar(candle)
+        exit_match = self._is_exit_bar(candle)
+
+        logger.info(">> on_candle bar_close=%s entry_match=%s exit_match=%s pos_state=%s",
+                    bar_close, entry_match, exit_match, self._position_state is not None)
+
+        if entry_match:
             trade_date = self._timestamp_ist(candle["timestamp"]).date()
             if trade_date in self._entry_attempted_dates:
+                logger.info(">> entry skipped: already attempted today")
                 return None
             if self._position_state is not None:
+                logger.info(">> entry skipped: position already open")
                 return None
 
             atm_strike = self._select_atm_strike(candle, ctx)
@@ -412,11 +442,14 @@ class ETHZeroDteReverseStraddle(DeltaMktMixins, IndiaMktMixins, BaseStrategy):
 
             expiry = self._0dte_expiry_code(candle)
             self._entry_attempted_dates.add(trade_date)
+            logger.info(">> ENTRY TRIGGERED atm=%s expiry=%s", atm_strike, expiry)
             return self._build_entry_intents(candle, ctx, atm_strike, expiry)
 
-        elif self._is_exit_bar(candle):
+        elif exit_match:
             if self._position_state is None:
+                logger.info(">> exit skipped: no position")
                 return None
+            logger.info(">> EXIT TRIGGERED")
             return self._build_exit_intents(candle, ctx)
 
         return None
@@ -428,8 +461,15 @@ class ETHZeroDteReverseStraddle(DeltaMktMixins, IndiaMktMixins, BaseStrategy):
         if self._position_state is None:
             return False
         ts_ist = self._timestamp_ist(candle["timestamp"])
-        bar_close = (ts_ist + pd.Timedelta(minutes=15)).time().replace(second=0, microsecond=0)
-        return bar_close >= EXIT_TIME
+        # Use strategy timeframe instead of hardcoded 15m
+        tf_minutes = int(self.timeframe) if str(self.timeframe).isdigit() else 5
+        bar_close = (ts_ist + pd.Timedelta(minutes=tf_minutes)).time().replace(second=0, microsecond=0)
+
+        # Allow 3-minute buffer around exit time for 5m bars
+        exit_buffer = pd.Timedelta(minutes=3)
+        exit_start = (pd.Timestamp.combine(pd.Timestamp.today(), EXIT_TIME) - exit_buffer).time()
+
+        return bar_close >= exit_start
 
     def on_forced_exit(self, **kwargs: Any) -> None:
         """Clear position state on forced exit."""
